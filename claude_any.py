@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import importlib.util
 import json
 import os
 import re
@@ -67,7 +68,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.1"
+VERSION = "0.1.2"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -325,7 +326,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "nvidia-hosted": {
             "base_url": "https://integrate.api.nvidia.com/v1",
             "api_key": "not-used",
-            "current_model": "claude-nvidia-qwen-qwen3-coder-480b-a35b-instruct",
+            "current_model": "qwen/qwen3-coder-480b-a35b-instruct",
             "custom_models": [],
             "native_compat": False,
             "max_output_tokens": 4096,
@@ -706,7 +707,12 @@ def install_ncp_proxy() -> str | None:
         )
     if proc.returncode != 0:
         return None
+    importlib.invalidate_caches()
     return find_executable("ncp")
+
+
+def ncp_module_available() -> bool:
+    return importlib.util.find_spec("nvd_claude_proxy") is not None
 
 
 def ensure_ncp() -> None:
@@ -718,23 +724,57 @@ def ensure_ncp() -> None:
     env["NVIDIA_BASE_URL"] = upstream.rstrip("/")
     env.setdefault("PROXY_HOST", "127.0.0.1")
     env.setdefault("PROXY_PORT", "8788")
+    env.setdefault("STORAGE_ENGINE", "sqlite")
+    timeout_ms = positive_int(provider.get("request_timeout_ms"))
+    if timeout_ms:
+        env["REQUEST_TIMEOUT_SECONDS"] = str(max(1, timeout_ms / 1000))
     base = f"http://{env['PROXY_HOST']}:{env['PROXY_PORT']}"
     if is_url_up(f"{base}/v1/models"):
         return
     NCP_LOG.parent.mkdir(parents=True, exist_ok=True)
-    ncp = find_executable("ncp") or install_ncp_proxy()
-    if not ncp:
-        raise RuntimeError("ncp executable was not found. Install it with: python -m pip install --user nvd-claude-proxy")
-    host = env["PROXY_HOST"]
-    port = str(env["PROXY_PORT"])
+    if not ncp_module_available():
+        install_ncp_proxy()
+    if not ncp_module_available():
+        raise RuntimeError("nvd-claude-proxy Python module was not found. Install it with: python -m pip install --user nvd-claude-proxy")
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     with open(NCP_LOG, "ab", buffering=0) as log:
-        subprocess.Popen([ncp, "proxy", "--host", host, "--port", port], stdout=log, stderr=log, env=env)
+        log.write(b"\n[claude-any] starting nvd-claude-proxy module\n")
+        subprocess.Popen(
+            [sys.executable, "-m", "nvd_claude_proxy.main"],
+            stdout=log,
+            stderr=log,
+            env=env,
+            cwd=str(NCP_ENV.parent),
+            creationflags=creationflags,
+        )
     deadline = time.time() + 45
     while time.time() < deadline:
         if is_url_up(f"{base}/v1/models"):
             return
         time.sleep(0.5)
     raise RuntimeError("nvd-claude-proxy did not become ready")
+
+
+def ncp_model_id_for_nvidia_hosted(model_id: str) -> str:
+    if model_id.startswith("claude-") and not model_id.startswith("claude-any-"):
+        return model_id
+    try:
+        data = http_json(join_url(nvidia_proxy_base_url(), "/v1/models"), timeout=3.0)
+    except Exception:
+        return model_id
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return model_id
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        ncp_id = str(item.get("id") or "").strip()
+        nvidia_id = str(item.get("nvidia_id") or "").strip()
+        if ncp_id == model_id:
+            return ncp_id
+        if nvidia_id and nvidia_id == model_id and ncp_id:
+            return ncp_id
+    return model_id
 
 
 def provider_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
@@ -1370,6 +1410,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 return
             body = cap_anthropic_body_for_provider(provider, pcfg, body)
             upstream_model = resolve_requested_model(provider, pcfg, body.get("model"))
+            if provider == "nvidia-hosted":
+                upstream_model = ncp_model_id_for_nvidia_hosted(upstream_model)
             body["model"] = upstream_model
             data = json.dumps(body).encode("utf-8")
             base = provider_upstream_request_base(provider, pcfg)
@@ -2290,10 +2332,25 @@ def cmd_stop(_: argparse.Namespace) -> None:
 
 
 def pid_is_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        try:
+            proc = subprocess.run(
+                ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=3,
+            )
+            out = proc.stdout or ""
+            return str(pid) in out and "No tasks" not in out and "INFO:" not in out
+        except Exception:
+            return False
     try:
         os.kill(pid, 0)
         return True
-    except OSError:
+    except (OSError, SystemError):
         return False
 
 
@@ -2315,12 +2372,15 @@ def terminate_pid_file(path: Path, label: str, quiet: bool = False) -> bool:
             pass
         return False
     try:
-        os.kill(pid, signal.SIGTERM)
-        deadline = time.time() + 4
-        while time.time() < deadline and pid_is_running(pid):
-            time.sleep(0.1)
-        if pid_is_running(pid):
-            os.kill(pid, signal.SIGKILL)
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        else:
+            os.kill(pid, signal.SIGTERM)
+            deadline = time.time() + 4
+            while time.time() < deadline and pid_is_running(pid):
+                time.sleep(0.1)
+            if pid_is_running(pid):
+                os.kill(pid, signal.SIGKILL)
         try:
             path.unlink()
         except FileNotFoundError:
@@ -2334,9 +2394,91 @@ def terminate_pid_file(path: Path, label: str, quiet: bool = False) -> bool:
         return False
 
 
+def windows_pids_on_port(port: int) -> list[int]:
+    if os.name != "nt":
+        return []
+    try:
+        proc = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=5,
+        )
+    except Exception:
+        return []
+    pids: set[int] = set()
+    marker = f":{port}"
+    for line in proc.stdout.splitlines():
+        if marker not in line or "LISTENING" not in line:
+            continue
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        try:
+            pids.add(int(parts[-1]))
+        except ValueError:
+            continue
+    return sorted(pids)
+
+
+def terminate_windows_port(port: int, label: str, quiet: bool = False) -> bool:
+    pids = windows_pids_on_port(port)
+    stopped = False
+    for pid in pids:
+        if pid in (os.getpid(), os.getppid()):
+            continue
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+            stopped = True
+        except Exception:
+            pass
+    if stopped and not quiet:
+        print(f"Stopped existing {label} session(s): {', '.join(map(str, pids))}.")
+    return stopped
+
+
 def terminate_matching_processes(needles: list[str], label: str, quiet: bool = False) -> bool:
     if os.name == "nt":
-        return False
+        script = (
+            "Get-CimInstance Win32_Process | "
+            "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
+        )
+        try:
+            p = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=8,
+            )
+            rows = json.loads(p.stdout or "[]")
+        except Exception:
+            return False
+        if isinstance(rows, dict):
+            rows = [rows]
+        current = os.getpid()
+        matched: list[int] = []
+        for row in rows if isinstance(rows, list) else []:
+            try:
+                pid = int(row.get("ProcessId"))
+            except Exception:
+                continue
+            command = str(row.get("CommandLine") or "")
+            if pid == current or pid == os.getppid() or not command:
+                continue
+            if all(needle in command for needle in needles):
+                matched.append(pid)
+        stopped = False
+        for pid in matched:
+            try:
+                subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+                stopped = True
+            except Exception:
+                pass
+        if stopped and not quiet:
+            print(f"Stopped existing {label} session(s): {', '.join(map(str, matched))}.")
+        return stopped
     try:
         p = subprocess.run(
             ["ps", "-u", getpass.getuser(), "-o", "pid=,stat=,command="],
@@ -2387,6 +2529,12 @@ def terminate_matching_processes(needles: list[str], label: str, quiet: bool = F
 
 
 def stop_ncp_proxy(quiet: bool = False) -> bool:
+    if os.name == "nt":
+        port = positive_int(read_env_file(NCP_ENV).get("PROXY_PORT")) or 8788
+        stopped = terminate_windows_port(port, "Nvidia NCP proxy", quiet=True)
+        if stopped and not quiet:
+            print("Stopped existing Nvidia NCP proxy session if one was running.")
+        return stopped
     ncp = find_executable("ncp")
     stopped = False
     if not ncp:
@@ -2405,6 +2553,9 @@ def stop_ncp_proxy(quiet: bool = False) -> bool:
 
 def stop_router_processes(quiet: bool = False) -> bool:
     stopped = terminate_pid_file(PID_PATH, "claude-any router", quiet=quiet)
+    if os.name == "nt":
+        stopped = terminate_windows_port(ROUTER_PORT, "claude-any router", quiet=quiet) or stopped
+        return stopped
     stopped = terminate_matching_processes(["claude_any.py", "serve"], "claude-any router", quiet=quiet) or stopped
     return stopped
 

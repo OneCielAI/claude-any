@@ -23,6 +23,7 @@ router.log*
 router.out*
 web-tools-mcp.json
 duckduckgo-mcp.json
+nvd_claude_proxy.db
 
 # Secrets and keys
 *.key
