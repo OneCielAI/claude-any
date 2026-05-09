@@ -68,7 +68,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.2"
+VERSION = "0.1.3"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -97,6 +97,7 @@ UI_TEXT = {
         "base_url": "Base URL",
         "model": "Model",
         "test": "Test compatibility",
+        "options": "LLM options",
         "launch": "Launch Claude Code",
         "quit": "Quit",
         "title": "claude-any pre-launch",
@@ -108,6 +109,7 @@ UI_TEXT = {
         "base_url": "Base URL",
         "model": "모델",
         "test": "호환성 테스트",
+        "options": "LLM 옵션",
         "launch": "Claude Code 실행",
         "quit": "종료",
         "title": "claude-any 실행 전 설정",
@@ -119,6 +121,7 @@ UI_TEXT = {
         "base_url": "Base URL",
         "model": "モデル",
         "test": "互換性テスト",
+        "options": "LLMオプション",
         "launch": "Claude Codeを起動",
         "quit": "終了",
         "title": "claude-any 起動前設定",
@@ -130,6 +133,7 @@ UI_TEXT = {
         "base_url": "Base URL",
         "model": "模型",
         "test": "兼容性测试",
+        "options": "LLM 选项",
         "launch": "启动 Claude Code",
         "quit": "退出",
         "title": "claude-any 启动前设置",
@@ -1927,7 +1931,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print("  claude-any --ca-ollama-option temperature=0.7 --ca-ollama-num-ctx 65536")
 
 
-PROVIDER_OPTION_PROVIDERS = ("vllm", "nvidia-hosted", "self-hosted-nim")
+PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "nvidia-hosted", "self-hosted-nim")
 
 
 def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
@@ -1941,8 +1945,102 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
     if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
-        parts.append(f"native={bool(pcfg.get('native_compat', True))}")
+        native_default = False if provider == "nvidia-hosted" else True
+        parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
     return ", ".join(parts)
+
+
+def llm_options_status(provider: str, pcfg: dict[str, Any]) -> str:
+    if provider in ("ollama", "ollama-cloud"):
+        opts = ollama_extra_options(pcfg)
+        pieces = [
+            f"ctx {ollama_num_ctx_status(pcfg)}",
+            f"keep {pcfg.get('keep_alive', 'default')}",
+            f"think {bool(pcfg.get('think', False))}",
+            f"timeout {pcfg.get('request_timeout_ms', 'default')}ms",
+        ]
+        for key in ("num_predict", "temperature", "top_p"):
+            if key in opts:
+                pieces.append(f"{key}={opts[key]}")
+        return "; ".join(pieces)
+    if provider == "anthropic":
+        return f"max_output_tokens={pcfg.get('max_output_tokens', 'Claude Code default')}"
+    if provider in PROVIDER_OPTION_PROVIDERS:
+        return provider_options_status(provider, pcfg)
+    return "provider defaults"
+
+
+def llm_option_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    rows: list[str] = []
+    values: list[str] = []
+
+    def add(label: str, key: str, value: Any) -> None:
+        rows.append(f"{label:<24} [{compact_text(value, 56)}]")
+        values.append(key)
+
+    if provider in ("ollama", "ollama-cloud"):
+        opts = ollama_extra_options(pcfg)
+        add("Context window", "num_ctx", ollama_num_ctx_status(pcfg))
+        add("Context min", "num_ctx_min", pcfg.get("num_ctx_min", "default"))
+        add("Context max", "num_ctx_max", pcfg.get("num_ctx_max", "default"))
+        add("Max output tokens", "num_predict", opts.get("num_predict", "default"))
+        add("Temperature", "temperature", opts.get("temperature", "default"))
+        add("Top P", "top_p", opts.get("top_p", "default"))
+        add("Think", "think", bool(pcfg.get("think", False)))
+        add("Keep alive", "keep_alive", pcfg.get("keep_alive", "default"))
+        add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
+    else:
+        if provider in ("vllm", "self-hosted-nim"):
+            add("Context window", "context_window", pcfg.get("context_window", "default"))
+            add("Context reserve", "context_reserve_tokens", pcfg.get("context_reserve_tokens", "default"))
+        add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
+        if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+            add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
+            add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", False)))
+        elif provider == "anthropic":
+            add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
+
+    rows.append("Back")
+    values.append("back")
+    return rows, values
+
+
+def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> str:
+    if provider in ("ollama", "ollama-cloud"):
+        opts = ollama_extra_options(pcfg)
+        if key == "num_ctx":
+            return str(pcfg.get("num_ctx", "auto"))
+        if key in ("num_ctx_min", "num_ctx_max", "keep_alive", "think", "request_timeout_ms"):
+            return str(pcfg.get(key, ""))
+        if key in opts:
+            return str(opts[key])
+        return ""
+    value = pcfg.get(key)
+    return "" if value is None else str(value)
+
+
+def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    value = raw_value.strip()
+    if not value:
+        return ["Option unchanged."]
+    clear_words = ("default", "unset", "none", "null")
+    token = f"unset:{key}" if value.lower() in clear_words else f"{key}={value}"
+    if provider in ("ollama", "ollama-cloud"):
+        apply_ollama_option(pcfg, token)
+    elif provider == "anthropic":
+        if key in ("max_output_tokens", "max_tokens", "maxtoken", "max_token"):
+            apply_provider_option(provider, pcfg, token)
+        elif key in ("timeout", "timeout_ms", "request_timeout", "request_timeout_ms"):
+            apply_provider_option(provider, pcfg, token)
+        else:
+            raise SystemExit(f"Unknown Anthropic option: {key}")
+    else:
+        apply_provider_option(provider, pcfg, token)
+    save_config(cfg)
+    clear_model_cache()
+    return [f"{PROVIDER_LABELS.get(provider, provider)} option updated.", f"{key}: {value}"]
 
 
 def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> None:
@@ -2009,7 +2107,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
         except SystemExit:
             pass
     if provider not in PROVIDER_OPTION_PROVIDERS:
-        raise SystemExit("Provider options are available for vllm, nvidia-hosted, and self-hosted-nim.")
+        raise SystemExit("Provider options are available for anthropic, vllm, nvidia-hosted, and self-hosted-nim.")
     pcfg = cfg["providers"][provider]
     if values:
         for token in values:
@@ -2023,6 +2121,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
     print("  max_output_tokens is passed to Claude Code as CLAUDE_CODE_MAX_OUTPUT_TOKENS.")
     print("  context_window is a claude-any/router cap; native mode still cannot raise the real server limit.")
     print("Examples:")
+    print("  claude-anyctl provider-options nvidia-hosted max_output_tokens=4096 timeout=120000 native=false")
     print("  claude-anyctl provider-options vllm max_output_tokens=4096 context_window=65536 timeout=1800000")
     print("  claude-anyctl provider-options self-hosted-nim native=true max_output_tokens=4096")
 
@@ -2887,7 +2986,8 @@ def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lan
         f"3. {ui_text('base_url', lang)}  [{compact_text(pcfg.get('base_url', 'unset'), 62)}]",
         f"4. {ui_text('model', lang)}  [{compact_text(pcfg.get('current_model', 'unset'), 62)}]",
         f"5. {ui_text('test', lang)}",
-        f"6. {ui_text('launch', lang)}",
+        f"6. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
+        f"7. {ui_text('launch', lang)}",
         ui_text("quit", lang),
     ]
 
@@ -3022,6 +3122,7 @@ def render_prelaunch_screen(
             "base-url": "Base URL",
             "model": "Model",
             "test": "Compatibility test",
+            "options": "LLM options",
         }
         add("")
         add("-" * render_width, "38;5;208")
@@ -3107,7 +3208,7 @@ def portable_language_menu() -> int:
 
 def portable_prelaunch_menu() -> int:
     enable_ansi()
-    main_idx = 6 if settings_ready_except_api_key() else 0
+    main_idx = 7 if settings_ready_except_api_key() else 0
     panel: str | None = None
     panel_idx = 0
     panel_rows: list[str] = []
@@ -3141,6 +3242,8 @@ def portable_prelaunch_menu() -> int:
                 panel_rows, panel_values = [f"Model list failed: {type(exc).__name__}: {exc}", "+ Custom model id..."], []
         elif name == "test":
             panel_rows, panel_values = ["Run compatibility test", "Back"], ["run", "back"]
+        elif name == "options":
+            panel_rows, panel_values = llm_option_panel_rows(provider, pcfg)
 
     def close_panel(next_idx: int | None = None) -> None:
         nonlocal panel, panel_idx, panel_rows, panel_values, main_idx
@@ -3257,17 +3360,31 @@ def portable_prelaunch_menu() -> int:
                         messages = lines[-8:] if lines else ["Test produced no output."]
                         panel_rows, panel_values = ["Run compatibility test again", "Back"], ["run", "back"]
                         refresh_checks()
-                        main_idx = 6 if "Compatibility: OK" in out else 4
+                        main_idx = 7 if "Compatibility: OK" in out else 4
+                elif panel == "options":
+                    if value == "back":
+                        close_panel()
+                    else:
+                        default = llm_option_prompt_default(provider, pcfg, value)
+                        entered = prompt_menu_value(f"{value} for {provider} (default/unset clears)", default)
+                        try:
+                            messages = set_llm_option_config(provider, value, entered)
+                        except Exception as exc:
+                            messages = [f"Option update failed: {type(exc).__name__}: {exc}"]
+                        refresh_checks()
+                        cfg = load_config()
+                        provider, pcfg = get_current_provider(cfg)
+                        panel_rows, panel_values = llm_option_panel_rows(provider, pcfg)
                 continue
 
             if key in ("up", "k"):
-                main_idx = (main_idx - 1) % 8
+                main_idx = (main_idx - 1) % 9
             elif key in ("down", "j"):
-                main_idx = (main_idx + 1) % 8
+                main_idx = (main_idx + 1) % 9
             elif key in ("esc", "q"):
                 return 10
             elif key == "enter":
-                actions = ["language", "provider", "api-key", "base-url", "model", "test", "launch", "quit"]
+                actions = ["language", "provider", "api-key", "base-url", "model", "test", "options", "launch", "quit"]
                 action = actions[main_idx]
                 if action == "launch":
                     return 0
