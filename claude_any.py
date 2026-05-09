@@ -5,6 +5,7 @@ import argparse
 import getpass
 import importlib.util
 import json
+import math
 import os
 import re
 import signal
@@ -68,7 +69,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.3"
+VERSION = "0.1.4"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -296,6 +297,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "ollama_options": {
                 "temperature": 0.7,
                 "top_p": 0.8,
+                "top_k": 40,
                 "num_predict": 4096,
             },
         },
@@ -313,6 +315,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "ollama_options": {
                 "temperature": 0.7,
                 "top_p": 0.8,
+                "top_k": 40,
                 "num_predict": 4096,
             },
         },
@@ -324,6 +327,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "native_compat": True,
             "context_window": 32768,
             "max_output_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.8,
             "context_reserve_tokens": 1024,
             "request_timeout_ms": 1800000,
         },
@@ -334,6 +339,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "custom_models": [],
             "native_compat": False,
             "max_output_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.8,
             "request_timeout_ms": 1800000,
         },
         "self-hosted-nim": {
@@ -344,6 +351,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "native_compat": True,
             "context_window": 32768,
             "max_output_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.8,
             "context_reserve_tokens": 1024,
             "request_timeout_ms": 1800000,
         },
@@ -1112,6 +1121,14 @@ def positive_int(value: Any) -> int | None:
     return out if out > 0 else None
 
 
+def finite_float(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except Exception:
+        return None
+    return out if math.isfinite(out) else None
+
+
 def parse_config_value(value: str) -> Any:
     text = value.strip()
     low = text.lower()
@@ -1245,6 +1262,17 @@ def cap_anthropic_body_for_provider(provider: str, pcfg: dict[str, Any], body: d
     if output_tokens:
         capped["max_tokens"] = output_tokens
     return capped
+
+
+def apply_provider_request_options(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    if provider not in PROVIDER_SAMPLING_OPTION_PROVIDERS:
+        return body
+    out = dict(body)
+    for key in PROVIDER_SAMPLING_OPTIONS:
+        value = pcfg.get(key)
+        if value is not None:
+            out[key] = value
+    return out
 
 
 def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any]) -> dict[str, Any]:
@@ -1413,6 +1441,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 forward_ollama_api_chat(self, provider, pcfg, body)
                 return
             body = cap_anthropic_body_for_provider(provider, pcfg, body)
+            body = apply_provider_request_options(provider, pcfg, body)
             upstream_model = resolve_requested_model(provider, pcfg, body.get("model"))
             if provider == "nvidia-hosted":
                 upstream_model = ncp_model_id_for_nvidia_hosted(upstream_model)
@@ -1932,6 +1961,45 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
 
 
 PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "nvidia-hosted", "self-hosted-nim")
+PROVIDER_SAMPLING_OPTION_PROVIDERS = ("vllm", "nvidia-hosted", "self-hosted-nim")
+PROVIDER_SAMPLING_OPTIONS = ("temperature", "top_p", "top_k")
+
+
+def sampling_option_key(key: str) -> str | None:
+    normalized = key.strip().lower().replace("-", "_")
+    aliases = {
+        "temp": "temperature",
+        "temperature": "temperature",
+        "top": "top_p",
+        "top_p": "top_p",
+        "topp": "top_p",
+        "topk": "top_k",
+        "top_k": "top_k",
+    }
+    return aliases.get(normalized)
+
+
+def validate_sampling_option(key: str, value: Any) -> float | int:
+    if key == "temperature":
+        fixed = finite_float(value)
+        if fixed is None or fixed < 0 or fixed > 2:
+            raise SystemExit("temperature must be a number from 0 to 2")
+        return fixed
+    if key == "top_p":
+        fixed = finite_float(value)
+        if fixed is None or fixed <= 0 or fixed > 1:
+            raise SystemExit("top_p must be a number greater than 0 and up to 1")
+        return fixed
+    if key == "top_k":
+        fixed = positive_int(value)
+        if not fixed:
+            raise SystemExit("top_k must be a positive integer")
+        return fixed
+    raise SystemExit(f"Unknown provider option: {key}")
+
+
+def provider_sampling_status(pcfg: dict[str, Any]) -> list[str]:
+    return [f"{key}={pcfg.get(key, 'default')}" for key in PROVIDER_SAMPLING_OPTIONS]
 
 
 def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
@@ -1947,6 +2015,8 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
         native_default = False if provider == "nvidia-hosted" else True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
+    if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
+        parts.extend(provider_sampling_status(pcfg))
     return ", ".join(parts)
 
 
@@ -1959,7 +2029,7 @@ def llm_options_status(provider: str, pcfg: dict[str, Any]) -> str:
             f"think {bool(pcfg.get('think', False))}",
             f"timeout {pcfg.get('request_timeout_ms', 'default')}ms",
         ]
-        for key in ("num_predict", "temperature", "top_p"):
+        for key in ("num_predict", "temperature", "top_p", "top_k"):
             if key in opts:
                 pieces.append(f"{key}={opts[key]}")
         return "; ".join(pieces)
@@ -1986,6 +2056,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str
         add("Max output tokens", "num_predict", opts.get("num_predict", "default"))
         add("Temperature", "temperature", opts.get("temperature", "default"))
         add("Top P", "top_p", opts.get("top_p", "default"))
+        add("Top K", "top_k", opts.get("top_k", "default"))
         add("Think", "think", bool(pcfg.get("think", False)))
         add("Keep alive", "keep_alive", pcfg.get("keep_alive", "default"))
         add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
@@ -1996,6 +2067,9 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
         if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
+            add("Temperature", "temperature", pcfg.get("temperature", "default"))
+            add("Top P", "top_p", pcfg.get("top_p", "default"))
+            add("Top K", "top_k", pcfg.get("top_k", "default"))
             add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", False)))
         elif provider == "anthropic":
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
@@ -2056,6 +2130,8 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg.pop("request_timeout_ms", None)
         elif key in ("native", "native_compat"):
             pcfg["native_compat"] = True
+        elif sampling_option_key(key):
+            pcfg.pop(sampling_option_key(key), None)
         else:
             raise SystemExit(f"Unknown provider option: {key}")
         return
@@ -2091,6 +2167,13 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
     if key in ("native", "native_compat"):
         pcfg["native_compat"] = bool(value)
         return
+    sample_key = sampling_option_key(key)
+    if sample_key:
+        if value is None:
+            pcfg.pop(sample_key, None)
+        else:
+            pcfg[sample_key] = validate_sampling_option(sample_key, value)
+        return
     raise SystemExit(f"Unknown provider option: {key}")
 
 
@@ -2120,8 +2203,9 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
     print("Notes:")
     print("  max_output_tokens is passed to Claude Code as CLAUDE_CODE_MAX_OUTPUT_TOKENS.")
     print("  context_window is a claude-any/router cap; native mode still cannot raise the real server limit.")
+    print("  temperature/top_p/top_k are injected by claude-any router mode when the provider supports them.")
     print("Examples:")
-    print("  claude-anyctl provider-options nvidia-hosted max_output_tokens=4096 timeout=120000 native=false")
+    print("  claude-anyctl provider-options nvidia-hosted max_output_tokens=4096 temperature=0.7 top_p=0.8 timeout=120000 native=false")
     print("  claude-anyctl provider-options vllm max_output_tokens=4096 context_window=65536 timeout=1800000")
     print("  claude-anyctl provider-options self-hosted-nim native=true max_output_tokens=4096")
 
@@ -3126,7 +3210,9 @@ def render_prelaunch_screen(
         }
         add("")
         add("-" * render_width, "38;5;208")
-        add(f"{titles.get(panel, panel)} options", "1;38;5;208")
+        panel_title = titles.get(panel, panel)
+        title_suffix = "" if panel_title.lower().endswith("options") else " options"
+        add(f"{panel_title}{title_suffix}", "1;38;5;208")
         fixed = len(screen) + len(checks) + len(messages) + 5
         limit = max(5, height - fixed)
         for actual, row in visible_rows(panel_rows, panel_idx, limit):
