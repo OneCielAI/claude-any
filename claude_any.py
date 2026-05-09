@@ -2763,15 +2763,19 @@ def render_prelaunch_screen(
     render_width = max(40, columns - 1)
     screen: list[str] = []
     def add(text: str = "", code: str | None = None) -> None:
-        fitted = fit_cells(text, render_width)
+        # Redraws start at cursor home. Each row must overwrite the full
+        # previous row; otherwise Windows cmd leaves stale text on the right.
+        fitted = pad_cells(text, render_width)
         screen.append(ansi(fitted, code) if code else fitted)
 
-    for line in intro_panel_lines(render_width):
-        add(line, "31" if line.startswith(("+", "| ")) else None)
+    mode_line = next((line for line in status_lines() if line.startswith("mode:")), "mode: claude-any-router")
+    add(f"Claude Any v{VERSION}", "1;31")
+    add(CREDITS, "2")
     add("")
-    for line in status_lines()[:5]:
-        color = "32" if line.startswith(("provider:", "model:")) else "2"
-        add("  " + line, color)
+    add(f"provider: {provider}    language: {lang}    {mode_line}", "32")
+    add(f"base_url: {pcfg.get('base_url')}", "2")
+    add(f"model: {pcfg.get('current_model')}", "32")
+    add(api_key_status_line(provider, pcfg), "2")
     add("")
     rows = main_menu_rows(cfg, provider, pcfg, lang)
     for i, row in enumerate(rows):
@@ -2794,7 +2798,7 @@ def render_prelaunch_screen(
             "test": "Compatibility test",
         }
         add("")
-        add("-" * min(render_width, 112), "38;5;208")
+        add("-" * render_width, "38;5;208")
         add(f"{titles.get(panel, panel)} options", "1;38;5;208")
         fixed = len(screen) + len(checks) + len(messages) + 5
         limit = max(5, height - fixed)
@@ -2811,8 +2815,8 @@ def render_prelaunch_screen(
             add("  " + line, "36;1")
     if checks:
         add("")
-        add("-" * min(render_width, 112), "38;5;208")
-        for line in checks:
+        add("-" * render_width, "38;5;208")
+        for line in checks[:2]:
             add("  " + line, "1;38;5;208")
     add("")
     help_text = "Up/Down moves. Enter selects. Esc/Left closes submenu. q quits. Actions expand in place."
