@@ -11,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -2464,6 +2465,49 @@ def ansi(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
 
 
+def cell_width(text: str) -> int:
+    width = 0
+    for ch in text:
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+    return width
+
+
+def fit_cells(value: Any, width: int) -> str:
+    text = str(value if value is not None else "")
+    width = max(1, width)
+    if cell_width(text) <= width:
+        return text
+    suffix = "..." if width >= 4 else ""
+    limit = max(1, width - cell_width(suffix))
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        ch_width = 0 if unicodedata.combining(ch) else (2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1)
+        if used + ch_width > limit:
+            break
+        out.append(ch)
+        used += ch_width
+    return "".join(out) + suffix
+
+
+def pad_cells(value: Any, width: int) -> str:
+    text = fit_cells(value, width)
+    return text + (" " * max(0, width - cell_width(text)))
+
+
+def color_line(text: str, code: str, width: int) -> str:
+    fitted = fit_cells(text, width)
+    return ansi(fitted, code)
+
+
+def clean_render_lines(lines: list[str], width: int) -> list[str]:
+    # All menu rows must stay single-line. Windows cmd corrupts redraws after
+    # implicit line wrapping, even when ANSI clear-to-end is used.
+    return [fit_cells(line, width) for line in lines]
+
+
 def clear_screen() -> None:
     if sys.stdout.isatty():
         print("\033[2J\033[H", end="")
@@ -2471,12 +2515,10 @@ def clear_screen() -> None:
 
 def intro_panel_lines(width: int) -> list[str]:
     width = max(48, min(width, 120))
-    border = "\033[31m" if sys.stdout.isatty() else ""
-    reset = "\033[0m" if sys.stdout.isatty() else ""
     line = "-" * (width - 2)
-    lines = [f"{border}+{line}+{reset}"]
+    lines = [f"+{line}+"]
     title = f" {APP_NAME} "
-    lines.append(f"{border}|{reset}{ansi(title, '1;31')}{' ' * max(0, width - len(title) - 2)}{border}|{reset}")
+    lines.append(f"|{title}{' ' * max(0, width - len(title) - 2)}|")
     if width >= 92:
         left_w = 39
         right_w = width - left_w - 4
@@ -2490,7 +2532,7 @@ def intro_panel_lines(width: int) -> list[str]:
         for left, right in rows:
             left_text = left[:left_w].ljust(left_w)
             right_text = right[:right_w].ljust(right_w)
-            lines.append(f"{border}|{reset} {left_text} {border}|{reset} {right_text}{border}|{reset}")
+            lines.append(f"| {left_text} | {right_text}|")
     else:
         rows = [
             f"{APP_NAME} routes Claude Code through selectable providers.",
@@ -2500,8 +2542,8 @@ def intro_panel_lines(width: int) -> list[str]:
             CREDITS,
         ]
         for row in rows:
-            lines.append(f"{border}|{reset} {row[: width - 4].ljust(width - 4)} {border}|{reset}")
-    lines.append(f"{border}+{line}+{reset}")
+            lines.append(f"| {row[: width - 4].ljust(width - 4)} |")
+    lines.append(f"+{line}+")
     return lines
 
 
@@ -2616,10 +2658,7 @@ def pause() -> None:
 
 
 def compact_text(value: Any, width: int = 72) -> str:
-    text = str(value if value is not None else "")
-    if len(text) <= width:
-        return text
-    return text[: max(0, width - 3)] + "..."
+    return fit_cells(value, width)
 
 
 def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lang: str) -> list[str]:
@@ -2664,7 +2703,7 @@ def model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], li
     current = pcfg.get("current_model")
     for mid in values:
         mark = "*" if mid == current else " "
-        rows.append(f"{mark} {compact_text(mid, 62):<62} {compact_text(alias_for(provider, mid), 46)}")
+        rows.append(f"{mark} {mid}  {alias_for(provider, mid)}")
     rows.append("+ Custom model id...")
     return rows, values
 
@@ -2721,24 +2760,30 @@ def render_prelaunch_screen(
     provider, pcfg = get_current_provider(cfg)
     lang = cfg.get("language", "en")
     columns, height = shutil.get_terminal_size((110, 32))
+    render_width = max(40, columns - 1)
     screen: list[str] = []
-    screen.extend(intro_panel_lines(columns))
-    screen.append("")
+    def add(text: str = "", code: str | None = None) -> None:
+        fitted = fit_cells(text, render_width)
+        screen.append(ansi(fitted, code) if code else fitted)
+
+    for line in intro_panel_lines(render_width):
+        add(line, "31" if line.startswith(("+", "| ")) else None)
+    add("")
     for line in status_lines()[:5]:
         color = "32" if line.startswith(("provider:", "model:")) else "2"
-        screen.append("  " + ansi(line, color))
-    screen.append("")
+        add("  " + line, color)
+    add("")
     rows = main_menu_rows(cfg, provider, pcfg, lang)
     for i, row in enumerate(rows):
         line = ("> " if i == main_idx and panel is None else "  ") + row
         if i == main_idx and panel is None:
-            screen.append(ansi(line, "7;1"))
+            add(line, "7;1")
         elif "Launch" in row or "실행" in row or "起動" in row or "启动" in row:
-            screen.append(ansi(line, "32;1"))
+            add(line, "32;1")
         elif row == ui_text("quit", lang):
-            screen.append(ansi(line, "31"))
+            add(line, "31")
         else:
-            screen.append(line)
+            add(line)
     if panel:
         titles = {
             "language": "Language",
@@ -2748,30 +2793,30 @@ def render_prelaunch_screen(
             "model": "Model",
             "test": "Compatibility test",
         }
-        screen.append("")
-        screen.append(ansi("-" * min(columns - 2, 112), "38;5;208"))
-        screen.append(ansi(f"{titles.get(panel, panel)} options", "1;38;5;208"))
+        add("")
+        add("-" * min(render_width, 112), "38;5;208")
+        add(f"{titles.get(panel, panel)} options", "1;38;5;208")
         fixed = len(screen) + len(checks) + len(messages) + 5
         limit = max(5, height - fixed)
         for actual, row in visible_rows(panel_rows, panel_idx, limit):
             if actual is None:
-                screen.append("    " + ansi(row, "2"))
+                add("    " + row, "2")
             elif actual == panel_idx:
-                screen.append(ansi("  > " + row, "7;1"))
+                add("  > " + row, "7;1")
             else:
-                screen.append("    " + row)
+                add("    " + row)
     if messages:
-        screen.append("")
+        add("")
         for line in messages[-8:]:
-            screen.append(ansi("  " + compact_text(line, columns - 6), "36;1"))
+            add("  " + line, "36;1")
     if checks:
-        screen.append("")
-        screen.append(ansi("-" * min(columns - 2, 112), "38;5;208"))
+        add("")
+        add("-" * min(render_width, 112), "38;5;208")
         for line in checks:
-            screen.append(ansi("  " + compact_text(line, columns - 6), "1;38;5;208"))
-    screen.append("")
+            add("  " + line, "1;38;5;208")
+    add("")
     help_text = "Up/Down moves. Enter selects. Esc/Left closes submenu. q quits. Actions expand in place."
-    screen.append(ansi(help_text, "2"))
+    add(help_text, "2")
     rendered = "\n".join(screen) + "\n"
     if sys.stdout.isatty():
         prefix = "\033[2J\033[H" if first_render else "\033[H"
@@ -2787,12 +2832,20 @@ def prompt_menu_value(prompt: str, default: str = "", secret: bool = False) -> s
     if default:
         label += f" [{default}]"
     label += ": "
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
     sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
     sys.stdout.flush()
-    if secret:
-        value = getpass.getpass("")
-    else:
-        value = input()
+    try:
+        if secret:
+            value = getpass.getpass("")
+        else:
+            value = input()
+    finally:
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
     value = value.strip()
     return value or default
 
