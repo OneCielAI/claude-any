@@ -63,6 +63,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
+VERSION = "0.1.0"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -2845,6 +2846,7 @@ def cli_usage() -> str:
   claude-any                         Launch Claude Code through claude-any router
 
 Control plane, runs before Claude Code and does not require LLM connectivity:
+  claude-any version                 Print claude-any version
   claude-any language [en|ko|ja|zh] Set display language
   claude-any provider                Pick provider with arrow-key TUI
   claude-any provider list           List providers
@@ -2897,6 +2899,9 @@ def run_cli(argv: list[str]) -> int:
         return 0
     if argv:
         head, rest = argv[0], argv[1:]
+        if head in ("version", "--version", "-v"):
+            print(f"claude-any {VERSION}")
+            return 0
         if head in ("language", "lang"):
             cmd_language(argparse.Namespace(value=rest[0] if rest else None))
             return 0
@@ -3182,6 +3187,10 @@ def cmd_launch(args: argparse.Namespace) -> None:
     raise SystemExit(launch_claude(args.argv))
 
 
+def cmd_version(args: argparse.Namespace) -> None:
+    print(f"claude-any {VERSION}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="claude-anyctl")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -3192,6 +3201,7 @@ def build_parser() -> argparse.ArgumentParser:
     launch.add_argument("argv", nargs=argparse.REMAINDER)
     launch.set_defaults(func=cmd_launch)
     sub.add_parser("serve").set_defaults(func=serve)
+    sub.add_parser("version").set_defaults(func=cmd_version)
     sub.add_parser("status").set_defaults(func=cmd_status)
     sub.add_parser("env").set_defaults(func=cmd_env)
     sub.add_parser("stop").set_defaults(func=cmd_stop)

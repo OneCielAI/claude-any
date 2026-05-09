@@ -41,7 +41,7 @@ macOS 尚未充分测试，但项目主要基于 portable Python 和 shell wrapp
 当前可直接使用的 GitHub 安装:
 
 ```sh
-npm install -g github:OneCielAI/claude-any
+npm install -g https://github.com/OneCielAI/claude-any.git
 claude-any
 ```
 
@@ -63,7 +63,7 @@ cd claude-any
 claude-any
 ```
 
-npm registry 发布后:
+首次发布到 npm registry 后安装:
 
 ```sh
 npm install -g @onecielai/claude-any
@@ -74,19 +74,32 @@ claude-any
 
 ```sh
 # GitHub 安装，当前推荐方式
-npm install -g github:OneCielAI/claude-any
+npm install -g https://github.com/OneCielAI/claude-any.git --force
+claude-any version
+```
 
-# npm registry 安装，发布后
+要让 `npm update -g @onecielai/claude-any` 正常工作，必须先用同一个 package
+name 发布到 public npm registry。
+
+```sh
+npm login
+npm publish --access public
+npm install -g @onecielai/claude-any
 npm update -g @onecielai/claude-any
 ```
 
-版本使用 SemVer。后续发布时，更新 `package.json` 中的 `version`，创建相同
-版本的 Git tag，例如 `v0.1.1`，再发布 GitHub Release 即可触发 npm publish
+如果使用自动发布，请创建 npm automation token，将它保存为 GitHub repository
+secret `NPM_TOKEN`，然后发布 GitHub Release 或手动运行 `Publish to npm`
 workflow。
 
-项目已准备 npm 发布流水线。创建 npm automation token，保存为 GitHub
-repository secret `NPM_TOKEN`，然后发布 GitHub Release 或手动运行
-`Publish to npm` workflow。
+版本使用 SemVer。后续发布时，更新 `package.json` 中的 `version`，创建相同
+版本的 Git tag，例如 `v0.1.1`，再发布 GitHub Release 即可触发 npm publish
+workflow。发布到 registry 之后，可以使用以下命令升级。
+
+```sh
+npm update -g @onecielai/claude-any
+```
+
 
 ![Claude Any menu](assets/claude-any-main.zh.png)
 

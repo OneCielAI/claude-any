@@ -43,7 +43,7 @@ macOS에서는 아직 충분히 테스트하지 않았지만, portable Python과
 현재 바로 동작하는 GitHub 설치:
 
 ```sh
-npm install -g github:OneCielAI/claude-any
+npm install -g https://github.com/OneCielAI/claude-any.git
 claude-any
 ```
 
@@ -65,7 +65,7 @@ cd claude-any
 claude-any
 ```
 
-npm registry 배포 후 설치:
+npm registry에 최초 publish한 뒤 설치:
 
 ```sh
 npm install -g @onecielai/claude-any
@@ -76,19 +76,33 @@ claude-any
 
 ```sh
 # GitHub 설치, 현재 권장 경로
-npm install -g github:OneCielAI/claude-any
+npm install -g https://github.com/OneCielAI/claude-any.git --force
+claude-any version
+```
 
-# npm registry 설치, 배포 이후
+`npm update -g @onecielai/claude-any`가 동작하려면 같은 패키지 이름으로 public
+npm registry에 publish되어 있어야 합니다.
+
+```sh
+npm login
+npm publish --access public
+npm install -g @onecielai/claude-any
 npm update -g @onecielai/claude-any
 ```
 
+자동 배포를 쓰려면 npm automation token을 GitHub repository secret `NPM_TOKEN`
+으로 저장한 뒤 GitHub Release를 만들거나 `Publish to npm` workflow를 수동
+실행하면 됩니다.
+
 버전은 SemVer를 사용합니다. 다음 릴리스에서는 `package.json`의 `version`을
 올리고, `v0.1.1` 같은 같은 버전의 Git tag와 GitHub Release를 만들면 npm publish
-workflow를 실행할 수 있습니다.
+workflow를 실행할 수 있습니다. registry publish 이후에는 다음 명령으로
+업그레이드할 수 있습니다.
 
-npm 배포 파이프라인도 준비되어 있습니다. npm automation token을 GitHub
-repository secret `NPM_TOKEN`으로 저장한 뒤 GitHub Release를 만들거나
-`Publish to npm` workflow를 수동 실행하면 됩니다.
+```sh
+npm update -g @onecielai/claude-any
+```
+
 
 ![Claude Any 메뉴](assets/claude-any-main.ko.png)
 

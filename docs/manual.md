@@ -19,7 +19,7 @@ Requirements:
 Current install from GitHub:
 
 ```sh
-npm install -g github:OneCielAI/claude-any
+npm install -g https://github.com/OneCielAI/claude-any.git
 claude-any
 ```
 
@@ -41,7 +41,7 @@ cd claude-any
 claude-any
 ```
 
-After the npm package is published:
+Registry install, after the first npm publish:
 
 ```sh
 npm install -g @onecielai/claude-any
@@ -52,19 +52,33 @@ Upgrade:
 
 ```sh
 # GitHub install, current recommended path
-npm install -g github:OneCielAI/claude-any
+npm install -g https://github.com/OneCielAI/claude-any.git --force
+claude-any version
+```
 
-# npm registry install, after publication
+To make `npm update -g @onecielai/claude-any` work, the package must be
+published to the public npm registry under the same package name:
+
+```sh
+npm login
+npm publish --access public
+npm install -g @onecielai/claude-any
 npm update -g @onecielai/claude-any
 ```
 
+For automated publishing, create an npm automation token, save it as the
+repository secret `NPM_TOKEN`, then publish a GitHub Release or run the
+`Publish to npm` workflow manually.
+
 Versioning uses SemVer. For future releases, bump `version` in `package.json`,
 create a matching Git tag such as `v0.1.1`, and publish a GitHub Release to
-trigger the npm publish workflow.
+trigger the npm publish workflow. After registry publication, the normal
+registry upgrade command will be:
 
-The repository includes an npm publish workflow. Add an npm automation token as
-the GitHub repository secret `NPM_TOKEN`, then publish a GitHub Release or run
-the `Publish to npm` workflow manually.
+```sh
+npm update -g @onecielai/claude-any
+```
+
 
 macOS has not been fully tested by the maintainer yet. The project uses
 portable Python and shell wrappers, so it is expected to work; please report

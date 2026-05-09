@@ -36,7 +36,8 @@
     "demo:assets": "python scripts/make_demo_assets.py"
   },
   "publishConfig": {
-    "access": "public"
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   },
   "engines": {
     "node": ">=18"

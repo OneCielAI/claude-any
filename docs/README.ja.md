@@ -43,7 +43,7 @@ macOS はまだ十分にテストしていませんが、portable Python と she
 現在すぐに使える GitHub インストール:
 
 ```sh
-npm install -g github:OneCielAI/claude-any
+npm install -g https://github.com/OneCielAI/claude-any.git
 claude-any
 ```
 
@@ -65,7 +65,7 @@ cd claude-any
 claude-any
 ```
 
-npm registry 公開後:
+npm registry に初回 publish した後:
 
 ```sh
 npm install -g @onecielai/claude-any
@@ -76,19 +76,33 @@ claude-any
 
 ```sh
 # GitHub インストール、現在の推奨経路
-npm install -g github:OneCielAI/claude-any
+npm install -g https://github.com/OneCielAI/claude-any.git --force
+claude-any version
+```
 
-# npm registry インストール、公開後
+`npm update -g @onecielai/claude-any` を動作させるには、同じ package 名で
+public npm registry に publish されている必要があります。
+
+```sh
+npm login
+npm publish --access public
+npm install -g @onecielai/claude-any
 npm update -g @onecielai/claude-any
 ```
 
+自動公開を使う場合は、npm automation token を GitHub repository secret
+`NPM_TOKEN` として保存し、GitHub Release を作成するか `Publish to npm`
+workflow を手動実行します。
+
 バージョン管理には SemVer を使います。次のリリースでは `package.json` の
 `version` を更新し、`v0.1.1` のような同じバージョンの Git tag と GitHub
-Release を作成すると npm publish workflow を実行できます。
+Release を作成すると npm publish workflow を実行できます。registry 公開後は
+次のコマンドでアップグレードできます。
 
-npm 公開用の GitHub Actions も用意しています。npm automation token を
-repository secret `NPM_TOKEN` として保存し、GitHub Release を作成するか
-`Publish to npm` workflow を手動実行してください。
+```sh
+npm update -g @onecielai/claude-any
+```
+
 
 ![Claude Any menu](assets/claude-any-main.ja.png)
 
