@@ -29,6 +29,7 @@ CONFIG_DIR = HOME / ".config" / "claude-any"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = CONFIG_DIR / "router.log"
 PID_PATH = CONFIG_DIR / "router.pid"
+MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 ROUTER_HOST = "127.0.0.1"
@@ -37,6 +38,8 @@ ROUTER_BASE = f"http://{ROUTER_HOST}:{ROUTER_PORT}"
 CLAUDE_GATEWAY_CACHE = HOME / ".claude" / "cache" / "gateway-models.json"
 NCP_ENV = HOME / ".config" / "nvd-claude-proxy" / ".env"
 NCP_LOG = HOME / ".config" / "nvd-claude-proxy" / "proxy.log"
+MODEL_CACHE_TTL_SECONDS = 300
+NCP_PYPI_PACKAGE = "nvd-claude-proxy"
 
 PROVIDER_ALIASES = {
     "anthropic": "anthropic",
@@ -384,6 +387,10 @@ def clear_model_cache() -> None:
         CLAUDE_GATEWAY_CACHE.unlink()
     except FileNotFoundError:
         pass
+    try:
+        MODEL_LIST_CACHE_PATH.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def normalize_provider(name: str) -> str:
@@ -475,10 +482,35 @@ def read_env_file(path: Path) -> dict[str, str]:
     return env
 
 
+def meaningful_key_value(value: Any) -> bool:
+    if value is None:
+        return False
+    text = str(value).strip()
+    return bool(text and text not in ("dummy", "not-used", "ollama"))
+
+
 def executable_candidates(name: str) -> list[str]:
     if os.name == "nt" and not Path(name).suffix:
         return [f"{name}.exe", f"{name}.cmd", f"{name}.bat", name]
     return [name]
+
+
+def executable_extra_dirs() -> list[Path]:
+    dirs = [HOME / ".local" / "bin"]
+    if os.name == "nt":
+        pyver = f"Python{sys.version_info.major}{sys.version_info.minor}"
+        for env_name in ("APPDATA", "LOCALAPPDATA"):
+            root = os.environ.get(env_name)
+            if root:
+                dirs.append(Path(root) / "Python" / pyver / "Scripts")
+        try:
+            import site
+
+            dirs.append(Path(site.getuserbase()) / "Scripts")
+        except Exception:
+            pass
+        dirs.append(Path(sys.executable).resolve().parent / "Scripts")
+    return dirs
 
 
 def find_executable(name: str) -> str | None:
@@ -486,11 +518,11 @@ def find_executable(name: str) -> str | None:
         found = shutil.which(candidate)
         if found:
             return found
-    local_bin = HOME / ".local" / "bin"
-    for candidate in executable_candidates(name):
-        path = local_bin / candidate
-        if path.exists():
-            return str(path)
+    for directory in executable_extra_dirs():
+        for candidate in executable_candidates(name):
+            path = directory / candidate
+            if path.exists():
+                return str(path)
     return None
 
 
@@ -498,6 +530,48 @@ def http_json(url: str, headers: dict[str, str] | None = None, timeout: float = 
     req = urllib.request.Request(url, headers=headers or {})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def model_cache_key(provider: str, pcfg: dict[str, Any]) -> str:
+    api_state = "key" if provider != "nvidia-hosted" and meaningful_key_value(pcfg.get("api_key")) else "nokey"
+    if provider == "nvidia-hosted":
+        api_state = "key" if meaningful_key_value(read_env_file(NCP_ENV).get("NVIDIA_API_KEY")) else "nokey"
+    return json.dumps(
+        {
+            "provider": provider,
+            "base_url": pcfg.get("base_url", ""),
+            "api": api_state,
+            "custom": pcfg.get("custom_models", []),
+        },
+        sort_keys=True,
+    )
+
+
+def read_model_list_cache(provider: str, pcfg: dict[str, Any]) -> list[str] | None:
+    try:
+        data = json.loads(MODEL_LIST_CACHE_PATH.read_text())
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("key") != model_cache_key(provider, pcfg):
+        return None
+    if time.time() - float(data.get("time", 0)) > MODEL_CACHE_TTL_SECONDS:
+        return None
+    models = data.get("models")
+    if not isinstance(models, list):
+        return None
+    return [str(mid) for mid in models if str(mid).strip()]
+
+
+def write_model_list_cache(provider: str, pcfg: dict[str, Any], models: list[str]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    data = {"time": time.time(), "key": model_cache_key(provider, pcfg), "models": models}
+    try:
+        MODEL_LIST_CACHE_PATH.write_text(json.dumps(data, indent=2) + "\n")
+        os.chmod(MODEL_LIST_CACHE_PATH, 0o600)
+    except Exception:
+        pass
 
 
 def model_ids_from_response(data: Any) -> list[str]:
@@ -573,6 +647,23 @@ def nvidia_proxy_base_url() -> str:
     return f"http://{host}:{port}"
 
 
+def install_ncp_proxy() -> str | None:
+    if os.environ.get("CLAUDE_ANY_AUTO_INSTALL_NCP", "1").lower() in ("0", "false", "no"):
+        return None
+    NCP_LOG.parent.mkdir(parents=True, exist_ok=True)
+    with open(NCP_LOG, "ab", buffering=0) as log:
+        log.write(b"\n[claude-any] installing nvd-claude-proxy with pip\n")
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--user", "--upgrade", NCP_PYPI_PACKAGE],
+            stdout=log,
+            stderr=log,
+            timeout=240,
+        )
+    if proc.returncode != 0:
+        return None
+    return find_executable("ncp")
+
+
 def ensure_ncp() -> None:
     cfg = load_config()
     provider = cfg["providers"]["nvidia-hosted"]
@@ -586,9 +677,9 @@ def ensure_ncp() -> None:
     if is_url_up(f"{base}/v1/models"):
         return
     NCP_LOG.parent.mkdir(parents=True, exist_ok=True)
-    ncp = find_executable("ncp")
+    ncp = find_executable("ncp") or install_ncp_proxy()
     if not ncp:
-        raise RuntimeError("ncp executable was not found in PATH or ~/.local/bin")
+        raise RuntimeError("ncp executable was not found. Install it with: python -m pip install --user nvd-claude-proxy")
     host = env["PROXY_HOST"]
     port = str(env["PROXY_PORT"])
     with open(NCP_LOG, "ab", buffering=0) as log:
@@ -628,6 +719,9 @@ def native_anthropic_enabled(provider: str) -> bool:
 
 
 def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    cached = read_model_list_cache(provider, pcfg)
+    if cached is not None:
+        return cached
     if provider == "nvidia-hosted":
         base = (pcfg.get("base_url") or nvidia_upstream_base_url()).rstrip("/")
     else:
@@ -667,7 +761,9 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
         ids.insert(0, cur)
     if provider == "nvidia-hosted" and cur and cur not in ids:
         ids.insert(0, cur)
-    return sorted_model_ids(ids)
+    sorted_ids = sorted_model_ids(ids)
+    write_model_list_cache(provider, pcfg, sorted_ids)
+    return sorted_ids
 
 
 def model_map_for(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
@@ -1294,6 +1390,94 @@ def store_nvidia_api_key(key: str) -> None:
     os.chmod(NCP_ENV, 0o600)
 
 
+def set_provider_config(provider: str) -> list[str]:
+    cfg = load_config()
+    cfg["current_provider"] = provider
+    pcfg = cfg["providers"][provider]
+    fixed_base = ensure_nvidia_hosted_base_url(pcfg) if provider == "nvidia-hosted" else False
+    save_config(cfg)
+    clear_model_cache()
+    lines = [f"Provider set to {provider} ({PROVIDER_LABELS[provider]})."]
+    if fixed_base:
+        lines.append(f"Base URL set to {pcfg['base_url']} for NVIDIA hosted.")
+    return lines
+
+
+def set_base_url_config(provider: str, url: str) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    if provider == "nvidia-hosted" and invalid_nvidia_hosted_base_url(url):
+        url = nvidia_upstream_base_url()
+    pcfg["base_url"] = url.rstrip("/")
+    save_config(cfg)
+    clear_model_cache()
+    return [f"Base URL for {provider} set to {pcfg['base_url']}."]
+
+
+def set_model_config(value: str) -> list[str]:
+    cfg = load_config()
+    provider, pcfg = get_current_provider(cfg)
+    mmap = model_map_for(provider, pcfg)
+    model_id = normalize_model_id(provider, unslug_provider_alias(provider, value, mmap) or value)
+    pcfg["current_model"] = model_id
+    known = read_model_list_cache(provider, pcfg) or []
+    custom = pcfg.setdefault("custom_models", [])
+    if model_id not in custom and model_id not in known:
+        custom.append(model_id)
+    save_config(cfg)
+    clear_model_cache()
+    return [f"Model for {provider} set to {model_id}.", f"Claude Code alias: {alias_for(provider, model_id)}"]
+
+
+def store_api_key_config(provider: str, key: str) -> list[str]:
+    if provider == "nvidia-hosted":
+        store_nvidia_api_key(key)
+        cfg = load_config()
+        if ensure_nvidia_hosted_base_url(cfg["providers"][provider]):
+            save_config(cfg)
+        location = str(NCP_ENV)
+    else:
+        cfg = load_config()
+        cfg["providers"][provider]["api_key"] = key
+        save_config(cfg)
+        location = str(CONFIG_PATH)
+    clear_model_cache()
+    return [f"Stored API key for {provider}.", f"Saved: {mask_secret(key)} in {location}"]
+
+
+def mask_secret(value: str | None) -> str:
+    text = value or ""
+    if not text:
+        return "not set"
+    if len(text) <= 8:
+        return "*" * len(text)
+    return f"{text[:4]}...{text[-4:]}"
+
+
+def stored_api_key_mask(provider: str, pcfg: dict[str, Any]) -> str:
+    if provider == "nvidia-hosted":
+        return mask_secret(read_env_file(NCP_ENV).get("NVIDIA_API_KEY"))
+    return mask_secret(str(pcfg.get("api_key") or ""))
+
+
+def read_clipboard_text() -> str:
+    commands: list[list[str]] = []
+    if os.name == "nt":
+        commands.append(["powershell", "-NoProfile", "-Command", "Get-Clipboard -Raw"])
+    elif sys.platform == "darwin":
+        commands.append(["pbpaste"])
+    else:
+        commands.extend([["xclip", "-selection", "clipboard", "-o"], ["xsel", "--clipboard", "--output"]])
+    for cmd in commands:
+        try:
+            proc = subprocess.run(cmd, text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=5)
+            if proc.returncode == 0 and proc.stdout.strip():
+                return proc.stdout.strip()
+        except Exception:
+            pass
+    return ""
+
+
 def cmd_provider(args: argparse.Namespace) -> None:
     cfg = load_config()
     if not args.name:
@@ -1308,19 +1492,8 @@ def cmd_provider(args: argparse.Namespace) -> None:
         print("Then run /model to choose a model for the selected provider.")
         return
     provider = normalize_provider(args.name)
-    cfg["current_provider"] = provider
-    pcfg = cfg["providers"][provider]
-    fixed_base = ensure_nvidia_hosted_base_url(pcfg) if provider == "nvidia-hosted" else False
-    if not pcfg.get("current_model"):
-        models = upstream_model_ids(provider, pcfg)
-        if models:
-            pcfg["current_model"] = models[0]
-    save_config(cfg)
-    clear_model_cache()
-    print(f"Provider set to {provider} ({PROVIDER_LABELS[provider]}).")
-    if fixed_base:
-        print(f"Base URL set to {pcfg['base_url']} for NVIDIA hosted proxy.")
-    print(f"Current model: {current_alias(cfg)}")
+    for line in set_provider_config(provider):
+        print(line)
     print("Gateway model cache cleared. Run /model to refresh the model picker.")
 
 
@@ -1329,17 +1502,8 @@ def cmd_set_api_key(args: argparse.Namespace) -> None:
     key = args.key.strip()
     if not key:
         raise SystemExit("No key provided; unchanged.")
-    if provider == "nvidia-hosted":
-        store_nvidia_api_key(key)
-        cfg = load_config()
-        if ensure_nvidia_hosted_base_url(cfg["providers"][provider]):
-            save_config(cfg)
-    else:
-        cfg = load_config()
-        cfg["providers"][provider]["api_key"] = key
-        save_config(cfg)
-    clear_model_cache()
-    print(f"Stored API key for {provider}.")
+    for line in store_api_key_config(provider, key):
+        print(line)
 
 def cmd_api_key(args: argparse.Namespace) -> None:
     cfg = load_config()
@@ -1366,30 +1530,14 @@ def cmd_api_key(args: argparse.Namespace) -> None:
     key = getpass.getpass(f"API key for {provider}: ").strip()
     if not key:
         raise SystemExit("No key entered; unchanged.")
-    if provider == "nvidia-hosted":
-        store_nvidia_api_key(key)
-        if ensure_nvidia_hosted_base_url(cfg["providers"][provider]):
-            save_config(cfg)
-    else:
-        cfg["providers"][provider]["api_key"] = key
-        save_config(cfg)
-    clear_model_cache()
-    print(f"Stored API key for {provider}.")
+    for line in store_api_key_config(provider, key):
+        print(line)
 
 
 def cmd_base_url(args: argparse.Namespace) -> None:
     provider = normalize_provider(args.provider)
-    cfg = load_config()
-    if provider == "nvidia-hosted" and invalid_nvidia_hosted_base_url(args.url):
-        cfg["providers"][provider]["base_url"] = nvidia_upstream_base_url()
-        save_config(cfg)
-        clear_model_cache()
-        print(f"Base URL for {provider} set to {nvidia_upstream_base_url()}")
-        return
-    cfg["providers"][provider]["base_url"] = args.url.rstrip("/")
-    save_config(cfg)
-    clear_model_cache()
-    print(f"Base URL for {provider} set to {args.url.rstrip('/')}")
+    for line in set_base_url_config(provider, args.url):
+        print(line)
 
 
 def cmd_model(args: argparse.Namespace) -> None:
@@ -1411,16 +1559,8 @@ def cmd_model(args: argparse.Namespace) -> None:
         value = value[4:].strip()
     if not value:
         raise SystemExit("Missing model id")
-    mmap = model_map_for(provider, pcfg)
-    model_id = normalize_model_id(provider, unslug_provider_alias(provider, value, mmap) or value)
-    pcfg["current_model"] = model_id
-    custom = pcfg.setdefault("custom_models", [])
-    if model_id not in custom and model_id not in upstream_model_ids(provider, pcfg):
-        custom.append(model_id)
-    save_config(cfg)
-    clear_model_cache()
-    print(f"Model for {provider} set to {model_id}")
-    print(f"Claude Code alias: {alias_for(provider, model_id)}")
+    for line in set_model_config(value):
+        print(line)
     print("Gateway model cache cleared. Run /model to refresh if needed.")
 
 
@@ -2228,7 +2368,7 @@ def default_base_url(provider: str) -> str:
 
 
 def meaningful_key(value: str | None) -> bool:
-    return bool(value and value not in ("dummy", "not-used", "ollama"))
+    return meaningful_key_value(value)
 
 
 def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
@@ -2475,146 +2615,386 @@ def pause() -> None:
     input("Press Enter to continue...")
 
 
+def compact_text(value: Any, width: int = 72) -> str:
+    text = str(value if value is not None else "")
+    if len(text) <= width:
+        return text
+    return text[: max(0, width - 3)] + "..."
+
+
+def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lang: str) -> list[str]:
+    return [
+        f"0. {ui_text('language', lang)}  [{LANGUAGES.get(lang, lang)}]",
+        f"1. {ui_text('provider', lang)}  [{provider}]",
+        f"2. {ui_text('api_key', lang)}  [{stored_api_key_mask(provider, pcfg)}]",
+        f"3. {ui_text('base_url', lang)}  [{compact_text(pcfg.get('base_url', 'unset'), 62)}]",
+        f"4. {ui_text('model', lang)}  [{compact_text(pcfg.get('current_model', 'unset'), 62)}]",
+        f"5. {ui_text('test', lang)}",
+        f"6. {ui_text('launch', lang)}",
+        ui_text("quit", lang),
+    ]
+
+
+def provider_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    rows: list[str] = []
+    values: list[str] = []
+    current = cfg.get("current_provider", "nvidia-hosted")
+    for key, label in PROVIDER_LABELS.items():
+        pcfg = cfg.get("providers", {}).get(key, {})
+        mark = "*" if key == current else " "
+        rows.append(f"{mark} {label:<16} {key:<15} {compact_text(pcfg.get('base_url', ''), 54)}")
+        values.append(key)
+    return rows, values
+
+
+def language_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    rows: list[str] = []
+    values: list[str] = []
+    current = cfg.get("language", "en")
+    for code, label in LANGUAGES.items():
+        mark = "*" if code == current else " "
+        rows.append(f"{mark} {code:<2} {label}")
+        values.append(code)
+    return rows, values
+
+
+def model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    values = upstream_model_ids(provider, pcfg)
+    rows: list[str] = []
+    current = pcfg.get("current_model")
+    for mid in values:
+        mark = "*" if mid == current else " "
+        rows.append(f"{mark} {compact_text(mid, 62):<62} {compact_text(alias_for(provider, mid), 46)}")
+    rows.append("+ Custom model id...")
+    return rows, values
+
+
+def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
+    rows = [
+        "Type or paste API key as hidden input",
+        "Read API key from an environment variable",
+        "Read API key from clipboard",
+        "Back",
+    ]
+    values = ["input", "env", "clipboard", "back"]
+    if os.name != "nt":
+        rows[2] = "Read API key from desktop clipboard if available"
+    return rows, values
+
+
+def base_url_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    return (
+        [
+            f"Edit Base URL  [{compact_text(pcfg.get('base_url') or default_base_url(provider), 72)}]",
+            f"Reset to provider default  [{default_base_url(provider)}]",
+            "Back",
+        ],
+        ["edit", "default", "back"],
+    )
+
+
+def visible_rows(rows: list[str], selected: int, limit: int) -> list[tuple[int | None, str]]:
+    if len(rows) <= limit:
+        return [(i, row) for i, row in enumerate(rows)]
+    limit = max(4, limit)
+    start = max(0, min(selected - limit // 2, len(rows) - limit))
+    end = min(len(rows), start + limit)
+    visible: list[tuple[int | None, str]] = []
+    if start > 0:
+        visible.append((None, f"... {start} above"))
+    visible.extend((i, rows[i]) for i in range(start, end))
+    if end < len(rows):
+        visible.append((None, f"... {len(rows) - end} below"))
+    return visible
+
+
+def render_prelaunch_screen(
+    main_idx: int,
+    panel: str | None,
+    panel_idx: int,
+    panel_rows: list[str],
+    checks: list[str],
+    messages: list[str],
+    first_render: bool,
+) -> bool:
+    cfg = load_config()
+    provider, pcfg = get_current_provider(cfg)
+    lang = cfg.get("language", "en")
+    columns, height = shutil.get_terminal_size((110, 32))
+    screen: list[str] = []
+    screen.extend(intro_panel_lines(columns))
+    screen.append("")
+    for line in status_lines()[:5]:
+        color = "32" if line.startswith(("provider:", "model:")) else "2"
+        screen.append("  " + ansi(line, color))
+    screen.append("")
+    rows = main_menu_rows(cfg, provider, pcfg, lang)
+    for i, row in enumerate(rows):
+        line = ("> " if i == main_idx and panel is None else "  ") + row
+        if i == main_idx and panel is None:
+            screen.append(ansi(line, "7;1"))
+        elif "Launch" in row or "실행" in row or "起動" in row or "启动" in row:
+            screen.append(ansi(line, "32;1"))
+        elif row == ui_text("quit", lang):
+            screen.append(ansi(line, "31"))
+        else:
+            screen.append(line)
+    if panel:
+        titles = {
+            "language": "Language",
+            "provider": "Provider",
+            "api-key": "API key",
+            "base-url": "Base URL",
+            "model": "Model",
+            "test": "Compatibility test",
+        }
+        screen.append("")
+        screen.append(ansi("-" * min(columns - 2, 112), "38;5;208"))
+        screen.append(ansi(f"{titles.get(panel, panel)} options", "1;38;5;208"))
+        fixed = len(screen) + len(checks) + len(messages) + 5
+        limit = max(5, height - fixed)
+        for actual, row in visible_rows(panel_rows, panel_idx, limit):
+            if actual is None:
+                screen.append("    " + ansi(row, "2"))
+            elif actual == panel_idx:
+                screen.append(ansi("  > " + row, "7;1"))
+            else:
+                screen.append("    " + row)
+    if messages:
+        screen.append("")
+        for line in messages[-8:]:
+            screen.append(ansi("  " + compact_text(line, columns - 6), "36;1"))
+    if checks:
+        screen.append("")
+        screen.append(ansi("-" * min(columns - 2, 112), "38;5;208"))
+        for line in checks:
+            screen.append(ansi("  " + compact_text(line, columns - 6), "1;38;5;208"))
+    screen.append("")
+    help_text = "Up/Down moves. Enter selects. Esc/Left closes submenu. q quits. Actions expand in place."
+    screen.append(ansi(help_text, "2"))
+    rendered = "\n".join(screen) + "\n"
+    if sys.stdout.isatty():
+        prefix = "\033[2J\033[H" if first_render else "\033[H"
+        sys.stdout.write(prefix + rendered + "\033[J")
+        sys.stdout.flush()
+    else:
+        print(rendered, end="")
+    return False
+
+
+def prompt_menu_value(prompt: str, default: str = "", secret: bool = False) -> str:
+    label = f"{prompt}"
+    if default:
+        label += f" [{default}]"
+    label += ": "
+    sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
+    sys.stdout.flush()
+    if secret:
+        value = getpass.getpass("")
+    else:
+        value = input()
+    value = value.strip()
+    return value or default
+
+
 def portable_provider_menu() -> int:
     cfg = load_config()
-    current = cfg.get("current_provider", "nvidia-hosted")
-    keys = list(PROVIDER_LABELS)
-    rows = []
-    idx = 0
-    for i, key in enumerate(keys):
-        if key == current:
-            idx = i
-        base = cfg.get("providers", {}).get(key, {}).get("base_url", "")
-        mark = "*" if key == current else " "
-        rows.append(f"{mark} {PROVIDER_LABELS[key]:<16} {key:<15} {base}")
-    selected = portable_select("Select claude-any provider", rows, idx)
+    rows, values = provider_panel_rows(cfg)
+    selected = portable_select("Select claude-any provider", rows, values.index(cfg.get("current_provider", "nvidia-hosted")))
     if selected is None:
         print("Cancelled.")
         return 1
-    code, out = self_cmd(["provider", keys[selected]])
-    print(out, end="")
-    return code
+    for line in set_provider_config(values[selected]):
+        print(line)
+    return 0
 
 
 def portable_language_menu() -> int:
     cfg = load_config()
-    current = cfg.get("language", "en")
-    codes = list(LANGUAGES)
-    rows = []
-    idx = 0
-    for i, code in enumerate(codes):
-        if code == current:
-            idx = i
-        mark = "*" if code == current else " "
-        rows.append(f"{mark} {code:<2} {LANGUAGES[code]}")
-    selected = portable_select("Select display language", rows, idx)
+    rows, values = language_panel_rows(cfg)
+    selected = portable_select("Select display language", rows, values.index(cfg.get("language", "en")))
     if selected is None:
         print("Cancelled.")
         return 1
-    code, out = self_cmd(["language", codes[selected]])
-    print(out, end="")
-    return code
-
-
-def model_rows_for_menu() -> tuple[list[str], list[str]]:
-    code, out = self_cmd(["models"])
-    if code != 0:
-        return [], []
-    rows: list[str] = []
-    values: list[str] = []
-    for line in out.splitlines()[1:]:
-        if "\t" not in line:
-            continue
-        alias, upstream = line.split("\t", 1)
-        values.append(upstream.strip())
-        rows.append(f"{upstream.strip():<58} {alias.strip()}")
-    return rows, values
+    cfg["language"] = values[selected]
+    save_config(cfg)
+    print(f"Language set to {values[selected]} ({LANGUAGES[values[selected]]}).")
+    return 0
 
 
 def portable_prelaunch_menu() -> int:
-    idx = 6 if settings_ready_except_api_key() else 0
+    enable_ansi()
+    main_idx = 6 if settings_ready_except_api_key() else 0
+    panel: str | None = None
+    panel_idx = 0
+    panel_rows: list[str] = []
+    panel_values: list[str] = []
     checks = preflight_lines()
-    while True:
+    messages: list[str] = []
+    first_render = True
+
+    def open_panel(name: str) -> None:
+        nonlocal panel, panel_idx, panel_rows, panel_values, messages, first_render
         cfg = load_config()
         provider, pcfg = get_current_provider(cfg)
-        lang = cfg.get("language", "en")
-        rows = [
-            f"0. {ui_text('language', lang)}  [{LANGUAGES.get(lang, lang)}]",
-            f"1. {ui_text('provider', lang)}  [{provider}]",
-            f"2. {ui_text('api_key', lang)}",
-            f"3. {ui_text('base_url', lang)}  [{pcfg.get('base_url', 'unset')}]",
-            f"4. {ui_text('model', lang)}  [{pcfg.get('current_model', 'unset')}]",
-            f"5. {ui_text('test', lang)}",
-            f"6. {ui_text('launch', lang)}",
-            ui_text("quit", lang),
-        ]
-        selected = portable_select(ui_text("title", lang), rows, idx, info_lines=checks, show_intro=True)
-        if selected is None:
-            return 10
-        action = ["language", "provider", "api-key", "base-url", "model", "test", "launch", "quit"][selected]
-        if action == "launch":
-            return 0
-        if action == "test":
-            clear_screen()
-            _, out = self_cmd(["test"])
-            print(out, end="")
-            pause()
-            checks = preflight_lines()
-            idx = 6 if "Compatibility: OK" in out else 4
-            continue
-        if action == "quit":
-            return 10
-        if action == "language":
-            rc = portable_language_menu()
-            if rc != 0:
-                return rc
-            checks = preflight_lines()
-            idx = 1
-        elif action == "provider":
-            rc = portable_provider_menu()
-            if rc != 0:
-                return rc
-            checks = preflight_lines()
-            idx = 2
-        elif action == "api-key":
-            clear_screen()
-            key = getpass.getpass(f"API key for {provider}: ").strip()
-            if key:
-                _, out = self_cmd(["set-api-key", provider, key])
-                print(out, end="")
-                pause()
-                checks = preflight_lines()
-            idx = 3
-        elif action == "base-url":
-            clear_screen()
-            default = pcfg.get("base_url") or default_base_url(provider)
-            value = input(f"Base URL for {provider} [{default}]: ").strip() or default
-            if value:
-                _, out = self_cmd(["base-url", provider, value])
-                print(out, end="")
-                pause()
-                checks = preflight_lines()
-            idx = 4
-        elif action == "model":
-            clear_screen()
-            print("Loading models from current provider...")
-            rows, values = model_rows_for_menu()
-            rows.append("Custom model id...")
-            selected_model = portable_select("Select model", rows, 0) if rows else None
-            if selected_model is None:
-                idx = 3
+        panel = name
+        panel_idx = 0
+        if name == "language":
+            panel_rows, panel_values = language_panel_rows(cfg)
+            panel_idx = panel_values.index(cfg.get("language", "en"))
+        elif name == "provider":
+            panel_rows, panel_values = provider_panel_rows(cfg)
+            panel_idx = panel_values.index(provider)
+        elif name == "api-key":
+            panel_rows, panel_values = api_key_panel_rows(provider)
+        elif name == "base-url":
+            panel_rows, panel_values = base_url_panel_rows(provider, pcfg)
+        elif name == "model":
+            panel_rows, panel_values = ["Loading models from current provider..."], []
+            first_render = render_prelaunch_screen(main_idx, panel, panel_idx, panel_rows, checks, messages, first_render)
+            try:
+                panel_rows, panel_values = model_panel_rows(provider, pcfg)
+            except Exception as exc:
+                panel_rows, panel_values = [f"Model list failed: {type(exc).__name__}: {exc}", "+ Custom model id..."], []
+        elif name == "test":
+            panel_rows, panel_values = ["Run compatibility test", "Back"], ["run", "back"]
+
+    def close_panel(next_idx: int | None = None) -> None:
+        nonlocal panel, panel_idx, panel_rows, panel_values, main_idx
+        panel = None
+        panel_idx = 0
+        panel_rows = []
+        panel_values = []
+        if next_idx is not None:
+            main_idx = next_idx
+
+    def refresh_checks() -> None:
+        nonlocal checks
+        checks = preflight_lines()
+
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[?25l")
+        sys.stdout.flush()
+    try:
+        while True:
+            first_render = render_prelaunch_screen(main_idx, panel, panel_idx, panel_rows, checks, messages, first_render)
+            key = read_menu_key()
+            if panel:
+                if key in ("up", "k"):
+                    panel_idx = (panel_idx - 1) % max(1, len(panel_rows))
+                    continue
+                if key in ("down", "j"):
+                    panel_idx = (panel_idx + 1) % max(1, len(panel_rows))
+                    continue
+                if key in ("esc", "left", "q"):
+                    close_panel()
+                    continue
+                if key != "enter":
+                    continue
+                cfg = load_config()
+                provider, pcfg = get_current_provider(cfg)
+                value = panel_values[panel_idx] if panel_idx < len(panel_values) else ""
+                if panel == "language" and value:
+                    cfg["language"] = value
+                    save_config(cfg)
+                    messages = [f"Language set to {value} ({LANGUAGES[value]})."]
+                    refresh_checks()
+                    close_panel(1)
+                elif panel == "provider" and value:
+                    messages = set_provider_config(value)
+                    refresh_checks()
+                    main_idx = 4
+                    open_panel("model")
+                elif panel == "model":
+                    if panel_idx >= len(panel_values):
+                        model_value = prompt_menu_value("Model id or alias")
+                    else:
+                        model_value = value
+                    if model_value:
+                        messages = set_model_config(model_value)
+                        refresh_checks()
+                    close_panel(5)
+                elif panel == "api-key":
+                    if value == "back":
+                        close_panel()
+                    elif value == "input":
+                        key_value = prompt_menu_value(f"API key for {provider}", secret=True)
+                        if key_value:
+                            messages = store_api_key_config(provider, key_value)
+                            refresh_checks()
+                        close_panel(3)
+                    elif value == "env":
+                        default_env = {
+                            "anthropic": "ANTHROPIC_API_KEY",
+                            "nvidia-hosted": "NVIDIA_API_KEY",
+                            "ollama-cloud": "OLLAMA_API_KEY",
+                        }.get(provider, "API_KEY")
+                        env_name = prompt_menu_value("Environment variable name", default_env)
+                        key_value = os.environ.get(env_name, "").strip()
+                        if key_value:
+                            messages = store_api_key_config(provider, key_value)
+                        else:
+                            messages = [f"Environment variable {env_name} is empty or not set."]
+                        refresh_checks()
+                        close_panel(3)
+                    elif value == "clipboard":
+                        key_value = read_clipboard_text()
+                        if not key_value:
+                            messages = ["Clipboard did not contain readable text."]
+                        else:
+                            confirm = prompt_menu_value(f"Clipboard contains {mask_secret(key_value)}. Store it? y/N")
+                            if confirm.lower().startswith("y"):
+                                messages = store_api_key_config(provider, key_value)
+                            else:
+                                messages = ["Clipboard API key was not stored."]
+                        refresh_checks()
+                        close_panel(3)
+                elif panel == "base-url":
+                    if value == "back":
+                        close_panel()
+                    elif value == "default":
+                        messages = set_base_url_config(provider, default_base_url(provider))
+                        refresh_checks()
+                        close_panel(4)
+                    elif value == "edit":
+                        default = pcfg.get("base_url") or default_base_url(provider)
+                        url = prompt_menu_value(f"Base URL for {provider}", default)
+                        if url:
+                            messages = set_base_url_config(provider, url)
+                            refresh_checks()
+                        close_panel(4)
+                elif panel == "test":
+                    if value == "back":
+                        close_panel()
+                    else:
+                        panel_rows, panel_values = ["Testing current provider/model..."], []
+                        first_render = render_prelaunch_screen(main_idx, panel, 0, panel_rows, checks, messages, first_render)
+                        _, out = self_cmd(["test"])
+                        lines = [line for line in out.splitlines() if line.strip()]
+                        messages = lines[-8:] if lines else ["Test produced no output."]
+                        panel_rows, panel_values = ["Run compatibility test again", "Back"], ["run", "back"]
+                        refresh_checks()
+                        main_idx = 6 if "Compatibility: OK" in out else 4
                 continue
-            if selected_model >= len(values):
-                clear_screen()
-                value = input("Model id or alias: ").strip()
-            else:
-                value = values[selected_model]
-            if value:
-                _, out = self_cmd(["model", value])
-                print(out, end="")
-                pause()
-                checks = preflight_lines()
-            idx = 5
+
+            if key in ("up", "k"):
+                main_idx = (main_idx - 1) % 8
+            elif key in ("down", "j"):
+                main_idx = (main_idx + 1) % 8
+            elif key in ("esc", "q"):
+                return 10
+            elif key == "enter":
+                actions = ["language", "provider", "api-key", "base-url", "model", "test", "launch", "quit"]
+                action = actions[main_idx]
+                if action == "launch":
+                    return 0
+                if action == "quit":
+                    return 10
+                open_panel(action)
+    finally:
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[?25h")
+            sys.stdout.flush()
 
 
 def run_external_menu(name: str) -> int | None:
@@ -2635,9 +3015,10 @@ def run_prelaunch_menu(passthrough: list[str], skip_menu: bool = False) -> int:
         return 0
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return 0
-    rc = run_external_menu("claude-any-menu")
-    if rc is not None:
-        return rc
+    if os.environ.get("CLAUDE_ANY_USE_LEGACY_MENU") == "1":
+        rc = run_external_menu("claude-any-menu")
+        if rc is not None:
+            return rc
     return portable_prelaunch_menu()
 
 
