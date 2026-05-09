@@ -69,7 +69,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.4"
+VERSION = "0.1.5"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -2839,6 +2839,29 @@ def preflight_lines() -> list[str]:
     ]
 
 
+def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
+    cfg = cfg or load_config()
+    provider, pcfg = get_current_provider(cfg)
+    status = base_url_status_line(provider, pcfg)
+    low = status.lower()
+    errors: list[str] = []
+    if any(marker in low for marker in ("unreachable", "placeholder", "missing")):
+        errors.append(f"Launch blocked: {status}")
+        if provider == "vllm":
+            errors.append("vLLM must be reachable from this machine and expose Anthropic-compatible /v1/messages.")
+        elif provider in ("ollama", "ollama-cloud"):
+            errors.append("Start Ollama or set a reachable Base URL before launching Claude Code.")
+        elif provider == "self-hosted-nim":
+            errors.append("Start NIM or set a reachable Anthropic-compatible Base URL before launching Claude Code.")
+        else:
+            errors.append("Set a reachable Base URL before launching Claude Code.")
+    if provider == "nvidia-hosted" and not (nvidia_api_key() or meaningful_key(pcfg.get("api_key"))):
+        errors.append("Launch blocked: NVIDIA hosted requires an NVIDIA API key.")
+    if provider == "ollama-cloud" and not meaningful_key(pcfg.get("api_key")):
+        errors.append("Launch blocked: Ollama Cloud requires an API key.")
+    return errors
+
+
 def settings_ready_except_api_key() -> bool:
     cfg = load_config()
     provider, pcfg = get_current_provider(cfg)
@@ -3473,6 +3496,11 @@ def portable_prelaunch_menu() -> int:
                 actions = ["language", "provider", "api-key", "base-url", "model", "test", "options", "launch", "quit"]
                 action = actions[main_idx]
                 if action == "launch":
+                    blockers = launch_readiness_errors()
+                    if blockers:
+                        messages = blockers
+                        refresh_checks()
+                        continue
                     return 0
                 if action == "quit":
                     return 10
@@ -3647,6 +3675,12 @@ def launch_claude(
         return rc
     cfg = load_config()
     provider, pcfg = get_current_provider(cfg)
+    blockers = launch_readiness_errors(cfg)
+    if blockers:
+        print("Claude Any launch blocked:", flush=True)
+        for line in blockers:
+            print(f"- {line}", flush=True)
+        return 2
     use_native_anthropic = native_anthropic_enabled(provider)
     use_ollama_native = ollama_native_compat_enabled(provider, pcfg)
     use_provider_native = provider_native_compat_enabled(provider, pcfg)

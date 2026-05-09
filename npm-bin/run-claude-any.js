@@ -7,7 +7,9 @@ const path = require("node:path");
 const root = path.resolve(__dirname, "..");
 const script = path.join(root, "claude_any.py");
 const extra = process.argv.slice(2);
-const mode = process.env.CLAUDE_ANY_NPM_MODE || "cli";
+const mode = Object.prototype.hasOwnProperty.call(process.env, "CLAUDE_ANY_NPM_MODE")
+  ? process.env.CLAUDE_ANY_NPM_MODE
+  : "cli";
 
 function candidates() {
   if (process.env.CLAUDE_ANY_PYTHON) {
