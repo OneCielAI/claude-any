@@ -6,7 +6,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.9`
+Current version: `0.1.10`
 
 ## Install
 
@@ -106,6 +106,9 @@ edit or select:
 
 The lower status area shows connection checks, API-key state, provider notes,
 and compatibility-test results.
+For vLLM and self-hosted NIM, the compatibility test also reads `/v1/models`
+when available and prints the runtime `max_model_len` next to Claude Any's
+configured `context_window` and `max_output_tokens`.
 
 ### LLM Option Presets
 

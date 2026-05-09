@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.9`
+Current version: `0.1.10`
 
 ## Why This Exists
 

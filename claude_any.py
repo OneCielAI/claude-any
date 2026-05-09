@@ -69,7 +69,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.9"
+VERSION = "0.1.10"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -893,7 +893,7 @@ def model_context_field(item: dict[str, Any]) -> int | None:
     return None
 
 
-def upstream_model_context_limit(provider: str, pcfg: dict[str, Any], timeout: float = 3.0) -> int | None:
+def upstream_model_runtime_info(provider: str, pcfg: dict[str, Any], timeout: float = 3.0) -> dict[str, Any] | None:
     if provider not in ("vllm", "self-hosted-nim"):
         return None
     base = provider_upstream_request_base(provider, pcfg)
@@ -907,16 +907,34 @@ def upstream_model_context_limit(provider: str, pcfg: dict[str, Any], timeout: f
     items = data.get("data") if isinstance(data, dict) else None
     if not isinstance(items, list):
         return None
-    fallback: int | None = None
+    fallback_item: dict[str, Any] | None = None
     for item in items:
         if not isinstance(item, dict):
             continue
-        limit = model_context_field(item)
-        if limit and fallback is None:
-            fallback = limit
-        if str(item.get("id") or "") == current and limit:
-            return limit
-    return fallback
+        if fallback_item is None:
+            fallback_item = item
+        if str(item.get("id") or "") == current:
+            selected = item
+            break
+    else:
+        selected = fallback_item
+    if not selected:
+        return None
+    return {
+        "models_url": join_url(base, "/v1/models"),
+        "requested_model": current,
+        "runtime_model": str(selected.get("id") or ""),
+        "max_model_len": model_context_field(selected),
+        "owned_by": selected.get("owned_by"),
+        "root": selected.get("root"),
+    }
+
+
+def upstream_model_context_limit(provider: str, pcfg: dict[str, Any], timeout: float = 3.0) -> int | None:
+    info = upstream_model_runtime_info(provider, pcfg, timeout=timeout)
+    if not info:
+        return None
+    return positive_int(info.get("max_model_len"))
 
 
 def model_map_for(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
@@ -2653,6 +2671,40 @@ def compatibility_failure_diagnosis(provider: str, code: int | None, msg: str) -
     return None
 
 
+def compatibility_runtime_lines(provider: str, pcfg: dict[str, Any], native: bool) -> list[str]:
+    if provider not in ("vllm", "self-hosted-nim"):
+        return []
+    lines: list[str] = []
+    info = upstream_model_runtime_info(provider, pcfg, timeout=4.0)
+    configured_context = positive_int(pcfg.get("context_window"))
+    configured_output = positive_int(pcfg.get("max_output_tokens"))
+    if info:
+        lines.append(f"Runtime models URL: {info.get('models_url')}")
+        if info.get("runtime_model"):
+            lines.append(f"Runtime model id: {info.get('runtime_model')}")
+        runtime_limit = positive_int(info.get("max_model_len"))
+        if runtime_limit:
+            lines.append(f"Runtime max_model_len: {runtime_limit}")
+        else:
+            lines.append("Runtime max_model_len: not reported by /v1/models")
+    else:
+        runtime_limit = None
+        lines.append("Runtime max_model_len: unavailable (/v1/models did not return model metadata)")
+    if configured_context:
+        lines.append(f"Configured context_window: {configured_context}")
+    if configured_output:
+        lines.append(f"Configured max_output_tokens: {configured_output}")
+    if runtime_limit and configured_context and configured_context != runtime_limit:
+        lines.append(f"Context warning: configured context_window {configured_context} differs from runtime max_model_len {runtime_limit}.")
+    if runtime_limit and configured_output and configured_output >= runtime_limit:
+        lines.append("Context warning: max_output_tokens is greater than or equal to the full runtime context length.")
+    if native:
+        lines.append("Runtime mode note: native mode sends Claude Code requests directly; claude-any cannot shrink max_tokens per request.")
+    else:
+        lines.append("Runtime mode note: router mode can cap max_tokens based on configured context_window.")
+    return lines
+
+
 def set_compatibility_cache(
     cfg: dict[str, Any],
     provider: str,
@@ -2719,6 +2771,8 @@ def _cmd_test(args: argparse.Namespace) -> None:
             req_preview = ollama_chat_request(resolve_requested_model(provider, pcfg, model), body, pcfg)
             print(f"Ollama num_ctx: {req_preview.get('options', {}).get('num_ctx', 'default')}")
     print(f"Model: {model}")
+    for line in compatibility_runtime_lines(provider, pcfg, native):
+        print(line)
     try:
         data = post_json(url, body, headers=headers, timeout=args.timeout)
     except urllib.error.HTTPError as exc:
