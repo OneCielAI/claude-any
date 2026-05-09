@@ -69,7 +69,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.6"
+VERSION = "0.1.7"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -2034,10 +2034,239 @@ def llm_options_status(provider: str, pcfg: dict[str, Any]) -> str:
                 pieces.append(f"{key}={opts[key]}")
         return "; ".join(pieces)
     if provider == "anthropic":
-        return f"max_output_tokens={pcfg.get('max_output_tokens', 'Claude Code default')}"
+        return (
+            f"max_output_tokens={pcfg.get('max_output_tokens', 'Claude Code default')}, "
+            f"timeout={pcfg.get('request_timeout_ms', 'Claude Code default')}ms"
+        )
     if provider in PROVIDER_OPTION_PROVIDERS:
         return provider_options_status(provider, pcfg)
     return "provider defaults"
+
+
+def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
+    model = str(pcfg.get("current_model") or "").lower()
+    if any(marker in model for marker in ("coder", "codegemma", "starcoder", "devstral")):
+        return "coding"
+    if any(marker in model for marker in ("reason", "thinking", "r1", "qwq")):
+        return "reasoning"
+    if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
+        return "large"
+    if provider in ("vllm", "self-hosted-nim"):
+        ctx = positive_int(pcfg.get("context_window")) or 0
+        if ctx >= 65536:
+            return "long-context"
+    if provider in ("ollama", "ollama-cloud"):
+        ctx = positive_int(pcfg.get("num_ctx_max")) or positive_int(pcfg.get("num_ctx")) or 0
+        if ctx >= 65536:
+            return "long-context"
+    return "general"
+
+
+def recommended_preset_id(provider: str, pcfg: dict[str, Any]) -> str:
+    family = model_option_family(provider, pcfg)
+    if family == "reasoning":
+        return "reasoning"
+    if family == "coding":
+        return "coding"
+    if family == "long-context":
+        return "long-context-65k"
+    if family == "large":
+        return "balanced"
+    return "balanced"
+
+
+LLM_PRESETS: dict[str, tuple[str, str]] = {
+    "balanced": ("Balanced Claude Code", "4K output, stable coding/chat defaults"),
+    "coding": ("Coding deterministic", "lower randomness for edits, scripts, reviews"),
+    "fast": ("Fast short tasks", "shorter output and timeout for quick jobs"),
+    "long-context-65k": ("Long context 65K", "65K context target, 4K output reserve"),
+    "large-output": ("Large output/report", "larger 8K output for summaries/reports"),
+    "reasoning": ("Reasoning model", "higher timeout and reasoning-friendly sampling"),
+}
+
+
+def llm_preset_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    recommended = recommended_preset_id(provider, pcfg)
+    family = model_option_family(provider, pcfg)
+    rows = [f"Model family: {family}; recommended preset is {LLM_PRESETS[recommended][0]}"]
+    values = ["__info__"]
+    for preset_id, (label, description) in LLM_PRESETS.items():
+        mark = "*" if preset_id == recommended else " "
+        rows.append(f"{mark} {label:<24} {description}")
+        values.append(preset_id)
+    rows.append("Back")
+    values.append("back")
+    return rows, values
+
+
+def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id: str) -> list[str]:
+    if preset_id not in LLM_PRESETS:
+        raise SystemExit(f"Unknown preset: {preset_id}")
+    label = LLM_PRESETS[preset_id][0]
+    if provider in ("ollama", "ollama-cloud"):
+        tokens_by_preset = {
+            "balanced": [
+                "num_ctx=auto",
+                "num_ctx_min=32768",
+                "num_ctx_max=65536",
+                "num_predict=4096",
+                "temperature=0.3",
+                "top_p=0.9",
+                "top_k=40",
+                "think=false",
+                "keep_alive=5m",
+                "timeout=600000",
+            ],
+            "coding": [
+                "num_ctx=auto",
+                "num_ctx_min=32768",
+                "num_ctx_max=65536",
+                "num_predict=4096",
+                "temperature=0.2",
+                "top_p=0.8",
+                "top_k=40",
+                "think=false",
+                "keep_alive=5m",
+                "timeout=600000",
+            ],
+            "fast": [
+                "num_ctx=32768",
+                "num_predict=2048",
+                "temperature=0.2",
+                "top_p=0.8",
+                "top_k=40",
+                "think=false",
+                "keep_alive=5m",
+                "timeout=300000",
+            ],
+            "long-context-65k": [
+                "num_ctx=auto",
+                "num_ctx_min=65536",
+                "num_ctx_max=131072",
+                "num_predict=4096",
+                "temperature=0.3",
+                "top_p=0.9",
+                "top_k=40",
+                "think=false",
+                "keep_alive=10m",
+                "timeout=900000",
+            ],
+            "large-output": [
+                "num_ctx=auto",
+                "num_ctx_min=65536",
+                "num_ctx_max=131072",
+                "num_predict=8192",
+                "temperature=0.3",
+                "top_p=0.9",
+                "top_k=40",
+                "think=false",
+                "keep_alive=10m",
+                "timeout=1200000",
+            ],
+            "reasoning": [
+                "num_ctx=auto",
+                "num_ctx_min=65536",
+                "num_ctx_max=131072",
+                "num_predict=4096",
+                "temperature=0.6",
+                "top_p=0.95",
+                "top_k=40",
+                "think=true",
+                "keep_alive=10m",
+                "timeout=1800000",
+            ],
+        }
+        for token in tokens_by_preset[preset_id]:
+            apply_ollama_option(pcfg, token)
+    elif provider == "anthropic":
+        tokens_by_preset = {
+            "balanced": ["max_output_tokens=4096", "timeout=600000"],
+            "coding": ["max_output_tokens=4096", "timeout=600000"],
+            "fast": ["max_output_tokens=2048", "timeout=300000"],
+            "long-context-65k": ["max_output_tokens=4096", "timeout=900000"],
+            "large-output": ["max_output_tokens=8192", "timeout=1200000"],
+            "reasoning": ["max_output_tokens=4096", "timeout=1800000"],
+        }
+        for token in tokens_by_preset[preset_id]:
+            apply_provider_option(provider, pcfg, token)
+    else:
+        native_default = "false" if provider == "nvidia-hosted" else "true"
+        tokens_by_preset = {
+            "balanced": [
+                "context_window=32768",
+                "reserve=2048",
+                "max_output_tokens=4096",
+                "timeout=600000",
+                "temperature=0.3",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
+            "coding": [
+                "context_window=32768",
+                "reserve=2048",
+                "max_output_tokens=4096",
+                "timeout=600000",
+                "temperature=0.2",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
+            "fast": [
+                "context_window=32768",
+                "reserve=1024",
+                "max_output_tokens=2048",
+                "timeout=300000",
+                "temperature=0.2",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
+            "long-context-65k": [
+                "context_window=65536",
+                "reserve=4096",
+                "max_output_tokens=4096",
+                "timeout=900000",
+                "temperature=0.3",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
+            "large-output": [
+                "context_window=65536",
+                "reserve=4096",
+                "max_output_tokens=8192",
+                "timeout=1200000",
+                "temperature=0.3",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
+            "reasoning": [
+                "context_window=65536",
+                "reserve=4096",
+                "max_output_tokens=4096",
+                "timeout=1800000",
+                "temperature=0.6",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
+        }
+        for token in tokens_by_preset[preset_id]:
+            if provider == "nvidia-hosted" and token.startswith(("context_window=", "reserve=")):
+                continue
+            apply_provider_option(provider, pcfg, token)
+    return [f"Applied preset: {label}", f"Provider: {provider}; model family: {model_option_family(provider, pcfg)}"]
+
+
+def apply_llm_preset_config(provider: str, preset_id: str) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    lines = apply_llm_preset_to_provider(provider, pcfg, preset_id)
+    save_config(cfg)
+    clear_model_cache()
+    return lines
 
 
 def llm_option_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -2048,6 +2277,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str
         rows.append(f"{label:<24} [{compact_text(value, 56)}]")
         values.append(key)
 
+    add("Apply preset", "preset", LLM_PRESETS[recommended_preset_id(provider, pcfg)][0])
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         add("Context window", "num_ctx", ollama_num_ctx_status(pcfg))
@@ -3233,6 +3463,7 @@ def render_prelaunch_screen(
             "model": "Model",
             "test": "Compatibility test",
             "options": "LLM options",
+            "preset": "LLM presets",
         }
         add("")
         add("-" * render_width, "38;5;208")
@@ -3356,6 +3587,8 @@ def portable_prelaunch_menu() -> int:
             panel_rows, panel_values = ["Run compatibility test", "Back"], ["run", "back"]
         elif name == "options":
             panel_rows, panel_values = llm_option_panel_rows(provider, pcfg)
+        elif name == "preset":
+            panel_rows, panel_values = llm_preset_panel_rows(provider, pcfg)
 
     def close_panel(next_idx: int | None = None) -> None:
         nonlocal panel, panel_idx, panel_rows, panel_values, main_idx
@@ -3479,6 +3712,8 @@ def portable_prelaunch_menu() -> int:
                 elif panel == "options":
                     if value == "back":
                         close_panel()
+                    elif value == "preset":
+                        open_panel("preset")
                     else:
                         default = llm_option_prompt_default(provider, pcfg, value)
                         entered = prompt_menu_value(f"{value} for {provider} (default/unset clears)", default)
@@ -3489,6 +3724,22 @@ def portable_prelaunch_menu() -> int:
                         refresh_checks()
                         cfg = load_config()
                         provider, pcfg = get_current_provider(cfg)
+                        panel_rows, panel_values = llm_option_panel_rows(provider, pcfg)
+                elif panel == "preset":
+                    if value == "back":
+                        open_panel("options")
+                    elif value == "__info__":
+                        continue
+                    else:
+                        try:
+                            messages = apply_llm_preset_config(provider, value)
+                        except Exception as exc:
+                            messages = [f"Preset failed: {type(exc).__name__}: {exc}"]
+                        refresh_checks()
+                        cfg = load_config()
+                        provider, pcfg = get_current_provider(cfg)
+                        panel = "options"
+                        panel_idx = 0
                         panel_rows, panel_values = llm_option_panel_rows(provider, pcfg)
                 continue
 

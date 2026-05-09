@@ -6,7 +6,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.6`
+Current version: `0.1.7`
 
 ## Install
 
@@ -100,12 +100,31 @@ edit or select:
 - API key: enter only when the selected provider needs one.
 - Base URL: provider-aware default or custom endpoint.
 - Model: provider model picker when available, custom input otherwise.
-- Options: provider-specific generation and timeout settings.
+- Options: provider-specific generation, timeout, and preset settings.
 - Compatibility test: makes a small request before launching Claude Code.
 - Launch Claude Code: starts Claude Code with the selected configuration.
 
 The lower status area shows connection checks, API-key state, provider notes,
 and compatibility-test results.
+
+### LLM Option Presets
+
+Open `LLM options`, then select `Apply preset` to apply a provider-aware preset
+without editing every parameter manually. Claude Any currently includes:
+
+- Balanced Claude Code: stable 4K-output default for normal Claude Code use.
+- Coding deterministic: lower randomness for edits, scripts, and code review.
+- Fast short tasks: shorter output and timeout for quick background jobs.
+- Long context 65K: 65K context target with a 4K output reserve.
+- Large output/report: 8K output for summaries and reports.
+- Reasoning model: longer timeout and reasoning-friendly sampling.
+
+The recommended preset is chosen from the current provider and model name. For
+example, `coder` models prefer the coding preset, `r1`/`thinking` models prefer
+the reasoning preset, and vLLM/NIM models configured for 65K context prefer the
+long-context preset. For vLLM native mode, the server must still be launched
+with a matching `--max-model-len`; Claude Any cannot raise the server-side
+context limit from the client.
 
 ## Provider Setup
 
