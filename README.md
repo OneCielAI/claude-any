@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.12`
+Current version: `0.1.13`
 
 ## Why This Exists
 
@@ -200,6 +200,45 @@ steps under that larger model's supervision.
 - DuckDuckGo and fetch MCP wiring for non-native providers.
 - Headless setup flags such as `--ca-provider`, `--ca-model`, `--ca-base-url`,
   `--ca-api-key-env`, `--ca-ollama-option`, and `--ca-max-output-tokens`.
+- Streaming proxy for Ollama/Ollama Cloud router path — tokens are delivered
+  to Claude Code as they arrive instead of waiting for the full response.
+- Config file caching — settings are read from disk once and reused until the
+  file changes, reducing per-request overhead in the router.
+
+## Changelog
+
+### 0.1.13
+
+- **Ollama streaming proxy**: The router now streams Ollama and Ollama Cloud
+  responses through to Claude Code in real time using Anthropic SSE format,
+  instead of buffering the entire response before delivery.
+- **Config caching**: `load_config()` now caches the configuration file in
+  memory and only re-reads from disk when the file modification time changes.
+  This eliminates repeated file I/O and JSON parsing on every router request.
+- **Token estimation caching**: `estimate_tokens()` now accepts an optional
+  cache dict to avoid redundant `json.dumps()` calls within a single request.
+  `ollama_chat_request` and `cap_output_tokens_for_context` share the same
+  cache when computing context window sizing.
+
+### 0.1.12
+
+- Refresh docs and demo assets.
+
+### 0.1.11
+
+- Validate tool call compatibility.
+
+### 0.1.10
+
+- Show runtime context in tests.
+
+### 0.1.9
+
+- Cap presets to server context.
+
+### 0.1.8
+
+- Localize LLM presets.
 
 ## Provider Notes
 

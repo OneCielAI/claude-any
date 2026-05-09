@@ -9,7 +9,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.12`
+현재 버전: `0.1.13`
 
 ## 왜 만들었나
 
@@ -181,6 +181,38 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 - 필요한 경우 provider-specific router 사용.
 - non-native provider용 DuckDuckGo/fetch MCP 연결.
 - `--ca-provider`, `--ca-model`, `--ca-base-url`, `--ca-api-key-env` 등 headless 플래그.
+- Ollama/Ollama Cloud 라우터 경로의 스트리밍 프록시 — 전체 응답을 기다리지 않고
+  토큰이 도착하는 즉시 Claude Code로 전달합니다.
+- 설정 파일 캐싱 — 라우터의 요청마다 디스크에서 읽던 설정을 메모리에 캐시하여
+  파일 수정 시에만 다시 읽습니다.
+
+## 변경 이력
+
+### 0.1.13
+
+- **Ollama 스트리밍 프록시**: 라우터가 Ollama/Ollama Cloud 응답을 Anthropic SSE 포맷으로 실시간 스트리밍합니다. 전체 응답을 버퍼링한 뒤 전달하던 기존 방식에서 토큰이 생성되는 즉시 전달하는 방식으로 변경되었습니다.
+- **설정 캐싱**: `load_config()`가 설정 파일을 메모리에 캐시하고 파일 수정 시간이 변경될 때만 다시 읽습니다. 라우터의 모든 요청에서 반복되던 디스크 I/O와 JSON 파싱이 제거되었습니다.
+- **토큰 추정 캐싱**: `estimate_tokens()`가 선택적 캐시 딕셔너리를 받아 단일 요청 내의 중복 `json.dumps()` 호출을 피합니다. `ollama_chat_request`와 `cap_output_tokens_for_context`가 같은 캐시를 공유합니다.
+
+### 0.1.12
+
+- 문서와 데모 에셋 갱신.
+
+### 0.1.11
+
+- 툴 호출 호환성 검증.
+
+### 0.1.10
+
+- 테스트에 런타임 컨텍스트 표시.
+
+### 0.1.9
+
+- 서버 컨텍스트에 맞춘 프리셋 상한.
+
+### 0.1.8
+
+- LLM 프리셋 현지화.
 
 ## 프로바이더
 

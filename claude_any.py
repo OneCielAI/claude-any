@@ -69,7 +69,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.12"
+VERSION = "0.1.13"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -405,7 +405,18 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
         migrations[marker] = True
 
 
+_config_cache: dict[str, Any] | None = None
+_config_cache_mtime: float = 0.0
+
+
 def load_config() -> dict[str, Any]:
+    global _config_cache, _config_cache_mtime
+    try:
+        mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
+        mtime = 0.0
+    if _config_cache is not None and mtime == _config_cache_mtime:
+        return json.loads(json.dumps(_config_cache))
     if CONFIG_PATH.exists():
         try:
             data = json.loads(CONFIG_PATH.read_text())
@@ -425,18 +436,33 @@ def load_config() -> dict[str, Any]:
                 pcfg["current_model"] = normalize_model_id(provider_name, str(pcfg["current_model"]))
             if isinstance(pcfg.get("custom_models"), list):
                 pcfg["custom_models"] = [normalize_model_id(provider_name, str(mid)) for mid in pcfg["custom_models"] if str(mid).strip()]
+    _config_cache = cfg
+    _config_cache_mtime = mtime
     return cfg
 
 
+def invalidate_config_cache() -> None:
+    global _config_cache, _config_cache_mtime
+    _config_cache = None
+    _config_cache_mtime = 0.0
+
+
 def save_config(cfg: dict[str, Any]) -> None:
+    global _config_cache, _config_cache_mtime
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp = CONFIG_PATH.with_name(f"{CONFIG_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
     tmp.write_text(json.dumps(cfg, indent=2, sort_keys=True) + "\n")
     os.chmod(tmp, 0o600)
     tmp.replace(CONFIG_PATH)
+    _config_cache = cfg
+    try:
+        _config_cache_mtime = CONFIG_PATH.stat().st_mtime
+    except OSError:
+        _config_cache_mtime = 0.0
 
 
 def clear_model_cache() -> None:
+    invalidate_config_cache()
     try:
         CLAUDE_GATEWAY_CACHE.unlink()
     except FileNotFoundError:
@@ -1044,9 +1070,16 @@ def write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> 
     handler.wfile.write(body)
 
 
-def estimate_tokens(body: Any) -> int:
+def estimate_tokens(body: Any, _cache: dict[int, int] | None = None) -> int:
+    if _cache is not None:
+        body_id = id(body)
+        if body_id in _cache:
+            return _cache[body_id]
     text = json.dumps(body, ensure_ascii=False)
-    return max(1, len(text) // 4)
+    result = max(1, len(text) // 4)
+    if _cache is not None:
+        _cache[id(body)] = result
+    return result
 
 
 def anthropic_content_to_text(content: Any) -> str:
@@ -1234,7 +1267,7 @@ def ctx_bucket(target: int, minimum: int, maximum: int) -> int:
     return maximum
 
 
-def ollama_num_ctx_for_payload(pcfg: dict[str, Any], payload: Any) -> int | None:
+def ollama_num_ctx_for_payload(pcfg: dict[str, Any], payload: Any, _token_cache: dict[int, int] | None = None) -> int | None:
     override = os.environ.get("CLAUDE_ANY_OLLAMA_NUM_CTX")
     if override:
         return positive_int(override)
@@ -1244,7 +1277,7 @@ def ollama_num_ctx_for_payload(pcfg: dict[str, Any], payload: Any) -> int | None
         maximum = positive_int(pcfg.get("num_ctx_max")) or 65536
         if maximum < minimum:
             maximum = minimum
-        estimated = estimate_tokens(payload)
+        estimated = estimate_tokens(payload, _token_cache)
         # Leave headroom for tool results, follow-up commands, and model-side formatting.
         target = int(estimated * 1.45) + 2048
         return ctx_bucket(target, minimum, maximum)
@@ -1305,13 +1338,14 @@ def cap_output_tokens_for_context(
     payload: Any,
     context_limit: int | None,
     configured: int | None,
+    _token_cache: dict[int, int] | None = None,
 ) -> int | None:
     if not configured:
         return None
     if not context_limit:
         return configured
     reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
-    estimated_input = estimate_tokens(payload)
+    estimated_input = estimate_tokens(payload, _token_cache)
     available = context_limit - estimated_input - reserve
     if available <= 0:
         return min(configured, 256)
@@ -1348,13 +1382,13 @@ def apply_provider_request_options(provider: str, pcfg: dict[str, Any], body: di
     return out
 
 
-def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any]) -> dict[str, Any]:
+def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], stream: bool = True) -> dict[str, Any]:
     messages = anthropic_messages_to_ollama(body)
     tools = anthropic_tools_to_ollama(body.get("tools"))
     req: dict[str, Any] = {
         "model": model,
         "messages": messages,
-        "stream": False,
+        "stream": stream,
         "think": bool(pcfg.get("think", False)),
     }
     if pcfg.get("keep_alive"):
@@ -1362,13 +1396,16 @@ def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any]) 
     if tools:
         req["tools"] = tools
     options: dict[str, Any] = ollama_extra_options(pcfg)
-    num_ctx = ollama_num_ctx_for_payload(pcfg, {"messages": messages, "tools": tools})
+    payload_for_est = {"messages": messages, "tools": tools}
+    token_cache: dict[int, int] = {}
+    num_ctx = ollama_num_ctx_for_payload(pcfg, payload_for_est, _token_cache=token_cache)
     num_predict = cap_output_tokens_for_context(
         pcfg,
         body,
-        {"messages": messages, "tools": tools},
+        payload_for_est,
         num_ctx,
         configured_output_tokens(pcfg, body, "num_predict"),
+        _token_cache=token_cache,
     )
     if num_predict:
         options["num_predict"] = num_predict
@@ -1436,13 +1473,164 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str) -> dict[str, Any]
     }
 
 
+def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, model: str) -> None:
+    """Stream Ollama NDJSON /api/chat response as Anthropic SSE /v1/messages format."""
+    handler.send_response(200)
+    handler.send_header("content-type", "text/event-stream")
+    handler.send_header("cache-control", "no-cache")
+    handler.send_header("connection", "keep-alive")
+    handler.end_headers()
+    msg_id = f"msg_ollama_{int(time.time() * 1000)}"
+    started = False
+    text_so_far = ""
+    tool_calls: list[dict[str, Any]] = []
+    input_tokens = 0
+    output_tokens = 0
+    try:
+        for line in resp:
+            line = line.decode("utf-8", errors="ignore").strip()
+            if not line:
+                continue
+            try:
+                chunk = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(chunk, dict):
+                continue
+            message = chunk.get("message") if isinstance(chunk.get("message"), dict) else {}
+            input_tokens = max(input_tokens, int(chunk.get("prompt_eval_count") or 0))
+            output_tokens = max(output_tokens, int(chunk.get("eval_count") or 0))
+            if not started:
+                started = True
+                # Send message_start event
+                event = {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": model,
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+                    },
+                }
+                handler.wfile.write(f"event: message_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+                handler.wfile.flush()
+            # Handle text content
+            text_chunk = message.get("content") or ""
+            if text_chunk:
+                text_so_far += text_chunk
+                event = {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text_chunk},
+                }
+                handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+                handler.wfile.flush()
+            # Handle tool calls
+            for call in message.get("tool_calls") or []:
+                fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+                if not isinstance(fn, dict) or not fn.get("name"):
+                    continue
+                tool_calls.append(call)
+                tool_id = f"toolu_ollama_{int(time.time() * 1000)}_{len(tool_calls) - 1}"
+                tool_event = {
+                    "type": "content_block_start",
+                    "index": 1 + len([b for b in tool_calls[:-1] if False]),  # tool blocks after text block
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": str(fn["name"]),
+                        "input": normalize_tool_arguments(str(fn["name"]), fn.get("arguments")),
+                    },
+                }
+                handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
+                handler.wfile.flush()
+        # Determine stop reason
+        stop_reason = "tool_use" if tool_calls else "end_turn"
+        if chunk.get("done_reason") == "length":
+            stop_reason = "max_tokens"
+        # Send message_delta with final stop_reason
+        event = {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop_reason, "stop_sequence": None},
+            "usage": {"output_tokens": output_tokens},
+        }
+        handler.wfile.write(f"event: message_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.flush()
+    except Exception:
+        # On error, try to send a minimal message_stop
+        try:
+            handler.wfile.write(b"event: message_stop\ndata: {}\n\n")
+            handler.wfile.flush()
+        except Exception:
+            pass
+
+
 def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     base = pcfg.get("base_url", "").rstrip("/")
-    req_body = ollama_chat_request(model, body, pcfg)
+    stream_requested = body.get("stream", True)
+    req_body = ollama_chat_request(model, body, pcfg, stream=stream_requested)
     headers = provider_headers(provider, pcfg)
+    url = join_url(base, "/api/chat")
+    if stream_requested:
+        # Stream Ollama response through as Anthropic SSE
+        data_bytes = json.dumps(req_body).encode("utf-8")
+        req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+        try:
+            resp = urllib.request.urlopen(req, timeout=ollama_request_timeout_seconds(pcfg))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="ignore")
+            msg = raw.strip() or str(exc)
+            try:
+                err = json.loads(raw)
+                if isinstance(err, dict):
+                    if isinstance(err.get("error"), dict):
+                        msg = str(err["error"].get("message") or err["error"])
+                    elif err.get("error"):
+                        msg = str(err["error"])
+                    elif err.get("message"):
+                        msg = str(err["message"])
+            except Exception:
+                pass
+            write_json(
+                handler,
+                {"type": "error", "error": {"type": "upstream_error", "message": msg}},
+                exc.code,
+            )
+            return
+        # Check if Claude Code requested SSE streaming
+        accept = handler.headers.get("accept", "")
+        if "text/event-stream" in accept or stream_requested:
+            _ollama_stream_to_anthropic_sse(handler, resp, model)
+        else:
+            # Non-SSE client but streaming from Ollama: collect full response
+            chunks = []
+            for line in resp:
+                chunks.append(line)
+            resp.close()
+            full = b"".join(chunks).decode("utf-8", errors="ignore")
+            data = None
+            for line in full.splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                    if isinstance(chunk, dict) and chunk.get("done"):
+                        data = chunk
+                except Exception:
+                    continue
+            if data is None:
+                data = {"message": {"content": ""}, "done": True, "done_reason": "end_turn"}
+            write_json(handler, ollama_chat_to_anthropic(data, model))
+        return
+    # Non-streaming fallback
     try:
-        data = post_json(join_url(base, "/api/chat"), req_body, headers=headers, timeout=ollama_request_timeout_seconds(pcfg))
+        data = post_json(url, req_body, headers=headers, timeout=ollama_request_timeout_seconds(pcfg))
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", errors="ignore")
         msg = raw.strip() or str(exc)
@@ -2902,7 +3090,7 @@ def _cmd_test(args: argparse.Namespace) -> None:
     if not native:
         print(f"Upstream base URL: {pcfg.get('base_url')}")
         if provider in ("ollama", "ollama-cloud"):
-            req_preview = ollama_chat_request(resolve_requested_model(provider, pcfg, model), tool_body, pcfg)
+            req_preview = ollama_chat_request(resolve_requested_model(provider, pcfg, model), tool_body, pcfg, stream=False)
             print(f"Ollama num_ctx: {req_preview.get('options', {}).get('num_ctx', 'default')}")
     print(f"Model: {model}")
     for line in compatibility_runtime_lines(provider, pcfg, native):

@@ -9,7 +9,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.12`
+当前版本: `0.1.13`
 
 ## 为什么存在
 
@@ -170,6 +170,38 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 - 必要时使用 provider-specific router。
 - 为 non-native provider 连接 DuckDuckGo/fetch MCP。
 - 支持 `--ca-provider`、`--ca-model`、`--ca-base-url` 等 headless 参数。
+- Ollama/Ollama Cloud 路由路径的流式代理 — token 到达后立即转发给 Claude Code，
+  不再等待完整响应。
+- 配置文件缓存 — 路由器将设置缓存到内存，仅在文件修改时重新读取，
+  减少了每次请求的磁盘 I/O 开销。
+
+## 更新日志
+
+### 0.1.13
+
+- **Ollama 流式代理**: 路由器现在以 Anthropic SSE 格式实时流式传输 Ollama/Ollama Cloud 响应，替代了之前缓冲完整响应再转发的方式。
+- **配置缓存**: `load_config()` 将配置文件缓存到内存，仅在文件修改时间变化时重新读取。消除了路由器每个请求中重复的磁盘读取和 JSON 解析。
+- **Token 估算缓存**: `estimate_tokens()` 接受可选的缓存字典，避免单个请求中的冗余 `json.dumps()` 调用。`ollama_chat_request` 和 `cap_output_tokens_for_context` 共享同一缓存。
+
+### 0.1.12
+
+- 刷新文档和演示素材。
+
+### 0.1.11
+
+- 验证工具调用兼容性。
+
+### 0.1.10
+
+- 在测试中显示运行时上下文。
+
+### 0.1.9
+
+- 将预设上限限制到服务器上下文。
+
+### 0.1.8
+
+- 本地化 LLM 预设。
 
 ## 供应商说明
 
