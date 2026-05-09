@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.10`
+Current version: `0.1.11`
 
 ## Why This Exists
 
@@ -169,7 +169,8 @@ steps under that larger model's supervision.
 - Pre-launch provider picker with English, Korean, Japanese, and Chinese UI.
 - Provider-aware model list and custom model entry.
 - API key entry outside the Claude Code chat input.
-- Compatibility test before launch.
+- Compatibility test before launch, including text response, tool use, and
+  tool-result round trip checks.
 - Console-first pre-launch menu for SSH and terminal workflows.
 - Native paths where providers expose Claude/Anthropic-compatible endpoints.
 - Router mode for providers that need request/response adaptation.

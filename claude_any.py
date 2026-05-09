@@ -69,7 +69,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.10"
+VERSION = "0.1.11"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -82,7 +82,8 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "Bash accepts command, description, timeout, and run_in_background; it does not accept content. "
     "Read accepts file_path, offset, and limit; it does not accept description. "
     "Write accepts file_path and content. Edit accepts file_path, old_string, new_string, and replace_all. "
-    "TaskList accepts no input. TaskUpdate requires taskId and status only."
+    "TaskList accepts no input. TaskUpdate requires taskId and status only. "
+    "Never write pseudo tool calls, partial JSON, or markdown code fences when a real Claude Code tool call is required."
 )
 LANGUAGES = {
     "en": "English",
@@ -2607,41 +2608,141 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
     print("  claude-anyctl provider-options self-hosted-nim native=true max_output_tokens=4096")
 
 
-def compatibility_request(model: str) -> dict[str, Any]:
+COMPAT_TOOL_NAME = "compat_echo"
+
+
+def compatibility_tool_schema() -> dict[str, Any]:
+    return {
+        "name": COMPAT_TOOL_NAME,
+        "description": "A minimal compatibility test tool. It echoes one required text argument.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string"}},
+            "required": ["text"],
+            "additionalProperties": False,
+        },
+    }
+
+
+def compatibility_text_request(model: str) -> dict[str, Any]:
     return {
         "model": model,
         "max_tokens": 16,
         "messages": [
             {
                 "role": "user",
-                "content": "Compatibility test. Reply with OK. Do not call tools unless required.",
-            }
-        ],
-        "tools": [
-            {
-                "name": "compat_echo",
-                "description": "A minimal compatibility test tool. Do not use unless explicitly asked.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"text": {"type": "string"}},
-                    "required": ["text"],
-                },
+                "content": "Compatibility text test. Reply with exactly OK and do not call tools.",
             }
         ],
     }
 
 
-def summarize_compat_response(data: Any) -> list[str]:
-    lines = ["Compatibility: OK"]
+def compatibility_tool_request(model: str) -> dict[str, Any]:
+    return {
+        "model": model,
+        "max_tokens": 128,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Compatibility tool test. Use the compat_echo tool exactly once with text set to ping.",
+            }
+        ],
+        "tools": [compatibility_tool_schema()],
+        "tool_choice": {"type": "tool", "name": COMPAT_TOOL_NAME},
+    }
+
+
+def compatibility_tool_result_request(model: str, tool_use: dict[str, Any]) -> dict[str, Any]:
+    tool_id = str(tool_use.get("id") or "toolu_compat_echo_1")
+    tool_input = tool_use.get("input") if isinstance(tool_use.get("input"), dict) else {"text": "ping"}
+    return {
+        "model": model,
+        "max_tokens": 64,
+        "messages": [
+            {
+                "role": "user",
+                "content": "Compatibility tool test. Use the compat_echo tool exactly once with text set to ping.",
+            },
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": tool_id,
+                        "name": COMPAT_TOOL_NAME,
+                        "input": tool_input,
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": tool_id,
+                        "content": "pong",
+                    },
+                    {
+                        "type": "text",
+                        "text": "Now reply with FINAL_OK and do not call tools.",
+                    },
+                ],
+            },
+        ],
+        "tools": [compatibility_tool_schema()],
+    }
+
+
+def response_content_blocks(data: Any) -> list[dict[str, Any]]:
+    if not isinstance(data, dict):
+        return []
+    content = data.get("content")
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
+
+
+def response_content_types(data: Any) -> list[str]:
+    return [str(block.get("type", "?")) for block in response_content_blocks(data)]
+
+
+def response_text_preview(data: Any) -> str:
+    parts: list[str] = []
+    for block in response_content_blocks(data):
+        if block.get("type") == "text" and isinstance(block.get("text"), str):
+            parts.append(block["text"].strip())
+    return " ".join(parts).strip()[:300]
+
+
+def find_compat_tool_use(data: Any) -> tuple[dict[str, Any] | None, str]:
+    for block in response_content_blocks(data):
+        if block.get("type") != "tool_use":
+            continue
+        if block.get("name") != COMPAT_TOOL_NAME:
+            return None, f"unexpected tool name {block.get('name')!r}"
+        tool_input = block.get("input")
+        if not isinstance(tool_input, dict):
+            return None, "tool input was not a JSON object"
+        if tool_input.get("text") != "ping":
+            return None, f"tool input text was {tool_input.get('text')!r}, expected 'ping'"
+        if not block.get("id"):
+            return None, "tool_use block did not include an id"
+        return block, ""
+    types = ", ".join(response_content_types(data)) or "none"
+    preview = response_text_preview(data)
+    suffix = f"; text={preview!r}" if preview else ""
+    return None, f"no compat_echo tool_use block returned; content blocks: {types}{suffix}"
+
+
+def summarize_compat_response(data: Any, label: str) -> list[str]:
+    lines = [f"{label}: OK"]
     if isinstance(data, dict):
         stop = data.get("stop_reason")
         if stop:
             lines.append(f"Stop reason: {stop}")
-        content = data.get("content")
-        if isinstance(content, list):
-            types = [str(block.get("type", "?")) for block in content if isinstance(block, dict)]
-            if types:
-                lines.append("Content blocks: " + ", ".join(types[:6]))
+        types = response_content_types(data)
+        if types:
+            lines.append("Content blocks: " + ", ".join(types[:6]))
         usage = data.get("usage")
         if isinstance(usage, dict):
             tokens = []
@@ -2656,6 +2757,12 @@ def summarize_compat_response(data: Any) -> list[str]:
 
 def compatibility_failure_diagnosis(provider: str, code: int | None, msg: str) -> str | None:
     lower = msg.lower()
+    if provider == "vllm" and ("tool" in lower or "parse" in lower or "parser" in lower):
+        return (
+            "Diagnosis: vLLM tool calling depends on the server's model-specific --tool-call-parser and chat template. "
+            "For Qwen3-Coder models, current vLLM docs recommend --tool-call-parser qwen3_xml; Hermes is for Hermes-style models "
+            "and some older Qwen tool templates."
+        )
     if "does not support tools" in lower:
         return "Diagnosis: selected model does not support tool calling, so it is not suitable for normal Claude Code use."
     if provider == "nvidia-hosted" and code == 404:
@@ -2667,6 +2774,32 @@ def compatibility_failure_diagnosis(provider: str, code: int | None, msg: str) -
         return (
             "Diagnosis: NVIDIA returned a missing function for this hosted model. The model is visible in /v1/models "
             "but is not callable with the current account."
+        )
+    return None
+
+
+def vllm_tool_parser_hint(model: str) -> str | None:
+    normalized = model.lower()
+    if "qwen3-coder" in normalized or "qwen3_coder" in normalized:
+        return "vLLM hint: Qwen3-Coder models should be served with --enable-auto-tool-choice --tool-call-parser qwen3_xml."
+    if "qwen2.5" in normalized or "qwen2_5" in normalized or "qwq" in normalized:
+        return "vLLM hint: Qwen2.5/QwQ tool templates usually use --enable-auto-tool-choice --tool-call-parser hermes."
+    if "glm-4.7" in normalized or "glm4.7" in normalized:
+        return "vLLM hint: GLM-4.7 models should be served with --enable-auto-tool-choice --tool-call-parser glm47."
+    if "glm-4.5" in normalized or "glm4.5" in normalized or "glm-4.6" in normalized or "glm4.6" in normalized:
+        return "vLLM hint: GLM-4.5/4.6 models should be served with --enable-auto-tool-choice --tool-call-parser glm45."
+    if "deepseek-v3.1" in normalized:
+        return "vLLM hint: DeepSeek-V3.1 models should be served with --enable-auto-tool-choice --tool-call-parser deepseek_v31."
+    if "deepseek-v3" in normalized or "deepseek-r1" in normalized:
+        return "vLLM hint: DeepSeek-V3/R1 models require the matching DeepSeek tool parser and chat template from vLLM examples."
+    if "llama-3" in normalized or "llama3" in normalized:
+        return "vLLM hint: Llama 3.x models usually need --enable-auto-tool-choice --tool-call-parser llama3_json and the matching tool chat template."
+    if "hermes" in normalized:
+        return "vLLM hint: Hermes models should be served with --enable-auto-tool-choice --tool-call-parser hermes."
+    if "qwen3" in normalized or "qwen-3" in normalized:
+        return (
+            "vLLM hint: this looks like a Qwen3-family model. Verify its model card/tool format; "
+            "Qwen3-Coder uses qwen3_xml, while older Hermes-style Qwen templates use hermes."
         )
     return None
 
@@ -2751,7 +2884,8 @@ def _cmd_test(args: argparse.Namespace) -> None:
             "authorization": "Bearer ollama",
             "x-api-key": "ollama",
         }
-    body = compatibility_request(model)
+    text_body = compatibility_text_request(model)
+    tool_body = compatibility_tool_request(model)
     print(f"Testing provider: {provider}")
     if ollama_native:
         mode = "ollama-native"
@@ -2768,52 +2902,91 @@ def _cmd_test(args: argparse.Namespace) -> None:
     if not native:
         print(f"Upstream base URL: {pcfg.get('base_url')}")
         if provider in ("ollama", "ollama-cloud"):
-            req_preview = ollama_chat_request(resolve_requested_model(provider, pcfg, model), body, pcfg)
+            req_preview = ollama_chat_request(resolve_requested_model(provider, pcfg, model), tool_body, pcfg)
             print(f"Ollama num_ctx: {req_preview.get('options', {}).get('num_ctx', 'default')}")
     print(f"Model: {model}")
     for line in compatibility_runtime_lines(provider, pcfg, native):
         print(line)
-    try:
-        data = post_json(url, body, headers=headers, timeout=args.timeout)
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="ignore")
-        msg = raw.strip()
-        try:
-            err = json.loads(raw)
-            if isinstance(err, dict):
-                if isinstance(err.get("error"), dict):
-                    msg = err["error"].get("message") or json.dumps(err["error"])
-                elif err.get("message"):
-                    msg = str(err["message"])
-        except Exception:
-            pass
+    if provider == "vllm":
+        hint = vllm_tool_parser_hint(model)
+        if hint:
+            print(hint)
+
+    def fail(message: str, code: int | None = None, diagnosis: str = "") -> None:
         print("Compatibility: FAIL")
-        print(f"HTTP: {exc.code}")
-        print(f"Reason: {msg[:1000]}")
-        diagnosis = compatibility_failure_diagnosis(provider, exc.code, msg)
+        if code is not None:
+            print(f"HTTP: {code}")
+        print(f"Reason: {message[:1000]}")
         if diagnosis:
             print(diagnosis)
-        set_compatibility_cache(cfg, provider, model, False, exc.code, msg, diagnosis or "")
+        set_compatibility_cache(cfg, provider, model, False, code, message, diagnosis)
         raise SystemExit(1)
-    except TimeoutError:
-        print("Compatibility: TIMEOUT")
-        print(f"Reason: no response before the {args.timeout:g}s compatibility-test timeout.")
-        print("Diagnosis: this timeout was not saved as a model failure. Retry the test or choose another model if it repeats.")
-        raise SystemExit(1)
-    except Exception as exc:
-        msg = f"{type(exc).__name__}: {exc}"
-        if "timed out" in msg.lower() or "timeout" in msg.lower():
+
+    def run_phase(label: str, request_body: dict[str, Any]) -> Any:
+        print(f"{label}: running")
+        try:
+            return post_json(url, request_body, headers=headers, timeout=args.timeout)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="ignore")
+            msg = raw.strip()
+            try:
+                err = json.loads(raw)
+                if isinstance(err, dict):
+                    if isinstance(err.get("error"), dict):
+                        msg = err["error"].get("message") or json.dumps(err["error"])
+                    elif err.get("message"):
+                        msg = str(err["message"])
+            except Exception:
+                pass
+            diagnosis = compatibility_failure_diagnosis(provider, exc.code, msg)
+            fail(f"{label}: {msg}", exc.code, diagnosis or "")
+        except TimeoutError:
             print("Compatibility: TIMEOUT")
-            print(f"Reason: {msg}")
+            print(f"Reason: {label} did not respond before the {args.timeout:g}s compatibility-test timeout.")
             print("Diagnosis: this timeout was not saved as a model failure. Retry the test or choose another model if it repeats.")
             raise SystemExit(1)
-        print("Compatibility: FAIL")
-        print(f"Reason: {msg}")
-        set_compatibility_cache(cfg, provider, model, False, None, msg, "")
-        raise SystemExit(1)
-    set_compatibility_cache(cfg, provider, model, True, 200, "OK", "")
-    for line in summarize_compat_response(data):
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"
+            if "timed out" in msg.lower() or "timeout" in msg.lower():
+                print("Compatibility: TIMEOUT")
+                print(f"Reason: {label}: {msg}")
+                print("Diagnosis: this timeout was not saved as a model failure. Retry the test or choose another model if it repeats.")
+                raise SystemExit(1)
+            fail(f"{label}: {msg}")
+
+    text_data = run_phase("Text response", text_body)
+    for line in summarize_compat_response(text_data, "Text response"):
         print(line)
+
+    tool_data = run_phase("Tool use", tool_body)
+    tool_use, tool_error = find_compat_tool_use(tool_data)
+    if not tool_use:
+        diagnosis = (
+            "Diagnosis: the model/server did not return a valid Anthropic tool_use block. "
+            "Claude Code can fail with 'tool call could not be parsed' on this provider/model."
+        )
+        if provider == "vllm":
+            hint = vllm_tool_parser_hint(model)
+            if hint:
+                diagnosis = f"{diagnosis} {hint}"
+        fail(f"Tool use: {tool_error}", diagnosis=diagnosis)
+    for line in summarize_compat_response(tool_data, "Tool use"):
+        print(line)
+
+    result_body = compatibility_tool_result_request(model, tool_use)
+    result_data = run_phase("Tool result", result_body)
+    result_preview = response_text_preview(result_data)
+    if not result_preview:
+        fail(
+            "Tool result: no final text response after tool_result.",
+            diagnosis="Diagnosis: the provider accepted tool_use but did not complete the tool_result round trip.",
+        )
+    for line in summarize_compat_response(result_data, "Tool result"):
+        print(line)
+    print(f"Tool result text: {result_preview[:120]}")
+
+    set_compatibility_cache(cfg, provider, model, True, 200, "text/tool_use/tool_result OK", "")
+    print("Compatibility: OK")
 
 
 def cmd_test(args: argparse.Namespace) -> None:
