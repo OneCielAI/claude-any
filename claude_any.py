@@ -559,8 +559,9 @@ def model_cache_key(provider: str, pcfg: dict[str, Any]) -> str:
             "provider": provider,
             "base_url": pcfg.get("base_url", ""),
             "api": api_state,
+            "current": pcfg.get("current_model", ""),
             "custom": pcfg.get("custom_models", []),
-            "schema": 2,
+            "schema": 3,
         },
         sort_keys=True,
     )
@@ -580,7 +581,7 @@ def read_model_list_cache(provider: str, pcfg: dict[str, Any]) -> list[str] | No
     models = data.get("models")
     if not isinstance(models, list):
         return None
-    return [str(mid) for mid in models if str(mid).strip()]
+    return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()])
 
 
 def write_model_list_cache(provider: str, pcfg: dict[str, Any], models: list[str]) -> None:
@@ -2748,14 +2749,22 @@ def language_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
 
 
 def model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
-    values = upstream_model_ids(provider, pcfg)
+    values = unique_model_ids(provider, upstream_model_ids(provider, pcfg))
     rows: list[str] = []
     current = pcfg.get("current_model")
+    seen_aliases: set[str] = set()
+    deduped_values: list[str] = []
     for mid in values:
+        alias = alias_for(provider, mid)
+        alias_key = alias.casefold()
+        if alias_key in seen_aliases:
+            continue
+        seen_aliases.add(alias_key)
+        deduped_values.append(mid)
         mark = "*" if mid == current else " "
-        rows.append(f"{mark} {mid}  {alias_for(provider, mid)}")
+        rows.append(f"{mark} {mid}  {alias}")
     rows.append("+ Custom model id...")
-    return rows, values
+    return rows, deduped_values
 
 
 def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
