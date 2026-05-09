@@ -1,0 +1,44 @@
+{
+  "name": "@onecielai/claude-any",
+  "version": "0.1.0",
+  "description": "Claude Code provider selector for Anthropic, Ollama, Ollama Cloud, vLLM, NVIDIA hosted, and self-hosted NIM.",
+  "license": "MIT",
+  "author": "One Ciel LLC",
+  "homepage": "https://github.com/OneCielAI/claude-any#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/OneCielAI/claude-any.git"
+  },
+  "bugs": {
+    "url": "https://github.com/OneCielAI/claude-any/issues"
+  },
+  "type": "commonjs",
+  "bin": {
+    "claude-any": "npm-bin/claude-any.js",
+    "claude-anyctl": "npm-bin/claude-anyctl.js",
+    "claude-any-stop": "npm-bin/claude-any-stop.js"
+  },
+  "files": [
+    "claude_any.py",
+    "claude-any-menu.py",
+    "claude-any-tool-guard.py",
+    "npm-bin/",
+    "install.sh",
+    "install.ps1",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+    "docs/"
+  ],
+  "scripts": {
+    "test": "python -m py_compile claude_any.py claude-any-menu.py claude-any-tool-guard.py scripts/make_demo_assets.py",
+    "lint": "python -m ruff check .",
+    "demo:assets": "python scripts/make_demo_assets.py"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
