@@ -69,7 +69,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.8"
+VERSION = "0.1.9"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -883,6 +883,40 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
     sorted_ids = sorted_model_ids(unique_model_ids(provider, ids))
     write_model_list_cache(provider, pcfg, sorted_ids)
     return sorted_ids
+
+
+def model_context_field(item: dict[str, Any]) -> int | None:
+    for key in ("max_model_len", "max_context_length", "context_length", "max_context_tokens", "max_position_embeddings"):
+        value = positive_int(item.get(key))
+        if value:
+            return value
+    return None
+
+
+def upstream_model_context_limit(provider: str, pcfg: dict[str, Any], timeout: float = 3.0) -> int | None:
+    if provider not in ("vllm", "self-hosted-nim"):
+        return None
+    base = provider_upstream_request_base(provider, pcfg)
+    if not base:
+        return None
+    current = current_upstream_model_id(provider, pcfg)
+    try:
+        data = http_json(join_url(base, "/v1/models"), headers=provider_model_list_headers(provider, pcfg), timeout=timeout)
+    except Exception:
+        return None
+    items = data.get("data") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None
+    fallback: int | None = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        limit = model_context_field(item)
+        if limit and fallback is None:
+            fallback = limit
+        if str(item.get("id") or "") == current and limit:
+            return limit
+    return fallback
 
 
 def model_map_for(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
@@ -2072,7 +2106,8 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
     if provider in ("vllm", "self-hosted-nim"):
-        ctx = positive_int(pcfg.get("context_window")) or 0
+        server_limit = upstream_model_context_limit(provider, pcfg, timeout=1.5) or 0
+        ctx = server_limit or positive_int(pcfg.get("context_window")) or 0
         if ctx >= 65536:
             return "long-context"
     if provider in ("ollama", "ollama-cloud"):
@@ -2281,6 +2316,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
             apply_provider_option(provider, pcfg, token)
     else:
         native_default = "false" if provider == "nvidia-hosted" else "true"
+        server_limit = upstream_model_context_limit(provider, pcfg) if provider in ("vllm", "self-hosted-nim") else None
         tokens_by_preset = {
             "balanced": [
                 "context_window=32768",
@@ -2347,11 +2383,29 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
             if provider == "nvidia-hosted" and token.startswith(("context_window=", "reserve=")):
                 continue
             apply_provider_option(provider, pcfg, token)
+        if server_limit:
+            requested_context = positive_int(pcfg.get("context_window"))
+            if requested_context and requested_context > server_limit:
+                pcfg["context_window"] = server_limit
+                if server_limit <= 32768:
+                    pcfg["max_output_tokens"] = min(positive_int(pcfg.get("max_output_tokens")) or 2048, 2048)
+                else:
+                    pcfg["max_output_tokens"] = min(positive_int(pcfg.get("max_output_tokens")) or 4096, max(1024, server_limit // 8))
     family = model_option_family(provider, pcfg)
-    return [
+    lines = [
         f"{ui_text('apply_preset', lang)}: {label}",
         f"Provider: {provider}; {ui_text('model_family', lang)}: {model_family_text(family, lang)}",
     ]
+    if provider in ("vllm", "self-hosted-nim"):
+        server_limit = upstream_model_context_limit(provider, pcfg)
+        if server_limit:
+            lines.append(f"Server max_model_len: {server_limit}")
+            if preset_id in ("long-context-65k", "large-output") and server_limit < 65536:
+                lines.append("Long-context preset requires restarting the server with --max-model-len 65536 or higher.")
+                lines.append("Client settings were capped to the server-reported context length.")
+        elif preset_id in ("long-context-65k", "large-output"):
+            lines.append("Could not verify server max_model_len; vLLM/NIM must be started with a matching context limit.")
+    return lines
 
 
 def apply_llm_preset_config(provider: str, preset_id: str) -> list[str]:
@@ -3139,6 +3193,9 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
                 count = f", {len(data.get('models', []))} models"
             elif isinstance(data.get("data"), list):
                 count = f", {len(data['data'])} models"
+                limit = upstream_model_context_limit(provider, pcfg, timeout=1.0)
+                if limit:
+                    count += f", max_model_len {limit}"
         except Exception:
             pass
         return f"Base URL: model list reachable ({path}{count})"
