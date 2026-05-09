@@ -165,7 +165,7 @@ PROVIDER_NOTES = {
         ],
         "nvidia-hosted": [
             "NVIDIA hosted: uses NVIDIA API Catalog at https://integrate.api.nvidia.com/v1.",
-            "Uses the Anthropic-compatible Messages path when available; disable native mode to force the router.",
+            "Hosted API Catalog currently uses the claude-any router path; self-hosted NIM uses native Messages.",
         ],
     },
     "ko": {
@@ -191,7 +191,7 @@ PROVIDER_NOTES = {
         ],
         "nvidia-hosted": [
             "NVIDIA hosted: https://integrate.api.nvidia.com/v1 의 NVIDIA API Catalog를 사용합니다.",
-            "가능하면 Anthropic 호환 Messages 경로를 직접 사용합니다. 필요하면 native mode를 끄고 router를 사용할 수 있습니다.",
+            "Hosted API Catalog는 claude-any router 경로를 기본 사용합니다. self-hosted NIM은 native Messages를 사용합니다.",
         ],
     },
     "ja": {
@@ -217,7 +217,7 @@ PROVIDER_NOTES = {
         ],
         "nvidia-hosted": [
             "NVIDIA hosted: https://integrate.api.nvidia.com/v1 のNVIDIA API Catalogを使います。",
-            "利用可能な場合はAnthropic互換Messages経路を直接使います。必要ならnative modeを無効にしてrouterを使えます。",
+            "Hosted API Catalogはclaude-any router経路を既定で使います。self-hosted NIMはnative Messagesを使います。",
         ],
     },
     "zh": {
@@ -243,7 +243,7 @@ PROVIDER_NOTES = {
         ],
         "nvidia-hosted": [
             "NVIDIA hosted: 使用 https://integrate.api.nvidia.com/v1 的 NVIDIA API Catalog。",
-            "可用时直接使用 Anthropic-compatible Messages 路径；必要时可关闭 native mode 使用 router。",
+            "Hosted API Catalog 默认使用 claude-any router 路径；self-hosted NIM 使用 native Messages。",
         ],
     },
 }
@@ -326,7 +326,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "api_key": "not-used",
             "current_model": "claude-nvidia-qwen-qwen3-coder-480b-a35b-instruct",
             "custom_models": [],
-            "native_compat": True,
+            "native_compat": False,
             "max_output_tokens": 4096,
             "request_timeout_ms": 1800000,
         },
@@ -413,6 +413,21 @@ def model_sort_key(model_id: str) -> tuple[str, str]:
 
 def sorted_model_ids(ids: list[str]) -> list[str]:
     return sorted(ids, key=model_sort_key)
+
+
+def unique_model_ids(provider: str, ids: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for raw in ids:
+        mid = normalize_model_id(provider, str(raw))
+        if not mid:
+            continue
+        key = mid.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(mid)
+    return out
 
 
 def normalize_model_id(provider: str, model_id: str) -> str:
@@ -545,6 +560,7 @@ def model_cache_key(provider: str, pcfg: dict[str, Any]) -> str:
             "base_url": pcfg.get("base_url", ""),
             "api": api_state,
             "custom": pcfg.get("custom_models", []),
+            "schema": 2,
         },
         sort_keys=True,
     )
@@ -774,7 +790,7 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
         ids.insert(0, cur)
     if provider == "nvidia-hosted" and cur and cur not in ids:
         ids.insert(0, cur)
-    sorted_ids = sorted_model_ids(ids)
+    sorted_ids = sorted_model_ids(unique_model_ids(provider, ids))
     write_model_list_cache(provider, pcfg, sorted_ids)
     return sorted_ids
 
@@ -2005,8 +2021,8 @@ def compatibility_failure_diagnosis(provider: str, code: int | None, msg: str) -
         return "Diagnosis: selected model does not support tool calling, so it is not suitable for normal Claude Code use."
     if provider == "nvidia-hosted" and code == 404:
         return (
-            "Diagnosis: NVIDIA listed this model in the catalog, but the current NVIDIA API account or endpoint "
-            "cannot run it. Pick another NVIDIA hosted model and run the test again."
+            "Diagnosis: NVIDIA API Catalog does not expose this request path/model for the current account. "
+            "Use the default router mode for nvidia-hosted, or pick another hosted model."
         )
     if provider == "nvidia-hosted" and "function" in lower and "not found" in lower:
         return (
