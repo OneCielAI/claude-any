@@ -165,7 +165,7 @@ PROVIDER_NOTES = {
         ],
         "nvidia-hosted": [
             "NVIDIA hosted: uses NVIDIA API Catalog at https://integrate.api.nvidia.com/v1.",
-            "Hosted catalog models are OpenAI-style, so claude-any keeps a compatibility route for Claude Code.",
+            "Uses the Anthropic-compatible Messages path when available; disable native mode to force the router.",
         ],
     },
     "ko": {
@@ -191,7 +191,7 @@ PROVIDER_NOTES = {
         ],
         "nvidia-hosted": [
             "NVIDIA hosted: https://integrate.api.nvidia.com/v1 의 NVIDIA API Catalog를 사용합니다.",
-            "Hosted catalog 모델은 OpenAI 방식이므로 Claude Code에는 claude-any 호환 라우트를 유지합니다.",
+            "가능하면 Anthropic 호환 Messages 경로를 직접 사용합니다. 필요하면 native mode를 끄고 router를 사용할 수 있습니다.",
         ],
     },
     "ja": {
@@ -217,7 +217,7 @@ PROVIDER_NOTES = {
         ],
         "nvidia-hosted": [
             "NVIDIA hosted: https://integrate.api.nvidia.com/v1 のNVIDIA API Catalogを使います。",
-            "Hosted catalogモデルはOpenAI形式のため、Claude Codeにはclaude-any互換ルートを維持します。",
+            "利用可能な場合はAnthropic互換Messages経路を直接使います。必要ならnative modeを無効にしてrouterを使えます。",
         ],
     },
     "zh": {
@@ -243,7 +243,7 @@ PROVIDER_NOTES = {
         ],
         "nvidia-hosted": [
             "NVIDIA hosted: 使用 https://integrate.api.nvidia.com/v1 的 NVIDIA API Catalog。",
-            "Hosted catalog 模型是 OpenAI 风格，因此 Claude Code 仍使用 claude-any 兼容路由。",
+            "可用时直接使用 Anthropic-compatible Messages 路径；必要时可关闭 native mode 使用 router。",
         ],
     },
 }
@@ -326,7 +326,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "api_key": "not-used",
             "current_model": "claude-nvidia-qwen-qwen3-coder-480b-a35b-instruct",
             "custom_models": [],
+            "native_compat": True,
             "max_output_tokens": 4096,
+            "request_timeout_ms": 1800000,
         },
         "self-hosted-nim": {
             "base_url": "http://127.0.0.1:8000",
@@ -648,6 +650,15 @@ def nvidia_proxy_base_url() -> str:
     return f"http://{host}:{port}"
 
 
+def nvidia_api_key() -> str:
+    return (
+        read_env_file(NCP_ENV).get("NVIDIA_API_KEY")
+        or os.environ.get("NVIDIA_API_KEY")
+        or os.environ.get("NV_API_KEY")
+        or ""
+    ).strip()
+
+
 def install_ncp_proxy() -> str | None:
     if os.environ.get("CLAUDE_ANY_AUTO_INSTALL_NCP", "1").lower() in ("0", "false", "no"):
         return None
@@ -704,9 +715,10 @@ def provider_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
     elif provider == "nvidia-hosted":
-        # nvd-claude-proxy usually has no proxy API key; it reads NVIDIA_API_KEY itself.
-        if pcfg.get("api_key") and pcfg.get("api_key") != "not-used":
-            headers["x-api-key"] = pcfg["api_key"]
+        key = nvidia_api_key() or (str(pcfg.get("api_key") or "") if meaningful_key(pcfg.get("api_key")) else "")
+        if key:
+            headers["authorization"] = f"Bearer {key}"
+            headers["x-api-key"] = key
     return headers
 
 
@@ -794,8 +806,16 @@ def nim_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return provider == "self-hosted-nim" and bool(pcfg.get("native_compat", True))
 
 
+def nvidia_hosted_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return provider == "nvidia-hosted" and bool(pcfg.get("native_compat", True))
+
+
 def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
-    return vllm_native_compat_enabled(provider, pcfg) or nim_native_compat_enabled(provider, pcfg)
+    return (
+        vllm_native_compat_enabled(provider, pcfg)
+        or nim_native_compat_enabled(provider, pcfg)
+        or nvidia_hosted_native_compat_enabled(provider, pcfg)
+    )
 
 
 def current_upstream_model_id(provider: str, pcfg: dict[str, Any]) -> str:
@@ -847,6 +867,13 @@ def provider_upstream_request_base(provider: str, pcfg: dict[str, Any]) -> str:
     if provider == "nvidia-hosted":
         return nvidia_proxy_base_url()
     return pcfg.get("base_url", "").rstrip("/")
+
+
+def native_anthropic_base_url(provider: str, pcfg: dict[str, Any]) -> str:
+    base = pcfg.get("base_url", "http://127.0.0.1:8000").rstrip("/")
+    if provider == "nvidia-hosted" and base.endswith("/v1"):
+        return base[:-3].rstrip("/")
+    return base
 
 
 def write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> None:
@@ -1457,7 +1484,7 @@ def mask_secret(value: str | None) -> str:
 
 def stored_api_key_mask(provider: str, pcfg: dict[str, Any]) -> str:
     if provider == "nvidia-hosted":
-        return mask_secret(read_env_file(NCP_ENV).get("NVIDIA_API_KEY"))
+        return mask_secret(nvidia_api_key())
     return mask_secret(str(pcfg.get("api_key") or ""))
 
 
@@ -1588,6 +1615,8 @@ def status_lines() -> list[str]:
         mode = "vllm-native"
     elif nim_native_compat_enabled(provider, pcfg):
         mode = "nim-native"
+    elif nvidia_hosted_native_compat_enabled(provider, pcfg):
+        mode = "nvidia-native"
     else:
         mode = "claude-any-router"
     direct_native = mode != "claude-any-router"
@@ -1836,6 +1865,7 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     if provider in ("vllm", "self-hosted-nim"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
         parts.append(f"native={bool(pcfg.get('native_compat', True))}")
     return ", ".join(parts)
 
@@ -1886,8 +1916,6 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         pcfg["request_timeout_ms"] = fixed if key.endswith("_ms") or fixed > 10000 else fixed * 1000
         return
     if key in ("native", "native_compat"):
-        if provider == "nvidia-hosted":
-            raise SystemExit("native_compat is not available for nvidia-hosted API Catalog; it uses a compatibility route.")
         pcfg["native_compat"] = bool(value)
         return
     raise SystemExit(f"Unknown provider option: {key}")
@@ -2022,7 +2050,7 @@ def _cmd_test(args: argparse.Namespace) -> None:
     provider_native = provider_native_compat_enabled(provider, pcfg)
     native = ollama_native or provider_native
     model = current_upstream_model_id(provider, pcfg) if provider_native else (launch_model_id(provider, pcfg) if ollama_native else current_alias(cfg))
-    base = pcfg.get("base_url", "").rstrip("/") if native else ROUTER_BASE
+    base = native_anthropic_base_url(provider, pcfg) if native else ROUTER_BASE
     if not native:
         start_router_if_needed()
     url = join_url(base, "/v1/messages")
@@ -2042,6 +2070,8 @@ def _cmd_test(args: argparse.Namespace) -> None:
         mode = "vllm-native"
     elif nim_native_compat_enabled(provider, pcfg):
         mode = "nim-native"
+    elif nvidia_hosted_native_compat_enabled(provider, pcfg):
+        mode = "nvidia-native"
     else:
         mode = "claude-any-router"
     print(f"Mode: {mode}")
@@ -2156,10 +2186,12 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         })
     if provider_native_compat_enabled(provider, pcfg):
         model = current_upstream_model_id(provider, pcfg)
-        token = str(pcfg.get("api_key") or "dummy")
+        token = nvidia_api_key() if provider == "nvidia-hosted" else str(pcfg.get("api_key") or "dummy")
+        if not token:
+            token = "not-used"
         return apply_common_claude_env(provider, pcfg, {
             "CLAUDE_ANY_PROVIDER": provider,
-            "ANTHROPIC_BASE_URL": pcfg.get("base_url", "http://127.0.0.1:8000").rstrip("/"),
+            "ANTHROPIC_BASE_URL": native_anthropic_base_url(provider, pcfg),
             "ANTHROPIC_AUTH_TOKEN": token,
             "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
@@ -2353,7 +2385,7 @@ def cleanup_managed_services_for_provider(provider: str, pcfg: dict[str, Any], c
         or provider_native_compat_enabled(provider, pcfg)
     ):
         stop_router_processes(quiet=quiet)
-    if provider != "nvidia-hosted":
+    if provider != "nvidia-hosted" or provider_native_compat_enabled(provider, pcfg):
         stop_ncp_proxy(quiet=quiet)
 
 
@@ -2374,7 +2406,7 @@ def meaningful_key(value: str | None) -> bool:
 
 def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
     if provider == "nvidia-hosted":
-        key = read_env_file(NCP_ENV).get("NVIDIA_API_KEY")
+        key = nvidia_api_key()
         return "API key: set (NVIDIA)" if meaningful_key(key) else "API key: missing (NVIDIA required)"
     if provider == "anthropic":
         return "API key: set (Anthropic)" if meaningful_key(pcfg.get("api_key")) else "API key: not set (use API key or Claude login)"
@@ -2394,6 +2426,8 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
     if "your-" in base:
         return f"Base URL: placeholder ({base})"
     if provider == "nvidia-hosted":
+        if nvidia_hosted_native_compat_enabled(provider, pcfg):
+            return f"Base URL: NVIDIA hosted native ({native_anthropic_base_url(provider, pcfg)}/v1/messages)"
         proxy = nvidia_proxy_base_url()
         state = "ready" if is_url_up(f"{proxy}/v1/models") else "starts on launch"
         return f"Base URL: NVIDIA hosted ({base}); local proxy {proxy} {state}"
