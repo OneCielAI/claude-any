@@ -9,7 +9,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.10`
+現在のバージョン: `0.1.12`
 
 ## 作られた理由
 
@@ -110,6 +110,14 @@ npm update -g @onecielai/claude-any
 
 ![Claude Any demo](assets/claude-any-demo.ja.gif)
 
+現在のデモは、プロバイダー選択、Base URL、モデル選択、LLM オプション、
+互換性テストの順に表示します。互換性テストは単純なテキスト応答だけでなく、
+必須の `tool_use` と `tool_result` の往復も確認します。
+
+| プロバイダー | Base URL | モデル | LLM オプション | 互換性 |
+| --- | --- | --- | --- | --- |
+| ![Provider](assets/claude-any-provider.ja.png) | ![Base URL](assets/claude-any-base-url.ja.png) | ![Model](assets/claude-any-model.ja.png) | ![Options](assets/claude-any-options.ja.png) | ![Test](assets/claude-any-test.ja.png) |
+
 詳しい設定、headless フラグ、トラブルシューティングは [manual](manual.md) を
 参照してください。デモ動画は [assets/claude-any-demo.ja.mp4](assets/claude-any-demo.ja.mp4)
 にあります。
@@ -136,6 +144,13 @@ parameter、tool result、反復呼び出し、retry、モデル選択の周辺�
 でした。そのため Claude Any は native Anthropic 互換 endpoint を優先し、
 provider-specific な変換が必要な場合だけ小さな router を使います。
 
+最近の vLLM テストでは、サーバー側の tool-call parser をモデル系列に合わせる
+必要があることが分かりました。vLLM サーバーに接続でき、`/v1/messages` が
+動作していても、`--tool-call-parser` が違うと Claude Code が tool call を
+解析できず止まることがあります。Qwen3-Coder 系では `--enable-auto-tool-choice
+--tool-call-parser qwen3_xml` を優先し、`hermes` は Hermes 形式のモデルや
+一部の古い Qwen tool template 向けとして扱います。
+
 ## 推奨用途
 
 速度が最重要ではないバックグラウンド運用に向いています。Docker ホスト管理、
@@ -159,12 +174,42 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 - 英語、韓国語、日本語、中国語 UI の起動前メニュー。
 - プロバイダー別モデル一覧とカスタムモデル入力。
 - Claude Code チャット外での API キー設定。
-- 起動前互換性テスト。
+- context window、output tokens、timeout、sampling、native compatibility の LLM オプション/プリセット。
+- 起動前にテキスト、`tool_use`、`tool_result` を確認する互換性テスト。
+- vLLM/NIM の `/v1/models` が `max_model_len` を返す場合は runtime context を表示。
 - SSH とターミナル向けのコンソール優先 UI。
 - Anthropic 互換エンドポイントがある場合は native 経路を優先。
 - 必要に応じた provider-specific router。
 - non-native provider 向け DuckDuckGo/fetch MCP。
 - `--ca-provider`、`--ca-model`、`--ca-base-url` などの headless フラグ。
+
+## プロバイダーの注意点
+
+| Provider | Mode | Notes |
+| --- | --- | --- |
+| Anthropic | Native Claude Code | Claude login または Anthropic API key を使用。 |
+| Ollama | Native 優先、必要時 router | ローカル Ollama は通常 API key 不要。ローカル Ollama で `:cloud` model を使う場合は Ollama host で `ollama signin` が必要。 |
+| Ollama Cloud | Router | `https://ollama.com/api` を直接呼び出し、Ollama API key が必要。 |
+| vLLM | Native Anthropic-compatible endpoint | Anthropic 互換 `/v1/messages` endpoint を使い、モデル系列に合う `--tool-call-parser` を指定。 |
+| NVIDIA hosted | Router/proxy | NVIDIA hosted API を compatibility 経路で使用。 |
+| self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM の Anthropic 互換 endpoint を使用。 |
+
+Qwen3-Coder を Claude Code 用に vLLM で起動する例:
+
+```sh
+vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name qwen3-coder-30b \
+  --max-model-len 65536 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_xml
+```
+
+リンク:
+
+- vLLM Claude Code integration: https://docs.vllm.ai/en/latest/serving/integrations/claude_code/
+- vLLM tool calling: https://docs.vllm.ai/en/stable/features/tool_calling/
 
 ## ライセンス
 

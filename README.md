@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.11`
+Current version: `0.1.12`
 
 ## Why This Exists
 
@@ -115,6 +115,17 @@ npm update -g @onecielai/claude-any
 
 ![Claude Any demo](docs/assets/claude-any-demo.en.gif)
 
+The demo sequence now shows provider selection, Base URL entry, model selection,
+LLM options, and the compatibility test. The compatibility test checks a plain
+text response, a required `tool_use`, and a `tool_result` follow-up before the
+launcher recommends starting Claude Code.
+
+Additional current screenshots:
+
+| Provider | Base URL | Model | LLM options | Compatibility |
+| --- | --- | --- | --- | --- |
+| ![Provider](docs/assets/claude-any-provider.en.png) | ![Base URL](docs/assets/claude-any-base-url.en.png) | ![Model](docs/assets/claude-any-model.en.png) | ![Options](docs/assets/claude-any-options.en.png) | ![Test](docs/assets/claude-any-test.en.png) |
+
 See the [full manual](docs/manual.md) for provider setup, headless flags, and
 troubleshooting. A downloadable demo video is available at
 [docs/assets/claude-any-demo.mp4](docs/assets/claude-any-demo.mp4).
@@ -139,6 +150,14 @@ OpenAI-compatible endpoints were deliberately kept out of the primary path for
 Claude Code use. In testing, tool-call translation through generic OpenAI chat
 compatibility was more brittle around tool parameters, tool results, repeated
 calls, retries, and model selection.
+
+The most recent vLLM finding is that server-side tool-call parsing must match
+the model family. For Claude Code, a vLLM server can be reachable and still fail
+if `--tool-call-parser` is wrong. In particular, Qwen3-Coder should be served
+with `--enable-auto-tool-choice --tool-call-parser qwen3_xml`; Hermes is for
+Hermes-style models and some older Qwen tool templates. Claude Any now surfaces
+this in the compatibility test instead of treating a simple text response as
+enough.
 
 ## Recommended Uses
 
@@ -169,8 +188,12 @@ steps under that larger model's supervision.
 - Pre-launch provider picker with English, Korean, Japanese, and Chinese UI.
 - Provider-aware model list and custom model entry.
 - API key entry outside the Claude Code chat input.
+- LLM option presets for context window, output tokens, timeout, sampling, and
+  native compatibility.
 - Compatibility test before launch, including text response, tool use, and
   tool-result round trip checks.
+- Runtime context reporting for vLLM/NIM when `/v1/models` exposes
+  `max_model_len`.
 - Console-first pre-launch menu for SSH and terminal workflows.
 - Native paths where providers expose Claude/Anthropic-compatible endpoints.
 - Router mode for providers that need request/response adaptation.
@@ -185,15 +208,27 @@ steps under that larger model's supervision.
 | Anthropic | Native Claude Code | Uses Claude login or Anthropic API key. |
 | Ollama | Native when available, router otherwise | Local Ollama normally needs no API key. Cloud models through local Ollama require `ollama signin` on the Ollama host. |
 | Ollama Cloud | Router | Calls `https://ollama.com/api`; requires an Ollama API key. |
-| vLLM | Native Anthropic-compatible endpoint | Use a vLLM endpoint that exposes Anthropic-compatible `/v1/messages`. |
+| vLLM | Native Anthropic-compatible endpoint | Use a vLLM endpoint that exposes Anthropic-compatible `/v1/messages`; match `--tool-call-parser` to the model family. |
 | NVIDIA hosted | Router/proxy | Uses NVIDIA hosted API through the compatibility path. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | Use the self-hosted NIM Anthropic-compatible endpoint. |
+
+For Qwen3-Coder on vLLM, start the server with a matching tool parser:
+
+```sh
+vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name qwen3-coder-30b \
+  --max-model-len 65536 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_xml
+```
 
 ## Provider Links
 
 - Ollama Cloud: [cloud overview](https://ollama.com/cloud), [API key settings](https://ollama.com/settings/keys), [authentication docs](https://docs.ollama.com/api/authentication).
 - Ollama local Anthropic compatibility: [Ollama Anthropic API docs](https://docs.ollama.com/api/anthropic-compatibility).
-- vLLM: [Claude Code integration](https://docs.vllm.ai/en/latest/serving/integrations/claude_code/), [project GitHub](https://github.com/vllm-project/vllm).
+- vLLM: [Claude Code integration](https://docs.vllm.ai/en/latest/serving/integrations/claude_code/), [tool calling](https://docs.vllm.ai/en/stable/features/tool_calling/), [project GitHub](https://github.com/vllm-project/vllm).
 - NVIDIA hosted NIM: [NVIDIA API Catalog](https://build.nvidia.com/), [API Catalog quickstart](https://docs.api.nvidia.com/nim/docs/api-quickstart).
 - Self-hosted NVIDIA NIM: [Claude Code with NIM](https://docs.nvidia.com/nim/large-language-models/latest/ai-assistant-integrations/claude-code.html), [NIM for LLMs getting started](https://docs.nvidia.com/nim/large-language-models/1.14.0/getting-started.html), [NGC personal keys](https://org.ngc.nvidia.com/setup/personal-keys).
 

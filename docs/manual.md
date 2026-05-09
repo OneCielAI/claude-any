@@ -6,7 +6,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.10`
+Current version: `0.1.12`
 
 ## Install
 
@@ -101,7 +101,8 @@ edit or select:
 - Base URL: provider-aware default or custom endpoint.
 - Model: provider model picker when available, custom input otherwise.
 - Options: provider-specific generation, timeout, and preset settings.
-- Compatibility test: makes a small request before launching Claude Code.
+- Compatibility test: checks a plain text response, a required `tool_use`, and
+  a `tool_result` follow-up before launching Claude Code.
 - Launch Claude Code: starts Claude Code with the selected configuration.
 
 The lower status area shows connection checks, API-key state, provider notes,
@@ -109,6 +110,9 @@ and compatibility-test results.
 For vLLM and self-hosted NIM, the compatibility test also reads `/v1/models`
 when available and prints the runtime `max_model_len` next to Claude Any's
 configured `context_window` and `max_output_tokens`.
+If the runtime model reports one context size but Claude Any is configured for
+another, the test output shows both values so you can fix either the server
+startup flags or the client preset.
 
 ### LLM Option Presets
 
@@ -183,9 +187,29 @@ http://127.0.0.1:8000
 Claude Any and Claude Code will call `/v1/messages` under that base URL. Use an
 API key only if your vLLM server is configured to require one.
 
+For Claude Code, vLLM tool calling must be started with a parser that matches
+the model family. A server can answer text requests and still fail Claude Code
+if `--tool-call-parser` is wrong. For Qwen3-Coder, use `qwen3_xml`:
+
+```sh
+vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name qwen3-coder-30b \
+  --max-model-len 65536 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_xml
+```
+
+Hermes-style models and some older Qwen tool templates may use `hermes`
+instead, but do not assume `hermes` is correct for every Qwen model. Run
+`claude-any test` after changing the parser; the test now checks text,
+`tool_use`, and `tool_result`.
+
 Links:
 
 - vLLM Claude Code integration: https://docs.vllm.ai/en/latest/serving/integrations/claude_code/
+- vLLM tool calling: https://docs.vllm.ai/en/stable/features/tool_calling/
 - vLLM GitHub: https://github.com/vllm-project/vllm
 
 ### NVIDIA Hosted NIM
@@ -290,6 +314,12 @@ those routes. Generic OpenAI-compatible chat endpoints were not selected as the
 primary route because tool-call translation was less stable around parameters,
 tool results, repeated calls, retries, and model selection.
 
+The vLLM work also showed that a successful text response is not enough for
+Claude Code. The selected model and server need compatible tool-call formatting.
+In particular, Qwen3-Coder should use vLLM's `qwen3_xml` tool parser. Claude Any
+therefore expanded its compatibility test to cover text, `tool_use`, and
+`tool_result` phases.
+
 Local Qwen 3.6 27B Q4 runs were tested through Ollama and vLLM on RTX 5090 and
 MSI GB10-class hardware. They worked, but the speed belongs in a different
 category from native Claude Code or Codex. For this hybrid workflow, some
@@ -315,7 +345,9 @@ Generated files live in `docs/assets/`.
 - If local Ollama cloud models fail, run `ollama signin` on the Ollama host.
 - If vLLM or NIM returns model `404`, map Claude Code's model aliases to the
   served model name or select the custom model entry.
-- If tool calls fail, verify that the selected model supports tool use.
+- If vLLM tool calls fail, verify both model support and the vLLM
+  `--tool-call-parser`/chat-template combination. Qwen3-Coder should start with
+  `--enable-auto-tool-choice --tool-call-parser qwen3_xml`.
 - If Claude Code update checks fail due to disk space, clean local caches or
   skip the check with `--ca-no-update-check`.
 

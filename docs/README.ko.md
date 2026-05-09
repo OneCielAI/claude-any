@@ -9,7 +9,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.10`
+현재 버전: `0.1.12`
 
 ## 왜 만들었나
 
@@ -110,6 +110,14 @@ npm update -g @onecielai/claude-any
 
 ![Claude Any 데모](assets/claude-any-demo.ko.gif)
 
+현재 데모는 프로바이더 선택, Base URL, 모델 선택, LLM 옵션, 호환성 테스트
+순서로 구성되어 있습니다. 호환성 테스트는 단순 텍스트 응답뿐 아니라 필수
+`tool_use`와 `tool_result` 후속 응답까지 확인합니다.
+
+| 프로바이더 | Base URL | 모델 | LLM 옵션 | 호환성 |
+| --- | --- | --- | --- | --- |
+| ![프로바이더](assets/claude-any-provider.ko.png) | ![Base URL](assets/claude-any-base-url.ko.png) | ![모델](assets/claude-any-model.ko.png) | ![옵션](assets/claude-any-options.ko.png) | ![테스트](assets/claude-any-test.ko.png) |
+
 자세한 설정법, headless 플래그, 문제 해결은 [manual](manual.md)을 참고하세요.
 데모 영상은 [assets/claude-any-demo.ko.mp4](assets/claude-any-demo.ko.mp4)에 있습니다.
 
@@ -133,6 +141,13 @@ OpenAI 호환 엔드포인트는 Claude Code 사용을 위한 기본 경로에�
 tool parameter, tool result, 반복 호출, retry, 모델 선택 주변에서 더 불안정한
 동작을 보였습니다. 그래서 Claude Any는 native Anthropic 호환 endpoint를 우선
 사용하고, provider-specific 변환이 필요한 경우에만 작은 router를 사용합니다.
+
+최근 vLLM 테스트에서 확인한 중요한 점은 서버의 tool-call parser가 모델 계열과
+정확히 맞아야 한다는 것입니다. vLLM 서버가 접속 가능하고 `/v1/messages`가
+동작해도 `--tool-call-parser`가 틀리면 Claude Code가 tool call을 파싱하지 못하고
+멈출 수 있습니다. Qwen3-Coder 계열은 `--enable-auto-tool-choice
+--tool-call-parser qwen3_xml` 조합을 우선 사용해야 하며, `hermes`는 Hermes 형식
+모델이나 일부 오래된 Qwen tool template에 맞는 선택입니다.
 
 ## 추천 사용처
 
@@ -158,7 +173,9 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 - 영어, 한국어, 일본어, 중국어 UI를 가진 실행 전 프로바이더 선택 메뉴.
 - 프로바이더별 모델 목록과 사용자 모델 직접 입력.
 - Claude Code 채팅 입력 밖에서 API 키 설정.
-- 실행 전 호환성 테스트.
+- context window, output tokens, timeout, sampling, native compatibility를 위한 LLM 옵션/프리셋.
+- 실행 전 텍스트, `tool_use`, `tool_result` 호환성 테스트.
+- vLLM/NIM의 `/v1/models`가 `max_model_len`을 제공하면 런타임 컨텍스트 표시.
 - SSH와 터미널 작업에 맞춘 콘솔 우선 메뉴.
 - Anthropic 호환 엔드포인트가 있는 경우 native 경로 우선.
 - 필요한 경우 provider-specific router 사용.
@@ -172,15 +189,27 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 | Anthropic | Native Claude Code | Claude 로그인 또는 Anthropic API 키 사용. |
 | Ollama | Native 우선, 필요 시 router | 로컬 Ollama는 보통 API 키가 필요 없습니다. 로컬 Ollama에서 `:cloud` 모델을 쓰려면 Ollama host에서 `ollama signin`이 필요합니다. |
 | Ollama Cloud | Router | `https://ollama.com/api` 직접 호출. Ollama API 키 필요. |
-| vLLM | Native Anthropic-compatible endpoint | Anthropic 호환 `/v1/messages`를 제공하는 vLLM endpoint 사용. |
+| vLLM | Native Anthropic-compatible endpoint | Anthropic 호환 `/v1/messages`를 제공하는 vLLM endpoint 사용. 모델 계열에 맞는 `--tool-call-parser` 필요. |
 | NVIDIA hosted | Router/proxy | NVIDIA hosted API를 compatibility 경로로 사용. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM Anthropic 호환 endpoint 사용. |
+
+Qwen3-Coder를 vLLM에서 Claude Code용으로 실행하는 예:
+
+```sh
+vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name qwen3-coder-30b \
+  --max-model-len 65536 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_xml
+```
 
 ## 링크
 
 - Ollama Cloud: [cloud overview](https://ollama.com/cloud), [API key settings](https://ollama.com/settings/keys), [authentication docs](https://docs.ollama.com/api/authentication).
 - Ollama Anthropic compatibility: [docs](https://docs.ollama.com/api/anthropic-compatibility).
-- vLLM: [Claude Code integration](https://docs.vllm.ai/en/latest/serving/integrations/claude_code/), [GitHub](https://github.com/vllm-project/vllm).
+- vLLM: [Claude Code integration](https://docs.vllm.ai/en/latest/serving/integrations/claude_code/), [tool calling](https://docs.vllm.ai/en/stable/features/tool_calling/), [GitHub](https://github.com/vllm-project/vllm).
 - NVIDIA hosted NIM: [NVIDIA API Catalog](https://build.nvidia.com/), [quickstart](https://docs.api.nvidia.com/nim/docs/api-quickstart).
 - Self-hosted NVIDIA NIM: [Claude Code with NIM](https://docs.nvidia.com/nim/large-language-models/latest/ai-assistant-integrations/claude-code.html), [getting started](https://docs.nvidia.com/nim/large-language-models/1.14.0/getting-started.html), [NGC keys](https://org.ngc.nvidia.com/setup/personal-keys).
 

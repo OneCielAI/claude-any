@@ -9,7 +9,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.10`
+当前版本: `0.1.12`
 
 ## 为什么存在
 
@@ -107,6 +107,13 @@ npm update -g @onecielai/claude-any
 
 ![Claude Any demo](assets/claude-any-demo.zh.gif)
 
+当前演示展示供应商选择、Base URL、模型选择、LLM 选项和兼容性测试。兼容性
+测试不仅检查普通文本响应，还会检查必需的 `tool_use` 和 `tool_result` 往返。
+
+| 供应商 | Base URL | 模型 | LLM 选项 | 兼容性 |
+| --- | --- | --- | --- | --- |
+| ![Provider](assets/claude-any-provider.zh.png) | ![Base URL](assets/claude-any-base-url.zh.png) | ![Model](assets/claude-any-model.zh.png) | ![Options](assets/claude-any-options.zh.png) | ![Test](assets/claude-any-test.zh.png) |
+
 详细设置、headless 参数和故障排查请看 [manual](manual.md)。演示视频位于
 [assets/claude-any-demo.zh.mp4](assets/claude-any-demo.zh.mp4)。
 
@@ -129,6 +136,12 @@ result、重复调用、retry 和模型选择附近表现得更脆弱。因此 C
 使用 native Anthropic 兼容 endpoint，只在需要 provider-specific 适配时使用
 一个小型 router。
 
+最近的 vLLM 测试说明，服务器端 tool-call parser 必须和模型系列匹配。即使
+vLLM 服务器可连接、`/v1/messages` 可用，只要 `--tool-call-parser` 不匹配，
+Claude Code 也可能无法解析 tool call 并停止。Qwen3-Coder 系列优先使用
+`--enable-auto-tool-choice --tool-call-parser qwen3_xml`；`hermes` 更适合
+Hermes 格式模型或部分较旧的 Qwen tool template。
+
 ## 推荐用途
 
 适合速度不是主要瓶颈的后台运维任务，例如 Docker 主机维护、Windows/Linux
@@ -149,12 +162,42 @@ result、重复调用、retry 和模型选择附近表现得更脆弱。因此 C
 - 英语、韩语、日语、中文 UI 的启动前菜单。
 - 按供应商列出模型，并支持自定义模型输入。
 - 在 Claude Code 聊天输入之外设置 API 密钥。
-- 启动前兼容性测试。
+- LLM 选项/预设，可配置 context window、output tokens、timeout、sampling 和 native compatibility。
+- 启动前文本、`tool_use`、`tool_result` 兼容性测试。
+- 当 vLLM/NIM 的 `/v1/models` 返回 `max_model_len` 时显示运行时上下文。
 - 面向 SSH 和终端的控制台优先 UI。
 - 有 Anthropic 兼容端点时优先使用 native 路径。
 - 必要时使用 provider-specific router。
 - 为 non-native provider 连接 DuckDuckGo/fetch MCP。
 - 支持 `--ca-provider`、`--ca-model`、`--ca-base-url` 等 headless 参数。
+
+## 供应商说明
+
+| Provider | Mode | Notes |
+| --- | --- | --- |
+| Anthropic | Native Claude Code | 使用 Claude 登录或 Anthropic API key。 |
+| Ollama | Native 优先，必要时 router | 本地 Ollama 通常不需要 API key；通过本地 Ollama 使用 `:cloud` 模型时，需要在 Ollama host 上 `ollama signin`。 |
+| Ollama Cloud | Router | 直接调用 `https://ollama.com/api`，需要 Ollama API key。 |
+| vLLM | Native Anthropic-compatible endpoint | 使用 Anthropic 兼容 `/v1/messages` endpoint，并让 `--tool-call-parser` 匹配模型系列。 |
+| NVIDIA hosted | Router/proxy | 通过 compatibility 路径使用 NVIDIA hosted API。 |
+| self-hosted NIM | Native Anthropic-compatible endpoint | 使用 self-hosted NIM 的 Anthropic 兼容 endpoint。 |
+
+为 Claude Code 启动 Qwen3-Coder vLLM 的示例:
+
+```sh
+vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
+  --host 0.0.0.0 \
+  --port 8000 \
+  --served-model-name qwen3-coder-30b \
+  --max-model-len 65536 \
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_xml
+```
+
+链接:
+
+- vLLM Claude Code integration: https://docs.vllm.ai/en/latest/serving/integrations/claude_code/
+- vLLM tool calling: https://docs.vllm.ai/en/stable/features/tool_calling/
 
 ## 许可证
 

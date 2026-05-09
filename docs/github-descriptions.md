@@ -157,6 +157,12 @@ and MSI GB10-class hardware. They worked, but this local setup should not be
 measured directly against native Claude Code or Codex. Some hosted/cloud models
 from NVIDIA NIM and Ollama Cloud felt more practical than expected for hybrid
 background work.
+The latest vLLM lesson was tool-call parsing: text replies can work while
+Claude Code tool calls still fail if the server's `--tool-call-parser` does not
+match the model. Qwen3-Coder should use `--enable-auto-tool-choice
+--tool-call-parser qwen3_xml`; Hermes is for Hermes-style models and some older
+Qwen templates. The compatibility test now checks text, `tool_use`, and
+`tool_result` phases.
 
 한국어:
 Claude Any는 실제적인 통합 테스트의 연속으로 만들어졌습니다. 먼저 프로바이더
@@ -175,6 +181,12 @@ OpenAI 호환 엔드포인트는 Claude Code 사용을 위한 기본 경로에�
 tool parameter, tool result, 반복 호출, retry, 모델 선택 주변에서 더 불안정한
 동작을 보였습니다. 그래서 Claude Any는 native Anthropic 호환 endpoint를 우선
 사용하고, provider-specific 변환이 필요한 경우에만 작은 router를 사용합니다.
+최근 vLLM 테스트에서 확인한 점은 tool-call parser가 모델 계열과 맞아야 한다는
+것입니다. 텍스트 응답은 정상이어도 `--tool-call-parser`가 틀리면 Claude Code의
+tool call은 실패할 수 있습니다. Qwen3-Coder는 `--enable-auto-tool-choice
+--tool-call-parser qwen3_xml` 조합을 우선 사용해야 하며, Hermes는 Hermes 형식
+모델이나 일부 오래된 Qwen template에 맞습니다. 호환성 테스트도 text, `tool_use`,
+`tool_result` 단계까지 확인하도록 확장했습니다.
 
 日本語:
 Claude Any は、実用的な統合テストの積み重ねとして作られました。まず
@@ -194,6 +206,12 @@ OpenAI 互換エンドポイントは、Claude Code 用の主経路から意図�
 parameter、tool result、反復呼び出し、retry、モデル選択の周辺でより不安定
 でした。そのため Claude Any は native Anthropic 互換 endpoint を優先し、
 provider-specific な変換が必要な場合だけ小さな router を使います。
+最近の vLLM テストでは、tool-call parser をモデル系列に合わせる必要がある
+ことが分かりました。テキスト応答が動いても `--tool-call-parser` が違うと
+Claude Code の tool call は失敗します。Qwen3-Coder は
+`--enable-auto-tool-choice --tool-call-parser qwen3_xml` を優先し、Hermes は
+Hermes 形式のモデルや一部の古い Qwen template 向けです。互換性テストも
+text、`tool_use`、`tool_result` まで確認するように拡張しました。
 
 中文:
 Claude Any 是通过一系列实际集成测试构建出来的：先尝试供应商切换，然后验证
@@ -210,3 +228,8 @@ generic OpenAI chat 兼容层进行 tool-call 转换时，在 tool parameter、t
 result、重复调用、retry 和模型选择附近表现得更脆弱。因此 Claude Any 优先
 使用 native Anthropic 兼容 endpoint，只在需要 provider-specific 适配时使用
 一个小型 router。
+最近的 vLLM 测试说明，tool-call parser 必须匹配模型系列。文本响应可以正常，
+但如果 `--tool-call-parser` 不匹配，Claude Code 的 tool call 仍然会失败。
+Qwen3-Coder 优先使用 `--enable-auto-tool-choice --tool-call-parser qwen3_xml`；
+Hermes 适合 Hermes 格式模型和部分较旧的 Qwen template。兼容性测试也扩展为
+检查 text、`tool_use` 和 `tool_result` 阶段。
