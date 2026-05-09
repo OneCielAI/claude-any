@@ -69,7 +69,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.7"
+VERSION = "0.1.8"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -99,6 +99,11 @@ UI_TEXT = {
         "model": "Model",
         "test": "Test compatibility",
         "options": "LLM options",
+        "presets": "LLM presets",
+        "apply_preset": "Apply preset",
+        "model_family": "Model family",
+        "recommended_preset_is": "recommended preset is",
+        "back": "Back",
         "launch": "Launch Claude Code",
         "quit": "Quit",
         "title": "claude-any pre-launch",
@@ -111,6 +116,11 @@ UI_TEXT = {
         "model": "모델",
         "test": "호환성 테스트",
         "options": "LLM 옵션",
+        "presets": "LLM 프리셋",
+        "apply_preset": "프리셋 적용",
+        "model_family": "모델 계열",
+        "recommended_preset_is": "추천 프리셋",
+        "back": "뒤로",
         "launch": "Claude Code 실행",
         "quit": "종료",
         "title": "claude-any 실행 전 설정",
@@ -123,6 +133,11 @@ UI_TEXT = {
         "model": "モデル",
         "test": "互換性テスト",
         "options": "LLMオプション",
+        "presets": "LLMプリセット",
+        "apply_preset": "プリセットを適用",
+        "model_family": "モデル系統",
+        "recommended_preset_is": "推奨プリセット",
+        "back": "戻る",
         "launch": "Claude Codeを起動",
         "quit": "終了",
         "title": "claude-any 起動前設定",
@@ -135,6 +150,11 @@ UI_TEXT = {
         "model": "模型",
         "test": "兼容性测试",
         "options": "LLM 选项",
+        "presets": "LLM 预设",
+        "apply_preset": "应用预设",
+        "model_family": "模型类型",
+        "recommended_preset_is": "推荐预设",
+        "back": "返回",
         "launch": "启动 Claude Code",
         "quit": "退出",
         "title": "claude-any 启动前设置",
@@ -2085,24 +2105,94 @@ LLM_PRESETS: dict[str, tuple[str, str]] = {
 }
 
 
-def llm_preset_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
+    "ko": {
+        "balanced": ("균형형 Claude Code", "4K 출력, 안정적인 코딩/채팅 기본값"),
+        "coding": ("코딩 결정형", "편집, 스크립트, 코드 리뷰용 낮은 무작위성"),
+        "fast": ("빠른 짧은 작업", "짧은 출력과 짧은 타임아웃"),
+        "long-context-65k": ("긴 컨텍스트 65K", "65K 컨텍스트 목표, 4K 출력 여유"),
+        "large-output": ("긴 출력/리포트", "요약과 리포트용 8K 출력"),
+        "reasoning": ("추론 모델", "긴 타임아웃과 추론 친화 샘플링"),
+    },
+    "ja": {
+        "balanced": ("バランス型 Claude Code", "4K 出力、安定したコーディング/チャット既定値"),
+        "coding": ("コーディング決定型", "編集、スクリプト、コードレビュー向けの低いランダム性"),
+        "fast": ("高速な短い作業", "短い出力と短いタイムアウト"),
+        "long-context-65k": ("長いコンテキスト 65K", "65K コンテキスト目標、4K 出力予約"),
+        "large-output": ("長い出力/レポート", "要約とレポート向けの 8K 出力"),
+        "reasoning": ("推論モデル", "長いタイムアウトと推論向けサンプリング"),
+    },
+    "zh": {
+        "balanced": ("均衡型 Claude Code", "4K 输出，稳定的编码/聊天默认值"),
+        "coding": ("编码确定型", "用于编辑、脚本和代码审查的低随机性"),
+        "fast": ("快速短任务", "较短输出和较短超时"),
+        "long-context-65k": ("长上下文 65K", "65K 上下文目标，4K 输出预留"),
+        "large-output": ("长输出/报告", "用于摘要和报告的 8K 输出"),
+        "reasoning": ("推理模型", "更长超时和适合推理的采样"),
+    },
+}
+
+
+MODEL_FAMILY_I18N: dict[str, dict[str, str]] = {
+    "ko": {
+        "coding": "코딩",
+        "reasoning": "추론",
+        "large": "대형 모델",
+        "long-context": "긴 컨텍스트",
+        "general": "일반",
+    },
+    "ja": {
+        "coding": "コーディング",
+        "reasoning": "推論",
+        "large": "大型モデル",
+        "long-context": "長いコンテキスト",
+        "general": "汎用",
+    },
+    "zh": {
+        "coding": "编码",
+        "reasoning": "推理",
+        "large": "大型模型",
+        "long-context": "长上下文",
+        "general": "通用",
+    },
+}
+
+
+def llm_preset_text(preset_id: str, lang: str | None = None) -> tuple[str, str]:
+    lang = lang or load_config().get("language", "en")
+    return LLM_PRESET_I18N.get(lang, {}).get(preset_id, LLM_PRESETS[preset_id])
+
+
+def model_family_text(family: str, lang: str | None = None) -> str:
+    lang = lang or load_config().get("language", "en")
+    return MODEL_FAMILY_I18N.get(lang, {}).get(family, family)
+
+
+def llm_preset_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None = None) -> tuple[list[str], list[str]]:
+    lang = lang or load_config().get("language", "en")
     recommended = recommended_preset_id(provider, pcfg)
     family = model_option_family(provider, pcfg)
-    rows = [f"Model family: {family}; recommended preset is {LLM_PRESETS[recommended][0]}"]
+    recommended_label, _ = llm_preset_text(recommended, lang)
+    rows = [
+        f"{ui_text('model_family', lang)}: {model_family_text(family, lang)}; "
+        f"{ui_text('recommended_preset_is', lang)} {recommended_label}"
+    ]
     values = ["__info__"]
-    for preset_id, (label, description) in LLM_PRESETS.items():
+    for preset_id in LLM_PRESETS:
+        label, description = llm_preset_text(preset_id, lang)
         mark = "*" if preset_id == recommended else " "
-        rows.append(f"{mark} {label:<24} {description}")
+        rows.append(f"{mark} {pad_cells(label, 24)} {description}")
         values.append(preset_id)
-    rows.append("Back")
+    rows.append(ui_text("back", lang))
     values.append("back")
     return rows, values
 
 
-def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id: str) -> list[str]:
+def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id: str, lang: str | None = None) -> list[str]:
     if preset_id not in LLM_PRESETS:
         raise SystemExit(f"Unknown preset: {preset_id}")
-    label = LLM_PRESETS[preset_id][0]
+    lang = lang or load_config().get("language", "en")
+    label = llm_preset_text(preset_id, lang)[0]
     if provider in ("ollama", "ollama-cloud"):
         tokens_by_preset = {
             "balanced": [
@@ -2257,19 +2347,24 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
             if provider == "nvidia-hosted" and token.startswith(("context_window=", "reserve=")):
                 continue
             apply_provider_option(provider, pcfg, token)
-    return [f"Applied preset: {label}", f"Provider: {provider}; model family: {model_option_family(provider, pcfg)}"]
+    family = model_option_family(provider, pcfg)
+    return [
+        f"{ui_text('apply_preset', lang)}: {label}",
+        f"Provider: {provider}; {ui_text('model_family', lang)}: {model_family_text(family, lang)}",
+    ]
 
 
 def apply_llm_preset_config(provider: str, preset_id: str) -> list[str]:
     cfg = load_config()
     pcfg = cfg["providers"][provider]
-    lines = apply_llm_preset_to_provider(provider, pcfg, preset_id)
+    lines = apply_llm_preset_to_provider(provider, pcfg, preset_id, cfg.get("language", "en"))
     save_config(cfg)
     clear_model_cache()
     return lines
 
 
-def llm_option_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None = None) -> tuple[list[str], list[str]]:
+    lang = lang or load_config().get("language", "en")
     rows: list[str] = []
     values: list[str] = []
 
@@ -2277,7 +2372,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str
         rows.append(f"{label:<24} [{compact_text(value, 56)}]")
         values.append(key)
 
-    add("Apply preset", "preset", LLM_PRESETS[recommended_preset_id(provider, pcfg)][0])
+    add(ui_text("apply_preset", lang), "preset", llm_preset_text(recommended_preset_id(provider, pcfg), lang)[0])
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         add("Context window", "num_ctx", ollama_num_ctx_status(pcfg))
@@ -2304,7 +2399,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str
         elif provider == "anthropic":
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
 
-    rows.append("Back")
+    rows.append(ui_text("back", lang))
     values.append("back")
     return rows, values
 
@@ -3462,13 +3557,13 @@ def render_prelaunch_screen(
             "base-url": "Base URL",
             "model": "Model",
             "test": "Compatibility test",
-            "options": "LLM options",
-            "preset": "LLM presets",
+            "options": ui_text("options", lang),
+            "preset": ui_text("presets", lang),
         }
         add("")
         add("-" * render_width, "38;5;208")
         panel_title = titles.get(panel, panel)
-        title_suffix = "" if panel_title.lower().endswith("options") else " options"
+        title_suffix = "" if panel_title.lower().endswith(("options", "presets", "옵션", "프리셋", "オプション", "プリセット", "选项", "预设")) else " options"
         add(f"{panel_title}{title_suffix}", "1;38;5;208")
         fixed = len(screen) + len(checks) + len(messages) + 5
         limit = max(5, height - fixed)
@@ -3586,9 +3681,9 @@ def portable_prelaunch_menu() -> int:
         elif name == "test":
             panel_rows, panel_values = ["Run compatibility test", "Back"], ["run", "back"]
         elif name == "options":
-            panel_rows, panel_values = llm_option_panel_rows(provider, pcfg)
+            panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
         elif name == "preset":
-            panel_rows, panel_values = llm_preset_panel_rows(provider, pcfg)
+            panel_rows, panel_values = llm_preset_panel_rows(provider, pcfg, cfg.get("language", "en"))
 
     def close_panel(next_idx: int | None = None) -> None:
         nonlocal panel, panel_idx, panel_rows, panel_values, main_idx
@@ -3724,7 +3819,7 @@ def portable_prelaunch_menu() -> int:
                         refresh_checks()
                         cfg = load_config()
                         provider, pcfg = get_current_provider(cfg)
-                        panel_rows, panel_values = llm_option_panel_rows(provider, pcfg)
+                        panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
                 elif panel == "preset":
                     if value == "back":
                         open_panel("options")
@@ -3740,7 +3835,7 @@ def portable_prelaunch_menu() -> int:
                         provider, pcfg = get_current_provider(cfg)
                         panel = "options"
                         panel_idx = 0
-                        panel_rows, panel_values = llm_option_panel_rows(provider, pcfg)
+                        panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
                 continue
 
             if key in ("up", "k"):
