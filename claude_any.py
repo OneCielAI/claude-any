@@ -69,7 +69,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.5"
+VERSION = "0.1.6"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -3092,8 +3092,8 @@ def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lan
         f"2. {ui_text('api_key', lang)}  [{stored_api_key_mask(provider, pcfg)}]",
         f"3. {ui_text('base_url', lang)}  [{compact_text(pcfg.get('base_url', 'unset'), 62)}]",
         f"4. {ui_text('model', lang)}  [{compact_text(pcfg.get('current_model', 'unset'), 62)}]",
-        f"5. {ui_text('test', lang)}",
-        f"6. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
+        f"5. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
+        f"6. {ui_text('test', lang)}",
         f"7. {ui_text('launch', lang)}",
         ui_text("quit", lang),
     ]
@@ -3138,6 +3138,9 @@ def model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], li
         mark = "*" if mid == current else " "
         rows.append(f"{mark} {mid}  {alias}")
     rows.append("+ Custom model id...")
+    deduped_values.append("__custom__")
+    rows.append("Back")
+    deduped_values.append("back")
     return rows, deduped_values
 
 
@@ -3401,14 +3404,17 @@ def portable_prelaunch_menu() -> int:
                     main_idx = 4
                     open_panel("model")
                 elif panel == "model":
-                    if panel_idx >= len(panel_values):
+                    if value == "back":
+                        close_panel()
+                        continue
+                    if value == "__custom__" or panel_idx >= len(panel_values):
                         model_value = prompt_menu_value("Model id or alias")
                     else:
                         model_value = value
                     if model_value:
                         messages = set_model_config(model_value)
                         refresh_checks()
-                    close_panel(5)
+                    close_panel(6)
                 elif panel == "api-key":
                     if value == "back":
                         close_panel()
@@ -3493,7 +3499,7 @@ def portable_prelaunch_menu() -> int:
             elif key in ("esc", "q"):
                 return 10
             elif key == "enter":
-                actions = ["language", "provider", "api-key", "base-url", "model", "test", "options", "launch", "quit"]
+                actions = ["language", "provider", "api-key", "base-url", "model", "options", "test", "launch", "quit"]
                 action = actions[main_idx]
                 if action == "launch":
                     blockers = launch_readiness_errors()
