@@ -67,7 +67,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.0"
+VERSION = "0.1.1"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -251,6 +251,7 @@ PROVIDER_NOTES = {
 DEFAULT_CONFIG: dict[str, Any] = {
     "current_provider": "nvidia-hosted",
     "language": "en",
+    "migrations": {},
     "claude_code": {
         "disable_skills_for_non_anthropic": False,
         "blocked_skills_for_non_anthropic": ["keybindings-help"],
@@ -355,6 +356,20 @@ def deep_merge(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def apply_config_migrations(cfg: dict[str, Any]) -> None:
+    migrations = cfg.setdefault("migrations", {})
+    if not isinstance(migrations, dict):
+        migrations = {}
+        cfg["migrations"] = migrations
+
+    marker = "nvidia_hosted_router_default_20260509"
+    if not migrations.get(marker):
+        pcfg = cfg.get("providers", {}).get("nvidia-hosted", {})
+        if isinstance(pcfg, dict) and bool(pcfg.get("native_compat", False)):
+            pcfg["native_compat"] = False
+        migrations[marker] = True
+
+
 def load_config() -> dict[str, Any]:
     if CONFIG_PATH.exists():
         try:
@@ -364,6 +379,7 @@ def load_config() -> dict[str, Any]:
     else:
         data = {}
     cfg = deep_merge(DEFAULT_CONFIG, data)
+    apply_config_migrations(cfg)
     cloud = cfg["providers"].get("ollama-cloud", {})
     local_key = cfg["providers"].get("ollama", {}).get("api_key", "")
     if not cloud.get("api_key") and local_key and local_key not in ("ollama", "dummy", "not-used"):
@@ -824,7 +840,7 @@ def nim_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
 
 
 def nvidia_hosted_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
-    return provider == "nvidia-hosted" and bool(pcfg.get("native_compat", True))
+    return provider == "nvidia-hosted" and bool(pcfg.get("native_compat", False))
 
 
 def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
