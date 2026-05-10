@@ -1054,7 +1054,7 @@ def read_menu_key(stdscr) -> int:
 
     stdscr.nodelay(True)
     try:
-        time.sleep(0.02)
+        time.sleep(0.1)
         seq = []
         for _ in range(3):
             nxt = stdscr.getch()
@@ -1064,22 +1064,23 @@ def read_menu_key(stdscr) -> int:
     finally:
         stdscr.nodelay(False)
 
-    if seq[:2] in ([ord("["), ord("A")], [ord("O"), ord("A")]):
-        for extra in reversed(seq[2:]):
-            curses.ungetch(extra)
-        return curses.KEY_UP
-    if seq[:2] in ([ord("["), ord("B")], [ord("O"), ord("B")]):
-        for extra in reversed(seq[2:]):
-            curses.ungetch(extra)
-        return curses.KEY_DOWN
-    if seq[:2] in ([ord("["), ord("5")]):
-        for extra in reversed(seq[3:]):
-            curses.ungetch(extra)
-        return curses.KEY_PPAGE
-    if seq[:2] in ([ord("["), ord("6")]):
-        for extra in reversed(seq[3:]):
-            curses.ungetch(extra)
-        return curses.KEY_NPAGE
+    if len(seq) >= 2:
+        if seq[:2] in ([ord("["), ord("A")], [ord("O"), ord("A")]):
+            for extra in reversed(seq[2:]):
+                curses.ungetch(extra)
+            return curses.KEY_UP
+        if seq[:2] in ([ord("["), ord("B")], [ord("O"), ord("B")]):
+            for extra in reversed(seq[2:]):
+                curses.ungetch(extra)
+            return curses.KEY_DOWN
+        if seq[:2] == [ord("["), ord("5")]:
+            for extra in reversed(seq[3:]):
+                curses.ungetch(extra)
+            return curses.KEY_PPAGE
+        if seq[:2] == [ord("["), ord("6")]:
+            for extra in reversed(seq[3:]):
+                curses.ungetch(extra)
+            return curses.KEY_NPAGE
     return 27
 
 

@@ -9,7 +9,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.13`
+현재 버전: `0.1.14`
 
 ## 왜 만들었나
 
