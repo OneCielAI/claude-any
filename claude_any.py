@@ -91,6 +91,34 @@ LANGUAGES = {
     "ja": "日本語",
     "zh": "中文",
 }
+
+MODEL_PRESETS: dict[str, dict[str, Any]] = {
+    "glm-4.7": {"compat_max_tokens": 64, "thinking": True, "num_ctx_min": 32768, "num_ctx_max": 131072},
+    "glm-5.1": {"compat_max_tokens": 64, "thinking": True, "num_ctx_min": 32768, "num_ctx_max": 131072},
+    "glm-4.7:cloud": {"compat_max_tokens": 64, "thinking": True, "num_ctx_min": 32768, "num_ctx_max": 131072},
+    "glm-5.1:cloud": {"compat_max_tokens": 64, "thinking": True, "num_ctx_min": 32768, "num_ctx_max": 131072},
+    "qwen3-coder": {"compat_max_tokens": 16, "thinking": False, "num_ctx_min": 32768, "num_ctx_max": 65536},
+    "qwen3-coder:30b": {"compat_max_tokens": 16, "thinking": False, "num_ctx_min": 32768, "num_ctx_max": 65536},
+    "qwen3.6:27b": {"compat_max_tokens": 16, "thinking": False, "num_ctx_min": 32768, "num_ctx_max": 65536},
+    "deepseek-r1": {"compat_max_tokens": 64, "thinking": True, "num_ctx_min": 32768, "num_ctx_max": 131072},
+    "llama3.3:70b": {"compat_max_tokens": 16, "thinking": False, "num_ctx_min": 32768, "num_ctx_max": 131072},
+}
+
+
+def model_preset(model_id: str) -> dict[str, Any]:
+    """Return preset dict for a model ID, checking exact match then prefix match."""
+    if model_id in MODEL_PRESETS:
+        return MODEL_PRESETS[model_id]
+    for key, value in MODEL_PRESETS.items():
+        if model_id.startswith(key) or key.startswith(model_id.split(":")[0]):
+            return value
+    return {}
+
+
+def compat_max_tokens_for_model(model_id: str) -> int:
+    return model_preset(model_id).get("compat_max_tokens", 16)
+
+
 UI_TEXT = {
     "en": {
         "language": "Language",
@@ -1817,13 +1845,21 @@ def set_model_config(value: str) -> list[str]:
     mmap = model_map_for(provider, pcfg)
     model_id = normalize_model_id(provider, unslug_provider_alias(provider, value, mmap) or value)
     pcfg["current_model"] = model_id
+    preset = model_preset(model_id)
+    if preset.get("num_ctx_min"):
+        pcfg["num_ctx_min"] = preset["num_ctx_min"]
+    if preset.get("num_ctx_max"):
+        pcfg["num_ctx_max"] = preset["num_ctx_max"]
     known = read_model_list_cache(provider, pcfg) or []
     custom = pcfg.setdefault("custom_models", [])
     if model_id not in custom and model_id not in known:
         custom.append(model_id)
     save_config(cfg)
     clear_model_cache()
-    return [f"Model for {provider} set to {model_id}.", f"Claude Code alias: {alias_for(provider, model_id)}"]
+    msgs = [f"Model for {provider} set to {model_id}.", f"Claude Code alias: {alias_for(provider, model_id)}"]
+    if preset.get("thinking"):
+        msgs.append("Note: this is a thinking model; compatibility test uses extended token budget.")
+    return msgs
 
 
 def store_api_key_config(provider: str, key: str) -> list[str]:
@@ -2815,7 +2851,7 @@ def compatibility_tool_schema() -> dict[str, Any]:
 def compatibility_text_request(model: str) -> dict[str, Any]:
     return {
         "model": model,
-        "max_tokens": 64,
+        "max_tokens": compat_max_tokens_for_model(model),
         "stream": False,
         "messages": [
             {
