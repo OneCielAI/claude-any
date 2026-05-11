@@ -286,7 +286,7 @@ def _coerce_value(value: Any, expected_type: str | None) -> Any:
 def _default_for_missing_required(tool_name: str, field: str) -> Any:
     """Return a safe default for known required fields."""
     defaults: dict[str, dict[str, Any]] = {
-        "Bash": {"timeout": 30000, "description": "", "run_in_background": False},
+        "Bash": {"command": "true", "timeout": 30000, "description": "", "run_in_background": False},
         "Read": {"offset": 0, "limit": 0},
         "Edit": {"replace_all": False},
         "Glob": {"path": "."},
@@ -296,6 +296,15 @@ def _default_for_missing_required(tool_name: str, field: str) -> Any:
         "TaskStop": {},
     }
     return defaults.get(tool_name, {}).get(field)
+
+
+def _is_empty_value(value: Any) -> bool:
+    """Check if a value is effectively empty and should be defaulted."""
+    if value is None:
+        return True
+    if isinstance(value, str) and value.strip() == "":
+        return True
+    return False
 
 
 def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> dict[str, Any]:
@@ -332,14 +341,14 @@ def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> 
         expected_type = prop_schema.get("type") if isinstance(prop_schema, dict) else None
         fixed[key] = _coerce_value(raw_value, expected_type)
 
-    # Fill in missing required fields with defaults or empty values
+    # Fill in missing or empty required fields with defaults
     injected: list[str] = []
     for req in required:
-        if req not in fixed:
+        if req not in fixed or _is_empty_value(fixed.get(req)):
             default = _default_for_missing_required(matched_name, req)
             if default is not None:
                 fixed[req] = default
-            else:
+            elif req not in fixed:
                 # No known default: inject empty value matching expected type
                 prop_schema = properties.get(req)
                 expected_type = prop_schema.get("type") if isinstance(prop_schema, dict) else None
