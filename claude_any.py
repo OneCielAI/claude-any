@@ -1506,14 +1506,16 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
     handler.send_response(200)
     handler.send_header("content-type", "text/event-stream")
     handler.send_header("cache-control", "no-cache")
-    handler.send_header("connection", "keep-alive")
+    handler.send_header("connection", "close")
     handler.end_headers()
     msg_id = f"msg_ollama_{int(time.time() * 1000)}"
     started = False
+    text_started = False
     text_so_far = ""
     tool_calls: list[dict[str, Any]] = []
     input_tokens = 0
     output_tokens = 0
+    chunk: dict[str, Any] = {}
     try:
         for line in resp:
             line = line.decode("utf-8", errors="ignore").strip()
@@ -1549,6 +1551,15 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             # Handle text content
             text_chunk = message.get("content") or ""
             if text_chunk:
+                if not text_started:
+                    text_started = True
+                    event = {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+                    handler.wfile.flush()
                 text_so_far += text_chunk
                 event = {
                     "type": "content_block_delta",
@@ -1566,7 +1577,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 tool_id = f"toolu_ollama_{int(time.time() * 1000)}_{len(tool_calls) - 1}"
                 tool_event = {
                     "type": "content_block_start",
-                    "index": 1 + len([b for b in tool_calls[:-1] if False]),  # tool blocks after text block
+                    "index": 1,
                     "content_block": {
                         "type": "tool_use",
                         "id": tool_id,
@@ -1576,6 +1587,16 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 }
                 handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
                 handler.wfile.flush()
+        # Send content_block_stop for text if any
+        if text_started:
+            event = {"type": "content_block_stop", "index": 0}
+            handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
+        # Send content_block_stop for each tool call
+        for i, _ in enumerate(tool_calls):
+            event = {"type": "content_block_stop", "index": 1 + i}
+            handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
         # Determine stop reason
         stop_reason = "tool_use" if tool_calls else "end_turn"
         if chunk.get("done_reason") == "length":
@@ -1588,11 +1609,20 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
         }
         handler.wfile.write(f"event: message_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
         handler.wfile.flush()
+        # Send message_stop
+        event = {"type": "message_stop"}
+        handler.wfile.write(f"event: message_stop\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.flush()
     except Exception:
         # On error, try to send a minimal message_stop
         try:
             handler.wfile.write(b"event: message_stop\ndata: {}\n\n")
             handler.wfile.flush()
+        except Exception:
+            pass
+    finally:
+        try:
+            resp.close()
         except Exception:
             pass
 
