@@ -192,6 +192,7 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 - **SSH/터미널 방향키 호환성**: `read_menu_key()`에 ANSI escape sequence 파서를 추가하여 재작성하고, raw 터미널 설정을 `portable_select()`로 이동해 메뉴 루프 동안 터미널이 계속 raw 모드를 유지하도록 변경. 키 입력 사이 `ECHO`가 복원되면서 escape sequence가 화면에 노출되던 문제 해결. 방향키, Home, End 키가 SSH 세션에서 안정적으로 동작합니다.
 - **테스트 타임아웃**: 느린 클라우드 공급자를 위해 호환성 테스트 기본 타임아웃을 60초에서 120초로 증가.
+- **Ollama Cloud 호환성 테스트 수정**: 호환성 테스트 요청에 `"stream": false`를 추가하여 라우터가 Ollama Cloud에 SSE 스트리밍 대신 단일 JSON 응답을 요청하도록 변경. 이로써 `post_json`이 모든 SSE 청크를 모으는 동안 timeout되던 문제 해결.
 
 ### 0.1.13
 

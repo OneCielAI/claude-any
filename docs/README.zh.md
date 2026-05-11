@@ -181,6 +181,7 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 - **SSH/终端方向键兼容性**: 重写 `read_menu_key()`，加入 ANSI escape sequence 解析器，并将 raw 终端设置移至 `portable_select()`，使菜单循环期间终端始终维持 raw 模式。解决按键间隙 `ECHO` 恢复导致转义序列泄漏到屏幕的问题。方向键、Home、End 键现可在 SSH 会话中稳定工作。
 - **测试超时**: 将兼容性测试默认超时从 60 秒延长至 120 秒，以适配较慢的云供应商。
+- **Ollama Cloud 兼容性测试修复**: 在兼容性测试请求中添加 `"stream": false`，使路由器向 Ollama Cloud 请求单个 JSON 响应而非 SSE 流式传输，从而解决 `post_json` 在收集所有 SSE 分片时超时的问题。
 
 ### 0.1.13
 

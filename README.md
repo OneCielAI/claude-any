@@ -211,6 +211,7 @@ steps under that larger model's supervision.
 
 - **SSH/terminal arrow-key compatibility**: rewrote `read_menu_key()` with a proper ANSI escape sequence parser and moved raw terminal setup into `portable_select()` so the terminal stays in raw mode for the entire menu loop. This prevents escape sequences from leaking to the screen when `ECHO` is restored between keystrokes. Arrow keys, Home, and End now work reliably in SSH sessions.
 - **Test timeout**: default compatibility test timeout increased from 60 s to 120 s for slower cloud providers.
+- **Ollama Cloud compatibility test fix**: added `"stream": false` to compatibility test requests so the router fetches a single JSON response from Ollama Cloud instead of SSE streaming, which was causing `post_json` to timeout while collecting all chunks.
 
 ### 0.1.13
 

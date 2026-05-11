@@ -509,8 +509,8 @@ def unique_model_ids(provider: str, ids: list[str]) -> list[str]:
 
 def normalize_model_id(provider: str, model_id: str) -> str:
     model_id = model_id.strip()
-    if provider == "ollama-cloud" and model_id and not model_id.endswith(":cloud"):
-        return f"{model_id}:cloud"
+    if provider == "ollama-cloud" and model_id.endswith(":cloud"):
+        return model_id[:-6]
     return model_id
 
 
@@ -2816,6 +2816,7 @@ def compatibility_text_request(model: str) -> dict[str, Any]:
     return {
         "model": model,
         "max_tokens": 16,
+        "stream": False,
         "messages": [
             {
                 "role": "user",
@@ -2829,6 +2830,7 @@ def compatibility_tool_request(model: str) -> dict[str, Any]:
     return {
         "model": model,
         "max_tokens": 128,
+        "stream": False,
         "messages": [
             {
                 "role": "user",
@@ -2846,6 +2848,7 @@ def compatibility_tool_result_request(model: str, tool_use: dict[str, Any]) -> d
     return {
         "model": model,
         "max_tokens": 64,
+        "stream": False,
         "messages": [
             {
                 "role": "user",
@@ -3789,7 +3792,7 @@ def read_menu_key(fd: int | None = None) -> str:
 
     import time
     debug_path = "/tmp/ca-key-debug.log"
-    if fd is None:
+    if fd is None or fd < 0:
         fd = sys.stdin.fileno()
     ch = os.read(fd, 1)
     log = f"{time.time():.3f} first={ch!r}"
@@ -3845,21 +3848,25 @@ def portable_select(
     enable_ansi()
     idx = max(0, min(current, len(rows) - 1))
     status_cache = status_lines()[:5]
-    first_render = True
-    if sys.stdout.isatty():
+    out_fd = sys.stdout.fileno()
+    out_is_tty = os.isatty(out_fd) if os.name != "nt" else True
+    if out_is_tty:
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
-    fd = -1
+    fd = sys.stdin.fileno()
     old_settings = None
-    if os.name != "nt" and sys.stdin.isatty():
-        import termios
-        fd = sys.stdin.fileno()
-        old_settings = termios.tcgetattr(fd)
-        new = termios.tcgetattr(fd)
-        new[3] = new[3] & ~(termios.ECHO | termios.ICANON)
-        new[6][termios.VMIN] = 1
-        new[6][termios.VTIME] = 0
-        termios.tcsetattr(fd, termios.TCSANOW, new)
+    in_is_tty = os.isatty(fd) if os.name != "nt" else False
+    if in_is_tty:
+        try:
+            import termios
+            old_settings = termios.tcgetattr(fd)
+            new = termios.tcgetattr(fd)
+            new[3] = new[3] & ~(termios.ECHO | termios.ICANON)
+            new[6][termios.VMIN] = 1
+            new[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, new)
+        except Exception:
+            fd = -1
     try:
         while True:
             screen: list[str] = []
@@ -3890,13 +3897,8 @@ def portable_select(
             screen.append("")
             screen.append(ansi(footer or "Up/Down moves. Enter selects. Esc/q cancels.", "2"))
             rendered = "\n".join(screen) + "\n"
-            if sys.stdout.isatty():
-                prefix = "\033[2J\033[H" if first_render else "\033[H"
-                sys.stdout.write(prefix + rendered + "\033[J")
-                sys.stdout.flush()
-                first_render = False
-            else:
-                print(rendered, end="")
+            sys.stdout.write("\033[2J\033[H" + rendered)
+            sys.stdout.flush()
             key = read_menu_key(fd) if fd >= 0 else read_menu_key()
             if key in ("up", "k"):
                 idx = (idx - 1) % len(rows)
@@ -4210,13 +4212,26 @@ def portable_prelaunch_menu() -> int:
         nonlocal checks
         checks = preflight_lines()
 
+    fd = sys.stdin.fileno()
+    old_settings = None
+    if os.name != "nt" and os.isatty(fd):
+        try:
+            import termios
+            old_settings = termios.tcgetattr(fd)
+            new = termios.tcgetattr(fd)
+            new[3] = new[3] & ~(termios.ECHO | termios.ICANON)
+            new[6][termios.VMIN] = 1
+            new[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, new)
+        except Exception:
+            fd = -1
     if sys.stdout.isatty():
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
     try:
         while True:
             first_render = render_prelaunch_screen(main_idx, panel, panel_idx, panel_rows, checks, messages, first_render)
-            key = read_menu_key()
+            key = read_menu_key(fd) if fd >= 0 else read_menu_key()
             if panel:
                 if key in ("up", "k"):
                     panel_idx = (panel_idx - 1) % max(1, len(panel_rows))
@@ -4370,6 +4385,9 @@ def portable_prelaunch_menu() -> int:
                     return 10
                 open_panel(action)
     finally:
+        if old_settings is not None:
+            import termios
+            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
         if sys.stdout.isatty():
             sys.stdout.write("\033[?25h")
             sys.stdout.flush()
