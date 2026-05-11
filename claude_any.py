@@ -79,10 +79,11 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "Use skills only when the user's request clearly matches that skill; never invoke keybindings-help unless the user asks about keybindings. "
     "Keep final answers concise and do not expose hidden chain-of-thought. "
     "When calling Claude Code tools, use exactly the tool schema and do not invent extra fields. "
-    "Bash accepts command, description, timeout, and run_in_background; it does not accept content. "
-    "Read accepts file_path, offset, and limit; it does not accept description. "
-    "Write accepts file_path and content. Edit accepts file_path, old_string, new_string, and replace_all. "
-    "TaskList accepts no input. TaskUpdate requires taskId and status only. "
+    "Bash: command (string), description (string), timeout (integer), run_in_background (boolean). "
+    "Read: file_path (string), offset (integer), limit (integer). "
+    "Write: file_path (string), content (string). "
+    "Edit: file_path (string), old_string (string), new_string (string), replace_all (boolean). "
+    "TaskList: no input. TaskUpdate: taskId (string), status (string). "
     "Never write pseudo tool calls, partial JSON, or markdown code fences when a real Claude Code tool call is required."
 )
 LANGUAGES = {
@@ -117,6 +118,226 @@ def model_preset(model_id: str) -> dict[str, Any]:
 
 def compat_max_tokens_for_model(model_id: str) -> int:
     return model_preset(model_id).get("compat_max_tokens", 16)
+
+
+# ---------------------------------------------------------------------------
+# Tool schema registry and parameter validation
+# ---------------------------------------------------------------------------
+
+_TOOL_SCHEMA_REGISTRY: dict[str, dict[str, Any]] = {}
+
+_BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
+    "Bash": {
+        "required": ["command"],
+        "properties": {
+            "command": {"type": "string"},
+            "description": {"type": "string"},
+            "timeout": {"type": "integer"},
+            "run_in_background": {"type": "boolean"},
+        },
+    },
+    "Read": {
+        "required": ["file_path"],
+        "properties": {
+            "file_path": {"type": "string"},
+            "offset": {"type": "integer"},
+            "limit": {"type": "integer"},
+        },
+    },
+    "Write": {
+        "required": ["file_path", "content"],
+        "properties": {
+            "file_path": {"type": "string"},
+            "content": {"type": "string"},
+        },
+    },
+    "Edit": {
+        "required": ["file_path", "old_string", "new_string"],
+        "properties": {
+            "file_path": {"type": "string"},
+            "old_string": {"type": "string"},
+            "new_string": {"type": "string"},
+            "replace_all": {"type": "boolean"},
+        },
+    },
+    "Glob": {
+        "required": ["pattern"],
+        "properties": {
+            "pattern": {"type": "string"},
+            "path": {"type": "string"},
+        },
+    },
+    "Grep": {
+        "required": ["pattern"],
+        "properties": {
+            "pattern": {"type": "string"},
+            "path": {"type": "string"},
+            "output_mode": {"type": "string"},
+        },
+    },
+    "TaskList": {
+        "required": [],
+        "properties": {},
+    },
+    "TaskUpdate": {
+        "required": ["taskId", "status"],
+        "properties": {
+            "taskId": {"type": "string"},
+            "status": {"type": "string"},
+        },
+    },
+    "TaskCreate": {
+        "required": ["subject", "description"],
+        "properties": {
+            "subject": {"type": "string"},
+            "description": {"type": "string"},
+        },
+    },
+    "TaskGet": {
+        "required": ["taskId"],
+        "properties": {
+            "taskId": {"type": "string"},
+        },
+    },
+    "TaskStop": {
+        "required": ["task_id"],
+        "properties": {
+            "task_id": {"type": "string"},
+        },
+    },
+}
+
+
+def _update_tool_schema_registry(tools: Any) -> None:
+    """Cache tool schemas from incoming Anthropic requests."""
+    if not isinstance(tools, list):
+        return
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if not name:
+            continue
+        _TOOL_SCHEMA_REGISTRY[name] = tool.get("input_schema") or {}
+
+
+def _lookup_tool_schema(tool_name: str) -> dict[str, Any] | None:
+    """Look up a tool schema by name, checking registry then builtins."""
+    if tool_name in _TOOL_SCHEMA_REGISTRY:
+        return _TOOL_SCHEMA_REGISTRY[tool_name]
+    if tool_name in _BUILTIN_TOOL_SCHEMAS:
+        return _BUILTIN_TOOL_SCHEMAS[tool_name]
+    return None
+
+
+def _fuzzy_match_tool_name(name: str) -> str | None:
+    """Fuzzy match a tool name against known schemas (case-insensitive, prefix)."""
+    low = name.lower()
+    candidates = list(_TOOL_SCHEMA_REGISTRY.keys()) + list(_BUILTIN_TOOL_SCHEMAS.keys())
+    # Exact match first
+    for c in candidates:
+        if c == name:
+            return c
+    # Case-insensitive
+    for c in candidates:
+        if c.lower() == low:
+            return c
+    # Prefix/substring match
+    for c in candidates:
+        if low in c.lower() or c.lower() in low:
+            return c
+    return None
+
+
+def _coerce_value(value: Any, expected_type: str | None) -> Any:
+    """Coerce a value to the expected JSON schema type."""
+    if expected_type is None:
+        return value
+    if isinstance(value, bool) and expected_type == "boolean":
+        return value
+    if isinstance(value, (int, float)) and expected_type == "integer":
+        return int(value)
+    if isinstance(value, (int, float)) and expected_type == "number":
+        return float(value)
+    if isinstance(value, str) and expected_type == "string":
+        return value
+    # Coerce string -> integer
+    if isinstance(value, str) and expected_type in ("integer", "number"):
+        try:
+            return int(value) if expected_type == "integer" else float(value)
+        except Exception:
+            pass
+    # Coerce string -> boolean
+    if isinstance(value, str) and expected_type == "boolean":
+        low = value.lower()
+        if low in ("true", "yes", "on", "1"):
+            return True
+        if low in ("false", "no", "off", "0"):
+            return False
+    # Coerce int/float -> string
+    if isinstance(value, (int, float)) and expected_type == "string":
+        return str(value)
+    # Coerce anything -> string as last resort
+    if expected_type == "string" and value is not None:
+        return str(value)
+    return value
+
+
+def _default_for_missing_required(tool_name: str, field: str) -> Any:
+    """Return a safe default for known required fields."""
+    defaults: dict[str, dict[str, Any]] = {
+        "Bash": {"timeout": 30000, "description": "", "run_in_background": False},
+        "Read": {"offset": 0, "limit": 0},
+        "Edit": {"replace_all": False},
+        "Glob": {"path": "."},
+        "Grep": {"output_mode": "content"},
+        "TaskUpdate": {"status": "completed"},
+        "TaskCreate": {"description": ""},
+        "TaskStop": {},
+    }
+    return defaults.get(tool_name, {}).get(field)
+
+
+def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> dict[str, Any]:
+    """
+    Validate tool_use input against schema and fix common errors:
+      - fuzzy-match tool name
+      - coerce types to match schema
+      - add defaults for missing required fields
+      - drop unknown fields
+    """
+    schema = _lookup_tool_schema(tool_name)
+    matched_name = tool_name
+    if schema is None:
+        matched = _fuzzy_match_tool_name(tool_name)
+        if matched:
+            matched_name = matched
+            schema = _lookup_tool_schema(matched)
+
+    if schema is None:
+        # No schema known: just ensure it's a dict and return
+        return input_dict if isinstance(input_dict, dict) else {}
+
+    properties = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    fixed: dict[str, Any] = {}
+
+    for key, raw_value in input_dict.items():
+        prop_schema = properties.get(key)
+        if prop_schema is None:
+            # Unknown field: drop it to avoid "invalid tool parameters"
+            continue
+        expected_type = prop_schema.get("type") if isinstance(prop_schema, dict) else None
+        fixed[key] = _coerce_value(raw_value, expected_type)
+
+    # Fill in missing required fields with defaults
+    for req in required:
+        if req not in fixed:
+            default = _default_for_missing_required(matched_name, req)
+            if default is not None:
+                fixed[req] = default
+
+    return fixed
 
 
 UI_TEXT = {
@@ -1479,7 +1700,7 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str) -> dict[str, Any]
                 "type": "tool_use",
                 "id": f"{tool_id_prefix}_{i}",
                 "name": name,
-                "input": normalize_tool_arguments(name, fn.get("arguments")),
+                "input": _validate_and_fix_tool_input(name, normalize_tool_arguments(name, fn.get("arguments"))),
             }
         )
     done_reason = data.get("done_reason")
@@ -1582,7 +1803,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                         "type": "tool_use",
                         "id": tool_id,
                         "name": str(fn["name"]),
-                        "input": normalize_tool_arguments(str(fn["name"]), fn.get("arguments")),
+                        "input": _validate_and_fix_tool_input(str(fn["name"]), normalize_tool_arguments(str(fn["name"]), fn.get("arguments"))),
                     },
                 }
                 handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
@@ -1628,6 +1849,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
 
 
 def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
+    _update_tool_schema_registry(body.get("tools"))
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     base = pcfg.get("base_url", "").rstrip("/")
     stream_requested = body.get("stream", True)
