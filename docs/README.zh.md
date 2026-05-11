@@ -179,7 +179,8 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 ### 0.1.14
 
-- **SSH/终端方向键兼容性**: 重写 `read_menu_key()`，加入 ANSI escape sequence 解析器。用 `termios` VTIME 和 `os.read(fd, 1)` 替代 `select.select` 和短超时，解决 SSH 延迟导致的转义序列被拆分为独立字节的问题。方向键、Home、End 键现可在 SSH 会话中稳定工作。
+- **SSH/终端方向键兼容性**: 重写 `read_menu_key()`，加入 ANSI escape sequence 解析器，并将 raw 终端设置移至 `portable_select()`，使菜单循环期间终端始终维持 raw 模式。解决按键间隙 `ECHO` 恢复导致转义序列泄漏到屏幕的问题。方向键、Home、End 键现可在 SSH 会话中稳定工作。
+- **测试超时**: 将兼容性测试默认超时从 60 秒延长至 120 秒，以适配较慢的云供应商。
 
 ### 0.1.13
 

@@ -3774,10 +3774,9 @@ def print_intro_panel(width: int) -> None:
     print("\n".join(intro_panel_lines(width)))
 
 
-def read_menu_key() -> str:
+def read_menu_key(fd: int | None = None) -> str:
     if os.name == "nt":
         import msvcrt
-
         ch = msvcrt.getwch()
         if ch in ("\x00", "\xe0"):
             code = msvcrt.getwch()
@@ -3788,68 +3787,51 @@ def read_menu_key() -> str:
             return "esc"
         return ch.lower()
 
-    import termios
     import time
-
-    fd = sys.stdin.fileno()
-    old = termios.tcgetattr(fd)
     debug_path = "/tmp/ca-key-debug.log"
-    try:
-        new = termios.tcgetattr(fd)
-        new[3] = new[3] & ~(termios.ECHO | termios.ICANON)
-        new[6][termios.VMIN] = 1
-        new[6][termios.VTIME] = 0
-        termios.tcsetattr(fd, termios.TCSANOW, new)
-
-        ch = os.read(fd, 1)
-        log = f"{time.time():.3f} first={ch!r}"
-        if ch == b"\x1b":
-            seq = ch.decode("latin-1")
-            new[6][termios.VMIN] = 0
-            new[6][termios.VTIME] = 10
-            termios.tcsetattr(fd, termios.TCSANOW, new)
-
-            b = os.read(fd, 1)
-            log += f" next={b!r}"
-            if not b:
-                with open(debug_path, "a", encoding="utf-8") as f:
-                    f.write(log + " result='esc'\n")
-                return "esc"
-            seq += b.decode("latin-1")
-
-            if b == b"[":
-                while True:
-                    b = os.read(fd, 1)
-                    log += f" next={b!r}"
-                    if not b:
-                        break
-                    seq += b.decode("latin-1")
-                    if 0x40 <= b[0] <= 0x7E:
-                        break
-            elif b == b"O":
+    if fd is None:
+        fd = sys.stdin.fileno()
+    ch = os.read(fd, 1)
+    log = f"{time.time():.3f} first={ch!r}"
+    if ch == b"\x1b":
+        seq = ch.decode("latin-1")
+        b = os.read(fd, 1)
+        log += f" next={b!r}"
+        if not b:
+            with open(debug_path, "a", encoding="utf-8") as f:
+                f.write(log + " result='esc'\n")
+            return "esc"
+        seq += b.decode("latin-1")
+        if b == b"[":
+            while True:
                 b = os.read(fd, 1)
                 log += f" next={b!r}"
-                if b:
-                    seq += b.decode("latin-1")
-
-            result = {
-                "\x1b[A": "up", "\x1b[B": "down", "\x1b[D": "left", "\x1b[C": "right",
-                "\x1b[5~": "pageup", "\x1b[6~": "pagedown",
-                "\x1b[H": "home", "\x1b[F": "end",
-            }.get(seq, "esc")
-            log += f" seq={seq!r} result={result!r}"
-            with open(debug_path, "a", encoding="utf-8") as f:
-                f.write(log + "\n")
-            return result
-        if ch in (b"\r", b"\n"):
-            result = "enter"
-        else:
-            result = ch.decode("latin-1").lower()
+                if not b:
+                    break
+                seq += b.decode("latin-1")
+                if 0x40 <= b[0] <= 0x7E:
+                    break
+        elif b == b"O":
+            b = os.read(fd, 1)
+            log += f" next={b!r}"
+            if b:
+                seq += b.decode("latin-1")
+        result = {
+            "\x1b[A": "up", "\x1b[B": "down", "\x1b[D": "left", "\x1b[C": "right",
+            "\x1b[5~": "pageup", "\x1b[6~": "pagedown",
+            "\x1b[H": "home", "\x1b[F": "end",
+        }.get(seq, "esc")
+        log += f" seq={seq!r} result={result!r}"
         with open(debug_path, "a", encoding="utf-8") as f:
-            f.write(log + f" result={result!r}\n")
+            f.write(log + "\n")
         return result
-    finally:
-        termios.tcsetattr(fd, termios.TCSANOW, old)
+    if ch in (b"\r", b"\n"):
+        result = "enter"
+    else:
+        result = ch.decode("latin-1").lower()
+    with open(debug_path, "a", encoding="utf-8") as f:
+        f.write(log + f" result={result!r}\n")
+    return result
 
 
 def portable_select(
@@ -3867,6 +3849,17 @@ def portable_select(
     if sys.stdout.isatty():
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
+    fd = -1
+    old_settings = None
+    if os.name != "nt" and sys.stdin.isatty():
+        import termios
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        new = termios.tcgetattr(fd)
+        new[3] = new[3] & ~(termios.ECHO | termios.ICANON)
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, new)
     try:
         while True:
             screen: list[str] = []
@@ -3904,7 +3897,7 @@ def portable_select(
                 first_render = False
             else:
                 print(rendered, end="")
-            key = read_menu_key()
+            key = read_menu_key(fd) if fd >= 0 else read_menu_key()
             if key in ("up", "k"):
                 idx = (idx - 1) % len(rows)
             elif key in ("down", "j"):
@@ -3914,6 +3907,8 @@ def portable_select(
             elif key in ("esc", "q"):
                 return None
     finally:
+        if old_settings is not None:
+            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
         if sys.stdout.isatty():
             sys.stdout.write("\033[?25h")
             sys.stdout.flush()
@@ -4994,7 +4989,7 @@ def build_parser() -> argparse.ArgumentParser:
     po.add_argument("values", nargs="*")
     po.set_defaults(func=cmd_provider_options)
     test = sub.add_parser("test")
-    test.add_argument("timeout", nargs="?", type=float, default=60.0)
+    test.add_argument("timeout", nargs="?", type=float, default=120.0)
     test.set_defaults(func=cmd_test)
     pp = sub.add_parser("provider")
     pp.add_argument("name", nargs="?")

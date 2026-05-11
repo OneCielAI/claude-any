@@ -209,7 +209,8 @@ steps under that larger model's supervision.
 
 ### 0.1.14
 
-- **SSH/terminal arrow-key compatibility**: rewrote `read_menu_key()` with a proper ANSI escape sequence parser. `select.select` and short timeouts were replaced by `termios` VTIME and `os.read(fd, 1)` so that SSH latency no longer splits escape sequences into separate bytes. Arrow keys, Home, and End now work reliably in SSH sessions.
+- **SSH/terminal arrow-key compatibility**: rewrote `read_menu_key()` with a proper ANSI escape sequence parser and moved raw terminal setup into `portable_select()` so the terminal stays in raw mode for the entire menu loop. This prevents escape sequences from leaking to the screen when `ECHO` is restored between keystrokes. Arrow keys, Home, and End now work reliably in SSH sessions.
+- **Test timeout**: default compatibility test timeout increased from 60 s to 120 s for slower cloud providers.
 
 ### 0.1.13
 
