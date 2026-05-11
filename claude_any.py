@@ -304,7 +304,7 @@ def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> 
       - fuzzy-match tool name
       - coerce types to match schema
       - add defaults for missing required fields
-      - drop unknown fields
+      - keep unknown fields (Claude Code may accept extra fields)
     """
     schema = _lookup_tool_schema(tool_name)
     matched_name = tool_name
@@ -325,17 +325,44 @@ def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> 
     for key, raw_value in input_dict.items():
         prop_schema = properties.get(key)
         if prop_schema is None:
-            # Unknown field: drop it to avoid "invalid tool parameters"
+            # Unknown field: keep it rather than dropping it.
+            # Claude Code may accept fields not in our static registry.
+            fixed[key] = raw_value
             continue
         expected_type = prop_schema.get("type") if isinstance(prop_schema, dict) else None
         fixed[key] = _coerce_value(raw_value, expected_type)
 
-    # Fill in missing required fields with defaults
+    # Fill in missing required fields with defaults or empty values
+    injected: list[str] = []
     for req in required:
         if req not in fixed:
             default = _default_for_missing_required(matched_name, req)
             if default is not None:
                 fixed[req] = default
+            else:
+                # No known default: inject empty value matching expected type
+                prop_schema = properties.get(req)
+                expected_type = prop_schema.get("type") if isinstance(prop_schema, dict) else None
+                if expected_type == "string":
+                    fixed[req] = ""
+                elif expected_type == "integer":
+                    fixed[req] = 0
+                elif expected_type == "number":
+                    fixed[req] = 0.0
+                elif expected_type == "boolean":
+                    fixed[req] = False
+                elif expected_type == "array":
+                    fixed[req] = []
+                elif expected_type == "object":
+                    fixed[req] = {}
+                else:
+                    fixed[req] = ""
+            injected.append(req)
+
+    # Log to router log for debugging
+    if injected:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write("%s [tool_guard] %s: injected missing required fields: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), matched_name, ", ".join(injected)))
 
     return fixed
 
