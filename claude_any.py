@@ -9,6 +9,7 @@ import math
 import os
 import re
 import signal
+import shlex
 import shutil
 import subprocess
 import sys
@@ -31,6 +32,7 @@ HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "claude-any"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = CONFIG_DIR / "router.log"
+TOOL_CALL_LOG_PATH = CONFIG_DIR / "tool-calls.jsonl"
 PID_PATH = CONFIG_DIR / "router.pid"
 MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
@@ -39,6 +41,7 @@ ROUTER_HOST = "127.0.0.1"
 ROUTER_PORT = 8799
 ROUTER_BASE = f"http://{ROUTER_HOST}:{ROUTER_PORT}"
 CLAUDE_GATEWAY_CACHE = HOME / ".claude" / "cache" / "gateway-models.json"
+CLAUDE_SETTINGS_PATH = HOME / ".claude" / "settings.json"
 NCP_ENV = HOME / ".config" / "nvd-claude-proxy" / ".env"
 NCP_LOG = HOME / ".config" / "nvd-claude-proxy" / "proxy.log"
 MODEL_CACHE_TTL_SECONDS = 300
@@ -69,7 +72,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.14"
+VERSION = "0.1.15"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -906,10 +909,119 @@ def find_executable(name: str) -> str | None:
     return None
 
 
+def shell_command_string(args: list[str]) -> str:
+    if os.name == "nt":
+        return subprocess.list2cmdline(args)
+    return " ".join(shlex.quote(arg) for arg in args)
+
+
+def find_tool_guard_script() -> Path | None:
+    candidates = [
+        Path(__file__).resolve().with_name("claude-any-tool-guard.py"),
+        HOME / ".local" / "bin" / "claude-any-tool-guard.py",
+        HOME / ".local" / "bin" / "claude-any-tool-guard",
+    ]
+    found = find_executable("claude-any-tool-guard")
+    if found:
+        candidates.append(Path(found))
+    found_py = find_executable("claude-any-tool-guard.py")
+    if found_py:
+        candidates.append(Path(found_py))
+    for path in candidates:
+        if path.exists():
+            return path
+    return None
+
+
+def claude_any_tool_guard_command() -> str | None:
+    script = find_tool_guard_script()
+    if script is None:
+        return None
+    if script.suffix == ".py":
+        return shell_command_string([sys.executable, str(script)])
+    return shell_command_string([str(script)])
+
+
+def install_tool_guard_hooks() -> None:
+    command = claude_any_tool_guard_command()
+    if not command:
+        print("Claude Any warning: tool guard hook was not installed; claude-any-tool-guard was not found.", flush=True)
+        return
+
+    if CLAUDE_SETTINGS_PATH.exists():
+        try:
+            settings = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
+            if not isinstance(settings, dict):
+                settings = {}
+        except Exception as exc:
+            print(f"Claude Any warning: could not read {CLAUDE_SETTINGS_PATH} ({type(exc).__name__}); tool guard hook was not installed.", flush=True)
+            return
+    else:
+        settings = {}
+
+    hooks = settings.setdefault("hooks", {})
+    if not isinstance(hooks, dict):
+        print(f"Claude Any warning: {CLAUDE_SETTINGS_PATH} has non-object hooks; tool guard hook was not installed.", flush=True)
+        return
+
+    changed = False
+    for event in ("PreToolUse", "PostToolUseFailure", "TaskCreated", "TaskCompleted"):
+        groups = hooks.setdefault(event, [])
+        if not isinstance(groups, list):
+            print(f"Claude Any warning: {CLAUDE_SETTINGS_PATH} hooks.{event} is not a list; tool guard hook was not installed.", flush=True)
+            return
+        existing = False
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            handlers = group.get("hooks")
+            if not isinstance(handlers, list):
+                continue
+            for handler in handlers:
+                if isinstance(handler, dict) and "claude-any-tool-guard" in str(handler.get("command", "")):
+                    existing = True
+                    if handler.get("command") != command:
+                        handler["command"] = command
+                        changed = True
+        if existing:
+            continue
+        group: dict[str, Any] = {"hooks": [{"type": "command", "command": command}]}
+        if event in ("PreToolUse", "PostToolUseFailure"):
+            group["matcher"] = "*"
+        groups.append(group)
+        changed = True
+
+    if changed:
+        CLAUDE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CLAUDE_SETTINGS_PATH.with_name(f"{CLAUDE_SETTINGS_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        tmp.replace(CLAUDE_SETTINGS_PATH)
+
+
 def http_json(url: str, headers: dict[str, str] | None = None, timeout: float = 8.0) -> Any:
     req = urllib.request.Request(url, headers=headers or {})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def append_tool_call_log(event: str, payload: dict[str, Any]) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if TOOL_CALL_LOG_PATH.exists() and TOOL_CALL_LOG_PATH.stat().st_size > 2_000_000:
+            TOOL_CALL_LOG_PATH.replace(TOOL_CALL_LOG_PATH.with_suffix(".jsonl.1"))
+        record = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "event": event,
+            **payload,
+        }
+        with TOOL_CALL_LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
 
 
 def model_cache_key(provider: str, pcfg: dict[str, Any]) -> str:
@@ -1732,12 +1844,26 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str) -> dict[str, Any]
             continue
         name = str(fn["name"])
         matched_name = _fuzzy_match_tool_name(name) or name
+        raw_args = fn.get("arguments")
+        normalized_args = normalize_tool_arguments(matched_name, raw_args)
+        fixed_input = _validate_and_fix_tool_input(matched_name, normalized_args)
+        append_tool_call_log(
+            "ollama_nonstream_tool_call",
+            {
+                "model": model,
+                "raw_name": name,
+                "matched_name": matched_name,
+                "raw_arguments": raw_args,
+                "normalized_arguments": normalized_args,
+                "emitted_input": fixed_input,
+            },
+        )
         content.append(
             {
                 "type": "tool_use",
                 "id": f"{tool_id_prefix}_{i}",
                 "name": matched_name,
-                "input": _validate_and_fix_tool_input(matched_name, normalize_tool_arguments(matched_name, fn.get("arguments"))),
+                "input": fixed_input,
             }
         )
     done_reason = data.get("done_reason")
@@ -1769,8 +1895,11 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
     msg_id = f"msg_ollama_{int(time.time() * 1000)}"
     started = False
     text_started = False
+    next_content_index = 0
+    text_index: int | None = None
     text_so_far = ""
     tool_calls: list[dict[str, Any]] = []
+    tool_indices: list[int] = []
     input_tokens = 0
     output_tokens = 0
     chunk: dict[str, Any] = {}
@@ -1811,9 +1940,11 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             if text_chunk:
                 if not text_started:
                     text_started = True
+                    text_index = next_content_index
+                    next_content_index += 1
                     event = {
                         "type": "content_block_start",
-                        "index": 0,
+                        "index": text_index,
                         "content_block": {"type": "text", "text": ""},
                     }
                     handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
@@ -1821,7 +1952,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 text_so_far += text_chunk
                 event = {
                     "type": "content_block_delta",
-                    "index": 0,
+                    "index": text_index,
                     "delta": {"type": "text_delta", "text": text_chunk},
                 }
                 handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
@@ -1835,26 +1966,54 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 tool_id = f"toolu_ollama_{int(time.time() * 1000)}_{len(tool_calls) - 1}"
                 raw_name = str(fn["name"])
                 matched_name = _fuzzy_match_tool_name(raw_name) or raw_name
+                raw_args = fn.get("arguments")
+                normalized_args = normalize_tool_arguments(matched_name, raw_args)
+                fixed_input = _validate_and_fix_tool_input(matched_name, normalized_args)
+                tool_index = next_content_index
+                next_content_index += 1
+                tool_indices.append(tool_index)
+                append_tool_call_log(
+                    "ollama_stream_tool_call",
+                    {
+                        "model": model,
+                        "raw_name": raw_name,
+                        "matched_name": matched_name,
+                        "raw_arguments": raw_args,
+                        "normalized_arguments": normalized_args,
+                        "emitted_input": fixed_input,
+                        "sse_index": tool_index,
+                    },
+                )
                 tool_event = {
                     "type": "content_block_start",
-                    "index": 1,
+                    "index": tool_index,
                     "content_block": {
                         "type": "tool_use",
                         "id": tool_id,
                         "name": matched_name,
-                        "input": _validate_and_fix_tool_input(matched_name, normalize_tool_arguments(matched_name, fn.get("arguments"))),
+                        "input": {},
                     },
                 }
                 handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
                 handler.wfile.flush()
+                delta_event = {
+                    "type": "content_block_delta",
+                    "index": tool_index,
+                    "delta": {
+                        "type": "input_json_delta",
+                        "partial_json": json.dumps(fixed_input, ensure_ascii=False),
+                    },
+                }
+                handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
+                handler.wfile.flush()
         # Send content_block_stop for text if any
         if text_started:
-            event = {"type": "content_block_stop", "index": 0}
+            event = {"type": "content_block_stop", "index": text_index}
             handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
             handler.wfile.flush()
         # Send content_block_stop for each tool call
-        for i, _ in enumerate(tool_calls):
-            event = {"type": "content_block_stop", "index": 1 + i}
+        for tool_index in tool_indices:
+            event = {"type": "content_block_stop", "index": tool_index}
             handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
             handler.wfile.flush()
         # Determine stop reason
@@ -4924,6 +5083,7 @@ def launch_claude(
         for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
             if key not in launch_env:
                 env.pop(key, None)
+        install_tool_guard_hooks()
     claude = find_executable("claude")
     if not claude:
         raise RuntimeError("claude executable was not found in PATH or ~/.local/bin")

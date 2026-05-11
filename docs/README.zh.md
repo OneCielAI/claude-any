@@ -9,7 +9,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.14`
+当前版本: `0.1.15`
 
 ## 为什么存在
 
@@ -176,6 +176,13 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.15
+
+- **Ollama/Ollama Cloud 工具调用流式修复**: 流式工具调用现在使用连续的 Anthropic SSE content block index 和 `input_json_delta` payload 输出，避免 Claude Code 将 malformed streamed tool-use block 拒绝为 `Invalid tool parameters`。
+- **Tool guard 自动安装**: 非 Anthropic provider 启动时会将 Claude Any tool guard 合并到 `~/.claude/settings.json`，在执行前规范化生成的工具输入。
+- **工具调用诊断日志**: 路由器侧工具调用记录到 `~/.config/claude-any/tool-calls.jsonl`，Claude Code hook 输入记录到 `~/.claude/claude-any-tool-guard/tool-events.jsonl`。
+- **工具输入规范化**: guard 会将 `path` 映射为 `file_path`、`cmd` 映射为 `command`、`query` 映射为 `pattern`，并在缺少必填字段时返回明确提示。
 
 ### 0.1.14
 

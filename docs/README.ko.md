@@ -9,7 +9,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.14`
+현재 버전: `0.1.15`
 
 ## 왜 만들었나
 
@@ -187,6 +187,13 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.15
+
+- **Ollama/Ollama Cloud 툴 호출 스트리밍 수정**: 스트리밍 툴 호출을 순차 Anthropic SSE content block index와 `input_json_delta` payload로 내보내도록 변경. Claude Code가 잘못된 streamed tool-use block을 `Invalid tool parameters`로 거절하던 문제를 방지합니다.
+- **툴 guard 자동 설치**: 비 Anthropic provider 실행 시 Claude Any tool guard를 `~/.claude/settings.json`에 병합하여, 실행 전 생성된 툴 입력을 정규화합니다.
+- **툴 호출 진단 로그**: 라우터가 만든 툴 호출은 `~/.config/claude-any/tool-calls.jsonl`, Claude Code hook 입력은 `~/.claude/claude-any-tool-guard/tool-events.jsonl`에 기록합니다.
+- **툴 입력 정규화**: guard가 `path`를 `file_path`, `cmd`를 `command`, `query`를 `pattern`으로 변환하고, 필수 필드가 없을 때 명확한 안내를 반환합니다.
 
 ### 0.1.14
 

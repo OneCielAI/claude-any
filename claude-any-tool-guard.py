@@ -35,6 +35,26 @@ STRICT_KEYS = {
     "TaskList": TASKLIST_KEYS,
     "TaskUpdate": TASKUPDATE_KEYS,
 }
+REQUIRED_KEYS = {
+    "Bash": {"command"},
+    "Read": {"file_path"},
+    "Write": {"file_path", "content"},
+    "Edit": {"file_path", "old_string", "new_string"},
+    "MultiEdit": {"file_path", "edits"},
+    "Glob": {"pattern"},
+    "Grep": {"pattern"},
+    "TaskUpdate": {"taskId", "status"},
+}
+TOOL_HINTS = {
+    "Bash": "Use Bash with command, description, timeout, and run_in_background only.",
+    "Read": "Use Read with file_path, offset, and limit only.",
+    "Write": "Use Write with file_path and content only.",
+    "Edit": "Use Edit with file_path, old_string, new_string, and replace_all only.",
+    "MultiEdit": "Use MultiEdit with file_path and edits only.",
+    "Glob": "Use Glob with pattern and optional path only.",
+    "Grep": "Use Grep with pattern, path, glob, type, output_mode, context, head_limit, or multiline only.",
+    "TaskUpdate": "Use TaskUpdate with taskId and status.",
+}
 
 
 def active() -> bool:
@@ -57,6 +77,25 @@ def log_event(message: str) -> None:
         pass
 
 
+def log_json_event(event: dict[str, Any], result: dict[str, Any] | None = None) -> None:
+    try:
+        path = cache_dir() / "tool-events.jsonl"
+        if path.exists() and path.stat().st_size > 2_000_000:
+            path.replace(path.with_suffix(".jsonl.1"))
+        record = {
+            "time": int(time.time()),
+            "hook_event_name": event.get("hook_event_name"),
+            "tool_name": event.get("tool_name"),
+            "tool_input": event.get("tool_input"),
+        }
+        if result is not None:
+            record["guard_result"] = result
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
 def pre_allow(updated: dict[str, Any], reason: str, context: str = "") -> None:
     out: dict[str, Any] = {
         "hookSpecificOutput": {
@@ -68,6 +107,7 @@ def pre_allow(updated: dict[str, Any], reason: str, context: str = "") -> None:
     }
     if context:
         out["hookSpecificOutput"]["additionalContext"] = context
+    log_json_event({"hook_event_name": "PreToolUse", "tool_input": updated}, out)
     emit(out)
 
 
@@ -81,6 +121,7 @@ def pre_deny(reason: str, context: str = "") -> None:
     }
     if context:
         out["hookSpecificOutput"]["additionalContext"] = context
+    log_json_event({"hook_event_name": "PreToolUse"}, out)
     emit(out)
 
 
@@ -153,10 +194,47 @@ def record_task_completed(event: dict[str, Any]) -> None:
     save_tasks(data)
 
 
-def strip_unknown_keys(tool: str, tool_input: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    if tool == "Bash" and "content" in tool_input and "command" not in tool_input:
-        tool_input = dict(tool_input)
-        tool_input["command"] = tool_input["content"]
+def normalize_aliases(tool: str, tool_input: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    updated = dict(tool_input)
+    changed: list[str] = []
+
+    def alias(target: str, *names: str) -> None:
+        if target in updated:
+            return
+        for name in names:
+            value = updated.get(name)
+            if value not in (None, ""):
+                updated[target] = value
+                changed.append(f"{name}->{target}")
+                return
+
+    if tool == "Bash":
+        alias("command", "cmd", "content", "script")
+    elif tool in {"Read", "Write", "Edit", "MultiEdit"}:
+        alias("file_path", "path", "file", "filename")
+    elif tool == "Glob":
+        alias("pattern", "glob", "path_pattern")
+    elif tool == "Grep":
+        alias("pattern", "query", "search", "regex")
+    elif tool == "LS":
+        alias("path", "file_path", "directory")
+    elif tool == "TaskUpdate":
+        alias("taskId", "task_id", "id")
+    return updated, changed
+
+
+def missing_required_keys(tool: str, tool_input: dict[str, Any]) -> list[str]:
+    required = REQUIRED_KEYS.get(tool, set())
+    missing: list[str] = []
+    for key in sorted(required):
+        value = tool_input.get(key)
+        if value is None or value == "":
+            missing.append(key)
+    return missing
+
+
+def strip_unknown_keys(tool: str, tool_input: dict[str, Any]) -> tuple[dict[str, Any], list[str], list[str]]:
+    tool_input, changed = normalize_aliases(tool, tool_input)
     allowed = STRICT_KEYS.get(tool)
     if not allowed:
         updated = dict(tool_input)
@@ -164,16 +242,17 @@ def strip_unknown_keys(tool: str, tool_input: dict[str, Any]) -> tuple[dict[str,
         if tool in DROP_DESCRIPTION and "description" in updated:
             updated.pop("description", None)
             dropped.append("description")
-        return updated, dropped
+        return updated, dropped, changed
     updated = {k: v for k, v in tool_input.items() if k in allowed}
     dropped = [k for k in tool_input if k not in allowed]
-    return updated, dropped
+    return updated, dropped, changed
 
 
 def handle_pre_tool(event: dict[str, Any]) -> None:
     tool = str(event.get("tool_name") or "")
     if tool.startswith("mcp__"):
         return
+    log_json_event(event)
     raw = event.get("tool_input")
     if not isinstance(raw, dict):
         pre_deny(
@@ -200,17 +279,32 @@ def handle_pre_tool(event: dict[str, Any]) -> None:
             )
             return
 
-    updated, dropped = strip_unknown_keys(tool, raw)
-    if dropped:
-        log_event(f"PreToolUse sanitized tool={tool} dropped={dropped} keys={list(raw.keys())}")
+    updated, dropped, changed = strip_unknown_keys(tool, raw)
+    missing = missing_required_keys(tool, updated)
+    if missing:
+        log_event(f"PreToolUse denied tool={tool} missing={missing} keys={list(raw.keys())}")
+        pre_deny(
+            f"{tool} tool input is missing required parameter(s): {', '.join(missing)}.",
+            TOOL_HINTS.get(tool, "Regenerate the tool call with the documented Claude Code tool schema."),
+        )
+        return
+    if dropped or changed:
+        reason_parts = []
+        if dropped:
+            reason_parts.append(f"removed unsupported parameter(s): {', '.join(dropped)}")
+        if changed:
+            reason_parts.append(f"normalized parameter name(s): {', '.join(changed)}")
+        reason = "; ".join(reason_parts)
+        log_event(f"PreToolUse sanitized tool={tool} dropped={dropped} changed={changed} keys={list(raw.keys())}")
         pre_allow(
             updated,
-            f"Removed unsupported parameter(s) for {tool}: {', '.join(dropped)}.",
-            f"{tool} was generated with unsupported parameter(s): {', '.join(dropped)}. The guard removed them before execution.",
+            f"Claude Any {reason} for {tool}.",
+            f"{tool} was generated with non-standard parameter(s). The guard normalized the input before execution.",
         )
 
 
 def handle_post_failure(event: dict[str, Any]) -> None:
+    log_json_event(event)
     tool = str(event.get("tool_name") or "")
     error = str(event.get("error") or "")
     raw = event.get("tool_input")

@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Minimal terminal raw-mode test for SSH debugging."""
-import sys, os, time
+import os
+import sys
+import time
 
 fd = sys.stdin.fileno()
 is_tty = os.isatty(fd)

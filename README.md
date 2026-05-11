@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.14`
+Current version: `0.1.15`
 
 ## Why This Exists
 
@@ -206,6 +206,13 @@ steps under that larger model's supervision.
   file changes, reducing per-request overhead in the router.
 
 ## Changelog
+
+### 0.1.15
+
+- **Ollama/Ollama Cloud tool-call streaming fix**: emit streamed tool calls using sequential Anthropic SSE content block indexes and `input_json_delta` payloads. This prevents Claude Code from rejecting malformed streamed tool-use blocks with `Invalid tool parameters`.
+- **Tool guard auto-install**: non-Anthropic launches now merge the Claude Any tool guard into `~/.claude/settings.json` so generated tool inputs can be normalized before execution.
+- **Tool-call diagnostics**: router-side tool calls are logged to `~/.config/claude-any/tool-calls.jsonl`, and Claude Code hook inputs are logged to `~/.claude/claude-any-tool-guard/tool-events.jsonl` for precise debugging.
+- **Tool input normalization**: the guard now maps common aliases such as `path` to `file_path`, `cmd` to `command`, and `query` to `pattern`, and returns explicit guidance when required fields are missing.
 
 ### 0.1.14
 

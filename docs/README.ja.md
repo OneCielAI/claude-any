@@ -9,7 +9,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.14`
+現在のバージョン: `0.1.15`
 
 ## 作られた理由
 
@@ -188,6 +188,13 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.15
+
+- **Ollama/Ollama Cloud ツール呼び出しストリーミング修正**: ストリーミングされるツール呼び出しを、連番の Anthropic SSE content block index と `input_json_delta` payload で送信するように変更。Claude Code が不正な streamed tool-use block を `Invalid tool parameters` として拒否する問題を防ぎます。
+- **ツール guard の自動インストール**: 非 Anthropic provider の起動時に Claude Any tool guard を `~/.claude/settings.json` へマージし、実行前に生成されたツール入力を正規化します。
+- **ツール呼び出し診断ログ**: ルーター側のツール呼び出しは `~/.config/claude-any/tool-calls.jsonl`、Claude Code hook 入力は `~/.claude/claude-any-tool-guard/tool-events.jsonl` に記録します。
+- **ツール入力の正規化**: guard が `path` を `file_path`、`cmd` を `command`、`query` を `pattern` に変換し、必須フィールドが欠けている場合は明確な案内を返します。
 
 ### 0.1.14
 
