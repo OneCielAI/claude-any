@@ -1,22 +1,189 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import curses
 import json
+import os
+import select
+import shutil
 import subprocess
 import sys
+import termios
 import time
 import textwrap
+import tty
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
 try:
+    import msvcrt
+    HAS_MSVCRT = True
+except ImportError:
+    HAS_MSVCRT = False
+
+try:
     sys.stdout.reconfigure(encoding="utf-8")
     sys.stderr.reconfigure(encoding="utf-8")
 except Exception:
     pass
+
+
+def _enable_windows_ansi() -> None:
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        hOut = kernel32.GetStdHandle(-11)
+        mode = ctypes.c_ulong()
+        kernel32.GetConsoleMode(hOut, ctypes.byref(mode))
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        kernel32.SetConsoleMode(hOut, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING)
+    except Exception:
+        pass
+
+
+class _RawTerminal:
+    def __enter__(self):
+        _enable_windows_ansi()
+        if sys.platform != "win32" and sys.stdin.isatty():
+            self._fd = sys.stdin.fileno()
+            self._old = termios.tcgetattr(self._fd)
+            tty.setraw(self._fd)
+        return self
+
+    def __exit__(self, *a):
+        if sys.platform != "win32" and hasattr(self, "_old"):
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+        return False
+
+
+def _getch(timeout: float = 60.0) -> bytes | None:
+    if sys.platform == "win32" and HAS_MSVCRT:
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            if msvcrt.kbhit():
+                return msvcrt.getch()
+            time.sleep(0.01)
+        return None
+    else:
+        r, _, _ = select.select([sys.stdin.buffer], [], [], timeout)
+        if r:
+            return sys.stdin.buffer.read(1)
+        return None
+
+
+def _debug_log(msg: str) -> None:
+    try:
+        with open("/tmp/ca-menu-debug.log", "a", encoding="utf-8") as f:
+            f.write(f"{time.monotonic():.3f} {msg}\n")
+            f.flush()
+    except Exception:
+        pass
+
+
+def read_menu_key() -> str:
+    ch = _getch()
+    _debug_log(f"_getch returned: {repr(ch)}")
+    if ch is None:
+        return ""
+    if ch == b"\x1b":
+        seq = b"\x1b"
+        for _ in range(3):
+            nxt = _getch(1.0)
+            _debug_log(f"  seq byte: {repr(nxt)}")
+            if nxt is None:
+                break
+            seq += nxt
+        _debug_log(f"  full seq: {repr(seq)} hex: {seq.hex()}")
+        if seq in (b"\x1b[A", b"\x1bOA"):
+            return "KEY_UP"
+        if seq in (b"\x1b[B", b"\x1bOB"):
+            return "KEY_DOWN"
+        if seq == b"\x1b[5~":
+            return "KEY_PPAGE"
+        if seq == b"\x1b[6~":
+            return "KEY_NPAGE"
+        return "KEY_ESC"
+    if sys.platform == "win32" and HAS_MSVCRT:
+        if ch in (b"\x00", b"\xe0"):
+            ch2 = _getch(0.05)
+            if ch2 == b"H":
+                return "KEY_UP"
+            if ch2 == b"P":
+                return "KEY_DOWN"
+            if ch2 == b"K":
+                return "KEY_LEFT"
+            if ch2 == b"M":
+                return "KEY_RIGHT"
+            if ch2 == b"I":
+                return "KEY_PPAGE"
+            if ch2 == b"Q":
+                return "KEY_NPAGE"
+            return ""
+    if ch in (b"\r", b"\n"):
+        return "KEY_ENTER"
+    if ch in (b"\x7f", b"\x08"):
+        return "KEY_BACKSPACE"
+    if ch and 0 < ch[0] < 128 and chr(ch[0]).isprintable():
+        return chr(ch[0])
+    return ""
+
+
+def _term_size() -> tuple[int, int]:
+    try:
+        return shutil.get_terminal_size(fallback=(80, 24))
+    except Exception:
+        return (80, 24)
+
+
+def _clear() -> None:
+    sys.stdout.write("\033[2J\033[H")
+    sys.stdout.flush()
+
+
+def _move(row: int, col: int) -> None:
+    sys.stdout.write(f"\033[{row + 1};{col + 1}H")
+
+
+def _style(fg: int | None = None, bg: int | None = None, bold: bool = False, dim: bool = False, reverse: bool = False) -> str:
+    codes: list[str] = []
+    if bold:
+        codes.append("1")
+    if dim:
+        codes.append("2")
+    if reverse:
+        codes.append("7")
+    if fg is not None:
+        codes.append(f"38;5;{fg}")
+    if bg is not None:
+        codes.append(f"48;5;{bg}")
+    return f"\033[{';&'.join(codes)}m" if codes else ""
+
+
+def _reset() -> str:
+    return "\033[0m"
+
+
+def _write(row: int, col: int, text: str, style: str = "") -> None:
+    if row < 0 or col < 0:
+        return
+    _move(row, col)
+    if style:
+        sys.stdout.write(style)
+    sys.stdout.write(text)
+    if style:
+        sys.stdout.write(_reset())
+    sys.stdout.flush()
+
+
+def _write_safe(row: int, col: int, text: str, style: str = "") -> None:
+    h, w = _term_size()
+    if row < 0 or row >= h or col >= w:
+        return
+    _write(row, col, text[: max(0, w - max(0, col) - 1)], style)
+
 
 CTL = str(Path.home() / ".local/bin/claude-anyctl")
 CONFIG = Path.home() / ".config/claude-any/config.json"
@@ -286,24 +453,23 @@ PROVIDER_NOTES = {
 
 
 def init_colors() -> None:
-    if not curses.has_colors():
-        return
-    curses.start_color()
-    try:
-        curses.use_default_colors()
-    except Exception:
-        pass
-    curses.init_pair(1, curses.COLOR_WHITE, -1)
-    curses.init_pair(2, curses.COLOR_GREEN, -1)
-    curses.init_pair(3, curses.COLOR_YELLOW, -1)
-    curses.init_pair(4, curses.COLOR_RED, -1)
-    curses.init_pair(5, curses.COLOR_WHITE, -1)
-    orange = 208 if getattr(curses, "COLORS", 0) > 208 else curses.COLOR_YELLOW
-    curses.init_pair(6, orange, -1)
+    pass
 
 
-def cp(n: int) -> int:
-    return curses.color_pair(n) if curses.has_colors() else curses.A_NORMAL
+def cp(n: int) -> str:
+    if n == 1:
+        return _style(fg=255)
+    if n == 2:
+        return _style(fg=10)
+    if n == 3:
+        return _style(fg=11)
+    if n == 4:
+        return _style(fg=9)
+    if n == 5:
+        return _style(fg=255)
+    if n == 6:
+        return _style(fg=208)
+    return ""
 
 
 def load_cfg() -> dict:
@@ -1027,7 +1193,7 @@ def test_submenu(lines: list[str]) -> dict:
     }
 
 
-def run_test_with_animation(stdscr, idx: int, checks: list[str]) -> tuple[int, str]:
+def run_test_with_animation(idx: int, checks: list[str]) -> tuple[int, str]:
     frames = ["|", "/", "-", "\\"]
     started = time.monotonic()
     proc = subprocess.Popen(
@@ -1040,125 +1206,93 @@ def run_test_with_animation(stdscr, idx: int, checks: list[str]) -> tuple[int, s
     while proc.poll() is None:
         elapsed = int(time.monotonic() - started)
         notice = [f"{frames[frame % len(frames)]} {t('running_test')} ({elapsed}s)"]
-        render(stdscr, idx, None, notice, checks)
+        render(None, idx, None, notice, checks)
         frame += 1
         time.sleep(0.2)
     out, _ = proc.communicate()
     return proc.returncode or 0, out or ""
 
 
-def read_menu_key(stdscr) -> int:
-    ch = stdscr.getch()
-    if ch != 27:
-        return ch
-
-    stdscr.nodelay(True)
-    try:
-        time.sleep(0.1)
-        seq = []
-        for _ in range(3):
-            nxt = stdscr.getch()
-            if nxt == -1:
-                break
-            seq.append(nxt)
-    finally:
-        stdscr.nodelay(False)
-
-    if len(seq) >= 2:
-        if seq[:2] in ([ord("["), ord("A")], [ord("O"), ord("A")]):
-            for extra in reversed(seq[2:]):
-                curses.ungetch(extra)
-            return curses.KEY_UP
-        if seq[:2] in ([ord("["), ord("B")], [ord("O"), ord("B")]):
-            for extra in reversed(seq[2:]):
-                curses.ungetch(extra)
-            return curses.KEY_DOWN
-        if seq[:2] == [ord("["), ord("5")]:
-            for extra in reversed(seq[3:]):
-                curses.ungetch(extra)
-            return curses.KEY_PPAGE
-        if seq[:2] == [ord("["), ord("6")]:
-            for extra in reversed(seq[3:]):
-                curses.ungetch(extra)
-            return curses.KEY_NPAGE
-    return 27
-
-
 def inline_prompt(stdscr, prompt_text: str, row: int, default: str = "") -> str:
-    curses.echo()
-    h, w = stdscr.getmaxyx()
+    h, w = _term_size()
     y = max(1, min(row, h - 3))
-    stdscr.move(y, 0)
-    stdscr.clrtoeol()
-    stdscr.addstr(y, 0, " " * max(0, w - 1), curses.A_REVERSE)
-    label = prompt_text
-    stdscr.addstr(y, 2, label[: max(0, w - 4)], curses.A_REVERSE | curses.A_BOLD)
-    x = min(len(label) + 2, max(0, w - 2))
+    style = _style(reverse=True)
+    style_bold = _style(reverse=True, bold=True)
+    _write(y, 0, " " * max(0, w - 1), style)
+    _write(y, 2, prompt_text[: max(0, w - 4)], style_bold)
+    x = min(len(prompt_text) + 2, max(0, w - 2))
     if default:
-        stdscr.addstr(y, x, default[: max(0, w - x - 1)], curses.A_REVERSE)
-        stdscr.move(y, min(x + len(default), max(0, w - 2)))
+        _write(y, x, default[: max(0, w - x - 1)], style)
+        _move(y, min(x + len(default), max(0, w - 2)))
     else:
-        stdscr.move(y, x)
-    stdscr.refresh()
-    try:
-        value = stdscr.getstr(y, x, max(1, w - x - 1)).decode().strip()
-    finally:
-        curses.noecho()
-    return value or default
+        _move(y, x)
+    sys.stdout.flush()
+    chars = []
+    while True:
+        ch = read_menu_key()
+        if ch == "KEY_ENTER":
+            break
+        if ch == "KEY_ESC":
+            return default
+        if ch == "KEY_BACKSPACE":
+            if chars:
+                chars.pop()
+        elif len(ch) == 1 and ch.isprintable():
+            chars.append(ch)
+        _write(y, 0, " " * max(0, w - 1), style)
+        _write(y, 2, prompt_text[: max(0, w - 4)], style_bold)
+        _write(y, x, "".join(chars)[: max(0, w - x - 1)], style)
+        _move(y, min(x + len(chars), max(0, w - 2)))
+        sys.stdout.flush()
+    return "".join(chars).strip() or default
 
 
 def inline_secret_prompt(stdscr, prompt_text: str, row: int) -> str:
-    curses.noecho()
-    h, w = stdscr.getmaxyx()
+    h, w = _term_size()
     y = max(1, min(row, h - 3))
-    stdscr.move(y, 0)
-    stdscr.clrtoeol()
-    stdscr.addstr(y, 0, " " * max(0, w - 1), curses.A_REVERSE)
-    stdscr.addstr(y, 2, prompt_text[: max(0, w - 4)], curses.A_REVERSE | curses.A_BOLD)
+    style = _style(reverse=True)
+    style_bold = _style(reverse=True, bold=True)
+    _write(y, 0, " " * max(0, w - 1), style)
+    _write(y, 2, prompt_text[: max(0, w - 4)], style_bold)
     x = min(len(prompt_text) + 2, max(0, w - 2))
-    stdscr.move(y, x)
-    stdscr.refresh()
+    _move(y, x)
+    sys.stdout.flush()
     chars = []
     while True:
-        ch = read_menu_key(stdscr)
-        if ch in (10, 13, curses.KEY_ENTER):
+        ch = read_menu_key()
+        if ch == "KEY_ENTER":
             break
-        if ch in (27,):
+        if ch == "KEY_ESC":
             return ""
-        if ch in (curses.KEY_BACKSPACE, 127, 8):
+        if ch == "KEY_BACKSPACE":
             if chars:
                 chars.pop()
-        elif 0 <= ch < 256 and chr(ch).isprintable():
-            chars.append(chr(ch))
-        stdscr.move(y, x)
-        stdscr.clrtoeol()
-        stdscr.addstr(y, 0, " " * max(0, w - 1), curses.A_REVERSE)
-        stdscr.addstr(y, 2, prompt_text[: max(0, w - 4)], curses.A_REVERSE | curses.A_BOLD)
+        elif len(ch) == 1 and ch.isprintable():
+            chars.append(ch)
+        _write(y, 0, " " * max(0, w - 1), style)
+        _write(y, 2, prompt_text[: max(0, w - 4)], style_bold)
         masked = "*" * len(chars)
-        stdscr.addstr(y, x, masked[: max(0, w - x - 1)], curses.A_REVERSE)
-        stdscr.move(y, min(x + len(masked), max(0, w - 2)))
-        stdscr.refresh()
+        _write(y, x, masked[: max(0, w - x - 1)], style)
+        _move(y, min(x + len(masked), max(0, w - 2)))
+        sys.stdout.flush()
     return "".join(chars).strip()
 
+
 def message(stdscr, title: str, lines: list[str]) -> None:
-    stdscr.clear()
-    h, w = stdscr.getmaxyx()
-    stdscr.addstr(0, 0, title[: w - 1], curses.A_BOLD)
+    _clear()
+    h, w = _term_size()
+    _write_safe(0, 0, title[: w - 1], _style(bold=True))
     for i, line in enumerate(lines[: h - 4]):
-        stdscr.addstr(2 + i, 0, line[: w - 1])
-    stdscr.addstr(h - 2, 0, "Press any key to continue", curses.A_DIM | cp(5))
-    stdscr.refresh()
-    stdscr.getch()
+        _write_safe(2 + i, 0, line[: w - 1])
+    _write_safe(h - 2, 0, "Press any key to continue", _style(dim=True) + cp(5))
+    sys.stdout.flush()
+    read_menu_key()
 
 
 def api_key_flow(stdscr) -> list[str]:
     provider = current_provider()
-    curses.endwin()
-    try:
-        subprocess.run([CTL, "api-key", provider], check=False)
-        input("Press Enter to return to claude-any menu...")
-    finally:
-        stdscr.refresh()
+    subprocess.run([CTL, "api-key", provider], check=False)
+    input("Press Enter to return to claude-any menu...")
     return [f"API key flow completed for {provider}"]
 
 
@@ -1190,20 +1324,14 @@ def index_for_action(action: str) -> int:
     return next((i for i, (key, _) in enumerate(items) if key == action), 0)
 
 
-def add(stdscr, y: int, x: int, text: str, attr: int = curses.A_NORMAL) -> None:
-    h, w = stdscr.getmaxyx()
-    if y < 0 or y >= h or x >= w:
-        return
-    try:
-        stdscr.addstr(y, max(0, x), text[: max(0, w - max(0, x) - 1)], attr)
-    except curses.error:
-        pass
+def add(stdscr, y: int, x: int, text: str, style: str = "") -> None:
+    _write_safe(y, max(0, x), text, style)
 
 
 def draw_intro_panel(stdscr) -> int:
-    h, w = stdscr.getmaxyx()
+    h, w = _term_size()
     if h < 20:
-        add(stdscr, 0, 0, f"{APP_NAME} - {CREDITS}", curses.A_BOLD)
+        add(stdscr, 0, 0, f"{APP_NAME} - {CREDITS}", _style(bold=True))
         return 1
 
     panel_w = max(40, w - 2)
@@ -1211,7 +1339,7 @@ def draw_intro_panel(stdscr) -> int:
     border = cp(4)
     title = f" {APP_NAME} "
     add(stdscr, 0, 0, "+" + "-" * (panel_w - 2) + "+", border)
-    add(stdscr, 0, 4, title, border | curses.A_BOLD)
+    add(stdscr, 0, 4, title, border + _style(bold=True))
     for y in range(1, panel_h - 1):
         add(stdscr, y, 0, "|", border)
         add(stdscr, y, panel_w - 1, "|", border)
@@ -1221,26 +1349,26 @@ def draw_intro_panel(stdscr) -> int:
         split = min(44, panel_w // 2)
         for y in range(1, panel_h - 1):
             add(stdscr, y, split, "|", border)
-        add(stdscr, 1, 8, "Welcome back!", curses.A_BOLD | cp(5))
-        add(stdscr, 3, 9, "CLAUDE", curses.A_BOLD | cp(2))
-        add(stdscr, 4, 12, "ANY", curses.A_BOLD | cp(3))
-        add(stdscr, 6, 6, CREDITS, curses.A_BOLD | cp(5))
+        add(stdscr, 1, 8, "Welcome back!", _style(bold=True) + cp(5))
+        add(stdscr, 3, 9, "CLAUDE", _style(bold=True) + cp(2))
+        add(stdscr, 4, 12, "ANY", _style(bold=True) + cp(3))
+        add(stdscr, 6, 6, CREDITS, _style(bold=True) + cp(5))
 
         right = split + 3
-        add(stdscr, 1, right, "Tips for getting started", curses.A_BOLD | cp(4))
+        add(stdscr, 1, right, "Tips for getting started", _style(bold=True) + cp(4))
         add(stdscr, 2, right, "Choose provider, model, base URL, and API key before launch.", cp(5))
         add(stdscr, 3, right, "Routes Claude Code to Anthropic, Ollama, vLLM, Nvidia, or NIM.", cp(5))
         add(stdscr, 4, right, "Adds DuckDuckGo web search tooling for non-native providers.", cp(5))
         add(stdscr, 5, right, "Use --ca-* flags for headless runs; Claude flags pass through.", cp(5))
     else:
-        add(stdscr, 1, 3, f"{APP_NAME} routes Claude Code through selectable providers.", curses.A_BOLD | cp(5))
+        add(stdscr, 1, 3, f"{APP_NAME} routes Claude Code through selectable providers.", _style(bold=True) + cp(5))
         add(stdscr, 2, 3, "Anthropic, Ollama, vLLM, Nvidia Hosted, and self-hosted NIM.", cp(5))
         add(stdscr, 3, 3, "DuckDuckGo web search is attached for non-native providers.", cp(5))
         add(stdscr, 4, 3, "Headless setup uses --ca-* flags; Claude flags pass through.", cp(5))
         if panel_h > 6:
-            add(stdscr, 6, 3, CREDITS, curses.A_BOLD | cp(3))
+            add(stdscr, 6, 3, CREDITS, _style(bold=True) + cp(3))
         else:
-            add(stdscr, 5, 3, CREDITS, curses.A_BOLD | cp(3))
+            add(stdscr, 5, 3, CREDITS, _style(bold=True) + cp(3))
 
     return panel_h + 1
 
@@ -1248,8 +1376,8 @@ def draw_intro_panel(stdscr) -> int:
 def render(stdscr, idx: int, sub: dict | None, notice: list[str], checks: list[str]) -> dict[str, int]:
     lines = status_text()
     items = main_items()
-    h, w = stdscr.getmaxyx()
-    stdscr.clear()
+    h, w = _term_size()
+    _clear()
     top = draw_intro_panel(stdscr)
     status_count = 5 if h >= 28 else 4 if h >= 23 else 2
     for i, line in enumerate(lines[:status_count]):
@@ -1268,24 +1396,24 @@ def render(stdscr, idx: int, sub: dict | None, notice: list[str], checks: list[s
         if row >= h - 3:
             break
         if i == idx and (sub is None or sub.get("readonly")):
-            attr = curses.A_REVERSE | curses.A_BOLD
+            style = _style(reverse=True, bold=True)
         elif key == "launch":
-            attr = cp(2) | curses.A_BOLD
+            style = cp(2) + _style(bold=True)
         elif key == "test":
-            attr = cp(3) | curses.A_BOLD
+            style = cp(3) + _style(bold=True)
         elif key == "quit":
-            attr = cp(4)
+            style = cp(4)
         elif key in ("language", "provider", "model", "ollama-options", "provider-options", "api-key", "base-url"):
-            attr = cp(3)
+            style = cp(3)
         else:
-            attr = curses.A_NORMAL
-        stdscr.addstr(row, 2, label[: max(0, w - 4)], attr)
+            style = ""
+        _write_safe(row, 2, label[: max(0, w - 4)], style)
         row += 1
 
         if sub and sub.get("parent") == key:
             start, end = visible_sub_window(sub, submenu_budget)
             if start > 0 and row < h - 3:
-                stdscr.addstr(row, 6, f"... {start} above", curses.A_DIM | cp(5))
+                _write_safe(row, 6, f"... {start} above", _style(dim=True) + cp(5))
                 row += 1
             for si in range(start, end):
                 if row >= h - 3:
@@ -1294,68 +1422,66 @@ def render(stdscr, idx: int, sub: dict | None, notice: list[str], checks: list[s
                 if sub.get("kind") == "test-result":
                     text = f"  {item['label']}"
                     if "FAIL" in item["label"] or "TIMEOUT" in item["label"] or item["label"].startswith(("HTTP:", "Reason:", "Diagnosis:")):
-                        attr = cp(4) | curses.A_BOLD
+                        style = cp(4) + _style(bold=True)
                     elif "OK" in item["label"]:
-                        attr = cp(2) | curses.A_BOLD
+                        style = cp(2) + _style(bold=True)
                     else:
-                        attr = curses.A_DIM | cp(5)
+                        style = _style(dim=True) + cp(5)
                 else:
                     marker = "*" if item.get("current") else " "
                     prefix = ">" if si == sub["idx"] else " "
                     text = f"{prefix} {marker} {item['label']}"
                     if si == sub["idx"]:
-                        attr = curses.A_REVERSE | curses.A_BOLD
+                        style = _style(reverse=True, bold=True)
                         sub_selected_row = row
                     elif item.get("current"):
-                        attr = cp(2) | curses.A_BOLD
+                        style = cp(2) + _style(bold=True)
                     elif "[OK]" in item["label"]:
-                        attr = cp(2)
+                        style = cp(2)
                     elif "[FAIL" in item["label"] or "[TIMEOUT]" in item["label"]:
-                        attr = cp(4) | curses.A_BOLD
+                        style = cp(4) + _style(bold=True)
                     else:
-                        attr = curses.A_DIM
+                        style = _style(dim=True)
                 if si == sub["idx"] and not sub.get("readonly"):
-                    attr = curses.A_REVERSE | curses.A_BOLD
+                    style = _style(reverse=True, bold=True)
                     sub_selected_row = row
-                stdscr.addstr(row, 4, text[: max(0, w - 6)], attr)
+                _write_safe(row, 4, text[: max(0, w - 6)], style)
                 row += 1
             remaining = len(sub["items"]) - end
             if remaining > 0 and row < h - 3:
-                stdscr.addstr(row, 6, f"... {remaining} more", curses.A_DIM | cp(5))
+                _write_safe(row, 6, f"... {remaining} more", _style(dim=True) + cp(5))
                 row += 1
 
     desc = selected_sub_description(sub)
     if desc and row < h - 5:
-        stdscr.addstr(row, 2, ("-" * max(8, w - 4))[: max(0, w - 4)], curses.A_DIM | cp(6))
+        _write_safe(row, 2, ("-" * max(8, w - 4))[: max(0, w - 4)], _style(dim=True) + cp(6))
         row += 1
         for line in textwrap.wrap(desc, width=max(24, w - 6))[:2]:
             if row >= h - 4:
                 break
-            stdscr.addstr(row, 2, line[: max(0, w - 4)], curses.A_BOLD | cp(6))
+            _write_safe(row, 2, line[: max(0, w - 4)], _style(bold=True) + cp(6))
             row += 1
 
     if row < h - 4:
-        stdscr.addstr(row, 2, ("-" * max(8, w - 4))[: max(0, w - 4)], curses.A_DIM | cp(6))
+        _write_safe(row, 2, ("-" * max(8, w - 4))[: max(0, w - 4)], _style(dim=True) + cp(6))
         row += 1
         for line in checks[: max(0, h - row - 3)]:
-            stdscr.addstr(row, 2, line[: max(0, w - 4)], curses.A_BOLD | cp(6))
+            _write_safe(row, 2, line[: max(0, w - 4)], _style(bold=True) + cp(6))
             row += 1
 
     if notice:
         y = max(0, h - 5 - min(len(notice), 2))
         for j, line in enumerate(notice[:2]):
-            stdscr.addstr(y + j, 0, line[: w - 1], cp(2) if j == 0 else curses.A_DIM)
+            _write_safe(y + j, 0, line[: w - 1], cp(2) if j == 0 else _style(dim=True))
 
     current_action = items[idx][0]
-    stdscr.addstr(h - 2, 0, help_for_action(current_action, sub.get("kind") if sub else None)[: w - 1], curses.A_DIM | cp(5))
-    stdscr.refresh()
+    _write_safe(h - 2, 0, help_for_action(current_action, sub.get("kind") if sub else None)[: w - 1], _style(dim=True) + cp(5))
+    sys.stdout.flush()
     row_by_action["__sub_selected__"] = sub_selected_row
     return row_by_action
 
 
-def main(stdscr) -> int:
-    stdscr.keypad(True)
-    curses.curs_set(0)
+def main() -> int:
     init_colors()
     idx = index_for_action("launch") if settings_ready_except_api_key() else 0
     sub: dict | None = None
@@ -1367,35 +1493,40 @@ def main(stdscr) -> int:
         nonlocal sub, notice, checks, idx
         ok = code == 0
         sub = test_submenu(summarize_test_output(code, out))
-        notice = [t("test_passed") if ok else t("test_failed")]
+        if ok:
+            notice = [t("test_passed")]
+        elif "TIMEOUT" in out.upper() or "timed out" in out.lower():
+            notice = ["Compatibility test timed out. The provider or model took too long to respond."]
+        else:
+            notice = [t("test_failed")]
         checks = preflight_checks()
         idx = index_for_action("launch" if ok else "model")
 
     while True:
         items = main_items()
         idx = max(0, min(idx, len(items) - 1))
-        row_by_action = render(stdscr, idx, sub, notice, checks)
-        ch = read_menu_key(stdscr)
+        row_by_action = render(None, idx, sub, notice, checks)
+        ch = read_menu_key()
 
         if sub and sub.get("readonly"):
-            if ch in (27, ord("q")):
+            if ch in ("KEY_ESC", "q"):
                 sub = None
                 notice = []
                 continue
-            if ch in (curses.KEY_UP, ord("k")):
+            if ch in ("KEY_UP", "k"):
                 notice = []
                 idx = (idx - 1) % len(items)
                 continue
-            if ch in (curses.KEY_DOWN, ord("j")):
+            if ch in ("KEY_DOWN", "j"):
                 notice = []
                 idx = (idx + 1) % len(items)
                 continue
-            if ch in (10, 13, curses.KEY_ENTER):
+            if ch == "KEY_ENTER":
                 action = items[idx][0]
                 if action == "launch":
                     return 0
                 if action == "test":
-                    code, out = run_test_with_animation(stdscr, idx, checks)
+                    code, out = run_test_with_animation(idx, checks)
                     apply_test_result(code, out)
                     continue
                 sub = None
@@ -1403,38 +1534,38 @@ def main(stdscr) -> int:
                 continue
 
         if sub:
-            if ch in (27, ord("q")):
+            if ch in ("KEY_ESC", "q"):
                 sub = None
                 notice = []
                 checks = preflight_checks()
                 continue
-            if ch in (curses.KEY_UP, ord("k")):
+            if ch in ("KEY_UP", "k"):
                 notice = []
                 sub["idx"] = (sub["idx"] - 1) % len(sub["items"])
                 provider_preview = selected_provider_value(sub)
                 if provider_preview:
                     checks = provider_preview_checks(provider_preview)
                 continue
-            if ch in (curses.KEY_DOWN, ord("j")):
+            if ch in ("KEY_DOWN", "j"):
                 notice = []
                 sub["idx"] = (sub["idx"] + 1) % len(sub["items"])
                 provider_preview = selected_provider_value(sub)
                 if provider_preview:
                     checks = provider_preview_checks(provider_preview)
                 continue
-            if ch in (curses.KEY_NPAGE,):
+            if ch == "KEY_NPAGE":
                 sub["idx"] = min(len(sub["items"]) - 1, sub["idx"] + 10)
                 provider_preview = selected_provider_value(sub)
                 if provider_preview:
                     checks = provider_preview_checks(provider_preview)
                 continue
-            if ch in (curses.KEY_PPAGE,):
+            if ch == "KEY_PPAGE":
                 sub["idx"] = max(0, sub["idx"] - 10)
                 provider_preview = selected_provider_value(sub)
                 if provider_preview:
                     checks = provider_preview_checks(provider_preview)
                 continue
-            if ch in (10, 13, curses.KEY_ENTER):
+            if ch == "KEY_ENTER":
                 item = sub["items"][sub["idx"]]
                 if sub["kind"] == "language":
                     _, out = run_cmd([CTL, "language", item["value"]])
@@ -1450,7 +1581,7 @@ def main(stdscr) -> int:
                     idx = index_for_action("api-key")
                 elif sub["kind"] == "api-key":
                     row = row_by_action.get("__sub_selected__", row_by_action.get("api-key", 10))
-                    key = inline_secret_prompt(stdscr, f"API key for {item['value']}: ", row)
+                    key = inline_secret_prompt(None, f"API key for {item['value']}: ", row)
                     if key:
                         _, out = run_cmd([CTL, "set-api-key", item["value"], key])
                         notice = (out.strip().splitlines() or [item["value"]])[:2]
@@ -1462,7 +1593,7 @@ def main(stdscr) -> int:
                 elif sub["kind"] == "model":
                     if item["value"] == "__custom__":
                         row = row_by_action.get("__sub_selected__", row_by_action.get("model", 10))
-                        value = inline_prompt(stdscr, "Model id or alias: ", row)
+                        value = inline_prompt(None, "Model id or alias: ", row)
                         if value:
                             _, out = run_cmd([CTL, "model", value])
                             notice = (out.strip().splitlines() or [value])[:2]
@@ -1486,38 +1617,38 @@ def main(stdscr) -> int:
                     value = ""
                     if action_value == "__edit_num_ctx__":
                         default = str(pcfg_now.get("num_ctx", "auto"))
-                        entered = inline_prompt(stdscr, "num_ctx (auto or integer): ", row, default)
+                        entered = inline_prompt(None, "num_ctx (auto or integer): ", row, default)
                         value = f"num_ctx={entered}" if entered else ""
                     elif action_value == "__edit_min__":
                         default = str(pcfg_now.get("num_ctx_min", 32768))
-                        entered = inline_prompt(stdscr, "num_ctx auto minimum: ", row, default)
+                        entered = inline_prompt(None, "num_ctx auto minimum: ", row, default)
                         value = f"min={entered}" if entered else ""
                     elif action_value == "__edit_max__":
                         default = str(pcfg_now.get("num_ctx_max", 131072))
-                        entered = inline_prompt(stdscr, "num_ctx auto maximum: ", row, default)
+                        entered = inline_prompt(None, "num_ctx auto maximum: ", row, default)
                         value = f"max={entered}" if entered else ""
                     elif action_value == "__edit_keep_alive__":
                         default = str(pcfg_now.get("keep_alive", "5m"))
-                        entered = inline_prompt(stdscr, "keep_alive: ", row, default)
+                        entered = inline_prompt(None, "keep_alive: ", row, default)
                         value = f"keep_alive={entered}" if entered else ""
                     elif action_value == "__edit_temperature__":
                         default = str(opts_now.get("temperature", "0.7"))
-                        entered = inline_prompt(stdscr, "temperature (unset:temperature clears): ", row, default)
+                        entered = inline_prompt(None, "temperature (unset:temperature clears): ", row, default)
                         value = entered if entered.startswith("unset:") else (f"temperature={entered}" if entered else "")
                     elif action_value == "__edit_top_p__":
                         default = str(opts_now.get("top_p", "0.8"))
-                        entered = inline_prompt(stdscr, "top_p (unset:top_p clears): ", row, default)
+                        entered = inline_prompt(None, "top_p (unset:top_p clears): ", row, default)
                         value = entered if entered.startswith("unset:") else (f"top_p={entered}" if entered else "")
                     elif action_value == "__edit_max_tokens__":
                         default = str(opts_now.get("num_predict", "4096"))
-                        entered = inline_prompt(stdscr, "max_tokens / num_predict: ", row, default)
+                        entered = inline_prompt(None, "max_tokens / num_predict: ", row, default)
                         value = f"max_tokens={entered}" if entered else ""
                     elif action_value == "__edit_timeout__":
                         default = str(pcfg_now.get("request_timeout_ms", "1800000"))
-                        entered = inline_prompt(stdscr, "timeout ms: ", row, default)
+                        entered = inline_prompt(None, "timeout ms: ", row, default)
                         value = f"timeout={entered}" if entered else ""
                     elif action_value == "__custom__":
-                        value = inline_prompt(stdscr, "Ollama option KEY=VALUE: ", row, "temperature=0.7")
+                        value = inline_prompt(None, "Ollama option KEY=VALUE: ", row, "temperature=0.7")
                     else:
                         value = action_value
                     if value:
@@ -1534,26 +1665,26 @@ def main(stdscr) -> int:
                     value = ""
                     if action_value == "__edit_context_window__":
                         default = str(pcfg_now.get("context_window", "32768"))
-                        entered = inline_prompt(stdscr, "context_window: ", row, default)
+                        entered = inline_prompt(None, "context_window: ", row, default)
                         value = f"context_window={entered}" if entered else ""
                     elif action_value == "__edit_reserve__":
                         default = str(pcfg_now.get("context_reserve_tokens", "1024"))
-                        entered = inline_prompt(stdscr, "context_reserve_tokens: ", row, default)
+                        entered = inline_prompt(None, "context_reserve_tokens: ", row, default)
                         value = f"context_reserve_tokens={entered}" if entered else ""
                     elif action_value == "__edit_max_output__":
                         default = str(pcfg_now.get("max_output_tokens", "4096"))
-                        entered = inline_prompt(stdscr, "max_output_tokens: ", row, default)
+                        entered = inline_prompt(None, "max_output_tokens: ", row, default)
                         value = f"max_output_tokens={entered}" if entered else ""
                     elif action_value == "__edit_timeout__":
                         default = str(pcfg_now.get("request_timeout_ms", "1800000"))
-                        entered = inline_prompt(stdscr, "timeout ms: ", row, default)
+                        entered = inline_prompt(None, "timeout ms: ", row, default)
                         value = f"timeout={entered}" if entered else ""
                     elif action_value == "__edit_native__":
                         default = "true" if pcfg_now.get("native_compat", True) else "false"
-                        entered = inline_prompt(stdscr, "native true/false: ", row, default)
+                        entered = inline_prompt(None, "native true/false: ", row, default)
                         value = f"native={entered}" if entered else ""
                     elif action_value == "__custom__":
-                        value = inline_prompt(stdscr, "Provider option KEY=VALUE: ", row, "max_output_tokens=4096")
+                        value = inline_prompt(None, "Provider option KEY=VALUE: ", row, "max_output_tokens=4096")
                     else:
                         value = action_value
                     if value:
@@ -1565,24 +1696,24 @@ def main(stdscr) -> int:
                 continue
             continue
 
-        if ch in (ord("q"), 27):
+        if ch in ("KEY_ESC", "q"):
             return 10
-        if ch in (curses.KEY_UP, ord("k")):
+        if ch in ("KEY_UP", "k"):
             notice = []
             idx = (idx - 1) % len(items)
             continue
-        if ch in (curses.KEY_DOWN, ord("j")):
+        if ch in ("KEY_DOWN", "j"):
             notice = []
             idx = (idx + 1) % len(items)
             continue
-        if ch not in (10, 13, curses.KEY_ENTER):
+        if ch != "KEY_ENTER":
             continue
 
         action = items[idx][0]
         if action == "launch":
             return 0
         if action == "test":
-            code, out = run_test_with_animation(stdscr, idx, checks)
+            code, out = run_test_with_animation(idx, checks)
             apply_test_result(code, out)
             continue
         if action == "quit":
@@ -1598,12 +1729,12 @@ def main(stdscr) -> int:
                 checks = provider_preview_checks(provider_preview)
         elif action == "model":
             notice = [t("loading_models")]
-            render(stdscr, idx, None, notice, checks)
+            render(None, idx, None, notice, checks)
             sub, fallback_notice = build_model_submenu()
             notice = fallback_notice
             if sub is None:
                 row = row_by_action.get("model", 10)
-                value = inline_prompt(stdscr, "Model id or alias: ", row)
+                value = inline_prompt(None, "Model id or alias: ", row)
                 if value:
                     _, out = run_cmd([CTL, "model", value])
                     notice = (out.strip().splitlines() or [value])[:2]
@@ -1626,7 +1757,7 @@ def main(stdscr) -> int:
         elif action == "api-key":
             provider = current_provider()
             row = row_by_action.get("api-key", 10)
-            key = inline_secret_prompt(stdscr, f"API key for {provider}: ", row)
+            key = inline_secret_prompt(None, f"API key for {provider}: ", row)
             if key:
                 _, out = run_cmd([CTL, "set-api-key", provider, key])
                 notice = (out.strip().splitlines() or [provider])[:2]
@@ -1637,7 +1768,7 @@ def main(stdscr) -> int:
         elif action == "base-url":
             provider = current_provider()
             row = row_by_action.get("base-url", 12)
-            value = inline_prompt(stdscr, f"Base URL for {provider}: ", row, default_base_url(provider))
+            value = inline_prompt(None, f"Base URL for {provider}: ", row, default_base_url(provider))
             if value:
                 _, out = run_cmd([CTL, "base-url", provider, value])
                 notice = (out.strip().splitlines() or [value])[:2]
@@ -1646,4 +1777,8 @@ def main(stdscr) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(curses.wrapper(main))
+    try:
+        with _RawTerminal():
+            raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(10)

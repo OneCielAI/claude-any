@@ -188,6 +188,10 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 ## 변경 이력
 
+### 0.1.14
+
+- **SSH/터미널 방향키 호환성**: `read_menu_key()`에 ANSI escape sequence 파서를 추가하여 재작성. `select.select`와 짧은 타임아웃 대신 `termios` VTIME과 `os.read(fd, 1)`을 사용해 SSH 지연으로 인한 escape sequence 분리 문제를 해결. 방향키, Home, End 키가 SSH 세션에서 안정적으로 동작합니다.
+
 ### 0.1.13
 
 - **Ollama 스트리밍 프록시**: 라우터가 Ollama/Ollama Cloud 응답을 Anthropic SSE 포맷으로 실시간 스트리밍합니다. 전체 응답을 버퍼링한 뒤 전달하던 기존 방식에서 토큰이 생성되는 즉시 전달하는 방식으로 변경되었습니다.

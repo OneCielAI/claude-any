@@ -207,6 +207,10 @@ steps under that larger model's supervision.
 
 ## Changelog
 
+### 0.1.14
+
+- **SSH/terminal arrow-key compatibility**: rewrote `read_menu_key()` with a proper ANSI escape sequence parser. `select.select` and short timeouts were replaced by `termios` VTIME and `os.read(fd, 1)` so that SSH latency no longer splits escape sequences into separate bytes. Arrow keys, Home, and End now work reliably in SSH sessions.
+
 ### 0.1.13
 
 - **Ollama streaming proxy**: The router now streams Ollama and Ollama Cloud

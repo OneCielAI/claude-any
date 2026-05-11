@@ -177,6 +177,10 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 ## 更新日志
 
+### 0.1.14
+
+- **SSH/终端方向键兼容性**: 重写 `read_menu_key()`，加入 ANSI escape sequence 解析器。用 `termios` VTIME 和 `os.read(fd, 1)` 替代 `select.select` 和短超时，解决 SSH 延迟导致的转义序列被拆分为独立字节的问题。方向键、Home、End 键现可在 SSH 会话中稳定工作。
+
 ### 0.1.13
 
 - **Ollama 流式代理**: 路由器现在以 Anthropic SSE 格式实时流式传输 Ollama/Ollama Cloud 响应，替代了之前缓冲完整响应再转发的方式。

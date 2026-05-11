@@ -3132,14 +3132,16 @@ def _cmd_test(args: argparse.Namespace) -> None:
             print("Compatibility: TIMEOUT")
             print(f"Reason: {label} did not respond before the {args.timeout:g}s compatibility-test timeout.")
             print("Diagnosis: this timeout was not saved as a model failure. Retry the test or choose another model if it repeats.")
-            raise SystemExit(1)
+            sys.stdout.flush()
+            sys.exit(1)
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
             if "timed out" in msg.lower() or "timeout" in msg.lower():
                 print("Compatibility: TIMEOUT")
                 print(f"Reason: {label}: {msg}")
                 print("Diagnosis: this timeout was not saved as a model failure. Retry the test or choose another model if it repeats.")
-                raise SystemExit(1)
+                sys.stdout.flush()
+                sys.exit(1)
             fail(f"{label}: {msg}")
 
     text_data = run_phase("Text response", text_body)
@@ -3786,25 +3788,68 @@ def read_menu_key() -> str:
             return "esc"
         return ch.lower()
 
-    import select
     import termios
-    import tty
+    import time
 
     fd = sys.stdin.fileno()
     old = termios.tcgetattr(fd)
+    debug_path = "/tmp/ca-key-debug.log"
     try:
-        tty.setraw(fd)
-        ch = sys.stdin.read(1)
-        if ch == "\x1b":
-            seq = ch
-            while select.select([sys.stdin], [], [], 0.03)[0]:
-                seq += sys.stdin.read(1)
-            return {"\x1b[A": "up", "\x1b[B": "down", "\x1b[D": "left", "\x1b[C": "right"}.get(seq, "esc")
-        if ch in ("\r", "\n"):
-            return "enter"
-        return ch.lower()
+        new = termios.tcgetattr(fd)
+        new[3] = new[3] & ~(termios.ECHO | termios.ICANON)
+        new[6][termios.VMIN] = 1
+        new[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, new)
+
+        ch = os.read(fd, 1)
+        log = f"{time.time():.3f} first={ch!r}"
+        if ch == b"\x1b":
+            seq = ch.decode("latin-1")
+            new[6][termios.VMIN] = 0
+            new[6][termios.VTIME] = 10
+            termios.tcsetattr(fd, termios.TCSANOW, new)
+
+            b = os.read(fd, 1)
+            log += f" next={b!r}"
+            if not b:
+                with open(debug_path, "a", encoding="utf-8") as f:
+                    f.write(log + " result='esc'\n")
+                return "esc"
+            seq += b.decode("latin-1")
+
+            if b == b"[":
+                while True:
+                    b = os.read(fd, 1)
+                    log += f" next={b!r}"
+                    if not b:
+                        break
+                    seq += b.decode("latin-1")
+                    if 0x40 <= b[0] <= 0x7E:
+                        break
+            elif b == b"O":
+                b = os.read(fd, 1)
+                log += f" next={b!r}"
+                if b:
+                    seq += b.decode("latin-1")
+
+            result = {
+                "\x1b[A": "up", "\x1b[B": "down", "\x1b[D": "left", "\x1b[C": "right",
+                "\x1b[5~": "pageup", "\x1b[6~": "pagedown",
+                "\x1b[H": "home", "\x1b[F": "end",
+            }.get(seq, "esc")
+            log += f" seq={seq!r} result={result!r}"
+            with open(debug_path, "a", encoding="utf-8") as f:
+                f.write(log + "\n")
+            return result
+        if ch in (b"\r", b"\n"):
+            result = "enter"
+        else:
+            result = ch.decode("latin-1").lower()
+        with open(debug_path, "a", encoding="utf-8") as f:
+            f.write(log + f" result={result!r}\n")
+        return result
     finally:
-        termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        termios.tcsetattr(fd, termios.TCSANOW, old)
 
 
 def portable_select(
