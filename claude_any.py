@@ -1722,12 +1722,13 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str) -> dict[str, Any]
         if not isinstance(fn, dict) or not fn.get("name"):
             continue
         name = str(fn["name"])
+        matched_name = _fuzzy_match_tool_name(name) or name
         content.append(
             {
                 "type": "tool_use",
                 "id": f"{tool_id_prefix}_{i}",
-                "name": name,
-                "input": _validate_and_fix_tool_input(name, normalize_tool_arguments(name, fn.get("arguments"))),
+                "name": matched_name,
+                "input": _validate_and_fix_tool_input(matched_name, normalize_tool_arguments(matched_name, fn.get("arguments"))),
             }
         )
     done_reason = data.get("done_reason")
@@ -1823,14 +1824,16 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                     continue
                 tool_calls.append(call)
                 tool_id = f"toolu_ollama_{int(time.time() * 1000)}_{len(tool_calls) - 1}"
+                raw_name = str(fn["name"])
+                matched_name = _fuzzy_match_tool_name(raw_name) or raw_name
                 tool_event = {
                     "type": "content_block_start",
                     "index": 1,
                     "content_block": {
                         "type": "tool_use",
                         "id": tool_id,
-                        "name": str(fn["name"]),
-                        "input": _validate_and_fix_tool_input(str(fn["name"]), normalize_tool_arguments(str(fn["name"]), fn.get("arguments"))),
+                        "name": matched_name,
+                        "input": _validate_and_fix_tool_input(matched_name, normalize_tool_arguments(matched_name, fn.get("arguments"))),
                     },
                 }
                 handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
