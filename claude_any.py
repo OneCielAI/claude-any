@@ -2815,7 +2815,7 @@ def compatibility_tool_schema() -> dict[str, Any]:
 def compatibility_text_request(model: str) -> dict[str, Any]:
     return {
         "model": model,
-        "max_tokens": 16,
+        "max_tokens": 64,
         "stream": False,
         "messages": [
             {
@@ -3910,10 +3910,13 @@ def portable_select(
                 return None
     finally:
         if old_settings is not None:
-            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
-        if sys.stdout.isatty():
-            sys.stdout.write("\033[?25h")
-            sys.stdout.flush()
+            try:
+                import termios
+                termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+            except Exception:
+                pass
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
 
 
 def pause() -> None:
@@ -4386,11 +4389,13 @@ def portable_prelaunch_menu() -> int:
                 open_panel(action)
     finally:
         if old_settings is not None:
-            import termios
-            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
-        if sys.stdout.isatty():
-            sys.stdout.write("\033[?25h")
-            sys.stdout.flush()
+            try:
+                import termios
+                termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+            except Exception:
+                pass
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
 
 
 def run_external_menu(name: str) -> int | None:
