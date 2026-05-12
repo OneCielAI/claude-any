@@ -72,7 +72,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.22"
+VERSION = "0.1.23"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -603,6 +603,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "keep_alive": "5m",
             "think": False,
             "request_timeout_ms": 1800000,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
             "ollama_options": {
                 "temperature": 0.7,
                 "top_p": 0.8,
@@ -621,6 +623,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "keep_alive": "5m",
             "think": False,
             "request_timeout_ms": 1800000,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
             "ollama_options": {
                 "temperature": 0.7,
                 "top_p": 0.8,
@@ -640,6 +644,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "top_p": 0.8,
             "context_reserve_tokens": 1024,
             "request_timeout_ms": 1800000,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
         },
         "nvidia-hosted": {
             "base_url": "https://integrate.api.nvidia.com/v1",
@@ -651,6 +657,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "temperature": 0.7,
             "top_p": 0.8,
             "request_timeout_ms": 1800000,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
         },
         "self-hosted-nim": {
             "base_url": "http://127.0.0.1:8000",
@@ -664,6 +672,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "top_p": 0.8,
             "context_reserve_tokens": 1024,
             "request_timeout_ms": 1800000,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
         },
     },
 }
@@ -911,7 +921,22 @@ def find_executable(name: str) -> str | None:
 
 def shell_command_string(args: list[str]) -> str:
     if os.name == "nt":
-        return subprocess.list2cmdline(args)
+        # Claude Code on Windows runs hook commands through sh/bash, which treats
+        # backslashes in unquoted Windows paths as escape characters (so
+        # "C:\Users\djlov" becomes "C:Usersdjlov"). Convert backslashes to
+        # forward slashes for path-like args (Python and sh both accept them on
+        # Windows) and use POSIX quoting.
+        normalized: list[str] = []
+        for arg in args:
+            looks_like_path = "\\" in arg and (
+                (len(arg) >= 2 and arg[1] == ":")
+                or arg.startswith("\\\\")
+                or arg.endswith((".py", ".exe", ".cmd", ".bat", ".ps1"))
+            )
+            if looks_like_path:
+                arg = arg.replace("\\", "/")
+            normalized.append(shlex.quote(arg))
+        return " ".join(normalized)
     return " ".join(shlex.quote(arg) for arg in args)
 
 
@@ -942,6 +967,41 @@ def claude_any_tool_guard_command() -> str | None:
     return shell_command_string([str(script)])
 
 
+TOOL_GUARD_EVENTS_WITH_TOOL_MATCHER: tuple[str, ...] = (
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure",
+    "PermissionRequest",
+    "PermissionDenied",
+)
+
+TOOL_GUARD_EVENTS_WITHOUT_MATCHER: tuple[str, ...] = (
+    "PostToolBatch",
+    "SessionStart",
+    "SessionEnd",
+    "Setup",
+    "UserPromptSubmit",
+    "UserPromptExpansion",
+    "Stop",
+    "StopFailure",
+    "InstructionsLoaded",
+    "ConfigChange",
+    "CwdChanged",
+    "Notification",
+    "SubagentStart",
+    "SubagentStop",
+    "TeammateIdle",
+    "TaskCreated",
+    "TaskCompleted",
+    "PreCompact",
+    "PostCompact",
+    "WorktreeCreate",
+    "WorktreeRemove",
+    "Elicitation",
+    "ElicitationResult",
+)
+
+
 def install_tool_guard_hooks() -> None:
     command = claude_any_tool_guard_command()
     if not command:
@@ -965,7 +1025,12 @@ def install_tool_guard_hooks() -> None:
         return
 
     changed = False
-    for event in ("PreToolUse", "PostToolUseFailure", "TaskCreated", "TaskCompleted"):
+    all_events: tuple[tuple[str, bool], ...] = tuple(
+        (event, True) for event in TOOL_GUARD_EVENTS_WITH_TOOL_MATCHER
+    ) + tuple(
+        (event, False) for event in TOOL_GUARD_EVENTS_WITHOUT_MATCHER
+    )
+    for event, with_matcher in all_events:
         groups = hooks.setdefault(event, [])
         if not isinstance(groups, list):
             print(f"Claude Any warning: {CLAUDE_SETTINGS_PATH} hooks.{event} is not a list; tool guard hook was not installed.", flush=True)
@@ -986,7 +1051,7 @@ def install_tool_guard_hooks() -> None:
         if existing:
             continue
         group: dict[str, Any] = {"hooks": [{"type": "command", "command": command}]}
-        if event in ("PreToolUse", "PostToolUseFailure"):
+        if with_matcher:
             group["matcher"] = "*"
         groups.append(group)
         changed = True
@@ -1666,6 +1731,21 @@ def parse_config_value(value: str) -> Any:
         return text
 
 
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("true", "yes", "on", "1", "enable", "enabled"):
+        return True
+    if text in ("false", "no", "off", "0", "disable", "disabled"):
+        return False
+    return default
+
+
 def ctx_bucket(target: int, minimum: int, maximum: int) -> int:
     target = max(minimum, min(maximum, target))
     buckets = [4096, 8192, 16384, 32768, 65536, 131072, 262144]
@@ -1896,7 +1976,131 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str) -> dict[str, Any]
     }
 
 
-def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, model: str) -> None:
+STREAM_WORD_CHUNK_MAX_BUFFER = 64
+
+
+def _split_word_buffer(buf: str, force: bool = False, max_buffer: int = STREAM_WORD_CHUNK_MAX_BUFFER) -> tuple[str, str]:
+    """
+    Split text into (to_flush, remainder) for word-boundary streaming.
+
+    Without force: flush up to and including the last whitespace, unless the
+    buffer length is at least max_buffer (then flush the entire buffer to avoid
+    unbounded buffering on input without whitespace, e.g. very long words or
+    CJK text).
+    With force=True: flush the entire buffer (used at content_block_stop).
+    """
+    if not buf:
+        return "", ""
+    if force:
+        return buf, ""
+    last_ws = -1
+    for i in range(len(buf) - 1, -1, -1):
+        if buf[i].isspace():
+            last_ws = i
+            break
+    if last_ws >= 0:
+        return buf[:last_ws + 1], buf[last_ws + 1:]
+    if len(buf) >= max_buffer:
+        return buf, ""
+    return "", buf
+
+
+def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any) -> None:
+    """
+    Parse upstream Anthropic SSE and re-emit it with text_delta events buffered
+    to word boundaries. Non-text events (message_start/stop, content_block_start/
+    stop, input_json_delta, thinking_delta, message_delta, ping, error) are
+    forwarded unchanged in the same SSE framing.
+    """
+    text_buffers: dict[int, str] = {}
+    pending_event_type: str | None = None
+    pending_event_lines: list[str] = []
+
+    def emit_raw(event_type: str | None, data_str: str) -> None:
+        if event_type:
+            handler.wfile.write(f"event: {event_type}\ndata: {data_str}\n\n".encode())
+        else:
+            handler.wfile.write(f"data: {data_str}\n\n".encode())
+        handler.wfile.flush()
+
+    def emit_text_delta(index: int, text: str) -> None:
+        if not text:
+            return
+        payload = {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "text_delta", "text": text},
+        }
+        emit_raw("content_block_delta", json.dumps(payload, ensure_ascii=False))
+
+    def flush_buffer(index: int, force: bool = False) -> None:
+        buf = text_buffers.get(index, "")
+        if not buf:
+            return
+        to_flush, remainder = _split_word_buffer(buf, force=force)
+        text_buffers[index] = remainder
+        emit_text_delta(index, to_flush)
+
+    def process_event(event_type: str | None, data_str: str) -> None:
+        try:
+            event = json.loads(data_str)
+        except Exception:
+            emit_raw(event_type, data_str)
+            return
+        if not isinstance(event, dict):
+            emit_raw(event_type, data_str)
+            return
+        evt_type = event.get("type") or event_type
+        if evt_type == "content_block_delta":
+            delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+            index = event.get("index")
+            if isinstance(index, int) and delta.get("type") == "text_delta":
+                text = delta.get("text") or ""
+                if not text:
+                    return
+                text_buffers[index] = text_buffers.get(index, "") + text
+                flush_buffer(index, force=False)
+                return
+            emit_raw(event_type, data_str)
+            return
+        if evt_type == "content_block_stop":
+            index = event.get("index")
+            if isinstance(index, int):
+                flush_buffer(index, force=True)
+            emit_raw(event_type, data_str)
+            return
+        emit_raw(event_type, data_str)
+
+    try:
+        for raw in resp:
+            line = raw.decode("utf-8", errors="ignore")
+            stripped = line.rstrip("\r\n")
+            if stripped == "":
+                if pending_event_lines:
+                    data_str = "\n".join(pending_event_lines)
+                    process_event(pending_event_type, data_str)
+                pending_event_type = None
+                pending_event_lines = []
+                continue
+            if stripped.startswith("event:"):
+                pending_event_type = stripped[len("event:"):].strip() or None
+                continue
+            if stripped.startswith("data:"):
+                pending_event_lines.append(stripped[len("data:"):].lstrip())
+                continue
+        if pending_event_lines:
+            data_str = "\n".join(pending_event_lines)
+            process_event(pending_event_type, data_str)
+        for index in list(text_buffers.keys()):
+            flush_buffer(index, force=True)
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
+def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, model: str, word_chunking: bool = False) -> None:
     """Stream Ollama NDJSON /api/chat response as Anthropic SSE /v1/messages format."""
     handler.send_response(200)
     handler.send_header("content-type", "text/event-stream")
@@ -1909,6 +2113,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
     next_content_index = 0
     text_index: int | None = None
     text_so_far = ""
+    text_buffer = ""
     tool_calls: list[dict[str, Any]] = []
     tool_indices: list[int] = []
     input_tokens = 0
@@ -1961,13 +2166,25 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                     handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
                     handler.wfile.flush()
                 text_so_far += text_chunk
-                event = {
-                    "type": "content_block_delta",
-                    "index": text_index,
-                    "delta": {"type": "text_delta", "text": text_chunk},
-                }
-                handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-                handler.wfile.flush()
+                if word_chunking:
+                    text_buffer += text_chunk
+                    to_flush, text_buffer = _split_word_buffer(text_buffer, force=False)
+                    if to_flush:
+                        event = {
+                            "type": "content_block_delta",
+                            "index": text_index,
+                            "delta": {"type": "text_delta", "text": to_flush},
+                        }
+                        handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+                        handler.wfile.flush()
+                else:
+                    event = {
+                        "type": "content_block_delta",
+                        "index": text_index,
+                        "delta": {"type": "text_delta", "text": text_chunk},
+                    }
+                    handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+                    handler.wfile.flush()
             # Handle tool calls
             for call in message.get("tool_calls") or []:
                 fn = call.get("function") if isinstance(call.get("function"), dict) else {}
@@ -2017,6 +2234,17 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 }
                 handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
                 handler.wfile.flush()
+        # Flush any remaining buffered text when word-chunking is active
+        if word_chunking and text_started and text_buffer:
+            to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
+            if to_flush:
+                event = {
+                    "type": "content_block_delta",
+                    "index": text_index,
+                    "delta": {"type": "text_delta", "text": to_flush},
+                }
+                handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+                handler.wfile.flush()
         # Send content_block_stop for text if any
         if text_started:
             event = {"type": "content_block_stop", "index": text_index}
@@ -2062,6 +2290,9 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     base = pcfg.get("base_url", "").rstrip("/")
     stream_requested = body.get("stream", True)
+    if not bool(pcfg.get("stream_enabled", True)):
+        stream_requested = False
+    word_chunking = bool(pcfg.get("stream_word_chunking", False))
     req_body = ollama_chat_request(model, body, pcfg, stream=stream_requested)
     headers = provider_headers(provider, pcfg)
     url = join_url(base, "/api/chat")
@@ -2094,7 +2325,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
         # Check if Claude Code requested SSE streaming
         accept = handler.headers.get("accept", "")
         if "text/event-stream" in accept or stream_requested:
-            _ollama_stream_to_anthropic_sse(handler, resp, model)
+            _ollama_stream_to_anthropic_sse(handler, resp, model, word_chunking=word_chunking)
         else:
             # Non-SSE client but streaming from Ollama: collect full response
             chunks = []
@@ -2196,6 +2427,10 @@ class RouterHandler(BaseHTTPRequestHandler):
             if provider == "nvidia-hosted":
                 upstream_model = ncp_model_id_for_nvidia_hosted(upstream_model)
             body["model"] = upstream_model
+            stream_enabled = bool(pcfg.get("stream_enabled", True))
+            word_chunking = bool(pcfg.get("stream_word_chunking", False))
+            if not stream_enabled:
+                body["stream"] = False
             data = json.dumps(body).encode("utf-8")
             base = provider_upstream_request_base(provider, pcfg)
             url = join_url(base, "/v1/messages")
@@ -2207,16 +2442,24 @@ class RouterHandler(BaseHTTPRequestHandler):
             try:
                 resp = urllib.request.urlopen(req, timeout=provider_request_timeout_seconds(pcfg))
                 status = getattr(resp, "status", 200)
-                self.send_response(status)
                 ctype = resp.headers.get("content-type", "application/json")
-                self.send_header("content-type", ctype)
-                self.end_headers()
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    self.wfile.write(chunk)
-                    self.wfile.flush()
+                if word_chunking and stream_enabled and "text/event-stream" in ctype:
+                    self.send_response(status)
+                    self.send_header("content-type", ctype)
+                    self.send_header("cache-control", "no-cache")
+                    self.send_header("connection", "close")
+                    self.end_headers()
+                    _rebatch_anthropic_sse_text(self, resp)
+                else:
+                    self.send_response(status)
+                    self.send_header("content-type", ctype)
+                    self.end_headers()
+                    while True:
+                        chunk = resp.read(65536)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
             except urllib.error.HTTPError as e:
                 err = e.read()
                 self.send_response(e.code)
@@ -2628,6 +2871,10 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
             pcfg.pop("keep_alive", None)
         elif key == "think":
             pcfg["think"] = False
+        elif key in ("stream", "stream_enabled"):
+            pcfg["stream_enabled"] = True
+        elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
+            pcfg["stream_word_chunking"] = False
         else:
             pcfg.setdefault("ollama_options", {}).pop(key, None)
         return
@@ -2677,6 +2924,12 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
         return
     if key == "think":
         pcfg["think"] = bool(value)
+        return
+    if key in ("stream", "stream_enabled"):
+        pcfg["stream_enabled"] = parse_bool(value, default=True)
+        return
+    if key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
+        pcfg["stream_word_chunking"] = parse_bool(value, default=False)
         return
     opts = pcfg.setdefault("ollama_options", {})
     if value is None:
@@ -2775,6 +3028,10 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+        parts.append(f"stream={'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
+        if bool(pcfg.get("stream_word_chunking", False)):
+            parts.append("word_chunk=on")
     return ", ".join(parts)
 
 
@@ -3121,6 +3378,150 @@ def apply_llm_preset_config(provider: str, preset_id: str) -> list[str]:
     return lines
 
 
+LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
+    "preset": {
+        "en": "Apply a bundled LLM preset (output tokens, sampling, timeout) tuned for this provider/model family.",
+        "ko": "현재 provider/모델 계열에 맞춘 LLM 프리셋(출력 토큰, 샘플링, 타임아웃)을 한 번에 적용합니다.",
+        "ja": "現在のprovider/モデル系列向けに調整されたLLMプリセット(出力トークン、サンプリング、タイムアウト)を一括適用します。",
+        "zh": "应用为当前 provider/模型系列调优的 LLM 预设（输出 token、采样、超时）。",
+    },
+    "num_ctx": {
+        "en": "Ollama context window (num_ctx). Use 'auto' to size per-request between min/max, or a fixed integer like 65536.",
+        "ko": "Ollama 컨텍스트 창(num_ctx). auto 면 요청 크기에 따라 min/max 사이에서 자동 선택, 또는 65536 같은 고정 정수.",
+        "ja": "Ollamaのコンテキスト窓(num_ctx)。autoでmin/max間を要求毎に自動選択、または65536のような固定整数を指定。",
+        "zh": "Ollama 上下文窗口（num_ctx）。auto 在 min/max 间按请求自动选择，或填固定整数如 65536。",
+    },
+    "num_ctx_min": {
+        "en": "Lower bound when num_ctx is auto. Small requests will not go below this value.",
+        "ko": "num_ctx=auto일 때 사용할 최소 컨텍스트. 작은 요청도 이 값보다 작게 내려가지 않습니다.",
+        "ja": "num_ctx=auto時の最小コンテキスト。小さな要求でもこの値未満にはなりません。",
+        "zh": "num_ctx=auto 时的下限。小请求也不会低于此值。",
+    },
+    "num_ctx_max": {
+        "en": "Upper bound when num_ctx is auto. Keep at or below the real server context limit.",
+        "ko": "num_ctx=auto일 때 사용할 최대 컨텍스트. 실제 서버 한계 이하로 두세요.",
+        "ja": "num_ctx=auto時の最大コンテキスト。実サーバー上限以下にしてください。",
+        "zh": "num_ctx=auto 时的上限。应不高于真实服务器上下文上限。",
+    },
+    "num_predict": {
+        "en": "Ollama max output tokens (num_predict). Input + reserved output must fit inside num_ctx.",
+        "ko": "Ollama 최대 출력 토큰(num_predict). 입력 + 예약 출력이 num_ctx 안에 들어가야 합니다.",
+        "ja": "Ollamaの最大出力トークン(num_predict)。入力と予約出力はnum_ctxの中に収まる必要があります。",
+        "zh": "Ollama 最大输出 token（num_predict）。输入加预留输出必须放进 num_ctx。",
+    },
+    "max_output_tokens": {
+        "en": "Max output tokens passed to Claude Code (CLAUDE_CODE_MAX_OUTPUT_TOKENS) and used as the router cap.",
+        "ko": "Claude Code에 전달되는 최대 출력 토큰(CLAUDE_CODE_MAX_OUTPUT_TOKENS)이자 라우터 출력 상한.",
+        "ja": "Claude Codeへ渡す最大出力トークン(CLAUDE_CODE_MAX_OUTPUT_TOKENS)であり、ルーター出力上限としても使われます。",
+        "zh": "传给 Claude Code 的最大输出 token（CLAUDE_CODE_MAX_OUTPUT_TOKENS），同时作为路由器输出上限。",
+    },
+    "context_window": {
+        "en": "vLLM/NIM context window used by claude-any caps. Native mode cannot raise the real server limit.",
+        "ko": "claude-any 라우터가 사용하는 vLLM/NIM 컨텍스트 값. native 모드에서는 실제 서버 한계를 늘릴 수 없습니다.",
+        "ja": "claude-anyルーターが使うvLLM/NIMコンテキスト値。nativeモードでは実サーバー上限は超えられません。",
+        "zh": "claude-any 路由器使用的 vLLM/NIM 上下文值。native 模式无法提高真实服务器上限。",
+    },
+    "context_reserve_tokens": {
+        "en": "Tokens reserved for the input side when claude-any caps max_tokens. Ignored by direct native requests.",
+        "ko": "claude-any가 max_tokens를 줄일 때 입력 쪽 여유로 남기는 토큰. direct native 요청에는 적용되지 않습니다.",
+        "ja": "claude-anyがmax_tokensを制限する時に入力側へ残す余裕。direct native要求では無視されます。",
+        "zh": "claude-any 限制 max_tokens 时为输入侧预留的 token。direct native 请求会忽略。",
+    },
+    "request_timeout_ms": {
+        "en": "Upstream wait timeout in milliseconds. 1800000 ms = 30 minutes.",
+        "ko": "업스트림 응답 대기 시간(ms). 1800000은 30분입니다.",
+        "ja": "上流応答待ちタイムアウト(ms)。1800000は30分です。",
+        "zh": "上游响应等待超时（毫秒）。1800000 表示 30 分钟。",
+    },
+    "temperature": {
+        "en": "Sampling temperature (0..2). Higher is more varied; lower is more deterministic.",
+        "ko": "샘플링 temperature (0~2). 높을수록 다양, 낮을수록 결정적.",
+        "ja": "サンプリングtemperature (0〜2)。高いほど多様、低いほど決定的。",
+        "zh": "采样 temperature（0..2）。越高越多样，越低越确定。",
+    },
+    "top_p": {
+        "en": "Nucleus sampling top_p (0..1). Lower restricts token choices; 0.8 is a moderate default.",
+        "ko": "누적 확률 top_p (0~1). 낮을수록 후보 토큰을 좁힘. 0.8 정도가 적당한 기본값.",
+        "ja": "nucleus samplingのtop_p (0〜1)。低いほど候補を絞ります。0.8は中程度の既定値。",
+        "zh": "nucleus 采样 top_p（0..1）。越低候选越窄；0.8 是中等默认值。",
+    },
+    "top_k": {
+        "en": "Top-K sampling cutoff. Smaller values pick from a tighter token shortlist.",
+        "ko": "Top-K 샘플링. 값이 작을수록 후보 토큰 집합이 좁아집니다.",
+        "ja": "Top-Kサンプリング。値が小さいほど候補集合は狭くなります。",
+        "zh": "Top-K 采样。值越小候选集合越窄。",
+    },
+    "think": {
+        "en": "Toggle Ollama 'think' output. Claude Code may not display provider-specific thinking cleanly.",
+        "ko": "Ollama thinking 출력 여부. Claude Code가 provider별 thinking을 항상 깔끔히 표시하지는 않습니다.",
+        "ja": "Ollama thinking出力を切り替えます。Claude Code側で常に綺麗に表示されるとは限りません。",
+        "zh": "切换 Ollama thinking 输出。Claude Code 不一定能完整显示。",
+    },
+    "keep_alive": {
+        "en": "How long Ollama keeps the model loaded after a request. Longer reduces reloads but holds memory.",
+        "ko": "요청 후 Ollama가 모델을 메모리에 유지하는 시간. 길수록 재로딩은 줄지만 메모리를 더 잡습니다.",
+        "ja": "要求後にOllamaがモデルを保持する時間。長いほど再読み込みは減りますがメモリを保持します。",
+        "zh": "请求后 Ollama 保持模型加载的时间。越长减少重载，但占用内存更久。",
+    },
+    "native_compat": {
+        "en": "Use direct Anthropic-compatible /v1/messages on this provider. Off routes through claude-any's translator.",
+        "ko": "이 provider의 Anthropic-호환 /v1/messages에 직접 연결합니다. off 면 claude-any 라우터를 거칩니다.",
+        "ja": "このproviderのAnthropic互換/v1/messagesに直接接続します。offだとclaude-anyルーターを経由します。",
+        "zh": "对该 provider 直接走 Anthropic 兼容 /v1/messages；关闭则经由 claude-any 路由器转换。",
+    },
+    "stream_enabled": {
+        "en": "Toggle streaming. Off forces stream:false upstream and returns the full response, useful when SSE fragmentation causes tool-call/JSON parse errors.",
+        "ko": "스트리밍 on/off. off면 업스트림에 stream:false를 강제하고 응답 전체를 받습니다. SSE 단편화로 tool-call/JSON 파싱이 실패할 때 유용합니다.",
+        "ja": "ストリーミングを切り替えます。offにすると上流にstream:falseを強制し、応答全体を返します。SSE断片化でtool-call/JSONが失敗する時に有効です。",
+        "zh": "切换流式输出。off 时强制对上游 stream:false 并返回完整响应；用于 SSE 分片导致的 tool-call/JSON 解析失败。",
+    },
+    "stream_word_chunking": {
+        "en": "Buffer text deltas at whitespace/word boundaries before flushing the SSE event. Tool deltas pass through unchanged.",
+        "ko": "텍스트 delta를 공백/단어 경계까지 모아서 SSE 이벤트로 전송. tool delta는 그대로 통과합니다.",
+        "ja": "テキストdeltaを空白/単語境界までバッファしてSSEイベントを送信します。tool deltaはそのまま透過します。",
+        "zh": "在空白/单词边界处合并文本 delta 后发送 SSE 事件。工具 delta 原样透传。",
+    },
+    "back": {
+        "en": "Return to the main menu.",
+        "ko": "메인 메뉴로 돌아갑니다.",
+        "ja": "メインメニューに戻ります。",
+        "zh": "返回主菜单。",
+    },
+}
+
+
+def llm_option_description(provider: str, key: str, lang: str | None = None) -> str:
+    lang = lang or load_config().get("language", "en")
+    entry = LLM_OPTION_DESCRIPTIONS.get(key)
+    if not entry:
+        return ""
+    return entry.get(lang) or entry.get("en", "")
+
+
+# Boolean keys whose Enter handler should flip on/off in place instead of
+# prompting for a value. Covers both on/off labels (stream_*) and True/False
+# labels (native_compat, think).
+LLM_OPTION_TOGGLE_KEYS = {
+    "stream_enabled",
+    "stream_word_chunking",
+    "native_compat",
+    "think",
+}
+
+
+def llm_option_current_bool(provider: str, pcfg: dict[str, Any], key: str) -> bool:
+    if key == "stream_enabled":
+        return bool(pcfg.get("stream_enabled", True))
+    if key == "stream_word_chunking":
+        return bool(pcfg.get("stream_word_chunking", False))
+    if key == "native_compat":
+        default = False if provider == "nvidia-hosted" else True
+        return bool(pcfg.get("native_compat", default))
+    if key == "think":
+        return bool(pcfg.get("think", False))
+    return bool(pcfg.get(key, False))
+
+
 def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None = None) -> tuple[list[str], list[str]]:
     lang = lang or load_config().get("language", "en")
     rows: list[str] = []
@@ -3143,6 +3544,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Think", "think", bool(pcfg.get("think", False)))
         add("Keep alive", "keep_alive", pcfg.get("keep_alive", "default"))
         add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
+        add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
+        add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
     else:
         if provider in ("vllm", "self-hosted-nim"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
@@ -3154,6 +3557,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
             add("Top P", "top_p", pcfg.get("top_p", "default"))
             add("Top K", "top_k", pcfg.get("top_k", "default"))
             add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", False)))
+            add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
+            add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
         elif provider == "anthropic":
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
 
@@ -3163,6 +3568,10 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
 
 
 def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> str:
+    if key == "stream_enabled":
+        return "true" if bool(pcfg.get("stream_enabled", True)) else "false"
+    if key == "stream_word_chunking":
+        return "true" if bool(pcfg.get("stream_word_chunking", False)) else "false"
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         if key == "num_ctx":
@@ -3213,6 +3622,10 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg.pop("request_timeout_ms", None)
         elif key in ("native", "native_compat"):
             pcfg["native_compat"] = True
+        elif key in ("stream", "stream_enabled"):
+            pcfg["stream_enabled"] = True
+        elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
+            pcfg["stream_word_chunking"] = False
         elif sampling_option_key(key):
             pcfg.pop(sampling_option_key(key), None)
         else:
@@ -3249,6 +3662,12 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         return
     if key in ("native", "native_compat"):
         pcfg["native_compat"] = bool(value)
+        return
+    if key in ("stream", "stream_enabled"):
+        pcfg["stream_enabled"] = parse_bool(value, default=True)
+        return
+    if key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
+        pcfg["stream_word_chunking"] = parse_bool(value, default=False)
         return
     sample_key = sampling_option_key(key)
     if sample_key:
@@ -4613,7 +5032,9 @@ def render_prelaunch_screen(
         panel_title = titles.get(panel, panel)
         title_suffix = "" if panel_title.lower().endswith(("options", "presets", "옵션", "프리셋", "オプション", "プリセット", "选项", "预设")) else " options"
         add(f"{panel_title}{title_suffix}", "1;38;5;208")
-        fixed = len(screen) + len(checks) + len(messages) + 5
+        # Reserve an extra line for the per-row description when shown.
+        description_reserve = 2 if panel == "options" else 0
+        fixed = len(screen) + len(checks) + len(messages) + 5 + description_reserve
         limit = max(5, height - fixed)
         for actual, row in visible_rows(panel_rows, panel_idx, limit):
             if actual is None:
@@ -4622,6 +5043,21 @@ def render_prelaunch_screen(
                 add("  > " + row, "7;1")
             else:
                 add("    " + row)
+        if panel == "options" and panel_rows:
+            # Map panel_idx back to its option key, then show its localized
+            # description below the panel so the user always sees the meaning of
+            # the currently-highlighted row.
+            try:
+                _, panel_values = llm_option_panel_rows(provider, pcfg, lang)
+            except Exception:
+                panel_values = []
+            current_key = panel_values[panel_idx] if 0 <= panel_idx < len(panel_values) else ""
+            description = llm_option_description(provider, current_key, lang) if current_key else ""
+            add("")
+            if description:
+                add("  " + description, "2")
+            else:
+                add("")
     if messages:
         add("")
         for line in messages[-8:]:
@@ -4870,6 +5306,17 @@ def portable_prelaunch_menu() -> int:
                         close_panel()
                     elif value == "preset":
                         open_panel("preset")
+                    elif value in LLM_OPTION_TOGGLE_KEYS:
+                        # Boolean toggles flip on Enter — no input prompt.
+                        current = llm_option_current_bool(provider, pcfg, value)
+                        try:
+                            messages = set_llm_option_config(provider, value, "false" if current else "true")
+                        except Exception as exc:
+                            messages = [f"Option update failed: {type(exc).__name__}: {exc}"]
+                        refresh_checks()
+                        cfg = load_config()
+                        provider, pcfg = get_current_provider(cfg)
+                        panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
                     else:
                         default = llm_option_prompt_default(provider, pcfg, value)
                         entered = prompt_menu_value(f"{value} for {provider} (default/unset clears)", default)

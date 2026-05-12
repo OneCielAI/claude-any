@@ -727,7 +727,10 @@ def ollama_options_summary(pcfg: dict) -> str:
         f"keep {pcfg.get('keep_alive', 'default')}",
         f"think {str(bool(pcfg.get('think', False))).lower()}",
         f"timeout {pcfg.get('request_timeout_ms', 'default')}ms",
+        f"stream {'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}",
     ]
+    if bool(pcfg.get("stream_word_chunking", False)):
+        parts.append("word_chunk on")
     opts = pcfg.get("ollama_options") or {}
     if isinstance(opts, dict) and opts:
         extra = ", ".join(f"{k}={v}" for k, v in sorted(opts.items())[:3])
@@ -746,6 +749,10 @@ def provider_options_summary(provider: str, pcfg: dict) -> str:
         parts.insert(0, f"ctx {pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve {pcfg.get('context_reserve_tokens', 'default')}")
         parts.append(f"native {str(bool(pcfg.get('native_compat', True))).lower()}")
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+        parts.append(f"stream {'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
+        if bool(pcfg.get("stream_word_chunking", False)):
+            parts.append("word_chunk on")
     return "; ".join(parts)
 
 
@@ -997,6 +1004,20 @@ def ollama_option_description(value: str) -> str:
             "ja": "Ollama thinking出力の要求を切り替えます。Claude Code側で常に綺麗に表示されるとは限りません。",
             "zh": "切换 Ollama thinking 输出请求。Claude Code 不一定能完整显示各提供商的 thinking。",
         }.get(lang, "Toggle Ollama thinking output support.")
+    if value.startswith("stream="):
+        return {
+            "en": "Toggle streaming. When off, the router waits for the full upstream response before sending it to Claude Code. Use this when streaming fragmentation causes tool-call or JSON parse errors.",
+            "ko": "스트리밍을 켜고/끕니다. off 면 업스트림 응답이 전부 모일 때까지 기다렸다가 Claude Code에 한 번에 보냅니다. 스트리밍 단편화로 tool-call/JSON 파싱이 실패할 때 사용합니다.",
+            "ja": "ストリーミングを切り替えます。offにすると、ルーターは上流応答が揃ってからClaude Codeへ一括送信します。ストリーミング断片化でtool-call/JSON解析が失敗する時に使用します。",
+            "zh": "切换流式输出。off 时路由器会等待上游完整响应再发送给 Claude Code。流式分片导致 tool-call/JSON 解析失败时使用。",
+        }.get(lang, "Toggle streaming. When off, the router waits for the full upstream response.")
+    if value.startswith("stream_word_chunking="):
+        return {
+            "en": "Buffer text tokens until a whitespace/word boundary before sending the SSE delta. Reduces SSE event volume and can mitigate tool/JSON fragmentation issues. Tool call inputs are not affected.",
+            "ko": "토큰을 공백 단위(단어 경계)까지 버퍼링해서 SSE delta로 전송합니다. SSE 이벤트 빈도를 줄이고 tool/JSON 단편화 문제를 완화합니다. tool call 입력은 영향을 받지 않습니다.",
+            "ja": "テキストトークンを空白/単語境界までバッファしてSSE deltaを送信します。SSEイベント量を減らし、tool/JSON断片化を緩和できます。tool call入力には影響しません。",
+            "zh": "在空白/单词边界处批量发送 SSE 文本 delta。降低 SSE 事件频率并缓解 tool/JSON 分片问题。工具调用输入不受影响。",
+        }.get(lang, "Buffer text tokens until a word boundary before sending the SSE delta.")
     if value.startswith("temperature="):
         return OLLAMA_OPTION_DESCRIPTIONS["__edit_temperature__"].get(lang, OLLAMA_OPTION_DESCRIPTIONS["__edit_temperature__"]["en"])
     if value.startswith("top_p="):
@@ -1013,6 +1034,8 @@ def build_ollama_options_submenu() -> dict:
     ctx = pcfg.get("num_ctx", "auto")
     keep = str(pcfg.get("keep_alive", "5m"))
     think = bool(pcfg.get("think", False))
+    stream_on = bool(pcfg.get("stream_enabled", True))
+    word_chunk_on = bool(pcfg.get("stream_word_chunking", False))
     options = pcfg.get("ollama_options") or {}
     if not isinstance(options, dict):
         options = {}
@@ -1036,6 +1059,10 @@ def build_ollama_options_submenu() -> dict:
         ("keep_alive=30m", "keep_alive 30m", keep == "30m"),
         ("think=false", "think false", not think),
         ("think=true", "think true", think),
+        ("stream=true", "stream on", stream_on),
+        ("stream=false", "stream off (buffer full response)", not stream_on),
+        ("stream_word_chunking=true", "stream_word_chunking on (flush at word boundary)", word_chunk_on),
+        ("stream_word_chunking=false", "stream_word_chunking off (token-by-token)", not word_chunk_on),
         ("temperature=0.7", f"temperature 0.7 (current {options.get('temperature', 'unset')})", options.get("temperature") == 0.7),
         ("top_p=0.8", f"top_p 0.8 (current {options.get('top_p', 'unset')})", options.get("top_p") == 0.8),
         ("max_tokens=4096", f"max_tokens 4096 (current {options.get('num_predict', 'unset')})", options.get("num_predict") == 4096),
@@ -1103,6 +1130,20 @@ def provider_option_description(value: str) -> str:
         return PROVIDER_OPTION_DESCRIPTIONS["__edit_timeout__"].get(lang, PROVIDER_OPTION_DESCRIPTIONS["__edit_timeout__"]["en"])
     if value.startswith(("native=", "native_compat=")):
         return PROVIDER_OPTION_DESCRIPTIONS["__edit_native__"].get(lang, PROVIDER_OPTION_DESCRIPTIONS["__edit_native__"]["en"])
+    if value.startswith("stream="):
+        return {
+            "en": "Toggle streaming. When off, the router forces stream:false upstream and returns the full response to Claude Code. Use this if streaming fragmentation causes tool-call or JSON parse errors.",
+            "ko": "스트리밍 on/off. off 면 업스트림에 stream:false 를 강제하고 응답 전체를 Claude Code에 보냅니다. 스트리밍 단편화로 tool-call/JSON 파싱이 실패할 때 사용합니다.",
+            "ja": "ストリーミングを切り替えます。offにすると上流にstream:falseを強制し、応答全体をClaude Codeへ返します。ストリーミング断片化でtool-call/JSONが失敗する時に使います。",
+            "zh": "切换流式输出。off 时强制对上游设置 stream:false 并返回完整响应给 Claude Code。流式分片导致 tool-call/JSON 解析失败时使用。",
+        }.get(lang, "Toggle streaming. When off, the router forces stream:false upstream and returns the full response.")
+    if value.startswith("stream_word_chunking="):
+        return {
+            "en": "Parse upstream Anthropic SSE and re-emit text_delta events buffered to word boundaries. Reduces SSE event volume; tool deltas and non-text events pass through unchanged.",
+            "ko": "업스트림 Anthropic SSE를 파싱해서 text_delta 를 단어 경계 단위로 모아서 다시 전송합니다. SSE 이벤트 빈도를 낮춥니다. tool delta와 텍스트가 아닌 이벤트는 그대로 통과합니다.",
+            "ja": "上流のAnthropic SSEを解析し、text_deltaを単語境界でまとめて再送します。SSEイベント量を削減します。tool deltaやテキスト以外のイベントはそのまま透過します。",
+            "zh": "解析上游 Anthropic SSE 并将 text_delta 在单词边界处合并后重新发送。降低 SSE 事件频率。工具 delta 与非文本事件原样透传。",
+        }.get(lang, "Buffer text_delta events at word boundaries; tool deltas pass through unchanged.")
     return PROVIDER_OPTION_DESCRIPTIONS["__custom__"].get(lang, PROVIDER_OPTION_DESCRIPTIONS["__custom__"]["en"])
 
 
@@ -1110,6 +1151,8 @@ def build_provider_options_submenu() -> dict:
     provider, pcfg = current_provider_cfg()
     max_output = pcfg.get("max_output_tokens", "4096")
     timeout = pcfg.get("request_timeout_ms", "1800000")
+    stream_on = bool(pcfg.get("stream_enabled", True))
+    word_chunk_on = bool(pcfg.get("stream_word_chunking", False))
     choices = [
         ("__edit_max_output__", f"Edit max_output_tokens [{max_output}]", False),
         ("__edit_timeout__", f"Edit timeout ms [{timeout}]", False),
@@ -1128,6 +1171,13 @@ def build_provider_options_submenu() -> dict:
         ("max_output_tokens=8192", f"max_output_tokens 8192 (current {max_output})", str(max_output) == "8192"),
         ("timeout=1800000", f"timeout 1800000ms (current {timeout})", str(timeout) == "1800000"),
     ])
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+        choices.extend([
+            ("stream=true", "stream on", stream_on),
+            ("stream=false", "stream off (buffer full response)", not stream_on),
+            ("stream_word_chunking=true", "stream_word_chunking on (flush at word boundary)", word_chunk_on),
+            ("stream_word_chunking=false", "stream_word_chunking off (raw upstream SSE)", not word_chunk_on),
+        ])
     if provider in ("vllm", "self-hosted-nim"):
         choices.extend([
             ("context_window=32768", f"context_window 32768 (current {pcfg.get('context_window', 'default')})", pcfg.get("context_window") == 32768),

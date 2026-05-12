@@ -325,23 +325,107 @@ def handle_post_failure(event: dict[str, Any]) -> None:
         post_failure_context(hint)
 
 
-def main() -> int:
-    provider = os.environ.get("CLAUDE_ANY_PROVIDER", "").strip()
-    if not active():
-        if provider:
-            log_event(f"inactive provider={provider}")
+OBSERVE_ONLY_EVENTS = {
+    "PostToolUse",
+    "PostToolBatch",
+    "PermissionRequest",
+    "PermissionDenied",
+    "SessionStart",
+    "SessionEnd",
+    "Setup",
+    "UserPromptSubmit",
+    "UserPromptExpansion",
+    "Stop",
+    "StopFailure",
+    "InstructionsLoaded",
+    "ConfigChange",
+    "CwdChanged",
+    "Notification",
+    "SubagentStart",
+    "SubagentStop",
+    "TeammateIdle",
+    "PreCompact",
+    "PostCompact",
+    "Elicitation",
+    "ElicitationResult",
+}
+
+
+def handle_worktree_create(event: dict[str, Any]) -> int:
+    """
+    Emit a worktreePath for Claude Code's Agent isolation. In non-git
+    directories, Claude Code errors with 'Cannot create agent worktree: not in a
+    git repository and no WorktreeCreate hooks are configured'. Returning the
+    base_path as worktreePath lets the subagent proceed in the same directory
+    (no real isolation, but execution is not blocked).
+    """
+    base_path = ""
+    for key in ("base_path", "cwd", "worktree_path"):
+        candidate = event.get(key)
+        if isinstance(candidate, str) and candidate.strip():
+            base_path = candidate.strip()
+            break
+    if not base_path:
+        log_event("WorktreeCreate received without base_path; emitting empty path")
+        emit({
+            "hookSpecificOutput": {
+                "hookEventName": "WorktreeCreate",
+                "worktreePath": "",
+            }
+        })
         return 0
+    log_event(f"WorktreeCreate stub worktreePath={base_path}")
+    emit({
+        "hookSpecificOutput": {
+            "hookEventName": "WorktreeCreate",
+            "worktreePath": base_path,
+        }
+    })
+    return 0
+
+
+def handle_worktree_remove(event: dict[str, Any]) -> int:
+    path = str(event.get("worktree_path") or "").strip()
+    if path:
+        log_event(f"WorktreeRemove noop path={path}")
+    return 0
+
+
+def main() -> int:
     try:
         event = json.loads(sys.stdin.read() or "{}")
     except Exception:
         return 0
     name = str(event.get("hook_event_name") or "")
+
+    # Worktree handlers always run, regardless of provider, so the non-git
+    # worktree fallback works whenever the hook is installed at all.
+    if name == "WorktreeCreate":
+        return handle_worktree_create(event)
+    if name == "WorktreeRemove":
+        return handle_worktree_remove(event)
+
+    # Lightweight observation for events we do not act on. Skip when inactive
+    # to avoid touching disk on every event.
+    if name in OBSERVE_ONLY_EVENTS:
+        if active():
+            try:
+                log_json_event(event)
+            except Exception:
+                pass
+        return 0
+
+    # Tool/task events: keep existing provider gating.
+    provider = os.environ.get("CLAUDE_ANY_PROVIDER", "").strip()
+    if not active():
+        if provider:
+            log_event(f"inactive provider={provider}")
+        return 0
     if name == "PreToolUse":
         tool = str(event.get("tool_name") or "")
         raw = event.get("tool_input")
         keys = list(raw.keys()) if isinstance(raw, dict) else []
         log_event(f"PreToolUse seen provider={provider} tool={tool} keys={keys}")
-    if name == "PreToolUse":
         handle_pre_tool(event)
     elif name == "PostToolUseFailure":
         handle_post_failure(event)

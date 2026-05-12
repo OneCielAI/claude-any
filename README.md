@@ -3,6 +3,30 @@
 | English | [한국어](docs/README.ko.md) | [日本語](docs/README.ja.md) | [中文](docs/README.zh.md) |
 | --- | --- | --- | --- |
 
+> ## 🚀 Use the full Claude Code experience with free or low-cost LLMs
+>
+> - **Free** — [NVIDIA hosted NIM](https://build.nvidia.com/) (qwen3-coder-480b, gpt-oss, and friends) through the API Catalog.
+> - **Low-cost** — [Ollama Cloud](https://ollama.com/cloud) for GLM, Qwen, DeepSeek, and other open-weight models at a fraction of frontier-model pricing.
+> - **Free + local** — [Ollama](https://ollama.com/) or [vLLM](https://github.com/vllm-project/vllm) on your own GPU, fully offline.
+>
+> Provider, model, base URL, API key, streaming behavior, and LLM options are all selected from a console menu **before** Claude Code starts. Claude Code itself runs untouched with all of its native tooling, slash commands, and workflows.
+
+### Demo
+
+<video src="demo/claude-any-nvidia-nim.mp4" controls width="720" muted loop playsinline>
+  Your browser does not support inline video. Download <a href="demo/claude-any-nvidia-nim.mp4">claude-any-nvidia-nim.mp4</a>.
+</video>
+
+NVIDIA hosted NIM (qwen3-coder-480b) driving Claude Code through the claude-any router.
+
+<video src="demo/claude-any-ollama-cloud.mp4" controls width="720" muted loop playsinline>
+  Your browser does not support inline video. Download <a href="demo/claude-any-ollama-cloud.mp4">claude-any-ollama-cloud.mp4</a>.
+</video>
+
+Ollama Cloud (glm-5.1) streamed through the claude-any router with SSE word-boundary chunking enabled.
+
+---
+
 Claude Any is a provider selector and compatibility launcher for Claude Code.
 It lets you choose Anthropic, Ollama, Ollama Cloud, vLLM, NVIDIA hosted models,
 or self-hosted NIM before Claude Code starts, then passes normal Claude Code
@@ -10,7 +34,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.22`
+Current version: `0.1.23`
 
 ## Why This Exists
 
@@ -202,10 +226,49 @@ steps under that larger model's supervision.
   `--ca-api-key-env`, `--ca-ollama-option`, and `--ca-max-output-tokens`.
 - Streaming proxy for Ollama/Ollama Cloud router path — tokens are delivered
   to Claude Code as they arrive instead of waiting for the full response.
+- Per-provider `stream` on/off toggle and `stream_word_chunking` option to
+  batch text deltas at word boundaries, mitigating SSE fragmentation that can
+  break tool-call / JSON parsing in long streamed responses.
+- LLM options menu shows the meaning of the highlighted row at the bottom of
+  the panel in the selected language (English, Korean, Japanese, Chinese), and
+  boolean rows (`Stream`, `Stream word chunking`, `Native compatibility`,
+  `Think`) toggle in place when you press Enter — no input prompt.
+- Tool guard hook coverage extended to the full Claude Code hook surface,
+  including `WorktreeCreate` / `WorktreeRemove`, so non-git working directories
+  no longer fail Agent isolation with
+  `Cannot create agent worktree: not in a git repository...`.
 - Config file caching — settings are read from disk once and reused until the
   file changes, reducing per-request overhead in the router.
 
 ## Changelog
+
+### 0.1.23
+
+- **Stream toggle**: each non-Anthropic provider now has a `stream_enabled`
+  knob in the LLM options menu, in `claude-anyctl ollama-options` /
+  `provider-options`, and in headless flags. When off, the router forces
+  `stream:false` upstream and returns the full response to Claude Code — a
+  workaround when streaming fragmentation breaks tool-call or JSON parsing.
+- **Word-boundary streaming**: new `stream_word_chunking` option buffers SSE
+  text deltas to whitespace/word boundaries before flushing. Implemented for
+  both the Ollama router path and the native pass-through path (vLLM, NVIDIA
+  hosted, self-hosted NIM). Tool deltas and non-text SSE events pass through
+  unchanged.
+- **All-hooks tool guard**: `install_tool_guard_hooks` now registers the full
+  set of Claude Code hook events (PreToolUse, PostToolUse, PostToolUseFailure,
+  PostToolBatch, PermissionRequest, PermissionDenied, SessionStart/End, Setup,
+  UserPromptSubmit/Expansion, Stop, StopFailure, InstructionsLoaded,
+  ConfigChange, CwdChanged, Notification, SubagentStart/Stop, TeammateIdle,
+  TaskCreated, TaskCompleted, PreCompact, PostCompact, WorktreeCreate,
+  WorktreeRemove, Elicitation, ElicitationResult). The WorktreeCreate handler
+  emits `worktreePath = base_path` so Agent isolation works in non-git
+  directories.
+- **Windows hook compatibility**: `shell_command_string` now emits forward
+  slashes and POSIX quoting on Windows so Claude Code's sh-based hook runner
+  doesn't strip backslashes from paths like `C:\Users\...`.
+- **LLM options UX**: per-row description footer rendered in the user's
+  selected language, and boolean toggles (`Stream`, `Stream word chunking`,
+  `Native compatibility`, `Think`) flip on Enter without a prompt.
 
 ### 0.1.22
 
