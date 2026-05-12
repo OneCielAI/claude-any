@@ -9,7 +9,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.18`
+現在のバージョン: `0.1.20`
 
 ## 作られた理由
 
@@ -188,6 +188,16 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.20
+
+- **NVIDIA hosted quick test**: `auto` モードでは NVIDIA hosted provider に対して text-only quick test を使用し、メニュー確認中の遅いまたは不安定な tool_use request を避けます。text + tool_use は `smoke`、完全な text/tool_use/tool_result round trip は `full` を使ってください。
+- **メニューテストタイムアウト**: 端末メニューは `claude-any test 60 auto` を実行し、hosted model の pre-launch test をより素早く終えるようにします。
+
+### 0.1.19
+
+- **より速い互換性テスト**: `claude-any test` が `auto`、`smoke`、`full` モードをサポートします。
+- **メニュー既定テストの高速化**: 端末メニューは `claude-any test 120 auto` を実行します。NVIDIA hosted の互換性確認は速くなり、完全検証は `claude-any test 180 full` で引き続き利用できます。
 
 ### 0.1.18
 

@@ -9,7 +9,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.18`
+현재 버전: `0.1.20`
 
 ## 왜 만들었나
 
@@ -187,6 +187,16 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.20
+
+- **NVIDIA hosted quick test**: `auto` 모드가 NVIDIA hosted provider에서는 text-only quick test를 사용합니다. 메뉴 확인 중 느리거나 불안정한 tool_use 요청을 피합니다. text + tool_use는 `smoke`, 전체 text/tool_use/tool_result 왕복은 `full`을 사용하세요.
+- **메뉴 테스트 타임아웃**: 터미널 메뉴는 `claude-any test 60 auto`를 실행하여 hosted 모델의 pre-launch 테스트가 더 빠르게 끝나도록 합니다.
+
+### 0.1.19
+
+- **더 빠른 호환성 테스트**: `claude-any test`가 `auto`, `smoke`, `full` 모드를 지원합니다.
+- **메뉴 기본 테스트 속도 개선**: 터미널 메뉴는 `claude-any test 120 auto`를 실행합니다. NVIDIA hosted 호환성 확인은 더 빨라지고, 전체 검증은 `claude-any test 180 full`로 계속 사용할 수 있습니다.
 
 ### 0.1.18
 

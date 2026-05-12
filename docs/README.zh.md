@@ -9,7 +9,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.18`
+当前版本: `0.1.20`
 
 ## 为什么存在
 
@@ -176,6 +176,16 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.20
+
+- **NVIDIA hosted quick test**: `auto` 模式现在对 NVIDIA hosted provider 使用 text-only quick test，避免菜单检查中较慢或不稳定的 tool_use 请求。text + tool_use 使用 `smoke`，完整 text/tool_use/tool_result round trip 使用 `full`。
+- **菜单测试超时**: 终端菜单现在运行 `claude-any test 60 auto`，让 hosted model 的 pre-launch test 更快结束。
+
+### 0.1.19
+
+- **更快的兼容性测试**: `claude-any test` 现在支持 `auto`、`smoke`、`full` 模式。
+- **菜单默认测试提速**: 终端菜单现在运行 `claude-any test 120 auto`。NVIDIA hosted 兼容性检查会更快，完整验证仍可通过 `claude-any test 180 full` 使用。
 
 ### 0.1.18
 

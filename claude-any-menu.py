@@ -1160,6 +1160,7 @@ def summarize_test_output(code: int, out: str) -> list[str]:
         return ["Compatibility: FAIL", "Reason: internal claude-any test error", reason[:160]]
     keep_prefixes = (
         "Testing provider:",
+        "Test mode:",
         "Mode:",
         "URL:",
         "Claude API URL:",
@@ -1172,13 +1173,15 @@ def summarize_test_output(code: int, out: str) -> list[str]:
         "Stop reason:",
         "Content blocks:",
         "Tokens:",
+        "Tool result text:",
+        "Note:",
     )
     lines = [line for line in raw if line.startswith(keep_prefixes)]
     if not lines:
         lines = raw[:8]
     if code != 0 and not any(line.startswith("Compatibility:") for line in lines):
         lines.insert(0, "Compatibility: FAIL")
-    return lines[:10]
+    return lines[:12]
 
 
 def test_submenu(lines: list[str]) -> dict:
@@ -1195,10 +1198,10 @@ def test_submenu(lines: list[str]) -> dict:
 def run_test_with_animation(idx: int, checks: list[str]) -> tuple[int, str]:
     frames = ["|", "/", "-", "\\"]
     started = time.monotonic()
-    test_timeout = 180
+    test_timeout = 60
     hard_timeout = test_timeout + 15
     proc = subprocess.Popen(
-        [CTL, "test", str(test_timeout)],
+        [CTL, "test", str(test_timeout), "auto"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,

@@ -72,7 +72,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.18"
+VERSION = "0.1.20"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -3572,6 +3572,10 @@ def set_compatibility_cache(
 def _cmd_test(args: argparse.Namespace) -> None:
     cfg = load_config()
     provider, pcfg = get_current_provider(cfg)
+    test_mode = getattr(args, "mode", "auto") or "auto"
+    if test_mode not in ("auto", "quick", "smoke", "full"):
+        raise SystemExit("test mode must be auto, quick, smoke, or full")
+    effective_mode = "quick" if test_mode == "auto" and provider == "nvidia-hosted" else ("full" if test_mode == "auto" else test_mode)
     ollama_native = ollama_native_compat_enabled(provider, pcfg)
     provider_native = provider_native_compat_enabled(provider, pcfg)
     native = ollama_native or provider_native
@@ -3591,6 +3595,7 @@ def _cmd_test(args: argparse.Namespace) -> None:
     text_body = compatibility_text_request(model)
     tool_body = compatibility_tool_request(model)
     print(f"Testing provider: {provider}")
+    print(f"Test mode: {effective_mode}")
     if ollama_native:
         mode = "ollama-native"
     elif vllm_native_compat_enabled(provider, pcfg):
@@ -3664,6 +3669,12 @@ def _cmd_test(args: argparse.Namespace) -> None:
     for line in summarize_compat_response(text_data, "Text response"):
         print(line)
 
+    if effective_mode == "quick":
+        set_compatibility_cache(cfg, provider, model, True, 200, "text quick OK", "")
+        print("Compatibility: OK")
+        print("Note: quick mode checked text only; run `claude-any test 120 smoke` for tool_use or `claude-any test 180 full` for tool_result.")
+        return
+
     tool_data = run_phase("Tool use", tool_body)
     tool_use, tool_error = find_compat_tool_use(tool_data)
     if not tool_use:
@@ -3678,6 +3689,12 @@ def _cmd_test(args: argparse.Namespace) -> None:
         fail(f"Tool use: {tool_error}", diagnosis=diagnosis)
     for line in summarize_compat_response(tool_data, "Tool use"):
         print(line)
+
+    if effective_mode == "smoke":
+        set_compatibility_cache(cfg, provider, model, True, 200, "text/tool_use smoke OK", "")
+        print("Compatibility: OK")
+        print("Note: smoke mode checked text and tool_use only; run `claude-any test 180 full` for tool_result round trip.")
+        return
 
     result_body = compatibility_tool_result_request(model, tool_use)
     result_data = run_phase("Tool result", result_body)
@@ -5166,7 +5183,7 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
                                       Set Ollama num_ctx/options/keep_alive/think
   claude-any provider-options [provider] [key=value ...]
                                       Set vLLM/NIM/NVIDIA output/context/timeouts
-  claude-any test                    Test current provider/model Claude Code compatibility
+  claude-any test [seconds] [mode]   Test compatibility; mode is auto, quick, smoke, or full
   claude-any stop                    Stop router/proxy
 
 Headless setup flags, namespaced to avoid Claude CLI collisions:
@@ -5257,12 +5274,20 @@ def run_cli(argv: list[str]) -> int:
             return 0
         if head in ("test", "compat", "compatibility"):
             timeout = 60.0
+            mode = "auto"
+            if rest and rest[0] in ("auto", "quick", "smoke", "full"):
+                mode = rest[0]
+                rest = rest[1:]
             if rest:
                 try:
                     timeout = float(rest[0])
                 except ValueError:
-                    raise SystemExit("Usage: claude-any test [timeout_seconds]")
-            cmd_test(argparse.Namespace(timeout=timeout))
+                    raise SystemExit("Usage: claude-any test [timeout_seconds] [auto|quick|smoke|full]")
+                if len(rest) > 1:
+                    mode = rest[1]
+            if mode not in ("auto", "quick", "smoke", "full"):
+                raise SystemExit("Usage: claude-any test [timeout_seconds] [auto|quick|smoke|full]")
+            cmd_test(argparse.Namespace(timeout=timeout, mode=mode))
             return 0
         if head == "status":
             cmd_status(argparse.Namespace())
@@ -5528,6 +5553,7 @@ def build_parser() -> argparse.ArgumentParser:
     po.set_defaults(func=cmd_provider_options)
     test = sub.add_parser("test")
     test.add_argument("timeout", nargs="?", type=float, default=120.0)
+    test.add_argument("mode", nargs="?", choices=("auto", "quick", "smoke", "full"), default="auto")
     test.set_defaults(func=cmd_test)
     pp = sub.add_parser("provider")
     pp.add_argument("name", nargs="?")

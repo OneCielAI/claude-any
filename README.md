@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.18`
+Current version: `0.1.20`
 
 ## Why This Exists
 
@@ -206,6 +206,16 @@ steps under that larger model's supervision.
   file changes, reducing per-request overhead in the router.
 
 ## Changelog
+
+### 0.1.20
+
+- **NVIDIA hosted quick test**: `auto` mode now uses a text-only quick test for NVIDIA hosted providers, avoiding slow or flaky tool_use requests during menu checks. Use `smoke` for text + tool_use, or `full` for the full text/tool_use/tool_result round trip.
+- **Menu test timeout**: the terminal menu now runs `claude-any test 60 auto`, which keeps the pre-launch test responsive for hosted models.
+
+### 0.1.19
+
+- **Faster compatibility tests**: `claude-any test` now supports `auto`, `smoke`, and `full` modes.
+- **Menu default speedup**: the terminal menu runs `claude-any test 120 auto`, so NVIDIA hosted compatibility checks finish faster while full validation remains available with `claude-any test 180 full`.
 
 ### 0.1.18
 
