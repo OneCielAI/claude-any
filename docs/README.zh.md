@@ -3,6 +3,10 @@
 | [English](../README.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | 中文 |
 | --- | --- | --- | --- |
 
+[![npm version](https://img.shields.io/npm/v/@oneciel-ai/claude-any?logo=npm&label=npm)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+[![npm downloads](https://img.shields.io/npm/dm/@oneciel-ai/claude-any?logo=npm&label=downloads)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
+
 > ## 🚀 用免费/低成本 LLM 获取完整的 Claude Code 体验
 >
 > - **免费** — [NVIDIA hosted NIM](https://build.nvidia.com/)（qwen3-coder-480b、gpt-oss 等），通过 API Catalog 使用。

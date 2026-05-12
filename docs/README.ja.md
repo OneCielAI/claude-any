@@ -3,6 +3,10 @@
 | [English](../README.md) | [한국어](README.ko.md) | 日本語 | [中文](README.zh.md) |
 | --- | --- | --- | --- |
 
+[![npm version](https://img.shields.io/npm/v/@oneciel-ai/claude-any?logo=npm&label=npm)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+[![npm downloads](https://img.shields.io/npm/dm/@oneciel-ai/claude-any?logo=npm&label=downloads)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](../LICENSE)
+
 > ## 🚀 無料/低コストの LLM で Claude Code の全機能を
 >
 > - **無料** — [NVIDIA hosted NIM](https://build.nvidia.com/) (qwen3-coder-480b、gpt-oss など) を API Catalog から使用。
