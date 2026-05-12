@@ -29,7 +29,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.23`
+現在のバージョン: `0.1.24`
 
 ## 作られた理由
 
@@ -88,7 +88,7 @@ claude-any
 npm registry に初回 publish した後:
 
 ```sh
-npm install -g @onecielai/claude-any
+npm install -g @oneciel-ai/claude-any
 claude-any
 ```
 
@@ -100,14 +100,14 @@ npm install -g https://github.com/OneCielAI/claude-any.git --force
 claude-any version
 ```
 
-`npm update -g @onecielai/claude-any` を動作させるには、同じ package 名で
+`npm update -g @oneciel-ai/claude-any` を動作させるには、同じ package 名で
 public npm registry に publish されている必要があります。
 
 ```sh
 npm login
 npm publish --access public
-npm install -g @onecielai/claude-any
-npm update -g @onecielai/claude-any
+npm install -g @oneciel-ai/claude-any
+npm update -g @oneciel-ai/claude-any
 ```
 
 自動公開を使う場合は、npm automation token を GitHub repository secret
@@ -120,7 +120,7 @@ Release を作成すると npm publish workflow を実行できます。registry
 次のコマンドでアップグレードできます。
 
 ```sh
-npm update -g @onecielai/claude-any
+npm update -g @oneciel-ai/claude-any
 ```
 
 
@@ -217,6 +217,10 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.24
+
+- **初の npm registry 公開リリース**: 正しいスコープ `@oneciel-ai/claude-any` で公開しました。これまでの 0.1.x は registry にアップロードされていない状態でしたが、このバージョンから `npm install -g @oneciel-ai/claude-any` で直接インストール可能です。
 
 ### 0.1.23
 

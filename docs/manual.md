@@ -44,7 +44,7 @@ claude-any
 Registry install, after the first npm publish:
 
 ```sh
-npm install -g @onecielai/claude-any
+npm install -g @oneciel-ai/claude-any
 claude-any
 ```
 
@@ -56,14 +56,14 @@ npm install -g https://github.com/OneCielAI/claude-any.git --force
 claude-any version
 ```
 
-To make `npm update -g @onecielai/claude-any` work, the package must be
+To make `npm update -g @oneciel-ai/claude-any` work, the package must be
 published to the public npm registry under the same package name:
 
 ```sh
 npm login
 npm publish --access public
-npm install -g @onecielai/claude-any
-npm update -g @onecielai/claude-any
+npm install -g @oneciel-ai/claude-any
+npm update -g @oneciel-ai/claude-any
 ```
 
 For automated publishing, create an npm automation token, save it as the
@@ -76,7 +76,7 @@ trigger the npm publish workflow. After registry publication, the normal
 registry upgrade command will be:
 
 ```sh
-npm update -g @onecielai/claude-any
+npm update -g @oneciel-ai/claude-any
 ```
 
 

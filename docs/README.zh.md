@@ -29,7 +29,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.23`
+当前版本: `0.1.24`
 
 ## 为什么存在
 
@@ -86,7 +86,7 @@ claude-any
 首次发布到 npm registry 后安装:
 
 ```sh
-npm install -g @onecielai/claude-any
+npm install -g @oneciel-ai/claude-any
 claude-any
 ```
 
@@ -98,14 +98,14 @@ npm install -g https://github.com/OneCielAI/claude-any.git --force
 claude-any version
 ```
 
-要让 `npm update -g @onecielai/claude-any` 正常工作，必须先用同一个 package
+要让 `npm update -g @oneciel-ai/claude-any` 正常工作，必须先用同一个 package
 name 发布到 public npm registry。
 
 ```sh
 npm login
 npm publish --access public
-npm install -g @onecielai/claude-any
-npm update -g @onecielai/claude-any
+npm install -g @oneciel-ai/claude-any
+npm update -g @oneciel-ai/claude-any
 ```
 
 如果使用自动发布，请创建 npm automation token，将它保存为 GitHub repository
@@ -117,7 +117,7 @@ workflow。
 workflow。发布到 registry 之后，可以使用以下命令升级。
 
 ```sh
-npm update -g @onecielai/claude-any
+npm update -g @oneciel-ai/claude-any
 ```
 
 
@@ -205,6 +205,10 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.24
+
+- **首次正式发布到 npm registry**: 在正确的 scope `@oneciel-ai/claude-any` 下发布。此前的 0.1.x 版本从未上传到 registry，从该版本起可以直接通过 `npm install -g @oneciel-ai/claude-any` 安装。
 
 ### 0.1.23
 

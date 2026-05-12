@@ -24,7 +24,7 @@ done
 
 # npm global
 if command -v npm >/dev/null 2>&1; then
-    npm_ls=$(npm ls -g @onecielai/claude-any 2>/dev/null || true)
+    npm_ls=$(npm ls -g @oneciel-ai/claude-any 2>/dev/null || true)
     if echo "$npm_ls" | grep -q 'claude-any'; then
         echo "Found npm global:"
         echo "$npm_ls" | sed 's/^/  /'
@@ -45,7 +45,7 @@ echo "=== 2. Remove all existing installations ==="
 
 # Remove npm global
 if command -v npm >/dev/null 2>&1; then
-    npm uninstall -g @onecielai/claude-any 2>/dev/null || true
+    npm uninstall -g @oneciel-ai/claude-any 2>/dev/null || true
 fi
 
 # Remove pip package

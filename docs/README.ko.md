@@ -29,7 +29,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.23`
+현재 버전: `0.1.24`
 
 ## 왜 만들었나
 
@@ -88,7 +88,7 @@ claude-any
 npm registry에 최초 publish한 뒤 설치:
 
 ```sh
-npm install -g @onecielai/claude-any
+npm install -g @oneciel-ai/claude-any
 claude-any
 ```
 
@@ -100,14 +100,14 @@ npm install -g https://github.com/OneCielAI/claude-any.git --force
 claude-any version
 ```
 
-`npm update -g @onecielai/claude-any`가 동작하려면 같은 패키지 이름으로 public
+`npm update -g @oneciel-ai/claude-any`가 동작하려면 같은 패키지 이름으로 public
 npm registry에 publish되어 있어야 합니다.
 
 ```sh
 npm login
 npm publish --access public
-npm install -g @onecielai/claude-any
-npm update -g @onecielai/claude-any
+npm install -g @oneciel-ai/claude-any
+npm update -g @oneciel-ai/claude-any
 ```
 
 자동 배포를 쓰려면 npm automation token을 GitHub repository secret `NPM_TOKEN`
@@ -120,7 +120,7 @@ workflow를 실행할 수 있습니다. registry publish 이후에는 다음 명
 업그레이드할 수 있습니다.
 
 ```sh
-npm update -g @onecielai/claude-any
+npm update -g @oneciel-ai/claude-any
 ```
 
 
@@ -217,6 +217,10 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.24
+
+- **첫 npm registry 공개 배포**: 올바른 스코프 `@oneciel-ai/claude-any` 로 게시. 이전 0.1.x 는 registry 에 올라가지 않은 상태였고, 이 버전부터 `npm install -g @oneciel-ai/claude-any` 로 직접 설치 가능합니다.
 
 ### 0.1.23
 
