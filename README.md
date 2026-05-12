@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.17`
+Current version: `0.1.18`
 
 ## Why This Exists
 
@@ -206,6 +206,11 @@ steps under that larger model's supervision.
   file changes, reducing per-request overhead in the router.
 
 ## Changelog
+
+### 0.1.18
+
+- **NVIDIA hosted transient diagnostics**: compatibility tests now identify `RemoteDisconnected`, connection resets, and 502/503/504 responses from NVIDIA hosted backends as transient upstream/API Catalog failures.
+- **NVIDIA proxy cleanup**: `claude-any stop` now also matches `nvd-claude-proxy` executable processes so stale proxy sessions are cleaned up reliably.
 
 ### 0.1.17
 

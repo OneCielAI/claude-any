@@ -9,7 +9,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.17`
+当前版本: `0.1.18`
 
 ## 为什么存在
 
@@ -176,6 +176,11 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.18
+
+- **NVIDIA hosted 临时故障诊断**: 兼容性测试现在会将 `RemoteDisconnected`、connection reset、502/503/504 响应标记为 NVIDIA hosted backend/API Catalog 的临时 upstream 故障。
+- **NVIDIA proxy 清理改进**: `claude-any stop` 现在也会匹配 `nvd-claude-proxy` 可执行进程，从而更可靠地清理 stale proxy session。
 
 ### 0.1.17
 

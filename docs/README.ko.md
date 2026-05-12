@@ -9,7 +9,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.17`
+현재 버전: `0.1.18`
 
 ## 왜 만들었나
 
@@ -187,6 +187,11 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.18
+
+- **NVIDIA hosted 일시 장애 진단**: 호환성 테스트가 `RemoteDisconnected`, connection reset, 502/503/504 응답을 NVIDIA hosted backend/API Catalog의 일시적인 upstream 실패로 표시합니다.
+- **NVIDIA proxy 정리 개선**: `claude-any stop`이 `nvd-claude-proxy` 실행 파일 프로세스도 찾아 정리하므로 stale proxy session이 더 안정적으로 종료됩니다.
 
 ### 0.1.17
 

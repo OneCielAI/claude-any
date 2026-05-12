@@ -9,7 +9,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.17`
+現在のバージョン: `0.1.18`
 
 ## 作られた理由
 
@@ -188,6 +188,11 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.18
+
+- **NVIDIA hosted 一時障害の診断**: 互換性テストが `RemoteDisconnected`、connection reset、502/503/504 応答を NVIDIA hosted backend/API Catalog の一時的な upstream failure として表示します。
+- **NVIDIA proxy cleanup**: `claude-any stop` が `nvd-claude-proxy` 実行ファイルプロセスも検出して停止するため、古い proxy session をより確実に整理できます。
 
 ### 0.1.17
 

@@ -72,7 +72,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.17"
+VERSION = "0.1.18"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -3458,6 +3458,22 @@ def compatibility_failure_diagnosis(provider: str, code: int | None, msg: str) -
             "Diagnosis: NVIDIA API Catalog does not expose this request path/model for the current account. "
             "Use the default router mode for nvidia-hosted, or pick another hosted model."
         )
+    if provider == "nvidia-hosted" and code in (502, 503, 504):
+        return (
+            "Diagnosis: NVIDIA API Catalog or the hosted model backend returned a transient upstream error. "
+            "Retry the compatibility test, or choose another NVIDIA hosted model if it repeats."
+        )
+    if provider == "nvidia-hosted" and (
+        "remotedisconnected" in lower
+        or "remote end closed connection" in lower
+        or "connection reset" in lower
+        or "gateway timeout" in lower
+    ):
+        return (
+            "Diagnosis: the NVIDIA hosted upstream closed the request without a complete response. "
+            "This is usually a transient API Catalog/backend issue rather than a local claude-any configuration error. "
+            "Retry the test, or choose another hosted model if it repeats."
+        )
     if provider == "nvidia-hosted" and "function" in lower and "not found" in lower:
         return (
             "Diagnosis: NVIDIA returned a missing function for this hosted model. The model is visible in /v1/models "
@@ -4023,6 +4039,7 @@ def stop_ncp_proxy(quiet: bool = False) -> bool:
         stopped = True
     except Exception:
         pass
+    stopped = terminate_matching_processes(["nvd-claude-proxy"], "Nvidia NCP proxy", quiet=True) or stopped
     stopped = terminate_matching_processes(["ncp", "proxy"], "Nvidia NCP proxy", quiet=True) or stopped
     stopped = terminate_matching_processes(["nvd_claude_proxy"], "Nvidia NCP proxy", quiet=True) or stopped
     if stopped and not quiet:
