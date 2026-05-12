@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.21`
+Current version: `0.1.22`
 
 ## Why This Exists
 
@@ -207,6 +207,10 @@ steps under that larger model's supervision.
 
 ## Changelog
 
+### 0.1.22
+
+- **Headless manual expansion**: expand the manual with practical headless setup, launch, testing, passthrough, and cleanup examples for automation and remote-server use.
+
 ### 0.1.21
 
 - **Service lifecycle documentation**: clarify that Claude Any starts only the router/proxy services required for the selected provider at launch time, and `claude-any stop` is the explicit cleanup command.
@@ -333,7 +337,12 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
 
 ## Headless Examples
 
+Headless commands skip the pre-launch menu and launch Claude Code immediately.
+Claude Any consumes `--ca-*` setup flags, starts the required router/proxy
+services, then passes the remaining arguments to Claude Code.
+
 ```sh
+claude-any --ca-provider ollama-cloud --ca-model glm-5.1
 claude-any --ca-provider ollama --ca-base-url http://127.0.0.1:11434 --ca-model qwen3-coder
 claude-any --ca-provider ollama-cloud --ca-api-key-env OLLAMA_API_KEY --ca-model qwen3-coder:480b:cloud
 claude-any --ca-provider vllm --ca-base-url http://127.0.0.1:8000 --ca-model Qwen/Qwen3-Coder

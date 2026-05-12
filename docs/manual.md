@@ -6,7 +6,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.21`
+Current version: `0.1.22`
 
 ## Install
 
@@ -238,26 +238,148 @@ Links:
 Claude Any options use the `--ca-*` prefix so they do not collide with Claude
 Code flags. All other arguments pass through to Claude Code.
 
-Examples:
+Headless mode is for launching Claude Code directly without opening the
+pre-launch menu. It is useful for SSH sessions, scripts, scheduled jobs,
+CI-like automation, and remote servers. Any `--ca-*` option updates Claude
+Any's saved configuration first, skips the menu, starts the required
+router/proxy services, then immediately executes Claude Code with the remaining
+arguments.
+
+Basic pattern:
 
 ```sh
-claude-any --ca-provider ollama --ca-base-url http://127.0.0.1:11434 --ca-model qwen3-coder
-claude-any --ca-provider ollama-cloud --ca-api-key-env OLLAMA_API_KEY --ca-model qwen3-coder:480b:cloud
-claude-any --ca-provider vllm --ca-base-url http://127.0.0.1:8000 --ca-model my-model
-claude-any --ca-max-output-tokens 4096 -p "Reply with OK only." --output-format text
+claude-any --ca-provider PROVIDER --ca-model MODEL [claude-code args...]
 ```
 
-Common Claude Any flags:
+Direct Claude Code launch examples:
 
-- `--ca-provider`
-- `--ca-model`
-- `--ca-base-url`
-- `--ca-api-key`
-- `--ca-api-key-env`
-- `--ca-max-output-tokens`
-- `--ca-timeout-ms`
-- `--ca-ollama-option`
-- `--ca-no-update-check`
+```sh
+# Open an interactive Claude Code session immediately with the saved model.
+claude-any --ca-provider ollama-cloud --ca-model glm-5.1
+
+# Run one non-interactive Claude Code prompt and print text output.
+claude-any \
+  --ca-provider ollama-cloud \
+  --ca-model glm-5.1 \
+  --ca-api-key-env OLLAMA_API_KEY \
+  --ca-no-update-check \
+  -p "Reply with OK only." \
+  --output-format text
+
+# Use the current saved Claude Any provider/model and pass args straight to Claude Code.
+claude-any --ca-no-update-check -p "Summarize the current project." --output-format text
+```
+
+In these examples, `claude-any` is not just configuring settings. It starts
+Claude Code in the same command. The `--ca-*` flags are consumed by Claude Any;
+the prompt flags such as `-p` and `--output-format` are passed through to
+Claude Code.
+
+Provider setup examples:
+
+```sh
+# Local Ollama
+claude-any \
+  --ca-provider ollama \
+  --ca-base-url http://127.0.0.1:11434 \
+  --ca-model qwen3-coder \
+  --ca-no-update-check \
+  -p "Reply with OK only." --output-format text
+
+# Ollama Cloud, reading the key from an environment variable
+export OLLAMA_API_KEY="..."
+claude-any \
+  --ca-provider ollama-cloud \
+  --ca-api-key-env OLLAMA_API_KEY \
+  --ca-model glm-5.1 \
+  -p "Summarize this repository." --output-format text
+
+# vLLM Anthropic-compatible endpoint
+claude-any \
+  --ca-provider vllm \
+  --ca-base-url http://127.0.0.1:8000 \
+  --ca-model my-model \
+  --ca-context-window 65536 \
+  --ca-max-output-tokens 4096
+
+# NVIDIA hosted API Catalog through the local compatibility proxy
+export NVIDIA_API_KEY="..."
+claude-any \
+  --ca-provider nvidia-hosted \
+  --ca-api-key-env NVIDIA_API_KEY \
+  --ca-model moonshotai/kimi-k2.6 \
+  --ca-request-timeout-ms 1800000
+
+# Self-hosted NIM Anthropic-compatible endpoint
+claude-any \
+  --ca-provider self-hosted-nim \
+  --ca-base-url http://127.0.0.1:8000 \
+  --ca-model model \
+  --ca-api-key not-used
+```
+
+Passing Claude Code arguments:
+
+```sh
+# Everything not recognized as --ca-* is passed through to Claude Code.
+claude-any --ca-provider ollama-cloud -p "Write a short status report." --output-format text
+
+# Use -- when you want to visually separate Claude Any setup from Claude args.
+claude-any --ca-provider ollama-cloud --ca-model glm-5.1 -- -p "Reply OK" --output-format text
+```
+
+Compatibility tests without the menu:
+
+```sh
+# Auto mode: fast default. NVIDIA hosted uses a text-only quick test.
+claude-any test 60 auto
+
+# Smoke mode: text response plus required tool_use.
+claude-any test 120 smoke
+
+# Full mode: text, tool_use, and tool_result round trip.
+claude-any test 180 full
+```
+
+Service cleanup and status:
+
+```sh
+claude-any status
+claude-any stop
+```
+
+Common Claude Any setup flags:
+
+| Flag | Purpose |
+| --- | --- |
+| `--ca-provider PROVIDER` | Set provider and skip the menu for this launch. |
+| `--ca-model MODEL` | Set the current provider model. |
+| `--ca-base-url URL` | Set the current provider base URL. |
+| `--ca-api-key KEY` | Store the current provider API key directly. Prefer env vars for scripts. |
+| `--ca-api-key-env ENVVAR` | Store the current provider API key from an environment variable. |
+| `--ca-set-api-key PROVIDER KEY` | Store a key for a specific provider. |
+| `--ca-set-api-key-env PROVIDER ENVVAR` | Store a provider key from an environment variable. |
+| `--ca-max-output-tokens VALUE` | Set provider output-token cap. |
+| `--ca-context-window VALUE` | Set provider/router context-window cap where supported. |
+| `--ca-request-timeout-ms VALUE` | Set upstream request timeout in milliseconds. |
+| `--ca-ollama-num-ctx VALUE` | Set Ollama `num_ctx`. |
+| `--ca-ollama-ctx-range MIN MAX` | Set Ollama auto context range. |
+| `--ca-ollama-option KEY=VALUE` | Set an Ollama option such as `temperature=0.3`. |
+| `--ca-web-search` / `--ca-no-web-search` | Force-enable or disable web-search MCP for this launch. |
+| `--ca-disable-skills` / `--ca-enable-skills` | Control Claude Code skills for this launch. |
+| `--ca-no-update-check` | Skip the Claude Code update check. |
+| `--ca-status` | Print status and exit. |
+| `--ca-stop` | Stop managed router/proxy services and exit. |
+
+Notes for automation:
+
+- `--ca-api-key-env` avoids putting secrets directly in shell history.
+- `claude-any stop` is safe to run before scripted tests to remove stale
+  router/proxy processes.
+- Use `claude-any test 60 auto` for a quick readiness check and reserve
+  `claude-any test 180 full` for deeper provider validation.
+- Headless flags persist in `~/.config/claude-any/config.json`, so the next
+  interactive launch starts from the same provider/model settings.
 
 ## Recommended Uses
 
