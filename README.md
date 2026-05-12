@@ -13,17 +13,15 @@
 
 ### Demo
 
-<video src="demo/claude-any-nvidia-nim.mp4" controls width="720" muted loop playsinline>
-  Your browser does not support inline video. Download <a href="demo/claude-any-nvidia-nim.mp4">claude-any-nvidia-nim.mp4</a>.
-</video>
+[![NVIDIA hosted NIM driving Claude Code (qwen3-coder-480b)](docs/assets/claude-any-nvidia-nim-poster.png)](demo/claude-any-nvidia-nim.mp4)
 
-NVIDIA hosted NIM (qwen3-coder-480b) driving Claude Code through the claude-any router.
+*Click to play — NVIDIA hosted NIM (qwen3-coder-480b) driving Claude Code through the claude-any router.* &nbsp;([open mp4](demo/claude-any-nvidia-nim.mp4))
 
-<video src="demo/claude-any-ollama-cloud.mp4" controls width="720" muted loop playsinline>
-  Your browser does not support inline video. Download <a href="demo/claude-any-ollama-cloud.mp4">claude-any-ollama-cloud.mp4</a>.
-</video>
+[![Ollama Cloud streamed through the claude-any router (glm-5.1)](docs/assets/claude-any-ollama-cloud-poster.png)](demo/claude-any-ollama-cloud.mp4)
 
-Ollama Cloud (glm-5.1) streamed through the claude-any router with SSE word-boundary chunking enabled.
+*Click to play — Ollama Cloud (glm-5.1) streamed through the claude-any router with SSE word-boundary chunking enabled.* &nbsp;([open mp4](demo/claude-any-ollama-cloud.mp4))
+
+> GitHub strips HTML `<video>` tags from rendered README. Click a poster image (or the “open mp4” link) and GitHub's blob viewer will play the video inline.
 
 ---
 
