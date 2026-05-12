@@ -33,7 +33,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.24`
+当前版本: `0.1.25`
 
 ## 为什么存在
 
@@ -212,6 +212,12 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 ## 更新日志
 
+### 0.1.25
+
+- **Plan mode guard 与诊断**: 转发到 non-Anthropic provider 前，路由器会移除 Claude Code 内部 self-tool，例如 `EnterPlanMode`。将 `TRACE` 写入 `~/.config/claude-any/log-level` 后，会在 `requests.jsonl` / `responses.jsonl` 中记录请求/响应摘要。
+- **Headless agent chat**: 路由器提供 `/ca/chat/messages`、`/ca/chat/wait`、`/ca/chat/stream`。子 coding agent 可以按最后看到的 message id 拉取更新，也可以通过 SSE 等待回复。
+- **Plan artifact 服务**: 可通过 `/ca/plan/artifacts` 创建 plan 文件并以本地 URL 分享。这里没有复制 Anthropic 的内部实现，只独立实现了文件/artifact 型工作流。
+
 ### 0.1.24
 
 - **首次正式发布到 npm registry**: 在正确的 scope `@oneciel-ai/claude-any` 下发布。此前的 0.1.x 版本从未上传到 registry，从该版本起可以直接通过 `npm install -g @oneciel-ai/claude-any` 安装。
@@ -335,6 +341,27 @@ Claude Any 不会一直运行所有可能的 backend helper。正常生命周期
 
 这样 Claude Code 可以始终使用稳定的 Claude Any 入口，同时 provider-specific helper
 只在需要时启动。
+
+## Headless Agent Chat
+
+路由器运行时，子 agent 可以不打开菜单，直接通过本地 HTTP 协作。
+
+```sh
+curl -s http://127.0.0.1:8799/ca/chat/messages \
+  -H 'content-type: application/json' \
+  -d '{"channel":"agents","sender_id":"codex","recipients":["kimi"],"message":"需要失败测试日志。"}'
+
+curl -s 'http://127.0.0.1:8799/ca/chat/messages?channel=agents&recipient=kimi&after=0'
+
+curl -N 'http://127.0.0.1:8799/ca/chat/stream?channel=agents&recipient=codex&after=10&timeout=300'
+
+curl -s http://127.0.0.1:8799/ca/plan/artifacts \
+  -H 'content-type: application/json' \
+  -d '{"title":"handoff","name":"handoff.md","content":"# Plan\n- reproduce\n- patch\n- verify"}'
+```
+
+消息保存在 `~/.config/claude-any/chat-messages.jsonl`，plan 文件保存在
+`~/.config/claude-any/plan-artifacts/`。
 
 为 Claude Code 启动 Qwen3-Coder vLLM 的示例:
 

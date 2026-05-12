@@ -33,7 +33,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.24`
+現在のバージョン: `0.1.25`
 
 ## 作られた理由
 
@@ -224,6 +224,12 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 
 ## 変更履歴
 
+### 0.1.25
+
+- **Plan mode guard と診断**: non-Anthropic provider へ転送する前に、Claude Code 内部 self-tool の `EnterPlanMode` などをルーターで除去します。`~/.config/claude-any/log-level` に `TRACE` を書くと、`requests.jsonl` / `responses.jsonl` にリクエスト/レスポンス要約を記録します。
+- **ヘッドレスエージェントチャット**: ルーターが `/ca/chat/messages`、`/ca/chat/wait`、`/ca/chat/stream` を提供します。サブ coding agent は最後に見た message id 以降の更新を取得したり、SSE で返信を待機できます。
+- **Plan artifact 配信**: `/ca/plan/artifacts` で plan ファイルを作成し、ローカル URL として共有できます。Anthropic の内部実装はコピーせず、ファイル/アーティファクト中心の流れだけを独立実装しています。
+
 ### 0.1.24
 
 - **初の npm registry 公開リリース**: 正しいスコープ `@oneciel-ai/claude-any` で公開しました。これまでの 0.1.x は registry にアップロードされていない状態でしたが、このバージョンから `npm install -g @oneciel-ai/claude-any` で直接インストール可能です。
@@ -355,6 +361,27 @@ Claude Any は、すべての backend helper を常時起動しておく設計�
 
 この構成により、Claude Code は安定した Claude Any entry point を使いながら、
 provider-specific helper は必要な時だけ起動できます。
+
+## ヘッドレスエージェントチャット
+
+ルーターが起動していれば、サブエージェントはメニューを開かずにローカル HTTP で連携できます。
+
+```sh
+curl -s http://127.0.0.1:8799/ca/chat/messages \
+  -H 'content-type: application/json' \
+  -d '{"channel":"agents","sender_id":"codex","recipients":["kimi"],"message":"失敗したテストログが必要です。"}'
+
+curl -s 'http://127.0.0.1:8799/ca/chat/messages?channel=agents&recipient=kimi&after=0'
+
+curl -N 'http://127.0.0.1:8799/ca/chat/stream?channel=agents&recipient=codex&after=10&timeout=300'
+
+curl -s http://127.0.0.1:8799/ca/plan/artifacts \
+  -H 'content-type: application/json' \
+  -d '{"title":"handoff","name":"handoff.md","content":"# Plan\n- reproduce\n- patch\n- verify"}'
+```
+
+メッセージは `~/.config/claude-any/chat-messages.jsonl`、plan ファイルは
+`~/.config/claude-any/plan-artifacts/` に保存されます。
 
 Qwen3-Coder を Claude Code 用に vLLM で起動する例:
 

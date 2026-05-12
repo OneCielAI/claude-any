@@ -6,7 +6,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.24`
+Current version: `0.1.25`
 
 ## Install
 
@@ -378,6 +378,77 @@ Notes for automation:
   `claude-any test 180 full` for deeper provider validation.
 - Headless flags persist in `~/.config/claude-any/config.json`, so the next
   interactive launch starts from the same provider/model settings.
+
+## Router Chat and Plan Artifacts
+
+Claude Code Plan mode uses internal Claude Code tools and UI state. With
+non-Anthropic providers those self-tools can be selected by the upstream model
+and leave the CLI stuck in planning instead of continuing work. Claude Any
+therefore removes known Claude Code self-tools, including `EnterPlanMode`,
+before forwarding requests to non-Anthropic providers. For troubleshooting,
+write `TRACE` to `~/.config/claude-any/log-level`; the router then records
+redacted request and response summaries in:
+
+- `~/.config/claude-any/requests.jsonl`
+- `~/.config/claude-any/responses.jsonl`
+
+The router also exposes a provider-neutral control plane for headless sub
+agents. It is intentionally separate from `/v1/messages` so it does not change
+Claude Code's API traffic.
+
+Endpoints:
+
+| Endpoint | Method | Purpose |
+| --- | --- | --- |
+| `/ca/chat/health` | `GET` | Check chat service availability. |
+| `/ca/chat/messages` | `POST` | Send a message. |
+| `/ca/chat/messages?after=N` | `GET` | Poll messages after the last seen id. |
+| `/ca/chat/wait?after=N&timeout=60` | `GET` | Long-poll until messages arrive or timeout. |
+| `/ca/chat/stream?after=N&timeout=300` | `GET` | Server-sent event stream for agents that must wait for replies. |
+| `/ca/chat/files` | `POST` | Upload a text/base64 file and optionally announce it to a channel. |
+| `/ca/chat/files/NAME` | `GET` | Fetch an uploaded file. |
+| `/ca/plan/artifacts` | `POST` | Create and serve a plan artifact file. |
+| `/ca/plan/artifacts` | `GET` | List plan artifacts. |
+| `/ca/plan/artifacts/NAME` | `GET` | Fetch a plan artifact. |
+
+Message shape:
+
+```json
+{
+  "channel": "agents",
+  "sender_id": "codex",
+  "recipients": ["kimi", "qwen"],
+  "thread_id": "task-123",
+  "parent_id": 42,
+  "message": "I need the current test failure output."
+}
+```
+
+The response includes a monotonically increasing `id`. Store that id and pass
+it back as `after=N` to receive only new messages.
+
+Headless examples:
+
+```sh
+# Send a direct message.
+curl -s http://127.0.0.1:8799/ca/chat/messages \
+  -H 'content-type: application/json' \
+  -d '{"channel":"agents","sender_id":"codex","recipients":["kimi"],"message":"Please inspect the failing test."}'
+
+# Poll for updates addressed to kimi.
+curl -s 'http://127.0.0.1:8799/ca/chat/messages?channel=agents&recipient=kimi&after=0'
+
+# Wait on SSE until a response arrives.
+curl -N 'http://127.0.0.1:8799/ca/chat/stream?channel=agents&recipient=codex&after=10&timeout=300'
+
+# Create a plan artifact that other agents can fetch by URL.
+curl -s http://127.0.0.1:8799/ca/plan/artifacts \
+  -H 'content-type: application/json' \
+  -d '{"title":"handoff","name":"handoff.md","content":"# Plan\n- reproduce\n- patch\n- verify"}'
+```
+
+Artifacts are stored under `~/.config/claude-any/plan-artifacts/`; chat
+messages are stored in `~/.config/claude-any/chat-messages.jsonl`.
 
 ## Recommended Uses
 

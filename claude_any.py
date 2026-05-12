@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import getpass
 import importlib.util
 import json
@@ -13,6 +14,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -32,7 +34,13 @@ HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "claude-any"
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = CONFIG_DIR / "router.log"
+LOG_LEVEL_PATH = CONFIG_DIR / "log-level"
+REQUEST_DUMP_PATH = CONFIG_DIR / "requests.jsonl"
+RESPONSE_DUMP_PATH = CONFIG_DIR / "responses.jsonl"
 TOOL_CALL_LOG_PATH = CONFIG_DIR / "tool-calls.jsonl"
+CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
+CHAT_FILES_DIR = CONFIG_DIR / "chat-files"
+PLAN_ARTIFACTS_DIR = CONFIG_DIR / "plan-artifacts"
 PID_PATH = CONFIG_DIR / "router.pid"
 MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
@@ -72,8 +80,40 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.24"
+VERSION = "0.1.25"
 CREDITS = "Credits: One Ciel LLC"
+
+LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
+LOG_LEVEL_NAMES = {v: k for k, v in LOG_LEVELS.items()}
+LOG_LEVEL_DEFAULT = LOG_LEVELS["ERROR"]
+ROUTER_LOG_MAX_BYTES = 1_000_000
+REQUEST_DUMP_MAX_BYTES = 5_000_000
+RESPONSE_DUMP_MAX_BYTES = 5_000_000
+RESPONSE_DUMP_TEXT_LIMIT = 16_000
+CHAT_MESSAGES_MAX_BYTES = 20_000_000
+_LOG_LEVEL_CACHE: dict[str, Any] = {"value": None, "checked_at": 0.0, "file_mtime": 0.0}
+_CHAT_CONDITION = threading.Condition()
+_CHAT_NEXT_ID: int | None = None
+
+# Tools Claude Code injects into every model's tool list that misfire when called
+# by non-Anthropic models. See docs/notes from anthropics/claude-code issues
+# #25720, #29950 and Piebald-AI/claude-code-system-prompts for tool semantics.
+DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC: tuple[str, ...] = (
+    "EnterPlanMode",
+    "EnterWorktree",
+    "ExitWorktree",
+    "TeamCreate",
+    "TeamDelete",
+    "TeammateTool",
+    "SendMessage",
+    "SendMessageTool",
+    "CronCreate",
+    "CronDelete",
+    "CronList",
+    "ScheduleWakeup",
+    "RemoteTrigger",
+    "PushNotification",
+)
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
     "Do not stop after announcing what you plan to do. When the user asks you to create, edit, or run code, "
@@ -371,10 +411,8 @@ def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> 
                     fixed[req] = ""
             injected.append(req)
 
-    # Log to router log for debugging
     if injected:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write("%s [tool_guard] %s: injected missing required fields: %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), matched_name, ", ".join(injected)))
+        router_log("WARN", f"tool_guard: {matched_name}: injected missing required fields: {', '.join(injected)}")
 
     return fixed
 
@@ -1073,6 +1111,171 @@ def http_json(url: str, headers: dict[str, str] | None = None, timeout: float = 
         return json.loads(r.read().decode("utf-8"))
 
 
+def current_log_level() -> int:
+    """Resolve effective log level. Priority: log-level file > env var > default.
+    File mtime + 1s wall cache to keep overhead near zero on hot paths."""
+    now = time.time()
+    cache = _LOG_LEVEL_CACHE
+    if cache["value"] is not None and (now - float(cache["checked_at"])) < 1.0:
+        return int(cache["value"])
+    level: int | None = None
+    try:
+        if LOG_LEVEL_PATH.exists():
+            mtime = LOG_LEVEL_PATH.stat().st_mtime
+            if cache["value"] is not None and mtime == cache["file_mtime"]:
+                cache["checked_at"] = now
+                return int(cache["value"])
+            txt = LOG_LEVEL_PATH.read_text(encoding="utf-8").strip().upper()
+            if txt in LOG_LEVELS:
+                level = LOG_LEVELS[txt]
+            elif txt.isdigit():
+                level = max(0, min(5, int(txt)))
+            cache["file_mtime"] = mtime
+    except Exception:
+        pass
+    if level is None:
+        env = os.environ.get("CLAUDE_ANY_LOG_LEVEL", "").strip().upper()
+        if env in LOG_LEVELS:
+            level = LOG_LEVELS[env]
+        elif env.isdigit():
+            level = max(0, min(5, int(env)))
+    if level is None:
+        level = LOG_LEVEL_DEFAULT
+    cache["value"] = level
+    cache["checked_at"] = now
+    return level
+
+
+def router_log(level: str, message: str) -> None:
+    """Append a line to router.log if the active level allows it.
+    Rotates router.log when it exceeds ROUTER_LOG_MAX_BYTES."""
+    threshold = LOG_LEVELS.get(level, 0)
+    if threshold <= 0 or threshold > current_log_level():
+        return
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if LOG_PATH.exists() and LOG_PATH.stat().st_size > ROUTER_LOG_MAX_BYTES:
+            LOG_PATH.replace(LOG_PATH.with_suffix(".log.1"))
+        with LOG_PATH.open("a", encoding="utf-8") as f:
+            f.write("%s [%s] %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), level, message))
+    except Exception:
+        pass
+
+
+def _truncate_for_dump(value: Any, max_len: int = 4000) -> Any:
+    try:
+        text = json.dumps(value, ensure_ascii=False) if not isinstance(value, str) else value
+    except Exception:
+        text = str(value)
+    if len(text) > max_len:
+        return text[:max_len] + f"...<truncated {len(text) - max_len} chars>"
+    return value
+
+
+def resolve_blocked_tools(provider: str, pcfg: dict[str, Any]) -> set[str]:
+    """Return the set of tool names to strip from upstream requests.
+    `pcfg['blocked_tools']` overrides: None/missing => default list, False/[] => disable, list => explicit set."""
+    if provider == "anthropic":
+        return set()
+    override = pcfg.get("blocked_tools", None)
+    if override is False:
+        return set()
+    if isinstance(override, list):
+        return {str(name).strip() for name in override if str(name).strip()}
+    return set(DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC)
+
+
+def filter_blocked_tools(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    """Strip Claude-Code self-tools the upstream model shouldn't see (e.g. EnterPlanMode).
+    Returns a (possibly new) body dict."""
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return body
+    blocked = resolve_blocked_tools(provider, pcfg)
+    if not blocked:
+        return body
+    kept: list[Any] = []
+    dropped: list[str] = []
+    for tool in tools:
+        name = tool.get("name") if isinstance(tool, dict) else None
+        if isinstance(name, str) and name in blocked:
+            dropped.append(name)
+            continue
+        kept.append(tool)
+    if not dropped:
+        return body
+    router_log("INFO", f"filtered upstream tools for {provider}: {', '.join(sorted(set(dropped)))}")
+    new_body = dict(body)
+    new_body["tools"] = kept
+    return new_body
+
+
+def dump_request_for_trace(provider: str, path: str, body: dict[str, Any]) -> None:
+    """At TRACE level, append a redacted snapshot of an inbound /v1/messages body
+    (tools list, system prompt summary, message count) to requests.jsonl.
+    Used to capture tool definitions Claude Code injects (e.g. EnterPlanMode)."""
+    if current_log_level() < LOG_LEVELS["TRACE"]:
+        return
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if REQUEST_DUMP_PATH.exists() and REQUEST_DUMP_PATH.stat().st_size > REQUEST_DUMP_MAX_BYTES:
+            REQUEST_DUMP_PATH.replace(REQUEST_DUMP_PATH.with_suffix(".jsonl.1"))
+        record = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "provider": provider,
+            "path": path,
+            "model": body.get("model"),
+            "stream": body.get("stream"),
+            "messages_count": len(body.get("messages") or []),
+            "system": _truncate_for_dump(body.get("system")),
+            "tools": body.get("tools"),
+        }
+        with REQUEST_DUMP_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
+def dump_response_for_trace(provider: str, model: str, text_so_far: str, tool_calls: list[dict[str, Any]], stop_reason: str | None, input_tokens: int, output_tokens: int, last_chunk: dict[str, Any] | None = None) -> None:
+    """At TRACE level, append a per-response summary to responses.jsonl.
+    Used to confirm what GLM-5.1 (and other upstream models) actually sent
+    when the Claude Code session appears to stall."""
+    if current_log_level() < LOG_LEVELS["TRACE"]:
+        return
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if RESPONSE_DUMP_PATH.exists() and RESPONSE_DUMP_PATH.stat().st_size > RESPONSE_DUMP_MAX_BYTES:
+            RESPONSE_DUMP_PATH.replace(RESPONSE_DUMP_PATH.with_suffix(".jsonl.1"))
+        text_truncated = text_so_far
+        text_full_len = len(text_so_far)
+        if text_full_len > RESPONSE_DUMP_TEXT_LIMIT:
+            text_truncated = text_so_far[:RESPONSE_DUMP_TEXT_LIMIT] + f"...<truncated {text_full_len - RESPONSE_DUMP_TEXT_LIMIT} chars>"
+        tool_summary: list[dict[str, Any]] = []
+        for call in tool_calls:
+            fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+            tool_summary.append({
+                "name": (fn or {}).get("name"),
+                "arguments": (fn or {}).get("arguments"),
+            })
+        record = {
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "provider": provider,
+            "model": model,
+            "stop_reason": stop_reason,
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
+            "text_full_len": text_full_len,
+            "tool_call_count": len(tool_calls),
+            "text": text_truncated,
+            "tool_calls": tool_summary,
+            "done_reason": (last_chunk or {}).get("done_reason"),
+        }
+        with RESPONSE_DUMP_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
 def append_tool_call_log(event: str, payload: dict[str, Any]) -> None:
     try:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -1541,6 +1744,281 @@ def write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> 
     handler.send_header("content-length", str(len(body)))
     handler.end_headers()
     handler.wfile.write(body)
+
+
+def write_text_response(handler: BaseHTTPRequestHandler, text: str, status: int = 200, content_type: str = "text/plain; charset=utf-8") -> None:
+    body = text.encode("utf-8")
+    handler.send_response(status)
+    handler.send_header("content-type", content_type)
+    handler.send_header("content-length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
+def parse_json_body(raw: bytes) -> dict[str, Any]:
+    try:
+        value = json.loads(raw.decode("utf-8") if raw else "{}")
+    except Exception:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _safe_segment(value: str, fallback: str = "item") -> str:
+    text = re.sub(r"[^A-Za-z0-9._-]+", "-", (value or "").strip()).strip(".-")
+    return text[:120] or fallback
+
+
+def _as_string_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        if value.strip().lower() in ("", "all", "*"):
+            return ["all"] if value.strip() else []
+        return [value.strip()]
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _chat_init_next_id() -> int:
+    global _CHAT_NEXT_ID
+    if _CHAT_NEXT_ID is not None:
+        return _CHAT_NEXT_ID
+    max_id = 0
+    try:
+        if CHAT_MESSAGES_PATH.exists():
+            with CHAT_MESSAGES_PATH.open("r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        item = json.loads(line)
+                        max_id = max(max_id, int(item.get("id") or 0))
+                    except Exception:
+                        continue
+    except Exception:
+        pass
+    _CHAT_NEXT_ID = max_id + 1
+    return _CHAT_NEXT_ID
+
+
+def _message_visible_to(message: dict[str, Any], recipient: str | None) -> bool:
+    if not recipient:
+        return True
+    recipients = _as_string_list(message.get("recipients"))
+    if not recipients or "all" in [r.lower() for r in recipients] or "*" in recipients:
+        return True
+    return recipient in recipients or recipient == str(message.get("sender_id") or "")
+
+
+def read_chat_messages(after_id: int = 0, channel: str | None = None, recipient: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    try:
+        if not CHAT_MESSAGES_PATH.exists():
+            return []
+        with CHAT_MESSAGES_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                try:
+                    if int(item.get("id") or 0) <= after_id:
+                        continue
+                except Exception:
+                    continue
+                if channel and item.get("channel") != channel:
+                    continue
+                if not _message_visible_to(item, recipient):
+                    continue
+                messages.append(item)
+                if len(messages) >= limit:
+                    break
+    except Exception as exc:
+        router_log("WARN", f"chat read failed: {exc}")
+    return messages
+
+
+def append_chat_message(payload: dict[str, Any]) -> dict[str, Any]:
+    global _CHAT_NEXT_ID
+    with _CHAT_CONDITION:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if CHAT_MESSAGES_PATH.exists() and CHAT_MESSAGES_PATH.stat().st_size > CHAT_MESSAGES_MAX_BYTES:
+            CHAT_MESSAGES_PATH.replace(CHAT_MESSAGES_PATH.with_suffix(".jsonl.1"))
+            _CHAT_NEXT_ID = 1
+        next_id = _chat_init_next_id()
+        _CHAT_NEXT_ID = next_id + 1
+        message = {
+            "id": next_id,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "channel": str(payload.get("channel") or "default"),
+            "sender_id": str(payload.get("sender_id") or payload.get("sender") or "anonymous"),
+            "recipients": _as_string_list(payload.get("recipients", payload.get("recipient_id"))),
+            "thread_id": str(payload.get("thread_id") or payload.get("parent_id") or next_id),
+            "parent_id": payload.get("parent_id"),
+            "message": str(payload.get("message") or payload.get("text") or ""),
+            "kind": str(payload.get("kind") or "message"),
+            "meta": payload.get("meta") if isinstance(payload.get("meta"), dict) else {},
+        }
+        with CHAT_MESSAGES_PATH.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+        _CHAT_CONDITION.notify_all()
+        return message
+
+
+def _query_params(handler: BaseHTTPRequestHandler) -> dict[str, list[str]]:
+    return urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query, keep_blank_values=True)
+
+
+def _first_param(params: dict[str, list[str]], name: str, default: str = "") -> str:
+    values = params.get(name)
+    return values[0] if values else default
+
+
+def handle_chat_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    if path == "/ca/chat/health":
+        write_json(handler, {"ok": True, "base": ROUTER_BASE, "messages": "/ca/chat/messages", "stream": "/ca/chat/stream"})
+        return True
+    if path in ("/ca/chat/messages", "/ca/chat/wait"):
+        params = _query_params(handler)
+        after = int(_first_param(params, "after", "0") or 0)
+        limit = max(1, min(500, int(_first_param(params, "limit", "100") or 100)))
+        channel = _first_param(params, "channel", "") or None
+        recipient = _first_param(params, "recipient", "") or _first_param(params, "recipient_id", "") or None
+        timeout = 0.0 if path.endswith("/messages") else max(0.0, min(300.0, float(_first_param(params, "timeout", "60") or 60)))
+        deadline = time.time() + timeout
+        messages = read_chat_messages(after, channel, recipient, limit)
+        while not messages and timeout > 0 and time.time() < deadline:
+            with _CHAT_CONDITION:
+                _CHAT_CONDITION.wait(timeout=min(5.0, max(0.0, deadline - time.time())))
+            messages = read_chat_messages(after, channel, recipient, limit)
+        write_json(handler, {"ok": True, "messages": messages, "last_id": messages[-1]["id"] if messages else after})
+        return True
+    if path == "/ca/chat/stream":
+        params = _query_params(handler)
+        after = int(_first_param(params, "after", "0") or 0)
+        channel = _first_param(params, "channel", "") or None
+        recipient = _first_param(params, "recipient", "") or _first_param(params, "recipient_id", "") or None
+        timeout = max(1.0, min(3600.0, float(_first_param(params, "timeout", "300") or 300)))
+        handler.send_response(200)
+        handler.send_header("content-type", "text/event-stream")
+        handler.send_header("cache-control", "no-cache")
+        handler.send_header("connection", "close")
+        handler.end_headers()
+        deadline = time.time() + timeout
+        last_id = after
+        try:
+            while time.time() < deadline:
+                messages = read_chat_messages(last_id, channel, recipient, 100)
+                for message in messages:
+                    last_id = int(message["id"])
+                    handler.wfile.write(f"id: {last_id}\n".encode("utf-8"))
+                    handler.wfile.write(b"event: message\n")
+                    handler.wfile.write(("data: " + json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n\n").encode("utf-8"))
+                    handler.wfile.flush()
+                if messages:
+                    continue
+                handler.wfile.write(b": wait\n\n")
+                handler.wfile.flush()
+                with _CHAT_CONDITION:
+                    _CHAT_CONDITION.wait(timeout=min(15.0, max(0.0, deadline - time.time())))
+        except (BrokenPipeError, ConnectionError):
+            pass
+        return True
+    if path.startswith("/ca/chat/files/"):
+        name = _safe_segment(urllib.parse.unquote(path[len("/ca/chat/files/"):]), "file")
+        target = CHAT_FILES_DIR / name
+        if not target.exists() or not target.is_file():
+            write_json(handler, {"ok": False, "error": "not_found"}, 404)
+            return True
+        data = target.read_bytes()
+        handler.send_response(200)
+        handler.send_header("content-type", "application/octet-stream")
+        handler.send_header("content-length", str(len(data)))
+        handler.end_headers()
+        handler.wfile.write(data)
+        return True
+    return False
+
+
+def handle_chat_post(handler: BaseHTTPRequestHandler, path: str, body: dict[str, Any]) -> bool:
+    if path == "/ca/chat/messages":
+        message = append_chat_message(body)
+        write_json(handler, {"ok": True, "message": message})
+        return True
+    if path == "/ca/chat/files":
+        CHAT_FILES_DIR.mkdir(parents=True, exist_ok=True)
+        raw_name = str(body.get("name") or f"file-{int(time.time())}.txt")
+        name = f"{int(time.time())}-{_safe_segment(raw_name, 'file')}"
+        content = body.get("content", "")
+        if body.get("encoding") == "base64":
+            data = base64.b64decode(str(content).encode("ascii"))
+        else:
+            data = str(content).encode("utf-8")
+        target = CHAT_FILES_DIR / name
+        target.write_bytes(data)
+        url = f"{ROUTER_BASE}/ca/chat/files/{urllib.parse.quote(name)}"
+        if body.get("announce", True):
+            append_chat_message({
+                "channel": body.get("channel", "default"),
+                "sender_id": body.get("sender_id", "system"),
+                "recipients": body.get("recipients", "all"),
+                "thread_id": body.get("thread_id"),
+                "parent_id": body.get("parent_id"),
+                "kind": "file",
+                "message": url,
+                "meta": {"name": raw_name, "url": url},
+            })
+        write_json(handler, {"ok": True, "name": name, "url": url, "bytes": len(data)})
+        return True
+    return False
+
+
+def handle_plan_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    if path == "/ca/plan/artifacts":
+        PLAN_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+        items = []
+        for item in sorted(PLAN_ARTIFACTS_DIR.glob("*")):
+            if item.is_file():
+                items.append({"name": item.name, "bytes": item.stat().st_size, "url": f"{ROUTER_BASE}/ca/plan/artifacts/{urllib.parse.quote(item.name)}"})
+        write_json(handler, {"ok": True, "artifacts": items})
+        return True
+    if path.startswith("/ca/plan/artifacts/"):
+        name = _safe_segment(urllib.parse.unquote(path[len("/ca/plan/artifacts/"):]), "plan.md")
+        target = PLAN_ARTIFACTS_DIR / name
+        if not target.exists() or not target.is_file():
+            write_json(handler, {"ok": False, "error": "not_found"}, 404)
+            return True
+        content_type = "text/markdown; charset=utf-8" if target.suffix.lower() in (".md", ".markdown") else "text/plain; charset=utf-8"
+        write_text_response(handler, target.read_text(encoding="utf-8", errors="replace"), content_type=content_type)
+        return True
+    return False
+
+
+def handle_plan_post(handler: BaseHTTPRequestHandler, path: str, body: dict[str, Any]) -> bool:
+    if path != "/ca/plan/artifacts":
+        return False
+    PLAN_ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
+    title = str(body.get("title") or "plan")
+    content = str(body.get("content") or body.get("message") or "")
+    name = _safe_segment(str(body.get("name") or f"{int(time.time())}-{title}.md"), "plan.md")
+    if "." not in name:
+        name += ".md"
+    target = PLAN_ARTIFACTS_DIR / name
+    target.write_text(content, encoding="utf-8")
+    latest = PLAN_ARTIFACTS_DIR / "latest.md"
+    if target.name != latest.name:
+        latest.write_text(content, encoding="utf-8")
+    url = f"{ROUTER_BASE}/ca/plan/artifacts/{urllib.parse.quote(name)}"
+    if body.get("announce", True):
+        append_chat_message({
+            "channel": body.get("channel", "plan"),
+            "sender_id": body.get("sender_id", "plan"),
+            "recipients": body.get("recipients", "all"),
+            "kind": "plan",
+            "message": url,
+            "meta": {"title": title, "url": url, "name": name},
+        })
+    write_json(handler, {"ok": True, "name": name, "url": url, "latest_url": f"{ROUTER_BASE}/ca/plan/artifacts/latest.md"})
+    return True
 
 
 def estimate_tokens(body: Any, _cache: dict[int, int] | None = None) -> int:
@@ -2100,7 +2578,7 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any) -> N
             pass
 
 
-def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, model: str, word_chunking: bool = False) -> None:
+def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, model: str, word_chunking: bool = False, provider: str = "ollama") -> None:
     """Stream Ollama NDJSON /api/chat response as Anthropic SSE /v1/messages format."""
     handler.send_response(200)
     handler.send_header("content-type", "text/event-stream")
@@ -2283,6 +2761,20 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             resp.close()
         except Exception:
             pass
+        try:
+            final_stop_reason = locals().get("stop_reason")
+            dump_response_for_trace(
+                provider=provider,
+                model=model,
+                text_so_far=text_so_far,
+                tool_calls=tool_calls,
+                stop_reason=final_stop_reason if isinstance(final_stop_reason, str) else None,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                last_chunk=chunk if isinstance(chunk, dict) else None,
+            )
+        except Exception:
+            pass
 
 
 def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
@@ -2325,7 +2817,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
         # Check if Claude Code requested SSE streaming
         accept = handler.headers.get("accept", "")
         if "text/event-stream" in accept or stream_requested:
-            _ollama_stream_to_anthropic_sse(handler, resp, model, word_chunking=word_chunking)
+            _ollama_stream_to_anthropic_sse(handler, resp, model, word_chunking=word_chunking, provider=provider)
         else:
             # Non-SSE client but streaming from Ollama: collect full response
             chunks = []
@@ -2378,15 +2870,25 @@ class RouterHandler(BaseHTTPRequestHandler):
     server_version = "claude-any/0.1"
 
     def log_message(self, fmt: str, *args: Any) -> None:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write("%s %s\n" % (time.strftime("%Y-%m-%dT%H:%M:%S"), fmt % args))
+        try:
+            router_log("INFO", "access " + (fmt % args))
+        except Exception:
+            pass
+
+    def log_error(self, fmt: str, *args: Any) -> None:
+        try:
+            router_log("ERROR", "http " + (fmt % args))
+        except Exception:
+            pass
 
     def do_GET(self) -> None:
         path = urllib.parse.urlparse(self.path).path
+        if handle_chat_get(self, path) or handle_plan_get(self, path):
+            return
         cfg = load_config()
         provider, pcfg = get_current_provider(cfg)
         if path in ("/health", "/healthz"):
-            write_json(self, {"ok": True, "provider": provider, "model": current_alias(cfg)})
+            write_json(self, {"ok": True, "provider": provider, "model": current_alias(cfg), "chat": "/ca/chat/health", "plan": "/ca/plan/artifacts"})
             return
         if path == "/v1/models":
             data = list_model_objects(provider, pcfg)
@@ -2403,10 +2905,9 @@ class RouterHandler(BaseHTTPRequestHandler):
         path = urllib.parse.urlparse(self.path).path
         length = int(self.headers.get("content-length", "0") or 0)
         raw = self.rfile.read(length) if length else b"{}"
-        try:
-            body = json.loads(raw.decode("utf-8"))
-        except Exception:
-            body = {}
+        body = parse_json_body(raw)
+        if handle_chat_post(self, path, body) or handle_plan_post(self, path, body):
+            return
         cfg = load_config()
         provider, pcfg = get_current_provider(cfg)
         if path == "/v1/messages/count_tokens":
@@ -2415,6 +2916,9 @@ class RouterHandler(BaseHTTPRequestHandler):
         if path != "/v1/messages":
             write_json(self, {"type": "error", "error": {"type": "not_found_error", "message": path}}, 404)
             return
+        dump_request_for_trace(provider, path, body)
+        body = filter_blocked_tools(provider, pcfg, body)
+        router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
         try:
             if provider == "nvidia-hosted":
                 ensure_ncp()
@@ -2474,6 +2978,10 @@ def serve(_: argparse.Namespace) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     PID_PATH.write_text(str(os.getpid()))
     os.chmod(PID_PATH, 0o600)
+    lvl = current_log_level()
+    src = "file" if LOG_LEVEL_PATH.exists() else ("env" if os.environ.get("CLAUDE_ANY_LOG_LEVEL") else "default")
+    sys.stderr.write(f"claude-any router starting on {ROUTER_HOST}:{ROUTER_PORT} (log level {LOG_LEVEL_NAMES.get(lvl, lvl)}, source={src})\n")
+    sys.stderr.flush()
     server = ThreadingHTTPServer((ROUTER_HOST, ROUTER_PORT), RouterHandler)
     try:
         server.serve_forever()

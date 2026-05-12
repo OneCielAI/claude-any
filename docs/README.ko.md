@@ -33,7 +33,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.24`
+현재 버전: `0.1.25`
 
 ## 왜 만들었나
 
@@ -224,6 +224,12 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 ## 변경 이력
 
+### 0.1.25
+
+- **Plan mode guard와 진단**: non-Anthropic provider로 보낼 때 Claude Code 내부 self-tool인 `EnterPlanMode` 등을 라우터에서 제거합니다. `~/.config/claude-any/log-level`에 `TRACE`를 쓰면 `requests.jsonl` / `responses.jsonl`에 요청/응답 요약이 남습니다.
+- **헤드리스 에이전트 채팅**: 라우터가 `/ca/chat/messages`, `/ca/chat/wait`, `/ca/chat/stream`을 제공합니다. 서브 코딩 에이전트는 마지막 message id 이후의 업데이트를 받거나 SSE로 답변을 기다릴 수 있습니다.
+- **Plan artifact 서빙**: `/ca/plan/artifacts`로 plan 파일을 만들고 로컬 URL로 공유할 수 있습니다. Anthropic 내부 구현을 복제하지 않고 파일/아티팩트 중심 흐름만 독립 구현했습니다.
+
 ### 0.1.24
 
 - **첫 npm registry 공개 배포**: 올바른 스코프 `@oneciel-ai/claude-any` 로 게시. 이전 0.1.x 는 registry 에 올라가지 않은 상태였고, 이 버전부터 `npm install -g @oneciel-ai/claude-any` 로 직접 설치 가능합니다.
@@ -353,6 +359,27 @@ Claude Any는 가능한 모든 backend helper를 항상 띄워두지 않습니�
 
 이 방식은 Claude Code가 하나의 안정적인 Claude Any 진입점을 사용하게 하면서,
 provider-specific helper는 필요한 시점에만 시작하도록 합니다.
+
+## 헤드리스 에이전트 채팅
+
+라우터가 실행 중이면 서브 에이전트는 메뉴 없이 로컬 HTTP로 대화할 수 있습니다.
+
+```sh
+curl -s http://127.0.0.1:8799/ca/chat/messages \
+  -H 'content-type: application/json' \
+  -d '{"channel":"agents","sender_id":"codex","recipients":["kimi"],"message":"테스트 실패 로그가 필요합니다."}'
+
+curl -s 'http://127.0.0.1:8799/ca/chat/messages?channel=agents&recipient=kimi&after=0'
+
+curl -N 'http://127.0.0.1:8799/ca/chat/stream?channel=agents&recipient=codex&after=10&timeout=300'
+
+curl -s http://127.0.0.1:8799/ca/plan/artifacts \
+  -H 'content-type: application/json' \
+  -d '{"title":"handoff","name":"handoff.md","content":"# Plan\n- reproduce\n- patch\n- verify"}'
+```
+
+메시지는 `~/.config/claude-any/chat-messages.jsonl`, plan 파일은
+`~/.config/claude-any/plan-artifacts/`에 저장됩니다.
 
 Qwen3-Coder를 vLLM에서 Claude Code용으로 실행하는 예:
 

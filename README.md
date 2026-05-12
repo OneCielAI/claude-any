@@ -34,7 +34,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.24`
+Current version: `0.1.25`
 
 ## Why This Exists
 
@@ -243,8 +243,25 @@ steps under that larger model's supervision.
   `Cannot create agent worktree: not in a git repository...`.
 - Config file caching — settings are read from disk once and reused until the
   file changes, reducing per-request overhead in the router.
+- Router control-plane endpoints for headless agent coordination:
+  `/ca/chat/messages`, `/ca/chat/wait`, `/ca/chat/stream`, `/ca/chat/files`,
+  and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.25
+
+- **Plan-mode guard + diagnostics**: non-Anthropic providers now strip Claude
+  Code self-tools such as `EnterPlanMode` before forwarding requests upstream.
+  Set `~/.config/claude-any/log-level` to `TRACE` to capture redacted request
+  and response summaries in `requests.jsonl` / `responses.jsonl`.
+- **Headless agent chat service**: the router exposes a small HTTP control
+  plane for sub coding agents. Agents can post messages, poll updates after
+  the last seen message id, or wait on an SSE stream when they do not have
+  their own loop.
+- **Plan artifact serving**: agents can create plan files through the router
+  and share stable local URLs, matching Claude Code's file/artifact-oriented
+  Plan-mode workflow without copying Anthropic's internal implementation.
 
 ### 0.1.24
 
@@ -421,6 +438,29 @@ claude-any --ca-no-update-check -p "Reply with OK only." --output-format text
 ```
 
 All other arguments are passed through to Claude Code.
+
+## Headless Agent Chat
+
+When the claude-any router is running, sub agents can coordinate through local
+HTTP endpoints without opening the menu:
+
+```sh
+# Send a message to a channel.
+curl -s http://127.0.0.1:8799/ca/chat/messages \
+  -H 'content-type: application/json' \
+  -d '{"channel":"agents","sender_id":"codex","recipients":["kimi"],"message":"Need logs after id 42"}'
+
+# Poll updates after the last message id.
+curl -s 'http://127.0.0.1:8799/ca/chat/messages?channel=agents&recipient=kimi&after=42'
+
+# Wait on a stream until messages arrive.
+curl -N 'http://127.0.0.1:8799/ca/chat/stream?channel=agents&recipient=kimi&after=42&timeout=300'
+
+# Publish a plan file and get a served URL.
+curl -s http://127.0.0.1:8799/ca/plan/artifacts \
+  -H 'content-type: application/json' \
+  -d '{"title":"handoff","name":"handoff.md","content":"# Plan\n- step 1"}'
+```
 
 ## Security
 
