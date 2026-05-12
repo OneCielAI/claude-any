@@ -72,7 +72,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.15"
+VERSION = "0.1.16"
 CREDITS = "Credits: One Ciel LLC"
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
@@ -1172,6 +1172,10 @@ def ncp_module_available() -> bool:
     return importlib.util.find_spec("nvd_claude_proxy") is not None
 
 
+def ncp_proxy_executable() -> str | None:
+    return find_executable("nvd-claude-proxy") or find_executable("ncp")
+
+
 def ensure_ncp() -> None:
     cfg = load_config()
     provider = cfg["providers"]["nvidia-hosted"]
@@ -1189,15 +1193,22 @@ def ensure_ncp() -> None:
     if is_url_up(f"{base}/v1/models"):
         return
     NCP_LOG.parent.mkdir(parents=True, exist_ok=True)
-    if not ncp_module_available():
+    ncp_exe = ncp_proxy_executable()
+    if not (ncp_exe or ncp_module_available()):
         install_ncp_proxy()
-    if not ncp_module_available():
-        raise RuntimeError("nvd-claude-proxy Python module was not found. Install it with: python -m pip install --user nvd-claude-proxy")
+        ncp_exe = ncp_proxy_executable()
+    if not (ncp_exe or ncp_module_available()):
+        raise RuntimeError("nvd-claude-proxy was not found. Install it with: python -m pip install --user nvd-claude-proxy")
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     with open(NCP_LOG, "ab", buffering=0) as log:
-        log.write(b"\n[claude-any] starting nvd-claude-proxy module\n")
+        if ncp_exe:
+            cmd = [ncp_exe]
+            log.write(f"\n[claude-any] starting nvd-claude-proxy executable: {ncp_exe}\n".encode())
+        else:
+            cmd = [sys.executable, "-m", "nvd_claude_proxy.main"]
+            log.write(b"\n[claude-any] starting nvd-claude-proxy module\n")
         subprocess.Popen(
-            [sys.executable, "-m", "nvd_claude_proxy.main"],
+            cmd,
             stdout=log,
             stderr=log,
             env=env,

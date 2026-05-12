@@ -9,7 +9,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.15`
+現在のバージョン: `0.1.16`
 
 ## 作られた理由
 
@@ -188,6 +188,10 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.16
+
+- **NVIDIA hosted proxy 起動修正**: `python -m nvd_claude_proxy.main` に fallback する前に、インストール済みの `nvd-claude-proxy`/`ncp` 実行ファイルを検出して起動します。proxy が uv tool としてインストールされ、コマンドは存在するが Claude Any の Python interpreter から import できない環境をサポートします。
 
 ### 0.1.15
 

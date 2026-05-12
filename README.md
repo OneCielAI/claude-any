@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.15`
+Current version: `0.1.16`
 
 ## Why This Exists
 
@@ -206,6 +206,10 @@ steps under that larger model's supervision.
   file changes, reducing per-request overhead in the router.
 
 ## Changelog
+
+### 0.1.16
+
+- **NVIDIA hosted proxy startup fix**: detect and launch an installed `nvd-claude-proxy`/`ncp` executable before falling back to `python -m nvd_claude_proxy.main`. This supports uv-tool installs where the proxy is available as a command but not importable from Claude Any's Python interpreter.
 
 ### 0.1.15
 

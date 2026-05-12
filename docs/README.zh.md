@@ -9,7 +9,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.15`
+当前版本: `0.1.16`
 
 ## 为什么存在
 
@@ -176,6 +176,10 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.16
+
+- **NVIDIA hosted proxy 启动修复**: 在 fallback 到 `python -m nvd_claude_proxy.main` 之前，先检测并启动已安装的 `nvd-claude-proxy`/`ncp` 可执行文件。支持 proxy 通过 uv tool 安装、命令可用但无法从 Claude Any 的 Python 解释器 import 的环境。
 
 ### 0.1.15
 

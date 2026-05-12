@@ -9,7 +9,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.15`
+현재 버전: `0.1.16`
 
 ## 왜 만들었나
 
@@ -187,6 +187,10 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.16
+
+- **NVIDIA hosted proxy 시작 수정**: `python -m nvd_claude_proxy.main`으로 fallback하기 전에 설치된 `nvd-claude-proxy`/`ncp` 실행 파일을 감지해 실행합니다. proxy가 uv tool로 설치되어 명령은 있지만 Claude Any의 Python 인터프리터에서 import되지 않는 환경을 지원합니다.
 
 ### 0.1.15
 
