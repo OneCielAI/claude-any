@@ -1195,8 +1195,10 @@ def test_submenu(lines: list[str]) -> dict:
 def run_test_with_animation(idx: int, checks: list[str]) -> tuple[int, str]:
     frames = ["|", "/", "-", "\\"]
     started = time.monotonic()
+    test_timeout = 180
+    hard_timeout = test_timeout + 15
     proc = subprocess.Popen(
-        [CTL, "test"],
+        [CTL, "test", str(test_timeout)],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
@@ -1204,8 +1206,21 @@ def run_test_with_animation(idx: int, checks: list[str]) -> tuple[int, str]:
     frame = 0
     while proc.poll() is None:
         elapsed = int(time.monotonic() - started)
-        notice = [f"{frames[frame % len(frames)]} {t('running_test')} ({elapsed}s)"]
+        notice = [f"{frames[frame % len(frames)]} {t('running_test')} ({elapsed}s/{test_timeout}s)"]
         render(None, idx, None, notice, checks)
+        if elapsed >= hard_timeout:
+            proc.terminate()
+            try:
+                out, _ = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                out, _ = proc.communicate()
+            timeout_msg = (
+                f"Compatibility: FAIL\n"
+                f"Reason: compatibility test exceeded {test_timeout}s and was stopped by the menu.\n"
+                "Diagnosis: retry the test or choose a faster/more reliable model."
+            )
+            return 124, ((out or "").rstrip() + "\n" + timeout_msg).strip()
         frame += 1
         time.sleep(0.2)
     out, _ = proc.communicate()

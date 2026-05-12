@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.16`
+Current version: `0.1.17`
 
 ## Why This Exists
 
@@ -206,6 +206,10 @@ steps under that larger model's supervision.
   file changes, reducing per-request overhead in the router.
 
 ## Changelog
+
+### 0.1.17
+
+- **Menu compatibility-test timeout**: the terminal menu now runs compatibility tests with an explicit 180 s timeout and stops the child process if it exceeds the menu hard limit, so slow hosted models cannot leave the menu appearing indefinitely pending.
 
 ### 0.1.16
 
