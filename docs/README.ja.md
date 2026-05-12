@@ -3,13 +3,33 @@
 | [English](../README.md) | [한국어](README.ko.md) | 日本語 | [中文](README.zh.md) |
 | --- | --- | --- | --- |
 
+> ## 🚀 無料/低コストの LLM で Claude Code の全機能を
+>
+> - **無料** — [NVIDIA hosted NIM](https://build.nvidia.com/) (qwen3-coder-480b、gpt-oss など) を API Catalog から使用。
+> - **低コスト** — [Ollama Cloud](https://ollama.com/cloud) で GLM、Qwen、DeepSeek などのオープン重みモデルを、フロンティアモデル比でごく安価に。
+> - **無料 + ローカル** — [Ollama](https://ollama.com/) または [vLLM](https://github.com/vllm-project/vllm) を自分の GPU で完全オフライン実行。
+>
+> プロバイダー、モデル、Base URL、API キー、ストリーミング動作、LLM オプションを Claude Code 起動 **前** にコンソールメニューで選択します。Claude Code 本体はそのまま — すべてのネイティブツール、slash コマンド、ワークフローが維持されます。
+
+### デモ
+
+![NVIDIA hosted NIM で Claude Code 駆動 (qwen3-coder-480b)](assets/claude-any-nvidia-nim.gif)
+
+NVIDIA hosted NIM (qwen3-coder-480b) を claude-any ルーター経由で Claude Code に接続。 &nbsp;[フル mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
+
+![Ollama Cloud を claude-any ルーターで (glm-5.1)](assets/claude-any-ollama-cloud.gif)
+
+Ollama Cloud (glm-5.1) を SSE 単語境界チャンキング有効状態で claude-any ルーターからストリーミング。 &nbsp;[フル mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-ollama-cloud.mp4)
+
+---
+
 Claude Any は、Claude Code の起動前に Anthropic、Ollama、Ollama Cloud、
 vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引数を
 そのまま渡すプロバイダー選択ランチャーです。
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.21`
+現在のバージョン: `0.1.23`
 
 ## 作られた理由
 
@@ -184,10 +204,50 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 - `--ca-provider`、`--ca-model`、`--ca-base-url` などの headless フラグ。
 - Ollama/Ollama Cloud ルーター経路でのストリーミングプロキシ — トークンが届く
   すぐに Claude Code に転送し、レスポンス全体のバッファリングを待ちません。
+- プロバイダー毎の `stream` on/off トグルと `stream_word_chunking` オプションで、
+  text delta を単語境界でまとめて送信。長いストリーミング応答での tool-call /
+  JSON 解析を壊しうる SSE 断片化を緩和します。
+- LLM options メニューで強調表示された行の意味を、選択中の言語(英語/韓国語/
+  日本語/中国語)で下部に表示。boolean 行(`Stream`、`Stream word chunking`、
+  `Native compatibility`、`Think`)は Enter キー一つで即座にトグルします。
+- Tool guard hook を Claude Code の hook event 全体に拡張(`WorktreeCreate` /
+  `WorktreeRemove` 含む) — git リポジトリでない作業ディレクトリで Agent isolation が
+  `Cannot create agent worktree: not in a git repository...` で失敗する問題を解消。
 - 設定ファイルキャッシュ — ルーターがリクエストごとにディスクから読み込んでいた
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.23
+
+- **ストリームトグル**: 各 non-Anthropic provider に `stream_enabled` 設定を追加
+  (LLM options メニュー、`claude-anyctl ollama-options` / `provider-options`、
+  headless フラグの全てで利用可能)。off にすると上流に `stream:false` を強制し、
+  応答全体を Claude Code に返します — ストリーミング断片化で tool-call/JSON 解析が
+  壊れる時の回避策。
+- **単語境界ストリーミング**: `stream_word_chunking` オプションを追加。SSE text delta
+  を空白/単語境界までバッファしてから送信します。Ollama ルーター経路と native
+  パススルー経路(vLLM、NVIDIA hosted、self-hosted NIM)の両方に実装。Tool delta
+  とテキスト以外の SSE イベントはそのまま透過します。
+- **全 hook 処理**: `install_tool_guard_hooks` が Claude Code の全 hook event を登録
+  (PreToolUse、PostToolUse、PostToolUseFailure、PostToolBatch、PermissionRequest、
+  PermissionDenied、SessionStart/End、Setup、UserPromptSubmit/Expansion、Stop、
+  StopFailure、InstructionsLoaded、ConfigChange、CwdChanged、Notification、
+  SubagentStart/Stop、TeammateIdle、TaskCreated、TaskCompleted、PreCompact、PostCompact、
+  WorktreeCreate、WorktreeRemove、Elicitation、ElicitationResult)。WorktreeCreate
+  ハンドラが `worktreePath = base_path` を返すので、git リポジトリでないディレクトリ
+  でも Agent isolation が動作します。
+- **Windows hook 互換性**: `shell_command_string` が Windows でフォワードスラッシュと
+  POSIX 引用を出力するように変更 — Claude Code の sh ベース hook 実行器が
+  `C:\Users\...` のような Windows パスのバックスラッシュを escape として解釈して
+  しまう問題を解消。
+- **LLM options UX**: 強調行の説明をユーザー言語でパネル下部に表示。boolean トグル
+  (`Stream`、`Stream word chunking`、`Native compatibility`、`Think`) は Enter で
+  in-place に on/off を反転します — 入力プロンプト無し。
+
+### 0.1.22
+
+- **ヘッドレスマニュアル拡張**: 自動化と遠隔サーバー用に、headless setup / launch / test / passthrough / cleanup の実例を追加したマニュアル拡張。
 
 ### 0.1.21
 

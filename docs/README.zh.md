@@ -3,13 +3,33 @@
 | [English](../README.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | 中文 |
 | --- | --- | --- | --- |
 
+> ## 🚀 用免费/低成本 LLM 获取完整的 Claude Code 体验
+>
+> - **免费** — [NVIDIA hosted NIM](https://build.nvidia.com/)（qwen3-coder-480b、gpt-oss 等），通过 API Catalog 使用。
+> - **低成本** — [Ollama Cloud](https://ollama.com/cloud) 提供 GLM、Qwen、DeepSeek 等开源权重模型，价格远低于前沿模型。
+> - **免费 + 本地** — 在自己的 GPU 上使用 [Ollama](https://ollama.com/) 或 [vLLM](https://github.com/vllm-project/vllm)，完全离线。
+>
+> 在 Claude Code 启动**之前**，通过控制台菜单选择 provider、模型、Base URL、API 密钥、流式行为以及 LLM 选项。Claude Code 本体保持原样运行 —— 所有原生工具、slash 命令和工作流都不受影响。
+
+### 演示
+
+![NVIDIA hosted NIM 驱动 Claude Code（qwen3-coder-480b）](assets/claude-any-nvidia-nim.gif)
+
+NVIDIA hosted NIM（qwen3-coder-480b）通过 claude-any 路由器驱动 Claude Code。 &nbsp;[完整 mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
+
+![Ollama Cloud 经由 claude-any 路由器（glm-5.1）](assets/claude-any-ollama-cloud.gif)
+
+Ollama Cloud（glm-5.1）在启用 SSE 单词边界分块的情况下通过 claude-any 路由器流式传输。 &nbsp;[完整 mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-ollama-cloud.mp4)
+
+---
+
 Claude Any 是 Claude Code 的启动前供应商选择器。它可以在 Claude Code 启动前
 选择 Anthropic、Ollama、Ollama Cloud、vLLM、NVIDIA hosted 或 self-hosted
 NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.21`
+当前版本: `0.1.23`
 
 ## 为什么存在
 
@@ -172,10 +192,47 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 - 支持 `--ca-provider`、`--ca-model`、`--ca-base-url` 等 headless 参数。
 - Ollama/Ollama Cloud 路由路径的流式代理 — token 到达后立即转发给 Claude Code，
   不再等待完整响应。
+- 按 provider 的 `stream` on/off 开关和 `stream_word_chunking` 选项，可将文本
+  delta 合并到单词边界后再发送，缓解长流式响应中 SSE 分片导致的 tool-call /
+  JSON 解析错误。
+- LLM options 菜单会在面板底部以当前语言（英语/韩语/日语/中文）显示高亮行的
+  含义；布尔行（`Stream`、`Stream word chunking`、`Native compatibility`、
+  `Think`）按 Enter 即可就地切换。
+- Tool guard hook 覆盖范围扩展到 Claude Code 的全部 hook event（包含
+  `WorktreeCreate` / `WorktreeRemove`），解决非 git 工作目录下 Agent isolation
+  因 `Cannot create agent worktree: not in a git repository...` 而失败的问题。
 - 配置文件缓存 — 路由器将设置缓存到内存，仅在文件修改时重新读取，
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.23
+
+- **流式开关**: 每个 non-Anthropic provider 新增 `stream_enabled` 开关（在 LLM
+  options 菜单、`claude-anyctl ollama-options` / `provider-options`、以及 headless
+  参数中都可用）。关闭后路由器会对上游强制 `stream:false`，把完整响应一次性
+  返回给 Claude Code — 这是流式分片破坏 tool-call/JSON 解析时的回避方案。
+- **单词边界流式**: 新增 `stream_word_chunking` 选项。将 SSE 文本 delta 在
+  空白/单词边界处合并后再发送。Ollama 路由路径和 native 透传路径（vLLM、NVIDIA
+  hosted、self-hosted NIM）都已实现。工具 delta 和非文本 SSE 事件原样透传。
+- **完整 hook 处理**: `install_tool_guard_hooks` 现在会注册 Claude Code 的全部
+  hook event（PreToolUse、PostToolUse、PostToolUseFailure、PostToolBatch、
+  PermissionRequest、PermissionDenied、SessionStart/End、Setup、UserPromptSubmit/
+  Expansion、Stop、StopFailure、InstructionsLoaded、ConfigChange、CwdChanged、
+  Notification、SubagentStart/Stop、TeammateIdle、TaskCreated、TaskCompleted、
+  PreCompact、PostCompact、WorktreeCreate、WorktreeRemove、Elicitation、
+  ElicitationResult）。WorktreeCreate 处理器返回 `worktreePath = base_path`，
+  因此非 git 目录中 Agent isolation 也能正常工作。
+- **Windows hook 兼容性**: `shell_command_string` 现在在 Windows 上输出正斜杠和
+  POSIX 引用，避免 Claude Code 的 sh hook 执行器把 `C:\Users\...` 中的反斜杠
+  当作转义字符吞掉。
+- **LLM options UX**: 在面板底部以用户语言显示高亮行的解释。布尔切换
+  （`Stream`、`Stream word chunking`、`Native compatibility`、`Think`）按 Enter
+  原地切换 — 无需输入提示。
+
+### 0.1.22
+
+- **Headless 手册扩展**: 增加面向自动化和远程服务器的 headless setup / launch / test / passthrough / cleanup 实用示例。
 
 ### 0.1.21
 

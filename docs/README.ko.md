@@ -3,13 +3,33 @@
 | [English](../README.md) | 한국어 | [日本語](README.ja.md) | [中文](README.zh.md) |
 | --- | --- | --- | --- |
 
+> ## 🚀 Claude Code의 모든 기능을 무료/저비용 LLM 으로
+>
+> - **무료** — [NVIDIA hosted NIM](https://build.nvidia.com/) (qwen3-coder-480b, gpt-oss 등) 을 API Catalog 로 사용.
+> - **저비용** — [Ollama Cloud](https://ollama.com/cloud) 로 GLM, Qwen, DeepSeek 같은 오픈 가중치 모델을 frontier 모델 대비 매우 낮은 가격에 사용.
+> - **무료 + 로컬** — [Ollama](https://ollama.com/) 또는 [vLLM](https://github.com/vllm-project/vllm) 을 본인 GPU 에서 완전 오프라인으로 사용.
+>
+> 프로바이더, 모델, Base URL, API 키, 스트리밍 동작, LLM 옵션을 Claude Code 실행 **전에** 콘솔 메뉴에서 모두 선택합니다. Claude Code 본체는 그대로 — 모든 native 툴링, slash command, 워크플로우가 유지됩니다.
+
+### 데모
+
+![NVIDIA hosted NIM 로 Claude Code 구동 (qwen3-coder-480b)](assets/claude-any-nvidia-nim.gif)
+
+NVIDIA hosted NIM (qwen3-coder-480b) 이 claude-any 라우터를 통해 Claude Code 를 구동. &nbsp;[전체 mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
+
+![Ollama Cloud 를 claude-any 라우터로 (glm-5.1)](assets/claude-any-ollama-cloud.gif)
+
+Ollama Cloud (glm-5.1) 를 SSE 단어경계 청킹 활성화 상태에서 claude-any 라우터로 스트리밍. &nbsp;[전체 mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-ollama-cloud.mp4)
+
+---
+
 Claude Any는 Claude Code 실행 전에 Anthropic, Ollama, Ollama Cloud, vLLM,
 NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 그대로
 전달하는 프로바이더 선택 런처입니다.
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.21`
+현재 버전: `0.1.23`
 
 ## 왜 만들었나
 
@@ -183,10 +203,49 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 - `--ca-provider`, `--ca-model`, `--ca-base-url`, `--ca-api-key-env` 등 headless 플래그.
 - Ollama/Ollama Cloud 라우터 경로의 스트리밍 프록시 — 전체 응답을 기다리지 않고
   토큰이 도착하는 즉시 Claude Code로 전달합니다.
+- 프로바이더별 `stream` on/off 토글과 `stream_word_chunking` 옵션으로 텍스트
+  delta 를 단어 경계 단위로 묶어서 전송 — 긴 스트리밍 응답에서 tool-call /
+  JSON 파싱을 깨뜨릴 수 있는 SSE 단편화 문제를 완화합니다.
+- LLM options 메뉴에서 강조된 행의 의미를 현재 언어(영어/한국어/일본어/중국어)로
+  하단에 표시하고, boolean 행(`Stream`, `Stream word chunking`,
+  `Native compatibility`, `Think`) 은 Enter 키 한 번에 즉시 토글됩니다.
+- Tool guard hook 등록을 Claude Code 의 전체 hook event 로 확장
+  (`WorktreeCreate` / `WorktreeRemove` 포함) — git 저장소가 아닌 작업 디렉터리에서
+  Agent isolation 이 `Cannot create agent worktree: not in a git repository...`
+  에러로 실패하던 문제 해결.
 - 설정 파일 캐싱 — 라우터의 요청마다 디스크에서 읽던 설정을 메모리에 캐시하여
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.23
+
+- **스트림 토글**: 각 non-Anthropic provider 에 `stream_enabled` 설정 추가
+  (LLM options 메뉴, `claude-anyctl ollama-options` / `provider-options`, headless 플래그
+  모두 지원). off 면 라우터가 업스트림에 `stream:false` 를 강제하고 응답 전체를
+  Claude Code 에 반환 — 스트리밍 단편화로 tool-call/JSON 파싱이 깨질 때의 우회책.
+- **단어 경계 스트리밍**: `stream_word_chunking` 옵션 추가. SSE text delta 를 공백/
+  단어 경계까지 모아서 한 번에 보냅니다. Ollama 라우터 경로와 native 패스스루 경로
+  (vLLM, NVIDIA hosted, self-hosted NIM) 양쪽 모두에 구현. Tool delta 와 텍스트가
+  아닌 SSE 이벤트는 그대로 통과합니다.
+- **전체 hook 처리**: `install_tool_guard_hooks` 가 Claude Code 의 모든 hook event
+  (PreToolUse, PostToolUse, PostToolUseFailure, PostToolBatch, PermissionRequest,
+  PermissionDenied, SessionStart/End, Setup, UserPromptSubmit/Expansion, Stop,
+  StopFailure, InstructionsLoaded, ConfigChange, CwdChanged, Notification,
+  SubagentStart/Stop, TeammateIdle, TaskCreated, TaskCompleted, PreCompact, PostCompact,
+  WorktreeCreate, WorktreeRemove, Elicitation, ElicitationResult) 를 등록합니다.
+  WorktreeCreate 핸들러가 `worktreePath = base_path` 를 반환해 git 저장소가 아닌
+  디렉터리에서도 Agent isolation 이 동작합니다.
+- **Windows hook 호환성**: `shell_command_string` 이 Windows 에서 forward slash 와
+  POSIX 인용을 사용하도록 변경 — Claude Code 의 sh 기반 hook 실행기가
+  `C:\Users\...` 같은 경로의 백슬래시를 escape 문자로 먹어버리던 문제 해결.
+- **LLM options UX**: 강조된 행의 설명을 사용자 언어로 패널 하단에 표시. boolean
+  토글(`Stream`, `Stream word chunking`, `Native compatibility`, `Think`) 은 Enter
+  키로 즉시 on/off 전환 — 입력 프롬프트 없이 in-place 토글.
+
+### 0.1.22
+
+- **Headless 매뉴얼 확장**: 자동화 및 원격 서버용 headless setup / launch / test / passthrough / cleanup 예제로 매뉴얼을 확장했습니다.
 
 ### 0.1.21
 

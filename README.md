@@ -13,15 +13,13 @@
 
 ### Demo
 
-[![NVIDIA hosted NIM driving Claude Code (qwen3-coder-480b)](docs/assets/claude-any-nvidia-nim-poster.png)](demo/claude-any-nvidia-nim.mp4)
+![NVIDIA hosted NIM driving Claude Code (qwen3-coder-480b)](docs/assets/claude-any-nvidia-nim.gif)
 
-*Click to play — NVIDIA hosted NIM (qwen3-coder-480b) driving Claude Code through the claude-any router.* &nbsp;([open mp4](demo/claude-any-nvidia-nim.mp4))
+NVIDIA hosted NIM (qwen3-coder-480b) driving Claude Code through the claude-any router. &nbsp;[full mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
 
-[![Ollama Cloud streamed through the claude-any router (glm-5.1)](docs/assets/claude-any-ollama-cloud-poster.png)](demo/claude-any-ollama-cloud.mp4)
+![Ollama Cloud streamed through the claude-any router (glm-5.1)](docs/assets/claude-any-ollama-cloud.gif)
 
-*Click to play — Ollama Cloud (glm-5.1) streamed through the claude-any router with SSE word-boundary chunking enabled.* &nbsp;([open mp4](demo/claude-any-ollama-cloud.mp4))
-
-> GitHub strips HTML `<video>` tags from rendered README. Click a poster image (or the “open mp4” link) and GitHub's blob viewer will play the video inline.
+Ollama Cloud (glm-5.1) streamed through the claude-any router with SSE word-boundary chunking enabled. &nbsp;[full mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-ollama-cloud.mp4)
 
 ---
 
