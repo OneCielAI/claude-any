@@ -54,20 +54,45 @@ macOS はまだ十分にテストしていませんが、portable Python と she
 
 ## インストール
 
+[![npm version](https://img.shields.io/npm/v/@oneciel-ai/claude-any.svg)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+[![npm downloads](https://img.shields.io/npm/dm/@oneciel-ai/claude-any.svg)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+
 要件:
 
 - Python 3.10+
 - `claude` コマンドで実行できる Claude Code
-- MCP Web ツールを使う場合のみ Node/npm
+- Node/npm (インストール shim および MCP Web ツール用)
 
-現在すぐに使える GitHub インストール:
+**npm registry からインストール (推奨):**
+
+```sh
+npm install -g @oneciel-ai/claude-any
+claude-any
+```
+
+**アップグレード:**
+
+```sh
+npm update -g @oneciel-ai/claude-any
+claude-any version
+```
+
+**アンインストール:**
+
+```sh
+npm uninstall -g @oneciel-ai/claude-any
+```
+
+### 別の取得方法
+
+GitHub リポジトリから直接インストール (publish 間の未公開コミットを試したい時に便利):
 
 ```sh
 npm install -g https://github.com/OneCielAI/claude-any.git
 claude-any
 ```
 
-ソースからインストール:
+POSIX 環境でソースからインストール:
 
 ```sh
 git clone https://github.com/OneCielAI/claude-any.git
@@ -85,43 +110,20 @@ cd claude-any
 claude-any
 ```
 
-npm registry に初回 publish した後:
+### リリース (メンテナー向け)
 
-```sh
-npm install -g @oneciel-ai/claude-any
-claude-any
-```
+新しい GitHub Release が公開されると
+[`Publish to npm`](../.github/workflows/npm-publish.yml) ワークフローが
+自動的に npm へ公開します。ワークフローは `@oneciel-ai/claude-any` に対する
+*Bypass 2FA for publishing* を有効にした granular token を、リポジトリ
+secret `NPM_TOKEN` として受け取ります。
 
-アップグレード:
+リリース手順:
 
-```sh
-# GitHub インストール、現在の推奨経路
-npm install -g https://github.com/OneCielAI/claude-any.git --force
-claude-any version
-```
-
-`npm update -g @oneciel-ai/claude-any` を動作させるには、同じ package 名で
-public npm registry に publish されている必要があります。
-
-```sh
-npm login
-npm publish --access public
-npm install -g @oneciel-ai/claude-any
-npm update -g @oneciel-ai/claude-any
-```
-
-自動公開を使う場合は、npm automation token を GitHub repository secret
-`NPM_TOKEN` として保存し、GitHub Release を作成するか `Publish to npm`
-workflow を手動実行します。
-
-バージョン管理には SemVer を使います。次のリリースでは `package.json` の
-`version` を更新し、`v0.1.1` のような同じバージョンの Git tag と GitHub
-Release を作成すると npm publish workflow を実行できます。registry 公開後は
-次のコマンドでアップグレードできます。
-
-```sh
-npm update -g @oneciel-ai/claude-any
-```
+1. `package.json` の `version` と `claude_any.py` の `VERSION` を上げる。
+2. Changelog 項目を追加。
+3. `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
+4. `gh release create vX.Y.Z --title "..." --notes "..."` — publish ワークフローを起動。
 
 
 ![Claude Any menu](assets/claude-any-main.ja.png)

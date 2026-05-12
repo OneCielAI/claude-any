@@ -52,20 +52,45 @@ macOS 尚未充分测试，但项目主要基于 portable Python 和 shell wrapp
 
 ## 安装
 
+[![npm version](https://img.shields.io/npm/v/@oneciel-ai/claude-any.svg)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+[![npm downloads](https://img.shields.io/npm/dm/@oneciel-ai/claude-any.svg)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+
 要求:
 
 - Python 3.10+
 - 已安装 Claude Code，并可通过 `claude` 命令运行
-- 只有启用 MCP 网页工具时才需要 Node/npm
+- Node/npm（用于安装 shim 和可选的 MCP 网页工具）
 
-当前可直接使用的 GitHub 安装:
+**从 npm registry 安装（推荐）:**
+
+```sh
+npm install -g @oneciel-ai/claude-any
+claude-any
+```
+
+**升级:**
+
+```sh
+npm update -g @oneciel-ai/claude-any
+claude-any version
+```
+
+**卸载:**
+
+```sh
+npm uninstall -g @oneciel-ai/claude-any
+```
+
+### 其它安装方式
+
+直接从 GitHub 仓库安装（在两次 publish 之间测试未发布的提交时有用）:
 
 ```sh
 npm install -g https://github.com/OneCielAI/claude-any.git
 claude-any
 ```
 
-源码安装:
+POSIX 源码安装:
 
 ```sh
 git clone https://github.com/OneCielAI/claude-any.git
@@ -83,42 +108,19 @@ cd claude-any
 claude-any
 ```
 
-首次发布到 npm registry 后安装:
+### 发布（维护者）
 
-```sh
-npm install -g @oneciel-ai/claude-any
-claude-any
-```
+发布新 GitHub Release 时，
+[`Publish to npm`](../.github/workflows/npm-publish.yml) 工作流会自动
+将包发布到 npm 。该工作流读取仓库 secret `NPM_TOKEN`，token 需要对
+`@oneciel-ai/claude-any` 拥有写权限并启用 *Bypass 2FA for publishing*。
 
-升级:
+发布流程:
 
-```sh
-# GitHub 安装，当前推荐方式
-npm install -g https://github.com/OneCielAI/claude-any.git --force
-claude-any version
-```
-
-要让 `npm update -g @oneciel-ai/claude-any` 正常工作，必须先用同一个 package
-name 发布到 public npm registry。
-
-```sh
-npm login
-npm publish --access public
-npm install -g @oneciel-ai/claude-any
-npm update -g @oneciel-ai/claude-any
-```
-
-如果使用自动发布，请创建 npm automation token，将它保存为 GitHub repository
-secret `NPM_TOKEN`，然后发布 GitHub Release 或手动运行 `Publish to npm`
-workflow。
-
-版本使用 SemVer。后续发布时，更新 `package.json` 中的 `version`，创建相同
-版本的 Git tag，例如 `v0.1.1`，再发布 GitHub Release 即可触发 npm publish
-workflow。发布到 registry 之后，可以使用以下命令升级。
-
-```sh
-npm update -g @oneciel-ai/claude-any
-```
+1. 升级 `package.json` 的 `version` 和 `claude_any.py` 的 `VERSION`。
+2. 增加 Changelog 条目。
+3. `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`。
+4. `gh release create vX.Y.Z --title "..." --notes "..."` —— 触发 publish 工作流。
 
 
 ![Claude Any menu](assets/claude-any-main.zh.png)

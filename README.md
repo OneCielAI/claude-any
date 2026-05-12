@@ -59,20 +59,46 @@ portable Python and shell wrappers. If you hit a macOS issue, please report it.
 
 ## Install
 
+[![npm version](https://img.shields.io/npm/v/@oneciel-ai/claude-any.svg)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+[![npm downloads](https://img.shields.io/npm/dm/@oneciel-ai/claude-any.svg)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+
 Requirements:
 
 - Python 3.10+
 - Claude Code installed and available as `claude`
-- Node/npm only if you enable MCP web tooling
+- Node/npm (used for the install shim and optional MCP web tooling)
 
-Current install from GitHub:
+**Install from the npm registry (recommended):**
+
+```sh
+npm install -g @oneciel-ai/claude-any
+claude-any
+```
+
+**Upgrade:**
+
+```sh
+npm update -g @oneciel-ai/claude-any
+claude-any version
+```
+
+**Uninstall:**
+
+```sh
+npm uninstall -g @oneciel-ai/claude-any
+```
+
+### Alternative install paths
+
+Install directly from the GitHub repository (useful for testing unreleased
+commits between npm publishes):
 
 ```sh
 npm install -g https://github.com/OneCielAI/claude-any.git
 claude-any
 ```
 
-Source install:
+POSIX source install:
 
 ```sh
 git clone https://github.com/OneCielAI/claude-any.git
@@ -90,43 +116,21 @@ cd claude-any
 claude-any
 ```
 
-Registry install, after the first npm publish:
+### Releasing (maintainers)
 
-```sh
-npm install -g @oneciel-ai/claude-any
-claude-any
-```
+The npm registry version is published automatically by the
+[`Publish to npm`](.github/workflows/npm-publish.yml) workflow when a new
+GitHub Release is published. The workflow needs an `NPM_TOKEN` repository
+secret containing a granular access token for `@oneciel-ai/claude-any` with
+*Bypass 2FA for publishing* enabled.
 
-Upgrade:
+Release flow:
 
-```sh
-# GitHub install, current recommended path
-npm install -g https://github.com/OneCielAI/claude-any.git --force
-claude-any version
-```
-
-To make `npm update -g @oneciel-ai/claude-any` work, the package must be
-published to the public npm registry under the same package name:
-
-```sh
-npm login
-npm publish --access public
-npm install -g @oneciel-ai/claude-any
-npm update -g @oneciel-ai/claude-any
-```
-
-For automated publishing, create an npm automation token, save it as the
-repository secret `NPM_TOKEN`, then publish a GitHub Release or run the
-`Publish to npm` workflow manually.
-
-Versioning uses SemVer. For future releases, bump `version` in `package.json`,
-create a matching Git tag such as `v0.1.1`, and publish a GitHub Release to
-trigger the npm publish workflow. After registry publication, the normal
-registry upgrade command will be:
-
-```sh
-npm update -g @oneciel-ai/claude-any
-```
+1. Bump `version` in `package.json` and `VERSION` in `claude_any.py`.
+2. Add a Changelog entry.
+3. `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
+4. `gh release create vX.Y.Z --title "..." --notes "..."` — this triggers
+   the publish workflow.
 
 
 ![Claude Any menu](docs/assets/claude-any-main.en.png)

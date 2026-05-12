@@ -54,20 +54,45 @@ macOS에서는 아직 충분히 테스트하지 않았지만, portable Python과
 
 ## 설치
 
+[![npm version](https://img.shields.io/npm/v/@oneciel-ai/claude-any.svg)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+[![npm downloads](https://img.shields.io/npm/dm/@oneciel-ai/claude-any.svg)](https://www.npmjs.com/package/@oneciel-ai/claude-any)
+
 요구사항:
 
 - Python 3.10+
 - `claude` 명령으로 실행 가능한 Claude Code
-- MCP 웹 도구를 사용할 경우 Node/npm
+- Node/npm (설치 shim 과 선택적인 MCP 웹 도구용)
 
-현재 바로 동작하는 GitHub 설치:
+**npm registry 에서 설치 (권장):**
+
+```sh
+npm install -g @oneciel-ai/claude-any
+claude-any
+```
+
+**업그레이드:**
+
+```sh
+npm update -g @oneciel-ai/claude-any
+claude-any version
+```
+
+**제거:**
+
+```sh
+npm uninstall -g @oneciel-ai/claude-any
+```
+
+### 다른 설치 경로
+
+GitHub 저장소에서 직접 설치 (publish 사이의 미릴리스 커밋을 시험할 때 유용):
 
 ```sh
 npm install -g https://github.com/OneCielAI/claude-any.git
 claude-any
 ```
 
-소스 설치:
+POSIX 소스 설치:
 
 ```sh
 git clone https://github.com/OneCielAI/claude-any.git
@@ -85,43 +110,20 @@ cd claude-any
 claude-any
 ```
 
-npm registry에 최초 publish한 뒤 설치:
+### 릴리즈 (메인테이너용)
 
-```sh
-npm install -g @oneciel-ai/claude-any
-claude-any
-```
+새 GitHub Release 가 publish 되면
+[`Publish to npm`](../.github/workflows/npm-publish.yml) 워크플로가
+자동으로 npm 에 배포합니다. 워크플로는 `@oneciel-ai/claude-any` 에 대한
+*Bypass 2FA for publishing* 권한이 있는 granular token 을 저장소 secret
+`NPM_TOKEN` 으로 받습니다.
 
-업그레이드:
+릴리즈 절차:
 
-```sh
-# GitHub 설치, 현재 권장 경로
-npm install -g https://github.com/OneCielAI/claude-any.git --force
-claude-any version
-```
-
-`npm update -g @oneciel-ai/claude-any`가 동작하려면 같은 패키지 이름으로 public
-npm registry에 publish되어 있어야 합니다.
-
-```sh
-npm login
-npm publish --access public
-npm install -g @oneciel-ai/claude-any
-npm update -g @oneciel-ai/claude-any
-```
-
-자동 배포를 쓰려면 npm automation token을 GitHub repository secret `NPM_TOKEN`
-으로 저장한 뒤 GitHub Release를 만들거나 `Publish to npm` workflow를 수동
-실행하면 됩니다.
-
-버전은 SemVer를 사용합니다. 다음 릴리스에서는 `package.json`의 `version`을
-올리고, `v0.1.1` 같은 같은 버전의 Git tag와 GitHub Release를 만들면 npm publish
-workflow를 실행할 수 있습니다. registry publish 이후에는 다음 명령으로
-업그레이드할 수 있습니다.
-
-```sh
-npm update -g @oneciel-ai/claude-any
-```
+1. `package.json` 의 `version` 과 `claude_any.py` 의 `VERSION` 을 올림.
+2. Changelog 항목 추가.
+3. `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
+4. `gh release create vX.Y.Z --title "..." --notes "..."` — publish 워크플로 트리거.
 
 
 ![Claude Any 메뉴](assets/claude-any-main.ko.png)
