@@ -13,9 +13,9 @@
 
 ### 데모
 
-![NVIDIA hosted NIM 로 Claude Code 구동 (qwen3-coder-480b)](assets/claude-any-nvidia-nim.gif)
+![NVIDIA hosted NIM 로 Claude Code 구동 (deepseek-4-flash)](assets/claude-any-nvidia-nim.gif)
 
-NVIDIA hosted NIM (qwen3-coder-480b) 이 claude-any 라우터를 통해 Claude Code 를 구동. &nbsp;[전체 mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
+NVIDIA hosted NIM (deepseek-4-flash) 이 claude-any 라우터를 통해 Claude Code 를 구동. &nbsp;[전체 mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
 
 ![Ollama Cloud 를 claude-any 라우터로 (glm-5.1)](assets/claude-any-ollama-cloud.gif)
 

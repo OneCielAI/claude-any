@@ -13,9 +13,9 @@
 
 ### 演示
 
-![NVIDIA hosted NIM 驱动 Claude Code（qwen3-coder-480b）](assets/claude-any-nvidia-nim.gif)
+![NVIDIA hosted NIM 驱动 Claude Code（deepseek-4-flash）](assets/claude-any-nvidia-nim.gif)
 
-NVIDIA hosted NIM（qwen3-coder-480b）通过 claude-any 路由器驱动 Claude Code。 &nbsp;[完整 mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
+NVIDIA hosted NIM（deepseek-4-flash）通过 claude-any 路由器驱动 Claude Code。 &nbsp;[完整 mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
 
 ![Ollama Cloud 经由 claude-any 路由器（glm-5.1）](assets/claude-any-ollama-cloud.gif)
 

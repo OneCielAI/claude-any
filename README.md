@@ -13,9 +13,9 @@
 
 ### Demo
 
-![NVIDIA hosted NIM driving Claude Code (qwen3-coder-480b)](docs/assets/claude-any-nvidia-nim.gif)
+![NVIDIA hosted NIM driving Claude Code (deepseek-4-flash)](docs/assets/claude-any-nvidia-nim.gif)
 
-NVIDIA hosted NIM (qwen3-coder-480b) driving Claude Code through the claude-any router. &nbsp;[full mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
+NVIDIA hosted NIM (deepseek-4-flash) driving Claude Code through the claude-any router. &nbsp;[full mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
 
 ![Ollama Cloud streamed through the claude-any router (glm-5.1)](docs/assets/claude-any-ollama-cloud.gif)
 

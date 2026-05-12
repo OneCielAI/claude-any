@@ -13,9 +13,9 @@
 
 ### デモ
 
-![NVIDIA hosted NIM で Claude Code 駆動 (qwen3-coder-480b)](assets/claude-any-nvidia-nim.gif)
+![NVIDIA hosted NIM で Claude Code 駆動 (deepseek-4-flash)](assets/claude-any-nvidia-nim.gif)
 
-NVIDIA hosted NIM (qwen3-coder-480b) を claude-any ルーター経由で Claude Code に接続。 &nbsp;[フル mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
+NVIDIA hosted NIM (deepseek-4-flash) を claude-any ルーター経由で Claude Code に接続。 &nbsp;[フル mp4 ⤓](https://github.com/OneCielAI/claude-any/raw/main/demo/claude-any-nvidia-nim.mp4)
 
 ![Ollama Cloud を claude-any ルーターで (glm-5.1)](assets/claude-any-ollama-cloud.gif)
 
