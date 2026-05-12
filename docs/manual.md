@@ -6,7 +6,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.20`
+Current version: `0.1.21`
 
 ## Install
 
@@ -300,6 +300,21 @@ for routine checks and summaries.
 Non-native providers may not have Claude Code's remote web-search capability.
 Claude Any can wire separate MCP tools for DuckDuckGo search and URL fetch so
 agents can still perform web research through explicit tools.
+
+## Service Lifecycle
+
+Claude Any starts provider helpers on demand rather than keeping every helper
+alive permanently.
+
+- `claude-any stop` stops managed Claude Any router and NVIDIA proxy processes.
+- When launching Claude Code, Claude Any starts only the services required by
+  the selected provider.
+- Ollama and Ollama Cloud router mode use the Claude Any router on
+  `127.0.0.1:8799`.
+- NVIDIA hosted router mode uses the Claude Any router on `127.0.0.1:8799` and
+  starts `nvd-claude-proxy` on `127.0.0.1:8788` only when that provider needs it.
+- For clean provider-switch testing, run `claude-any stop`, select the provider,
+  then launch or test. This avoids stale port ownership from old sessions.
 
 ## Development Story
 

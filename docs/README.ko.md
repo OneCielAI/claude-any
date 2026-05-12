@@ -9,7 +9,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.20`
+현재 버전: `0.1.21`
 
 ## 왜 만들었나
 
@@ -188,6 +188,10 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 ## 변경 이력
 
+### 0.1.21
+
+- **서비스 생명주기 문서화**: Claude Any가 실행 시 선택된 provider에 필요한 router/proxy만 시작하며, `claude-any stop`이 명시적인 정리 명령임을 명확히 설명합니다.
+
 ### 0.1.20
 
 - **NVIDIA hosted quick test**: `auto` 모드가 NVIDIA hosted provider에서는 text-only quick test를 사용합니다. 메뉴 확인 중 느리거나 불안정한 tool_use 요청을 피합니다. text + tool_use는 `smoke`, 전체 text/tool_use/tool_result 왕복은 `full`을 사용하세요.
@@ -260,6 +264,26 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 호환 `/v1/messages`를 제공하는 vLLM endpoint 사용. 모델 계열에 맞는 `--tool-call-parser` 필요. |
 | NVIDIA hosted | Router/proxy | NVIDIA hosted API를 compatibility 경로로 사용. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM Anthropic 호환 endpoint 사용. |
+
+## 서비스 생명주기
+
+Claude Any는 가능한 모든 backend helper를 항상 띄워두지 않습니다. 기본
+생명주기는 다음과 같습니다.
+
+- 실행 전 관리 중인 router/proxy는 `claude-any stop`으로 정리할 수 있습니다.
+- `claude-any`가 Claude Code를 시작할 때, 선택된 provider에 필요한 서비스만
+  시작합니다.
+- Ollama/Ollama Cloud router mode는 `127.0.0.1:8799`의 Claude Any router를
+  사용합니다.
+- NVIDIA hosted router mode는 `127.0.0.1:8799`의 Claude Any router를 쓰고,
+  해당 provider에 필요할 때만 `127.0.0.1:8788`의 `nvd-claude-proxy`를
+  시작합니다.
+- NVIDIA hosted에서 다른 provider로 전환할 때 NVIDIA proxy를 계속 살려둘
+  필요는 없습니다. 새 테스트나 실행 전 stale session은 `claude-any stop`으로
+  정리하세요.
+
+이 방식은 Claude Code가 하나의 안정적인 Claude Any 진입점을 사용하게 하면서,
+provider-specific helper는 필요한 시점에만 시작하도록 합니다.
 
 Qwen3-Coder를 vLLM에서 Claude Code용으로 실행하는 예:
 

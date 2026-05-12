@@ -9,7 +9,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.20`
+当前版本: `0.1.21`
 
 ## 为什么存在
 
@@ -177,6 +177,10 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 ## 更新日志
 
+### 0.1.21
+
+- **服务生命周期文档**: 明确说明 Claude Any 会在启动时只启动当前 provider 所需的 router/proxy，`claude-any stop` 是显式清理命令。
+
 ### 0.1.20
 
 - **NVIDIA hosted quick test**: `auto` 模式现在对 NVIDIA hosted provider 使用 text-only quick test，避免菜单检查中较慢或不稳定的 tool_use 请求。text + tool_use 使用 `smoke`，完整 text/tool_use/tool_result round trip 使用 `full`。
@@ -249,6 +253,21 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 | vLLM | Native Anthropic-compatible endpoint | 使用 Anthropic 兼容 `/v1/messages` endpoint，并让 `--tool-call-parser` 匹配模型系列。 |
 | NVIDIA hosted | Router/proxy | 通过 compatibility 路径使用 NVIDIA hosted API。 |
 | self-hosted NIM | Native Anthropic-compatible endpoint | 使用 self-hosted NIM 的 Anthropic 兼容 endpoint。 |
+
+## 服务生命周期
+
+Claude Any 不会一直运行所有可能的 backend helper。正常生命周期如下：
+
+- 启动前，可用 `claude-any stop` 清理受管理的 router/proxy 进程。
+- `claude-any` 启动 Claude Code 时，只启动当前所选 provider 需要的服务。
+- Ollama/Ollama Cloud router mode 使用 `127.0.0.1:8799` 上的 Claude Any router。
+- NVIDIA hosted router mode 使用 `127.0.0.1:8799` 上的 Claude Any router，并且只在
+  该 provider 需要时启动 `127.0.0.1:8788` 上的 `nvd-claude-proxy`。
+- 从 NVIDIA hosted 切换到其他 provider 时，不需要让 NVIDIA proxy 一直运行。新的
+  test 或 launch 之前，请用 `claude-any stop` 清理 stale session。
+
+这样 Claude Code 可以始终使用稳定的 Claude Any 入口，同时 provider-specific helper
+只在需要时启动。
 
 为 Claude Code 启动 Qwen3-Coder vLLM 的示例:
 

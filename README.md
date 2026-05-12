@@ -10,7 +10,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.20`
+Current version: `0.1.21`
 
 ## Why This Exists
 
@@ -207,6 +207,10 @@ steps under that larger model's supervision.
 
 ## Changelog
 
+### 0.1.21
+
+- **Service lifecycle documentation**: clarify that Claude Any starts only the router/proxy services required for the selected provider at launch time, and `claude-any stop` is the explicit cleanup command.
+
 ### 0.1.20
 
 - **NVIDIA hosted quick test**: `auto` mode now uses a text-only quick test for NVIDIA hosted providers, avoiding slow or flaky tool_use requests during menu checks. Use `smoke` for text + tool_use, or `full` for the full text/tool_use/tool_result round trip.
@@ -286,6 +290,26 @@ steps under that larger model's supervision.
 | vLLM | Native Anthropic-compatible endpoint | Use a vLLM endpoint that exposes Anthropic-compatible `/v1/messages`; match `--tool-call-parser` to the model family. |
 | NVIDIA hosted | Router/proxy | Uses NVIDIA hosted API through the compatibility path. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | Use the self-hosted NIM Anthropic-compatible endpoint. |
+
+## Service Lifecycle
+
+Claude Any does not keep every possible backend helper running all the time. The
+normal lifecycle is:
+
+- Before launch, managed router/proxy processes can be stopped with
+  `claude-any stop`.
+- When `claude-any` starts Claude Code, it starts only the services required by
+  the selected provider.
+- Ollama and Ollama Cloud router mode use the Claude Any router on
+  `127.0.0.1:8799`.
+- NVIDIA hosted router mode uses the Claude Any router on `127.0.0.1:8799` and
+  starts `nvd-claude-proxy` on `127.0.0.1:8788` only when that provider needs it.
+- Switching away from NVIDIA hosted does not require keeping the NVIDIA proxy
+  alive; stale sessions should be cleaned with `claude-any stop` before a fresh
+  test or launch.
+
+This keeps Claude Code pointed at one stable Claude Any entry point while still
+letting provider-specific helpers start on demand.
 
 For Qwen3-Coder on vLLM, start the server with a matching tool parser:
 
