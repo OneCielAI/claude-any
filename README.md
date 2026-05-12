@@ -34,7 +34,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.25`
+Current version: `0.1.27`
 
 ## Why This Exists
 
@@ -249,12 +249,24 @@ steps under that larger model's supervision.
 
 ## Changelog
 
+### 0.1.27
+
+- **Plan mode support for non-Anthropic providers**: the router now keeps
+  `EnterPlanMode` available and supports Claude Code Plan mode even when the
+  upstream model does not reliably choose that internal tool. Forced
+  `tool_choice=EnterPlanMode` is answered locally with a valid Anthropic
+  `tool_use`, and long implementation requests that receive only a short or
+  empty non-actionable text response are promoted to `EnterPlanMode` using
+  language-agnostic structure checks.
+- **Plan-mode self-tool handling**: unsupported Claude Code self-tools are
+  still stripped for non-Anthropic providers, but Plan-mode tools are handled
+  separately so planning can work instead of being disabled.
+
 ### 0.1.25
 
-- **Plan-mode guard + diagnostics**: non-Anthropic providers now strip Claude
-  Code self-tools such as `EnterPlanMode` before forwarding requests upstream.
-  Set `~/.config/claude-any/log-level` to `TRACE` to capture redacted request
-  and response summaries in `requests.jsonl` / `responses.jsonl`.
+- **Plan-mode diagnostics**: set `~/.config/claude-any/log-level` to `TRACE`
+  to capture redacted request and response summaries in `requests.jsonl` /
+  `responses.jsonl`.
 - **Headless agent chat service**: the router exposes a small HTTP control
   plane for sub coding agents. Agents can post messages, poll updates after
   the last seen message id, or wait on an SSE stream when they do not have

@@ -80,7 +80,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.25"
+VERSION = "0.1.27"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -98,8 +98,8 @@ _CHAT_NEXT_ID: int | None = None
 # Tools Claude Code injects into every model's tool list that misfire when called
 # by non-Anthropic models. See docs/notes from anthropics/claude-code issues
 # #25720, #29950 and Piebald-AI/claude-code-system-prompts for tool semantics.
+PLAN_MODE_SELF_TOOLS: tuple[str, ...] = ("EnterPlanMode", "ExitPlanMode")
 DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC: tuple[str, ...] = (
-    "EnterPlanMode",
     "EnterWorktree",
     "ExitWorktree",
     "TeamCreate",
@@ -1185,15 +1185,130 @@ def resolve_blocked_tools(provider: str, pcfg: dict[str, Any]) -> set[str]:
     return set(DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC)
 
 
+def forced_tool_choice_name(body: dict[str, Any]) -> str | None:
+    tool_choice = body.get("tool_choice") if isinstance(body.get("tool_choice"), dict) else None
+    if not tool_choice:
+        return None
+    if tool_choice.get("type") != "tool":
+        return None
+    name = tool_choice.get("name")
+    return name if isinstance(name, str) and name else None
+
+
+def tool_names_in_body(body: dict[str, Any]) -> set[str]:
+    names: set[str] = set()
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return names
+    for tool in tools:
+        if isinstance(tool, dict) and isinstance(tool.get("name"), str):
+            names.add(tool["name"])
+    return names
+
+
+def synthetic_tool_use_response(model: str, tool_name: str, tool_input: dict[str, Any] | None = None) -> dict[str, Any]:
+    now = int(time.time() * 1000)
+    return {
+        "id": f"msg_claude_any_tool_{now}",
+        "type": "message",
+        "role": "assistant",
+        "model": model or "claude-any-router",
+        "content": [
+            {
+                "type": "tool_use",
+                "id": f"toolu_claude_any_{tool_name}_{now}",
+                "name": tool_name,
+                "input": tool_input or {},
+            }
+        ],
+        "stop_reason": "tool_use",
+        "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
+
+
+def has_tool(body: dict[str, Any], name: str) -> bool:
+    return name in tool_names_in_body(body)
+
+
+def latest_user_text(body: dict[str, Any]) -> str:
+    for message in reversed(body.get("messages") or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        return anthropic_content_to_text(message.get("content"))
+    return ""
+
+
+def likely_implementation_planning_request(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if len(normalized) >= 120:
+        return True
+    # Multi-line prompts usually carry enough task structure that a one-line
+    # "I'll make a plan" style response is not a useful final answer.
+    non_empty_lines = [line for line in (text or "").splitlines() if line.strip()]
+    if len(non_empty_lines) >= 3 and len(normalized) >= 80:
+        return True
+    return False
+
+
+def non_actionable_short_response(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return True
+    # Language-agnostic: for a long implementation request, a short single-line
+    # text response with no tool call is not actionable. Do not inspect words.
+    if len(normalized) <= 80 and "\n" not in (text or ""):
+        return True
+    if len(normalized) <= 160 and "\n" not in (text or "") and not re.search(r"[`{};/\\\\]|https?://", normalized):
+        return True
+    return False
+
+
+def should_auto_enter_plan_mode(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
+    if tool_calls:
+        return False
+    if not has_tool(body, "EnterPlanMode"):
+        return False
+    if not non_actionable_short_response(response_text):
+        return False
+    return likely_implementation_planning_request(latest_user_text(body))
+
+
+def maybe_handle_plan_mode_tool_choice(handler: BaseHTTPRequestHandler, provider: str, body: dict[str, Any]) -> bool:
+    """Support Claude Code's forced Plan-mode entry without relying on upstream model behavior."""
+    if provider == "anthropic":
+        return False
+    name = forced_tool_choice_name(body)
+    if name != "EnterPlanMode":
+        return False
+    # Claude Code may force this tool when the user uses /plan or toggles Plan mode.
+    # Returning a valid tool_use locally is more reliable than asking arbitrary
+    # OpenAI/Ollama-compatible backends to select an internal Claude Code tool.
+    available = tool_names_in_body(body)
+    if available and name not in available:
+        return False
+    router_log("INFO", f"synthesized {name} tool_use for {provider} forced tool_choice")
+    write_json(handler, synthetic_tool_use_response(str(body.get("model") or ""), name))
+    return True
+
+
 def filter_blocked_tools(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     """Strip Claude-Code self-tools the upstream model shouldn't see (e.g. EnterPlanMode).
     Returns a (possibly new) body dict."""
-    tools = body.get("tools")
-    if not isinstance(tools, list) or not tools:
-        return body
     blocked = resolve_blocked_tools(provider, pcfg)
     if not blocked:
         return body
+    tools = body.get("tools")
+    tool_choice = body.get("tool_choice") if isinstance(body.get("tool_choice"), dict) else None
+    tool_choice_name = tool_choice.get("name") if tool_choice else None
+    must_drop_tool_choice = isinstance(tool_choice_name, str) and tool_choice_name in blocked
+    if not isinstance(tools, list) or not tools:
+        if not must_drop_tool_choice:
+            return body
+        new_body = dict(body)
+        new_body.pop("tool_choice", None)
+        router_log("WARN", f"removed blocked tool_choice for {provider}: {tool_choice_name}")
+        return new_body
     kept: list[Any] = []
     dropped: list[str] = []
     for tool in tools:
@@ -1203,10 +1318,18 @@ def filter_blocked_tools(provider: str, pcfg: dict[str, Any], body: dict[str, An
             continue
         kept.append(tool)
     if not dropped:
-        return body
+        if not must_drop_tool_choice:
+            return body
+        new_body = dict(body)
+        new_body.pop("tool_choice", None)
+        router_log("WARN", f"removed blocked tool_choice for {provider}: {tool_choice_name}")
+        return new_body
     router_log("INFO", f"filtered upstream tools for {provider}: {', '.join(sorted(set(dropped)))}")
     new_body = dict(body)
     new_body["tools"] = kept
+    if must_drop_tool_choice:
+        new_body.pop("tool_choice", None)
+        router_log("WARN", f"removed blocked tool_choice for {provider}: {tool_choice_name}")
     return new_body
 
 
@@ -2400,7 +2523,7 @@ def normalize_tool_arguments(tool_name: str, args: Any) -> dict[str, Any]:
     return {}
 
 
-def ollama_chat_to_anthropic(data: dict[str, Any], model: str) -> dict[str, Any]:
+def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict[str, Any] | None = None) -> dict[str, Any]:
     message = data.get("message") if isinstance(data.get("message"), dict) else {}
     content: list[dict[str, Any]] = []
     text = message.get("content") or ""
@@ -2435,6 +2558,9 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str) -> dict[str, Any]
                 "input": fixed_input,
             }
         )
+    if source_body is not None and should_auto_enter_plan_mode(source_body, text, message.get("tool_calls") or []):
+        router_log("WARN", "auto-synthesized EnterPlanMode from short/empty upstream response")
+        return synthetic_tool_use_response(model, "EnterPlanMode")
     done_reason = data.get("done_reason")
     stop_reason = "tool_use" if any(block.get("type") == "tool_use" for block in content) else "end_turn"
     if done_reason == "length":
@@ -2578,7 +2704,7 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any) -> N
             pass
 
 
-def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, model: str, word_chunking: bool = False, provider: str = "ollama") -> None:
+def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, model: str, word_chunking: bool = False, provider: str = "ollama", source_body: dict[str, Any] | None = None) -> None:
     """Stream Ollama NDJSON /api/chat response as Anthropic SSE /v1/messages format."""
     handler.send_response(200)
     handler.send_header("content-type", "text/event-stream")
@@ -2588,6 +2714,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
     msg_id = f"msg_ollama_{int(time.time() * 1000)}"
     started = False
     text_started = False
+    text_suppressed_for_plan = False
     next_content_index = 0
     text_index: int | None = None
     text_so_far = ""
@@ -2632,6 +2759,10 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             # Handle text content
             text_chunk = message.get("content") or ""
             if text_chunk:
+                if source_body is not None and not text_started and not tool_calls and should_auto_enter_plan_mode(source_body, text_so_far + text_chunk, []):
+                    text_so_far += text_chunk
+                    text_suppressed_for_plan = True
+                    continue
                 if not text_started:
                     text_started = True
                     text_index = next_content_index
@@ -2713,6 +2844,50 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
                 handler.wfile.flush()
         # Flush any remaining buffered text when word-chunking is active
+        if source_body is not None and should_auto_enter_plan_mode(source_body, text_so_far, tool_calls):
+            router_log("WARN", "auto-synthesized EnterPlanMode from short/empty upstream stream")
+            tool_calls.append({"function": {"name": "EnterPlanMode", "arguments": {}}})
+            tool_id = f"toolu_ollama_plan_{int(time.time() * 1000)}"
+            tool_index = next_content_index
+            next_content_index += 1
+            tool_indices.append(tool_index)
+            tool_event = {
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": "EnterPlanMode",
+                    "input": {},
+                },
+            }
+            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
+            delta_event = {
+                "type": "content_block_delta",
+                "index": tool_index,
+                "delta": {"type": "input_json_delta", "partial_json": "{}"},
+            }
+            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
+        elif text_suppressed_for_plan and text_so_far:
+            text_started = True
+            text_index = next_content_index
+            next_content_index += 1
+            event = {
+                "type": "content_block_start",
+                "index": text_index,
+                "content_block": {"type": "text", "text": ""},
+            }
+            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
+            event = {
+                "type": "content_block_delta",
+                "index": text_index,
+                "delta": {"type": "text_delta", "text": text_so_far},
+            }
+            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
         if word_chunking and text_started and text_buffer:
             to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
             if to_flush:
@@ -2817,7 +2992,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
         # Check if Claude Code requested SSE streaming
         accept = handler.headers.get("accept", "")
         if "text/event-stream" in accept or stream_requested:
-            _ollama_stream_to_anthropic_sse(handler, resp, model, word_chunking=word_chunking, provider=provider)
+            _ollama_stream_to_anthropic_sse(handler, resp, model, word_chunking=word_chunking, provider=provider, source_body=body)
         else:
             # Non-SSE client but streaming from Ollama: collect full response
             chunks = []
@@ -2838,7 +3013,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                     continue
             if data is None:
                 data = {"message": {"content": ""}, "done": True, "done_reason": "end_turn"}
-            write_json(handler, ollama_chat_to_anthropic(data, model))
+            write_json(handler, ollama_chat_to_anthropic(data, model, source_body=body))
         return
     # Non-streaming fallback
     try:
@@ -2863,7 +3038,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
             exc.code,
         )
         return
-    write_json(handler, ollama_chat_to_anthropic(data, model))
+    write_json(handler, ollama_chat_to_anthropic(data, model, source_body=body))
 
 
 class RouterHandler(BaseHTTPRequestHandler):
@@ -2917,6 +3092,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             write_json(self, {"type": "error", "error": {"type": "not_found_error", "message": path}}, 404)
             return
         dump_request_for_trace(provider, path, body)
+        if maybe_handle_plan_mode_tool_choice(self, provider, body):
+            return
         body = filter_blocked_tools(provider, pcfg, body)
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
         try:

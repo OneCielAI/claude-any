@@ -33,7 +33,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.25`
+現在のバージョン: `0.1.27`
 
 ## 作られた理由
 
@@ -224,9 +224,14 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 
 ## 変更履歴
 
+### 0.1.27
+
+- **non-Anthropic provider の Plan mode 対応**: ルーターは `EnterPlanMode` を残し、上流モデルが Claude Code 内部の Plan tool を安定して選択できない場合でも Claude Code Plan mode へ移行できるようにします。`tool_choice=EnterPlanMode` が強制されたリクエストには、ルーターがローカルで有効な Anthropic `tool_use` を返します。長い実装リクエストに対して短い、または空の実行不能なテキストだけが返った場合は、言語に依存しない構造チェックで `EnterPlanMode` に昇格します。
+- **Plan-mode self-tool 処理**: 未対応の Claude Code self-tool は non-Anthropic provider では引き続き除去しますが、Plan-mode tool は別扱いにして planning 機能を無効化しません。
+
 ### 0.1.25
 
-- **Plan mode guard と診断**: non-Anthropic provider へ転送する前に、Claude Code 内部 self-tool の `EnterPlanMode` などをルーターで除去します。`~/.config/claude-any/log-level` に `TRACE` を書くと、`requests.jsonl` / `responses.jsonl` にリクエスト/レスポンス要約を記録します。
+- **Plan mode 診断**: `~/.config/claude-any/log-level` に `TRACE` を書くと、`requests.jsonl` / `responses.jsonl` にリクエスト/レスポンス要約を記録します。
 - **ヘッドレスエージェントチャット**: ルーターが `/ca/chat/messages`、`/ca/chat/wait`、`/ca/chat/stream` を提供します。サブ coding agent は最後に見た message id 以降の更新を取得したり、SSE で返信を待機できます。
 - **Plan artifact 配信**: `/ca/plan/artifacts` で plan ファイルを作成し、ローカル URL として共有できます。Anthropic の内部実装はコピーせず、ファイル/アーティファクト中心の流れだけを独立実装しています。
 

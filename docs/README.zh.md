@@ -33,7 +33,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.25`
+当前版本: `0.1.27`
 
 ## 为什么存在
 
@@ -212,9 +212,14 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 ## 更新日志
 
+### 0.1.27
+
+- **支持 non-Anthropic provider 的 Plan mode**: 路由器会保留 `EnterPlanMode`，即使上游模型不能稳定选择 Claude Code 内部 Plan tool，也能让 Claude Code 进入 Plan mode。对于强制 `tool_choice=EnterPlanMode` 的请求，路由器会在本地返回有效的 Anthropic `tool_use`。当较长的实现请求只得到很短或空的、不可执行的文本响应时，路由器会通过不依赖语言的结构检查将其提升为 `EnterPlanMode`。
+- **Plan-mode self-tool 处理**: 不支持的 Claude Code self-tool 在 non-Anthropic provider 下仍会被移除，但 Plan-mode tool 会单独处理，不再禁用 planning 能力。
+
 ### 0.1.25
 
-- **Plan mode guard 与诊断**: 转发到 non-Anthropic provider 前，路由器会移除 Claude Code 内部 self-tool，例如 `EnterPlanMode`。将 `TRACE` 写入 `~/.config/claude-any/log-level` 后，会在 `requests.jsonl` / `responses.jsonl` 中记录请求/响应摘要。
+- **Plan mode 诊断**: 将 `TRACE` 写入 `~/.config/claude-any/log-level` 后，会在 `requests.jsonl` / `responses.jsonl` 中记录请求/响应摘要。
 - **Headless agent chat**: 路由器提供 `/ca/chat/messages`、`/ca/chat/wait`、`/ca/chat/stream`。子 coding agent 可以按最后看到的 message id 拉取更新，也可以通过 SSE 等待回复。
 - **Plan artifact 服务**: 可通过 `/ca/plan/artifacts` 创建 plan 文件并以本地 URL 分享。这里没有复制 Anthropic 的内部实现，只独立实现了文件/artifact 型工作流。
 

@@ -33,7 +33,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.25`
+현재 버전: `0.1.27`
 
 ## 왜 만들었나
 
@@ -224,9 +224,14 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 ## 변경 이력
 
+### 0.1.27
+
+- **non-Anthropic provider의 Plan mode 지원**: 라우터가 `EnterPlanMode`를 유지하고, 업스트림 모델이 Claude Code 내부 Plan tool을 안정적으로 선택하지 못해도 Claude Code Plan mode로 전환할 수 있게 처리합니다. `tool_choice=EnterPlanMode`가 강제된 요청은 라우터가 로컬에서 유효한 Anthropic `tool_use`로 응답하고, 긴 구현 요청에 대해 짧거나 빈 비실행 텍스트만 돌아오면 언어에 의존하지 않는 구조 검사로 `EnterPlanMode`로 승격합니다.
+- **Plan-mode self-tool 처리**: 지원하지 않는 Claude Code self-tool은 non-Anthropic provider에서 계속 제거하지만, Plan-mode tool은 별도 처리하여 planning 기능을 비활성화하지 않습니다.
+
 ### 0.1.25
 
-- **Plan mode guard와 진단**: non-Anthropic provider로 보낼 때 Claude Code 내부 self-tool인 `EnterPlanMode` 등을 라우터에서 제거합니다. `~/.config/claude-any/log-level`에 `TRACE`를 쓰면 `requests.jsonl` / `responses.jsonl`에 요청/응답 요약이 남습니다.
+- **Plan mode 진단**: `~/.config/claude-any/log-level`에 `TRACE`를 쓰면 `requests.jsonl` / `responses.jsonl`에 요청/응답 요약이 남습니다.
 - **헤드리스 에이전트 채팅**: 라우터가 `/ca/chat/messages`, `/ca/chat/wait`, `/ca/chat/stream`을 제공합니다. 서브 코딩 에이전트는 마지막 message id 이후의 업데이트를 받거나 SSE로 답변을 기다릴 수 있습니다.
 - **Plan artifact 서빙**: `/ca/plan/artifacts`로 plan 파일을 만들고 로컬 URL로 공유할 수 있습니다. Anthropic 내부 구현을 복제하지 않고 파일/아티팩트 중심 흐름만 독립 구현했습니다.
 

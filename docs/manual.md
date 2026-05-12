@@ -6,7 +6,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.25`
+Current version: `0.1.27`
 
 ## Install
 
@@ -381,13 +381,18 @@ Notes for automation:
 
 ## Router Chat and Plan Artifacts
 
-Claude Code Plan mode uses internal Claude Code tools and UI state. With
-non-Anthropic providers those self-tools can be selected by the upstream model
-and leave the CLI stuck in planning instead of continuing work. Claude Any
-therefore removes known Claude Code self-tools, including `EnterPlanMode`,
-before forwarding requests to non-Anthropic providers. For troubleshooting,
-write `TRACE` to `~/.config/claude-any/log-level`; the router then records
-redacted request and response summaries in:
+Claude Code Plan mode uses internal Claude Code tools and UI state. Claude Any
+keeps `EnterPlanMode` available for non-Anthropic providers and handles the
+Plan-mode transition in the router when the upstream model does not reliably
+select that internal tool. If Claude Code forces `tool_choice=EnterPlanMode`,
+the router returns a valid Anthropic `tool_use` locally. If a long
+implementation request receives only a short or empty non-actionable text
+response, the router promotes that response to `EnterPlanMode` using
+language-agnostic structure checks. Other unsupported Claude Code self-tools
+are still removed before forwarding requests to non-Anthropic providers.
+
+For troubleshooting, write `TRACE` to `~/.config/claude-any/log-level`; the
+router then records redacted request and response summaries in:
 
 - `~/.config/claude-any/requests.jsonl`
 - `~/.config/claude-any/responses.jsonl`
