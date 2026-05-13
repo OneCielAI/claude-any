@@ -20,6 +20,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -1193,8 +1194,11 @@ def main():
         rpm = 40
     state = load_json(STATE_PATH, {})
     now = time.time()
-    key = f"{provider}:{model}" if provider and model else ""
+    key = f"{provider}:__global__" if provider else ""
     entry = state.get(key) if key else None
+    if not isinstance(entry, dict):
+        legacy_key = f"{provider}:{model}" if provider and model else ""
+        entry = state.get(legacy_key) if legacy_key else None
     if not isinstance(entry, dict):
         prefix = f"{provider}:"
         candidates = [(k, v) for k, v in state.items() if isinstance(k, str) and k.startswith(prefix) and isinstance(v, dict)]
@@ -1212,6 +1216,17 @@ def main():
         last_wait = float(entry.get("last_wait") or 0.0) if isinstance(entry, dict) else 0.0
     except Exception:
         last_wait = 0.0
+    try:
+        penalty_until = float(entry.get("penalty_until") or 0.0) if isinstance(entry, dict) else 0.0
+    except Exception:
+        penalty_until = 0.0
+    try:
+        updated_at = float(entry.get("updated_at") or 0.0) if isinstance(entry, dict) else 0.0
+    except Exception:
+        updated_at = 0.0
+    server_remaining = entry.get("server_remaining") if isinstance(entry, dict) else None
+    server_reset_seconds = entry.get("server_reset_seconds") if isinstance(entry, dict) else None
+    server_rpm = entry.get("server_rpm") if isinstance(entry, dict) else None
     used = len([ts for ts in (timestamps or []) if isinstance(ts, (int, float)) and 0.0 <= now - float(ts) < 60.0])
     model_name = ((session.get("model") or {}).get("display_name") if isinstance(session.get("model"), dict) else None) or model or "model"
     current_dir = ((session.get("workspace") or {}).get("current_dir") if isinstance(session.get("workspace"), dict) else None) or session.get("cwd") or ""
@@ -1223,7 +1238,22 @@ def main():
         rpm_text = f"RPM used: {used}/{rpm}"
     else:
         rpm_text = f"RPM used: {used}/min (unlimited)"
-    if last_wait >= 0.5:
+    if server_rpm or server_remaining is not None or server_reset_seconds is not None:
+        parts = []
+        if server_remaining is not None:
+            parts.append(f"remaining {server_remaining}")
+        if server_rpm:
+            parts.append(f"limit {server_rpm}")
+        try:
+            if server_reset_seconds is not None and float(server_reset_seconds) > 0:
+                parts.append(f"reset {float(server_reset_seconds):.0f}s")
+        except Exception:
+            pass
+        if parts:
+            rpm_text += " | server " + ", ".join(parts)
+    if penalty_until > now:
+        rpm_text += f" | wait {max(0.0, penalty_until - now):.0f}s"
+    elif last_wait >= 0.5 and 0.0 <= now - updated_at < 60.0:
         rpm_text += f" | wait {last_wait:.1f}s"
     print(f"{left} | {color(rpm_text)}")
 
@@ -1954,26 +1984,77 @@ def router_rate_limit_rpm(provider: str, pcfg: dict[str, Any]) -> int | None:
     return rpm if rpm and rpm > 0 else None
 
 
+def router_rate_limit_key(provider: str, pcfg: dict[str, Any], model: str | None = None) -> str:
+    # Provider/account limits such as NVIDIA NIM RPM apply across models.
+    return f"{provider}:__global__"
+
+
+def router_rate_limit_state_entry(provider: str, pcfg: dict[str, Any], model: str | None = None) -> dict[str, Any]:
+    key = router_rate_limit_key(provider, pcfg, model)
+    try:
+        state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
+        if not isinstance(state, dict):
+            return {}
+        entry = state.get(key)
+        if isinstance(entry, dict):
+            return entry
+        legacy_key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+        entry = state.get(legacy_key)
+        return entry if isinstance(entry, dict) else {}
+    except Exception:
+        return {}
+
+
+def router_rate_limit_effective_rpm(provider: str, pcfg: dict[str, Any], model: str | None = None) -> int | None:
+    configured = router_rate_limit_configured_rpm(provider, pcfg)
+    if configured == 0:
+        return 0
+    entry = router_rate_limit_state_entry(provider, pcfg, model)
+    try:
+        server_rpm = int(entry.get("server_rpm") or 0)
+        updated_at = float(entry.get("server_rpm_updated_at") or 0.0)
+        if server_rpm > 0 and 0.0 <= time.time() - updated_at < 3600.0:
+            return server_rpm
+    except Exception:
+        pass
+    return configured
+
+
+def router_rate_limit_recent(timestamps: Any, now: float, window: float, *, include_future: bool) -> list[float]:
+    recent: list[float] = []
+    for ts in timestamps or []:
+        if not isinstance(ts, (int, float)):
+            continue
+        value = float(ts)
+        age = now - value
+        if age < window and (include_future or age >= 0.0):
+            recent.append(value)
+    return sorted(recent)
+
+
 def router_rate_limit_usage(provider: str, pcfg: dict[str, Any], model: str | None = None) -> tuple[int, int | None]:
-    rpm = router_rate_limit_configured_rpm(provider, pcfg)
+    rpm = router_rate_limit_effective_rpm(provider, pcfg, model)
     if rpm is None:
         return 0, None
-    key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+    key = router_rate_limit_key(provider, pcfg, model)
     now = time.time()
     try:
         state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
         entry = state.get(key) if isinstance(state, dict) else None
+        if not isinstance(entry, dict):
+            legacy_key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+            entry = state.get(legacy_key) if isinstance(state, dict) else None
         timestamps = entry.get("timestamps") if isinstance(entry, dict) else ([float(entry)] if isinstance(entry, (int, float)) else [])
     except Exception:
         timestamps = []
-    used = len([ts for ts in (timestamps or []) if isinstance(ts, (int, float)) and 0.0 <= now - float(ts) < 60.0])
+    used = len(router_rate_limit_recent(timestamps, now, 60.0, include_future=False))
     return used, rpm
 
 
 def record_router_rate_usage(provider: str, pcfg: dict[str, Any], model: str | None, rpm: int | None) -> tuple[int, int | None]:
     if rpm is None:
         return 0, None
-    key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+    key = router_rate_limit_key(provider, pcfg, model)
     window = 60.0
     with _RATE_LIMIT_LOCK:
         try:
@@ -1984,21 +2065,205 @@ def record_router_rate_usage(provider: str, pcfg: dict[str, Any], model: str | N
             state = {}
         now = time.time()
         entry = state.get(key)
+        if not isinstance(entry, dict):
+            legacy_key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+            entry = state.get(legacy_key)
         timestamps = entry.get("timestamps") if isinstance(entry, dict) else ([float(entry)] if isinstance(entry, (int, float)) else [])
-        recent = sorted(
-            float(ts) for ts in (timestamps or [])
-            if isinstance(ts, (int, float)) and now - float(ts) < window
-        )
+        recent = router_rate_limit_recent(timestamps, now, window, include_future=True)
         recent.append(now)
         keep = max(int(rpm or 0), 240)
-        state[key] = {"timestamps": recent[-keep:], "rpm": int(rpm or 0), "updated_at": now, "last_wait": 0.0}
+        existing_penalty = float(entry.get("penalty_until") or 0.0) if isinstance(entry, dict) else 0.0
+        new_entry: dict[str, Any] = {"timestamps": recent[-keep:], "rpm": int(rpm or 0), "updated_at": now, "last_wait": 0.0}
+        if existing_penalty > now:
+            new_entry["penalty_until"] = existing_penalty
+        state[key] = new_entry
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
         return len(recent), rpm
 
 
+def parse_retry_after_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    text = value.strip()
+    try:
+        seconds = float(text)
+        return max(0.0, seconds)
+    except Exception:
+        pass
+    try:
+        dt = parsedate_to_datetime(text)
+        return max(0.0, dt.timestamp() - time.time())
+    except Exception:
+        return None
+
+
+def first_header(headers: Any, names: list[str]) -> str | None:
+    for name in names:
+        try:
+            value = headers.get(name)
+        except Exception:
+            value = None
+        if value:
+            return str(value)
+    return None
+
+
+def first_int_in_header(value: str | None) -> int | None:
+    if not value:
+        return None
+    match = re.search(r"\d+", value)
+    if not match:
+        return None
+    try:
+        return int(match.group(0))
+    except Exception:
+        return None
+
+
+def rate_limit_reset_seconds(value: str | None) -> float | None:
+    if not value:
+        return None
+    text = value.strip()
+    try:
+        numeric = float(text)
+        if numeric > time.time() + 60.0:
+            return max(0.0, numeric - time.time())
+        return max(0.0, numeric)
+    except Exception:
+        return parse_retry_after_seconds(text)
+
+
+def learn_router_rate_limit_headers(provider: str, pcfg: dict[str, Any], model: str | None, headers: Any) -> None:
+    limit = first_int_in_header(first_header(headers, [
+        "x-ratelimit-limit-requests",
+        "x-rate-limit-limit-requests",
+        "ratelimit-limit",
+        "rate-limit-limit",
+        "x-ratelimit-limit",
+        "x-rate-limit-limit",
+    ]))
+    remaining = first_int_in_header(first_header(headers, [
+        "x-ratelimit-remaining-requests",
+        "x-rate-limit-remaining-requests",
+        "ratelimit-remaining",
+        "rate-limit-remaining",
+        "x-ratelimit-remaining",
+        "x-rate-limit-remaining",
+    ]))
+    reset = rate_limit_reset_seconds(first_header(headers, [
+        "x-ratelimit-reset-requests",
+        "x-rate-limit-reset-requests",
+        "ratelimit-reset",
+        "rate-limit-reset",
+        "x-ratelimit-reset",
+        "x-rate-limit-reset",
+    ]))
+    if limit is None and remaining is None and reset is None:
+        return
+    configured = router_rate_limit_configured_rpm(provider, pcfg)
+    rpm = limit if limit and limit > 0 else configured
+    if rpm is None:
+        rpm = 0
+    key = router_rate_limit_key(provider, pcfg, model)
+    with _RATE_LIMIT_LOCK:
+        try:
+            state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
+            if not isinstance(state, dict):
+                state = {}
+        except Exception:
+            state = {}
+        now = time.time()
+        entry = state.get(key)
+        if not isinstance(entry, dict):
+            legacy_key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+            entry = state.get(legacy_key)
+        timestamps = entry.get("timestamps") if isinstance(entry, dict) else []
+        recent = router_rate_limit_recent(timestamps, now, 60.0, include_future=True)
+        penalty_until = float(entry.get("penalty_until") or 0.0) if isinstance(entry, dict) else 0.0
+        if remaining == 0 and reset and reset > 0:
+            penalty_until = max(penalty_until, now + reset)
+        new_entry: dict[str, Any] = {
+            "timestamps": recent[-max(int(rpm or 0), 240):],
+            "rpm": int(rpm or 0),
+            "updated_at": now,
+            "last_wait": float(entry.get("last_wait") or 0.0) if isinstance(entry, dict) else 0.0,
+            "server_remaining": remaining,
+            "server_reset_seconds": reset,
+        }
+        if limit and limit > 0:
+            new_entry["server_rpm"] = int(limit)
+            new_entry["server_rpm_updated_at"] = now
+        elif isinstance(entry, dict) and entry.get("server_rpm"):
+            new_entry["server_rpm"] = entry.get("server_rpm")
+            new_entry["server_rpm_updated_at"] = entry.get("server_rpm_updated_at")
+        if penalty_until > now:
+            new_entry["penalty_until"] = penalty_until
+        state[key] = new_entry
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
+    router_log("INFO", f"rate_limit_headers provider={provider} model={model or ''} limit={limit} remaining={remaining} reset={reset}")
+
+
+def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], model: str | None, retry_after: str | None = None) -> float:
+    rpm = router_rate_limit_effective_rpm(provider, pcfg, model)
+    fallback = 60.0 / float(rpm) if rpm and rpm > 0 else 15.0
+    wait = parse_retry_after_seconds(retry_after)
+    if wait is None:
+        wait = max(10.0, min(60.0, fallback * 4.0))
+    wait = max(1.0, min(300.0, wait))
+    key = router_rate_limit_key(provider, pcfg, model)
+    with _RATE_LIMIT_LOCK:
+        try:
+            state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
+            if not isinstance(state, dict):
+                state = {}
+        except Exception:
+            state = {}
+        now = time.time()
+        entry = state.get(key)
+        if not isinstance(entry, dict):
+            legacy_key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+            entry = state.get(legacy_key)
+        timestamps = entry.get("timestamps") if isinstance(entry, dict) else []
+        recent = router_rate_limit_recent(timestamps, now, 60.0, include_future=True)
+        actual_recent = router_rate_limit_recent(timestamps, now, 60.0, include_future=False)
+        configured_rpm = router_rate_limit_configured_rpm(provider, pcfg)
+        inferred_rpm: int | None = None
+        if (
+            isinstance(entry, dict)
+            and not entry.get("server_rpm")
+            and configured_rpm
+            and configured_rpm > 0
+            and 0 < len(actual_recent) < configured_rpm
+        ):
+            inferred_rpm = max(1, len(actual_recent))
+            rpm = inferred_rpm
+        penalty_until = max(float(entry.get("penalty_until") or 0.0) if isinstance(entry, dict) else 0.0, now + wait)
+        state[key] = {
+            "timestamps": recent[-max(int(rpm or 0), 240):],
+            "rpm": int(rpm or 0),
+            "updated_at": now,
+            "last_wait": wait,
+            "penalty_until": penalty_until,
+            "last_429_at": now,
+        }
+        if isinstance(entry, dict):
+            for preserve_key in ("server_rpm", "server_rpm_updated_at", "server_remaining", "server_reset_seconds"):
+                if preserve_key in entry:
+                    state[key][preserve_key] = entry[preserve_key]
+        if inferred_rpm:
+            state[key]["server_rpm"] = inferred_rpm
+            state[key]["server_rpm_updated_at"] = now
+            state[key]["server_rpm_reason"] = "inferred_from_429"
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
+    router_log("WARN", f"rate_limit_429_backoff provider={provider} model={model or ''} wait={wait:.2f}s")
+    return wait
+
+
 def apply_router_rate_limit(provider: str, pcfg: dict[str, Any], model: str | None = None) -> tuple[float, int, int | None]:
-    rpm = router_rate_limit_configured_rpm(provider, pcfg)
+    rpm = router_rate_limit_effective_rpm(provider, pcfg, model)
     if rpm is None:
         return 0.0, 0, None
     if rpm <= 0:
@@ -2006,7 +2271,7 @@ def apply_router_rate_limit(provider: str, pcfg: dict[str, Any], model: str | No
         return 0.0, used, limit
     window = 60.0
     base_interval = window / float(rpm)
-    key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+    key = router_rate_limit_key(provider, pcfg, model)
     waited = 0.0
     while True:
         with _RATE_LIMIT_LOCK:
@@ -2018,19 +2283,27 @@ def apply_router_rate_limit(provider: str, pcfg: dict[str, Any], model: str | No
                 state = {}
             now = time.time()
             entry = state.get(key)
+            if not isinstance(entry, dict):
+                legacy_key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+                entry = state.get(legacy_key)
             if isinstance(entry, dict):
                 timestamps = entry.get("timestamps")
+                try:
+                    penalty_until = float(entry.get("penalty_until") or 0.0)
+                except Exception:
+                    penalty_until = 0.0
             elif isinstance(entry, (int, float)):
                 timestamps = [float(entry)]
+                penalty_until = 0.0
             else:
                 timestamps = []
-            recent = sorted(
-                float(ts) for ts in (timestamps or [])
-                if isinstance(ts, (int, float)) and now - float(ts) < window
-            )
+                penalty_until = 0.0
+            recent = router_rate_limit_recent(timestamps, now, window, include_future=True)
             used = len(recent)
             usage_ratio = min(1.0, used / float(rpm))
             wait = 0.0
+            if penalty_until > now:
+                wait = max(wait, penalty_until - now)
             if used >= rpm and recent:
                 wait = max(0.0, recent[0] + window - now)
             elif recent:
@@ -2043,13 +2316,19 @@ def apply_router_rate_limit(provider: str, pcfg: dict[str, Any], model: str | No
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             if wait <= 0.001:
                 recent.append(now)
-                state[key] = {"timestamps": recent[-rpm:], "rpm": rpm, "updated_at": now, "last_wait": waited}
+                new_entry = {"timestamps": recent[-rpm:], "rpm": rpm, "updated_at": now, "last_wait": waited}
+                if penalty_until > now:
+                    new_entry["penalty_until"] = penalty_until
+                state[key] = new_entry
                 RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
                 return waited, len(recent), rpm
             if used < rpm:
                 scheduled = now + wait
                 recent.append(scheduled)
-                state[key] = {"timestamps": recent[-rpm:], "rpm": rpm, "updated_at": scheduled, "last_wait": wait}
+                new_entry = {"timestamps": recent[-rpm:], "rpm": rpm, "updated_at": scheduled, "last_wait": wait}
+                if penalty_until > now:
+                    new_entry["penalty_until"] = penalty_until
+                state[key] = new_entry
                 RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
                 router_log("INFO", f"rate_limit_soft_wait provider={provider} model={model or ''} rpm={rpm} wait={wait:.2f}s")
                 time.sleep(wait)
@@ -4137,6 +4416,51 @@ def openai_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
     return ollama_chat_to_anthropic(wrapped, model, source_body=source_body)
 
 
+def upstream_http_error_message(exc: urllib.error.HTTPError, raw: str | None = None) -> str:
+    if raw is None:
+        raw = exc.read().decode("utf-8", errors="ignore")
+    msg = raw.strip() or str(exc)
+    try:
+        err = json.loads(raw)
+        if isinstance(err, dict):
+            if isinstance(err.get("error"), dict):
+                msg = str(err["error"].get("message") or err["error"])
+            elif err.get("error"):
+                msg = str(err["error"])
+            elif err.get("message"):
+                msg = str(err["message"])
+    except Exception:
+        pass
+    return msg
+
+
+def post_json_with_rate_retry(
+    url: str,
+    req_body: Any,
+    headers: dict[str, str],
+    timeout: float,
+    provider: str,
+    pcfg: dict[str, Any],
+    model: str,
+) -> Any:
+    for attempt in range(2):
+        try:
+            data_bytes = json.dumps(req_body).encode("utf-8")
+            req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="ignore")
+            learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
+            if exc.code == 429 and attempt == 0:
+                wait = register_router_rate_limit_backoff(provider, pcfg, model, exc.headers.get("Retry-After"))
+                time.sleep(wait)
+                continue
+            raise RuntimeError(upstream_http_error_message(exc, raw)) from exc
+    raise RuntimeError("upstream request failed")
+
+
 def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
     _update_tool_schema_registry(body.get("tools"))
     model = resolve_requested_model(provider, pcfg, body.get("model"))
@@ -4153,21 +4477,17 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
         if notice:
             index = write_anthropic_stream_blocks(handler, [{"type": "text", "text": notice}], index)
         try:
-            data = post_json(url, req_body, headers=provider_headers(provider, pcfg), timeout=provider_request_timeout_seconds(pcfg))
-        except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="ignore")
-            msg = raw.strip() or str(exc)
-            try:
-                err = json.loads(raw)
-                if isinstance(err, dict):
-                    if isinstance(err.get("error"), dict):
-                        msg = str(err["error"].get("message") or err["error"])
-                    elif err.get("error"):
-                        msg = str(err["error"])
-                    elif err.get("message"):
-                        msg = str(err["message"])
-            except Exception:
-                pass
+            data = post_json_with_rate_retry(
+                url,
+                req_body,
+                provider_headers(provider, pcfg),
+                provider_request_timeout_seconds(pcfg),
+                provider,
+                pcfg,
+                model,
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
             write_anthropic_stream_blocks(handler, [{"type": "text", "text": f"Upstream error: {msg}"}], index)
             write_anthropic_open_stream_stop(handler)
             return
@@ -4176,22 +4496,17 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
         write_anthropic_open_stream_stop(handler, message)
         return
     try:
-        data = post_json(url, req_body, headers=provider_headers(provider, pcfg), timeout=provider_request_timeout_seconds(pcfg))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="ignore")
-        msg = raw.strip() or str(exc)
-        try:
-            err = json.loads(raw)
-            if isinstance(err, dict):
-                if isinstance(err.get("error"), dict):
-                    msg = str(err["error"].get("message") or err["error"])
-                elif err.get("error"):
-                    msg = str(err["error"])
-                elif err.get("message"):
-                    msg = str(err["message"])
-        except Exception:
-            pass
-        write_json(handler, {"type": "error", "error": {"type": "upstream_error", "message": msg}}, exc.code)
+        data = post_json_with_rate_retry(
+            url,
+            req_body,
+            provider_headers(provider, pcfg),
+            provider_request_timeout_seconds(pcfg),
+            provider,
+            pcfg,
+            model,
+        )
+    except RuntimeError as exc:
+        write_json(handler, {"type": "error", "error": {"type": "upstream_error", "message": str(exc)}}, 500)
         return
     message = prepend_anthropic_text(
         openai_chat_to_anthropic(data, model, source_body=body),

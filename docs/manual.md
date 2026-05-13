@@ -547,6 +547,24 @@ python scripts/make_demo_assets.py
 
 Generated files live in `docs/assets/`.
 
+## Next Stage TODO
+
+- **True NVIDIA hosted upstream streaming**: the current NVIDIA hosted router
+  path opens an SSE stream back to Claude Code, but calls NVIDIA hosted
+  `/v1/chat/completions` with `stream:false` and emits the converted Anthropic
+  response only after the upstream request completes. Implement an OpenAI
+  streaming parser for NVIDIA hosted so text deltas are forwarded to Claude Code
+  as they arrive.
+- **Safe streamed tool-call conversion**: when enabling NVIDIA upstream
+  streaming, accumulate OpenAI `tool_calls` / function-call chunks until each
+  tool input JSON object is complete, then emit valid Anthropic
+  `content_block_start`, `input_json_delta`, and `content_block_stop` events.
+  Text deltas can stream immediately; tool-use blocks must preserve Claude
+  Code's strict content-block ordering and indexes.
+- **Streaming diagnostics**: add router debug logs or a compatibility subtest
+  that distinguishes "Claude Code SSE is open" from "upstream provider is truly
+  streaming" so long NVIDIA hosted waits are easier to explain.
+
 ## Troubleshooting
 
 - If the first request says a model does not exist, re-open the menu and select
