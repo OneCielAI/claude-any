@@ -6,7 +6,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.29`
+Current version: `0.1.30`
 
 ## Install
 
@@ -240,7 +240,7 @@ Headless mode is for launching Claude Code directly without opening the
 pre-launch menu. It is useful for SSH sessions, scripts, scheduled jobs,
 CI-like automation, and remote servers. Any `--ca-*` option updates Claude
 Any's saved configuration first, skips the menu, starts the required
-router/proxy services, then immediately executes Claude Code with the remaining
+router services, then immediately executes Claude Code with the remaining
 arguments.
 
 Basic pattern:
@@ -300,7 +300,7 @@ claude-any \
   --ca-context-window 65536 \
   --ca-max-output-tokens 4096
 
-# NVIDIA hosted API Catalog through the local compatibility proxy
+# NVIDIA hosted API Catalog through the local Claude Any router
 export NVIDIA_API_KEY="..."
 claude-any \
   --ca-provider nvidia-hosted \
@@ -367,7 +367,7 @@ Common Claude Any setup flags:
 | `--ca-disable-skills` / `--ca-enable-skills` | Control Claude Code skills for this launch. |
 | `--ca-no-update-check` | Skip the Claude Code update check. |
 | `--ca-status` | Print status and exit. |
-| `--ca-stop` | Stop managed router/proxy services and exit. |
+| `--ca-stop` | Stop managed router services and exit. |
 
 Notes for automation:
 
@@ -502,15 +502,15 @@ agents can still perform web research through explicit tools.
 Claude Any starts provider helpers on demand rather than keeping every helper
 alive permanently.
 
-- `claude-any stop` stops managed Claude Any router and NVIDIA proxy processes.
+- `claude-any stop` stops managed Claude Any router processes.
 - When launching Claude Code, Claude Any starts only the services required by
   the selected provider.
 - Ollama and Ollama Cloud router mode use the Claude Any router on
   `127.0.0.1:8799`.
-- NVIDIA hosted router mode uses the Claude Any router on `127.0.0.1:8799` and
-  starts `nvd-claude-proxy` on `127.0.0.1:8788` only when that provider needs it.
+- NVIDIA hosted router mode uses the Claude Any router on `127.0.0.1:8799`;
+  hosted API Catalog models do not require a separate NVIDIA proxy.
 - For clean provider-switch testing, run `claude-any stop`, select the provider,
-  then launch or test. This avoids stale port ownership from old sessions.
+  then launch or test. This avoids stale router port ownership from old sessions.
 
 ## Development Story
 

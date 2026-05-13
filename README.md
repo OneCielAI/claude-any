@@ -44,7 +44,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.29`
+Current version: `0.1.30`
 
 ## Why This Exists
 
@@ -91,6 +91,40 @@ npm install -g @oneciel-ai/claude-any
 ```sh
 claude-any
 ```
+
+## Run Claude Code Headlessly
+
+Use headless mode when a script, SSH session, CI job, or parent agent needs to
+launch Claude Code directly without opening the pre-launch menu. `claude-any`
+consumes `--ca-*` options, starts the required local router, and passes the
+remaining arguments to Claude Code.
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-model z-ai/glm-4.7
+```
+
+```sh
+claude-any --ca-provider ollama-cloud --ca-model glm-5.1
+```
+
+```sh
+claude-any --ca-provider ollama --ca-base-url http://127.0.0.1:11434 --ca-model qwen3-coder
+```
+
+Run one non-interactive Claude Code prompt:
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-model z-ai/glm-4.7 --ca-no-update-check -p "Reply with OK only." --output-format text
+```
+
+Use the saved provider/model and only skip the menu:
+
+```sh
+CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-format text
+```
+
+More examples are in [Headless Examples](#headless-examples) and
+[the full manual](docs/manual.md#headless-usage).
 
 **Upgrade:**
 
@@ -300,6 +334,15 @@ steps under that larger model's supervision.
 
 ## Changelog
 
+### 0.1.30
+
+- **Headless launch docs moved up**: README now shows copy-ready examples for
+  launching Claude Code directly with `--ca-provider`, `--ca-model`, `-p`, and
+  `CLAUDE_ANY_SKIP_MENU=1` immediately after install.
+- **NVIDIA hosted wording cleanup**: provider and lifecycle docs now describe
+  NVIDIA hosted as using the Claude Any local router, with no separate hosted
+  API Catalog proxy requirement.
+
 ### 0.1.29
 
 - **NVIDIA compatibility test fix**: `claude-any test` now restarts the local
@@ -466,7 +509,7 @@ steps under that larger model's supervision.
 | Ollama | Native when available, router otherwise | Local Ollama normally needs no API key. Cloud models through local Ollama require `ollama signin` on the Ollama host. |
 | Ollama Cloud | Router | Calls `https://ollama.com/api`; requires an Ollama API key. |
 | vLLM | Native Anthropic-compatible endpoint | Use a vLLM endpoint that exposes Anthropic-compatible `/v1/messages`; match `--tool-call-parser` to the model family. |
-| NVIDIA hosted | Router/proxy | Uses NVIDIA hosted API through the compatibility path. |
+| NVIDIA hosted | Router | Uses the NVIDIA hosted API Catalog through the Claude Any local router. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | Use the self-hosted NIM Anthropic-compatible endpoint. |
 
 ## Service Lifecycle
@@ -474,17 +517,16 @@ steps under that larger model's supervision.
 Claude Any does not keep every possible backend helper running all the time. The
 normal lifecycle is:
 
-- Before launch, managed router/proxy processes can be stopped with
+- Before launch, managed router processes can be stopped with
   `claude-any stop`.
 - When `claude-any` starts Claude Code, it starts only the services required by
   the selected provider.
 - Ollama and Ollama Cloud router mode use the Claude Any router on
   `127.0.0.1:8799`.
-- NVIDIA hosted router mode uses the Claude Any router on `127.0.0.1:8799` and
-  starts `nvd-claude-proxy` on `127.0.0.1:8788` only when that provider needs it.
-- Switching away from NVIDIA hosted does not require keeping the NVIDIA proxy
-  alive; stale sessions should be cleaned with `claude-any stop` before a fresh
-  test or launch.
+- NVIDIA hosted router mode uses the Claude Any router on `127.0.0.1:8799`;
+  hosted API Catalog models do not require a separate NVIDIA proxy.
+- Run `claude-any stop` before a fresh provider-switch test if an old router is
+  still bound to the local port.
 
 This keeps Claude Code pointed at one stable Claude Any entry point while still
 letting provider-specific helpers start on demand.
@@ -512,7 +554,7 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
 ## Headless Examples
 
 Headless commands skip the pre-launch menu and launch Claude Code immediately.
-Claude Any consumes `--ca-*` setup flags, starts the required router/proxy
+Claude Any consumes `--ca-*` setup flags, starts the required router
 services, then passes the remaining arguments to Claude Code.
 
 ```sh

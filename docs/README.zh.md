@@ -43,7 +43,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.29`
+当前版本: `0.1.30`
 
 ## 为什么存在
 
@@ -84,6 +84,38 @@ npm install -g @oneciel-ai/claude-any
 ```sh
 claude-any
 ```
+
+## Headless 直接启动 Claude Code
+
+当脚本、SSH 会话、CI 任务或上级 agent 需要跳过启动菜单并直接运行 Claude
+Code 时，使用 headless mode。`claude-any` 会先消费 `--ca-*` 选项，启动所需
+的 local router，然后把剩余参数原样传给 Claude Code。
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-model z-ai/glm-4.7
+```
+
+```sh
+claude-any --ca-provider ollama-cloud --ca-model glm-5.1
+```
+
+```sh
+claude-any --ca-provider ollama --ca-base-url http://127.0.0.1:11434 --ca-model qwen3-coder
+```
+
+执行一次非交互 Claude Code prompt:
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-model z-ai/glm-4.7 --ca-no-update-check -p "Reply with OK only." --output-format text
+```
+
+使用已保存的 provider/model，只跳过菜单:
+
+```sh
+CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-format text
+```
+
+更多示例见 [manual](manual.md#headless-usage)。
 
 **升级:**
 
@@ -261,6 +293,15 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 ## 更新日志
 
+### 0.1.30
+
+- **Headless 启动文档前置**：README 在安装后立即给出可复制示例，展示如何用
+  `--ca-provider`、`--ca-model`、`-p`、`CLAUDE_ANY_SKIP_MENU=1` 直接启动
+  Claude Code。
+- **NVIDIA hosted 文案清理**：provider/lifecycle 文档现在说明 NVIDIA hosted
+  通过 Claude Any local router 使用，不再暗示 hosted API Catalog 需要单独
+  proxy。
+
 ### 0.1.29
 
 - **NVIDIA 兼容性测试修复**：`claude-any test` 现在会在 router mode 测试前
@@ -399,20 +440,20 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 | Ollama | Native 优先，必要时 router | 本地 Ollama 通常不需要 API key；通过本地 Ollama 使用 `:cloud` 模型时，需要在 Ollama host 上 `ollama signin`。 |
 | Ollama Cloud | Router | 直接调用 `https://ollama.com/api`，需要 Ollama API key。 |
 | vLLM | Native Anthropic-compatible endpoint | 使用 Anthropic 兼容 `/v1/messages` endpoint，并让 `--tool-call-parser` 匹配模型系列。 |
-| NVIDIA hosted | Router/proxy | 通过 compatibility 路径使用 NVIDIA hosted API。 |
+| NVIDIA hosted | Router | 通过 Claude Any local router 使用 NVIDIA hosted API Catalog。 |
 | self-hosted NIM | Native Anthropic-compatible endpoint | 使用 self-hosted NIM 的 Anthropic 兼容 endpoint。 |
 
 ## 服务生命周期
 
 Claude Any 不会一直运行所有可能的 backend helper。正常生命周期如下：
 
-- 启动前，可用 `claude-any stop` 清理受管理的 router/proxy 进程。
+- 启动前，可用 `claude-any stop` 清理受管理的 router 进程。
 - `claude-any` 启动 Claude Code 时，只启动当前所选 provider 需要的服务。
 - Ollama/Ollama Cloud router mode 使用 `127.0.0.1:8799` 上的 Claude Any router。
-- NVIDIA hosted router mode 使用 `127.0.0.1:8799` 上的 Claude Any router，并且只在
-  该 provider 需要时启动 `127.0.0.1:8788` 上的 `nvd-claude-proxy`。
-- 从 NVIDIA hosted 切换到其他 provider 时，不需要让 NVIDIA proxy 一直运行。新的
-  test 或 launch 之前，请用 `claude-any stop` 清理 stale session。
+- NVIDIA hosted router mode 使用 `127.0.0.1:8799` 上的 Claude Any router；
+  hosted API Catalog 模型不需要单独的 NVIDIA proxy。
+- provider 切换测试前，如果旧 router 仍占用 local port，请用
+  `claude-any stop` 清理。
 
 这样 Claude Code 可以始终使用稳定的 Claude Any 入口，同时 provider-specific helper
 只在需要时启动。

@@ -43,7 +43,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.29`
+現在のバージョン: `0.1.30`
 
 ## 作られた理由
 
@@ -86,6 +86,39 @@ npm install -g @oneciel-ai/claude-any
 ```sh
 claude-any
 ```
+
+## Claude Code を headless で直接起動
+
+スクリプト、SSH セッション、CI ジョブ、親エージェントが事前メニューなしで
+Claude Code を直接起動したい場合は headless mode を使います。
+`claude-any` は `--ca-*` オプションを先に処理し、必要な local router を
+起動してから、残りの引数を Claude Code にそのまま渡します。
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-model z-ai/glm-4.7
+```
+
+```sh
+claude-any --ca-provider ollama-cloud --ca-model glm-5.1
+```
+
+```sh
+claude-any --ca-provider ollama --ca-base-url http://127.0.0.1:11434 --ca-model qwen3-coder
+```
+
+1 回だけ実行する非対話 Claude Code prompt:
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-model z-ai/glm-4.7 --ca-no-update-check -p "Reply with OK only." --output-format text
+```
+
+保存済み provider/model を使い、メニューだけをスキップ:
+
+```sh
+CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-format text
+```
+
+その他の例は [manual](manual.md#headless-usage) を参照してください。
 
 **アップグレード:**
 
@@ -274,6 +307,15 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 
 ## 変更履歴
 
+### 0.1.30
+
+- **Headless 起動ドキュメントを上部へ移動**: インストール直後の README で
+  `--ca-provider`、`--ca-model`、`-p`、`CLAUDE_ANY_SKIP_MENU=1` を使って
+  Claude Code を直接起動する copy-ready な例を確認できます。
+- **NVIDIA hosted の文言整理**: provider/lifecycle ドキュメントで NVIDIA
+  hosted を Claude Any local router 経由として説明し、hosted API Catalog に
+  別 proxy が必要だという表現をなくしました。
+
 ### 0.1.29
 
 - **NVIDIA 互換性テストの修正**: `claude-any test` は router mode のテスト前に
@@ -417,7 +459,7 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 | Ollama | Native 優先、必要時 router | ローカル Ollama は通常 API key 不要。ローカル Ollama で `:cloud` model を使う場合は Ollama host で `ollama signin` が必要。 |
 | Ollama Cloud | Router | `https://ollama.com/api` を直接呼び出し、Ollama API key が必要。 |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 互換 `/v1/messages` endpoint を使い、モデル系列に合う `--tool-call-parser` を指定。 |
-| NVIDIA hosted | Router/proxy | NVIDIA hosted API を compatibility 経路で使用。 |
+| NVIDIA hosted | Router | NVIDIA hosted API Catalog を Claude Any local router 経由で使用。 |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM の Anthropic 互換 endpoint を使用。 |
 
 ## サービスライフサイクル
@@ -425,16 +467,14 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 Claude Any は、すべての backend helper を常時起動しておく設計ではありません。
 通常のライフサイクルは次の通りです。
 
-- 起動前に、管理中の router/proxy は `claude-any stop` で停止できます。
+- 起動前に、管理中の router は `claude-any stop` で停止できます。
 - `claude-any` が Claude Code を起動するとき、選択中 provider に必要な
   service だけを開始します。
 - Ollama/Ollama Cloud router mode は `127.0.0.1:8799` の Claude Any router
   を使います。
 - NVIDIA hosted router mode は `127.0.0.1:8799` の Claude Any router を使い、
-  その provider に必要な場合だけ `127.0.0.1:8788` の `nvd-claude-proxy` を
-  開始します。
-- NVIDIA hosted から別 provider に切り替えるとき、NVIDIA proxy を生かし
-  続ける必要はありません。新しい test や launch の前に stale session は
+  hosted API Catalog model には別の NVIDIA proxy は不要です。
+- provider 切り替えテスト前に古い router が local port を保持している場合は、
   `claude-any stop` で整理してください。
 
 この構成により、Claude Code は安定した Claude Any entry point を使いながら、
