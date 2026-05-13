@@ -84,7 +84,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.31"
+VERSION = "0.1.32"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -5725,7 +5725,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
             ],
         }
         for token in tokens_by_preset[preset_id]:
-            if provider == "nvidia-hosted" and token.startswith(("context_window=", "reserve=")):
+            if provider == "nvidia-hosted" and token.startswith(("context_window=", "reserve=", "native=")):
                 continue
             apply_provider_option(provider, pcfg, token)
         if server_limit:

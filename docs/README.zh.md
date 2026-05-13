@@ -43,7 +43,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.31`
+当前版本: `0.1.32`
 
 ## 为什么存在
 
@@ -292,6 +292,11 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.32
+
+- **NVIDIA preset 菜单修复**：在 NVIDIA hosted 上应用 LLM preset 时不再触碰
+  不支持的 `native` 选项，因此选择 Long context / Large output preset 不会退出菜单。
 
 ### 0.1.31
 

@@ -43,7 +43,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.31`
+현재 버전: `0.1.32`
 
 ## 왜 만들었나
 
@@ -306,6 +306,12 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.32
+
+- **NVIDIA preset 메뉴 수정**: NVIDIA hosted에서 지원하지 않는 `native` 옵션을
+  LLM preset 적용 중 더 이상 건드리지 않으므로, Long context / Large output
+  preset 선택 시 메뉴가 종료되지 않습니다.
 
 ### 0.1.31
 

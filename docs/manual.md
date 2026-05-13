@@ -6,7 +6,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.31`
+Current version: `0.1.32`
 
 ## Install
 

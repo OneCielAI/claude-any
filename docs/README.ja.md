@@ -43,7 +43,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.31`
+現在のバージョン: `0.1.32`
 
 ## 作られた理由
 
@@ -306,6 +306,12 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.32
+
+- **NVIDIA preset メニュー修正**: NVIDIA hosted で未対応の `native` option を
+  LLM preset 適用時に触らないようにしました。Long context / Large output
+  preset を選択してもメニューが終了しません。
 
 ### 0.1.31
 

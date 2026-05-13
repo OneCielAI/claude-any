@@ -44,7 +44,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.31`
+Current version: `0.1.32`
 
 ## Why This Exists
 
@@ -333,6 +333,12 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.32
+
+- **NVIDIA preset menu fix**: LLM presets no longer try to apply the unsupported
+  `native` option for NVIDIA hosted, so selecting Long context / Large output
+  presets stays inside the menu instead of exiting.
 
 ### 0.1.31
 
