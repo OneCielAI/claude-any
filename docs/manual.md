@@ -1,12 +1,16 @@
 # Claude Any Manual
 
+<p align="center">
+  <img src="../logo-small.png" alt="Claude Any logo" width="220">
+</p>
+
 Claude Any is a pre-launch configuration layer for Claude Code. It lets you
 choose a provider, model, base URL, API key, and provider options before Claude
 Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.32`
+Current version: `0.1.33`
 
 ## Install
 

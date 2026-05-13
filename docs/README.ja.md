@@ -1,5 +1,9 @@
 # Claude Any
 
+<p align="center">
+  <img src="../logo.png" alt="Claude Any ロゴ" width="360">
+</p>
+
 ![Claude Any: 無料または低コスト LLM で Claude Code 体験](../claude-any-adv.png)
 
 | [English](../README.md) | [한국어](README.ko.md) | 日本語 | [中文](README.zh.md) |
@@ -43,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.32`
+現在のバージョン: `0.1.33`
 
 ## 作られた理由
 
@@ -306,6 +310,13 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.33
+
+- **すべての README の先頭にロゴを追加**: 英語、韓国語、日本語、中国語 README
+  の先頭に Claude Any ロゴを配置しました。
+- **npm に画像アセットを同梱**: npm README でも GitHub と同じブランディングが
+  表示されるよう、`logo.png`、`logo-small.png`、`claude-any-adv.png` をパッケージに含めました。
 
 ### 0.1.32
 

@@ -1,5 +1,9 @@
 # Claude Any
 
+<p align="center">
+  <img src="../logo.png" alt="Claude Any 로고" width="360">
+</p>
+
 ![Claude Any: 무료 또는 저비용 LLM으로 Claude Code 경험](../claude-any-adv.png)
 
 | [English](../README.md) | 한국어 | [日本語](README.ja.md) | [中文](README.zh.md) |
@@ -43,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.32`
+현재 버전: `0.1.33`
 
 ## 왜 만들었나
 
@@ -306,6 +310,13 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.33
+
+- **모든 README 상단 로고 브랜딩**: 영어, 한국어, 일본어, 중국어 README 최상단에
+  Claude Any 로고를 추가했습니다.
+- **npm 이미지 자산 포함**: npm README에서도 GitHub와 같은 브랜딩이 보이도록
+  `logo.png`, `logo-small.png`, `claude-any-adv.png`를 패키지에 포함했습니다.
 
 ### 0.1.32
 

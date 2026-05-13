@@ -1,5 +1,9 @@
 # Claude Any
 
+<p align="center">
+  <img src="logo.png" alt="Claude Any logo" width="360">
+</p>
+
 ![Claude Any: full Claude Code experience with free or low-cost LLMs](claude-any-adv.png)
 
 | English | [한국어](docs/README.ko.md) | [日本語](docs/README.ja.md) | [中文](docs/README.zh.md) |
@@ -44,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.32`
+Current version: `0.1.33`
 
 ## Why This Exists
 
@@ -333,6 +337,13 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.33
+
+- **Logo branding in every README**: add the Claude Any logo at the top of the
+  English, Korean, Japanese, and Chinese README files.
+- **npm image assets included**: package `logo.png`, `logo-small.png`, and
+  `claude-any-adv.png` so the npm README renders the same branding as GitHub.
 
 ### 0.1.32
 

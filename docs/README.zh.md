@@ -1,5 +1,9 @@
 # Claude Any
 
+<p align="center">
+  <img src="../logo.png" alt="Claude Any 标志" width="360">
+</p>
+
 ![Claude Any: 使用免费或低成本 LLM 获得 Claude Code 体验](../claude-any-adv.png)
 
 | [English](../README.md) | [한국어](README.ko.md) | [日本語](README.ja.md) | 中文 |
@@ -43,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.32`
+当前版本: `0.1.33`
 
 ## 为什么存在
 
@@ -292,6 +296,13 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.33
+
+- **所有 README 顶部加入 Logo 品牌展示**：在英文、韩文、日文和中文 README
+  顶部添加 Claude Any Logo。
+- **npm 包包含图片资源**：将 `logo.png`、`logo-small.png` 和
+  `claude-any-adv.png` 打进包内，让 npm README 与 GitHub 显示一致的品牌图片。
 
 ### 0.1.32
 
