@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.45`
+現在のバージョン: `0.1.46`
 
 ## 作られた理由
 
@@ -350,6 +350,11 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.46
+
+- **Stream options の整理**: `Stream` が off の場合、`Stream word chunking` を
+  LLM options menu から非表示にします。chunking は stream 応答にだけ意味があります。
 
 ### 0.1.45
 

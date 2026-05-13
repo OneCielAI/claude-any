@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.45`
+현재 버전: `0.1.46`
 
 ## 왜 만들었나
 
@@ -350,6 +350,11 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.46
+
+- **Stream 옵션 정리**: `Stream`이 off일 때는 `Stream word chunking` 항목을
+  LLM 옵션 메뉴에서 숨깁니다. chunking은 스트리밍 응답에만 의미가 있습니다.
 
 ### 0.1.45
 

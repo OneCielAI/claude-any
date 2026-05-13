@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.45`
+Current version: `0.1.46`
 
 ## Why This Exists
 
@@ -380,6 +380,12 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.46
+
+- **Cleaner stream options**: the LLM options menu now hides `Stream word
+  chunking` whenever `Stream` is off, since chunking only applies to streamed
+  responses.
 
 ### 0.1.45
 

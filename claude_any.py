@@ -85,7 +85,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.45"
+VERSION = "0.1.46"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -6598,7 +6598,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Keep alive", "keep_alive", pcfg.get("keep_alive", "default"))
         add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
         add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
-        add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
+        if bool(pcfg.get("stream_enabled", True)):
+            add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
         add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 40))
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
     else:
@@ -6616,7 +6617,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
             if provider in ("vllm", "self-hosted-nim"):
                 add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", True)))
             add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
-            add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
+            if bool(pcfg.get("stream_enabled", True)):
+                add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
         elif provider == "anthropic":
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
 
