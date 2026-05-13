@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.44`
+Current version: `0.1.45`
 
 ## Why This Exists
 
@@ -380,6 +380,13 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.45
+
+- **Interactive npm self-update check**: npm-installed `claude-any` now checks
+  the npm registry before launch. If a newer version exists, it asks whether to
+  run `npm update -g @oneciel-ai/claude-any`, then restarts into the updated
+  version. Non-interactive/headless runs are not interrupted.
 
 ### 0.1.44
 

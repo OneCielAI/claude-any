@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.44`
+現在のバージョン: `0.1.45`
 
 ## 作られた理由
 
@@ -350,6 +350,13 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.45
+
+- **対話型 npm self-update check**: npm でインストールされた `claude-any` は起動前に
+  npm registry の最新バージョンを確認します。新しいバージョンがあれば
+  `npm update -g @oneciel-ai/claude-any` を実行するか確認し、更新後に新しい
+  バージョンで再起動します。non-interactive/headless 実行は止めません。
 
 ### 0.1.44
 

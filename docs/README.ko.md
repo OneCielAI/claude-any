@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.44`
+현재 버전: `0.1.45`
 
 ## 왜 만들었나
 
@@ -350,6 +350,13 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.45
+
+- **대화형 npm self-update check**: npm으로 설치된 `claude-any`는 실행 전 npm
+  registry의 최신 버전을 확인합니다. 새 버전이 있으면 `npm update -g
+  @oneciel-ai/claude-any` 실행 여부를 묻고, 업데이트 후 새 버전으로 재시작합니다.
+  non-interactive/headless 실행은 중단하지 않습니다.
 
 ### 0.1.44
 

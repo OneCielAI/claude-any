@@ -85,7 +85,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.44"
+VERSION = "0.1.45"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -8758,6 +8758,92 @@ def run_claude_update_check(claude: str, enabled: bool = True) -> None:
         print(f"Claude Code update check exited with {p.returncode}; continuing.", flush=True)
 
 
+def parse_version_tuple(value: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for item in re.split(r"[^0-9]+", value.strip()):
+        if item:
+            parts.append(int(item))
+    return tuple(parts)
+
+
+def version_newer(latest: str, current: str) -> bool:
+    left = list(parse_version_tuple(latest))
+    right = list(parse_version_tuple(current))
+    size = max(len(left), len(right), 1)
+    left.extend([0] * (size - len(left)))
+    right.extend([0] * (size - len(right)))
+    return tuple(left) > tuple(right)
+
+
+def running_from_npm_package() -> bool:
+    if os.environ.get("CLAUDE_ANY_NPM_MODE") is not None:
+        return True
+    path = str(Path(__file__).resolve()).replace("\\", "/")
+    return "/node_modules/@oneciel-ai/claude-any/" in path
+
+
+def run_claude_any_update_check(enabled: bool = True) -> bool:
+    if not enabled:
+        return False
+    if os.environ.get("CLAUDE_ANY_SKIP_SELF_UPDATE") == "1":
+        return False
+    if env_bool(os.environ.get("CLAUDE_ANY_SELF_UPDATE_CHECK")) is False:
+        return False
+    if not running_from_npm_package():
+        return False
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return False
+    npm = find_executable("npm")
+    if not npm:
+        return False
+    try:
+        p = subprocess.run(
+            [npm, "view", "@oneciel-ai/claude-any@latest", "version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=8,
+        )
+    except Exception:
+        return False
+    if p.returncode != 0:
+        return False
+    latest = (p.stdout or "").strip().splitlines()[-1].strip() if (p.stdout or "").strip() else ""
+    if not latest or not version_newer(latest, VERSION):
+        return False
+    print(f"Claude Any update available: {VERSION} -> {latest}", flush=True)
+    answer = input("Update now with npm? [y/N] ").strip().lower()
+    if answer not in ("y", "yes"):
+        return False
+    try:
+        update = subprocess.run(
+            [npm, "update", "-g", "@oneciel-ai/claude-any"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=300,
+        )
+    except subprocess.TimeoutExpired:
+        print("Claude Any update timed out; continuing with current version.", flush=True)
+        return False
+    except Exception as exc:
+        print(f"Claude Any update failed ({type(exc).__name__}); continuing.", flush=True)
+        return False
+    out = (update.stdout or "").strip()
+    if out:
+        print(out, flush=True)
+    if update.returncode != 0:
+        print(f"Claude Any update exited with {update.returncode}; continuing with current version.", flush=True)
+        return False
+    print("Claude Any updated. Restarting with the new version...", flush=True)
+    os.environ["CLAUDE_ANY_SKIP_SELF_UPDATE"] = "1"
+    try:
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+    except Exception as exc:
+        print(f"Restart failed ({type(exc).__name__}); continuing with the current process.", flush=True)
+    return True
+
+
 def launch_claude(
     passthrough: list[str],
     skip_menu: bool = False,
@@ -8765,7 +8851,9 @@ def launch_claude(
     web_search_override: bool | None = None,
     disable_skills_override: bool | None = None,
     update_check: bool = True,
+    self_update_check: bool = True,
 ) -> int:
+    run_claude_any_update_check(enabled=self_update_check)
     rc = run_prelaunch_menu(passthrough, skip_menu=skip_menu, force_menu=force_menu)
     if rc == 10:
         return 0
@@ -8897,6 +8985,8 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-no-web-fetch       Disable fetch MCP
   claude-any --ca-disable-skills     Disable Claude Code skills for this launch
   claude-any --ca-enable-skills      Keep Claude Code skills enabled for this launch
+  claude-any --ca-no-self-update-check
+                                      Skip Claude Any npm self-update check
   claude-any --ca-no-update-check    Skip Claude Code update check for this launch
   claude-any --ca-stop               Stop router/proxy
   claude-any --                      Pass all following args directly to Claude Code
@@ -8930,12 +9020,13 @@ def pop_headless_env_file_args(argv: list[str]) -> list[str]:
     return cleaned
 
 
-def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | None, bool]:
+def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | None, bool | None, bool]:
     skip_menu = os.environ.get("CLAUDE_ANY_SKIP_MENU") == "1"
     force_menu = bool(env_bool(os.environ.get("CLAUDE_ANY_FORCE_MENU"), False))
     web_search_override = env_bool(os.environ.get("CLAUDE_ANY_WEB_SEARCH"))
     disable_skills_override = env_bool(os.environ.get("CLAUDE_ANY_DISABLE_SKILLS"))
     update_check_override = env_bool(os.environ.get("CLAUDE_ANY_UPDATE_CHECK"))
+    self_update_check_override = env_bool(os.environ.get("CLAUDE_ANY_SELF_UPDATE_CHECK"))
     language = os.environ.get("CLAUDE_ANY_LANGUAGE", "").strip()
     if language:
         cmd_language(argparse.Namespace(value=language))
@@ -8999,7 +9090,7 @@ def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | 
     if ollama_values:
         cmd_ollama_options(argparse.Namespace(values=ollama_values))
         skip_menu = True
-    return skip_menu, web_search_override, disable_skills_override, update_check_override, force_menu
+    return skip_menu, web_search_override, disable_skills_override, update_check_override, self_update_check_override, force_menu
 
 
 def run_cli(argv: list[str]) -> int:
@@ -9093,10 +9184,13 @@ def run_cli(argv: list[str]) -> int:
             return 0
 
     passthrough: list[str] = []
-    skip_menu, web_search_override, disable_skills_override, update_check_override, force_menu = apply_headless_env_config()
+    skip_menu, web_search_override, disable_skills_override, update_check_override, self_update_check_override, force_menu = apply_headless_env_config()
     update_check = True
     if update_check_override is not None:
         update_check = update_check_override
+    self_update_check = True
+    if self_update_check_override is not None:
+        self_update_check = self_update_check_override
     i = 0
     while i < len(argv):
         arg = argv[i]
@@ -9357,6 +9451,10 @@ def run_cli(argv: list[str]) -> int:
             update_check = False
             skip_menu = True
             i += 1
+        elif arg == "--ca-no-self-update-check":
+            self_update_check = False
+            skip_menu = True
+            i += 1
         elif arg == "--ca-status":
             cmd_status(argparse.Namespace())
             return 0
@@ -9376,6 +9474,7 @@ def run_cli(argv: list[str]) -> int:
         web_search_override=web_search_override,
         disable_skills_override=disable_skills_override,
         update_check=update_check,
+        self_update_check=self_update_check,
     )
 
 

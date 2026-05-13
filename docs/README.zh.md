@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.44`
+当前版本: `0.1.45`
 
 ## 为什么存在
 
@@ -336,6 +336,13 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.45
+
+- **交互式 npm self-update check**：通过 npm 安装的 `claude-any` 会在启动前检查
+  npm registry 的最新版本。如果有新版本，会询问是否运行 `npm update -g
+  @oneciel-ai/claude-any`，更新后重新启动到新版本。non-interactive/headless
+  运行不会被打断。
 
 ### 0.1.44
 

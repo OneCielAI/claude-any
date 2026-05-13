@@ -10,7 +10,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.44`
+Current version: `0.1.45`
 
 ## Install
 
@@ -376,6 +376,7 @@ export CLAUDE_ANY_STREAM_WORD_CHUNKING=off
 export CLAUDE_ANY_WEB_SEARCH=on
 export CLAUDE_ANY_WEB_FETCH=on
 export CLAUDE_ANY_DISABLE_SKILLS=off
+export CLAUDE_ANY_SELF_UPDATE_CHECK=off
 export CLAUDE_ANY_UPDATE_CHECK=off
 claude-any -p "Reply with OK only." --output-format text
 ```
@@ -400,6 +401,7 @@ CLAUDE_ANY_STREAM_WORD_CHUNKING=off
 CLAUDE_ANY_WEB_SEARCH=on
 CLAUDE_ANY_WEB_FETCH=on
 CLAUDE_ANY_DISABLE_SKILLS=off
+CLAUDE_ANY_SELF_UPDATE_CHECK=off
 CLAUDE_ANY_UPDATE_CHECK=off
 ```
 
@@ -472,6 +474,7 @@ Common Claude Any setup flags:
 | `--ca-web-search` / `--ca-no-web-search` | Force-enable or disable web-search MCP for this launch. |
 | `--ca-web-fetch` / `--ca-no-web-fetch` | Enable or disable fetch MCP for web page content. |
 | `--ca-disable-skills` / `--ca-enable-skills` | Control Claude Code skills for this launch. |
+| `--ca-no-self-update-check` | Skip the Claude Any npm self-update check. |
 | `--ca-no-update-check` | Skip the Claude Code update check. |
 | `--ca-status` | Print status and exit. |
 | `--ca-stop` | Stop managed router services and exit. |
@@ -483,6 +486,11 @@ Notes for automation:
   but prefer the environment-variable forms in shared scripts and terminals.
 - `claude-any stop` is safe to run before scripted tests to remove stale
   router/proxy processes.
+- npm-installed interactive launches check the npm registry for a newer
+  Claude Any version and ask before running `npm update -g
+  @oneciel-ai/claude-any`. Headless/non-TTY launches are not interrupted; set
+  `CLAUDE_ANY_SELF_UPDATE_CHECK=off` or pass `--ca-no-self-update-check` to
+  disable it explicitly.
 - Use `claude-any test 60 auto` for a quick readiness check and reserve
   `claude-any test 180 full` for deeper provider validation.
 - Headless flags persist in `~/.config/claude-any/config.json`, so the next
