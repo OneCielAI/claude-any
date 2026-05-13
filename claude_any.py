@@ -32,7 +32,7 @@ except Exception:
     pass
 
 HOME = Path.home()
-CONFIG_DIR = HOME / ".config" / "claude-any"
+CONFIG_DIR = Path(os.environ.get("CLAUDE_ANY_CONFIG_DIR") or (HOME / ".config" / "claude-any"))
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = CONFIG_DIR / "router.log"
 LOG_LEVEL_PATH = CONFIG_DIR / "log-level"
@@ -84,7 +84,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.33"
+VERSION = "0.1.34"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -960,6 +960,23 @@ def meaningful_key_value(value: Any) -> bool:
         return False
     text = str(value).strip()
     return bool(text and text not in ("dummy", "not-used", "ollama"))
+
+
+def env_bool(value: str | None, default: bool | None = None) -> bool | None:
+    if value is None:
+        return default
+    text = value.strip().lower()
+    if text in ("1", "true", "yes", "on", "y"):
+        return True
+    if text in ("0", "false", "no", "off", "n"):
+        return False
+    return default
+
+
+def load_dotenv_into_environ(path: Path, *, override: bool = True) -> None:
+    for key, value in read_env_file(path).items():
+        if override or key not in os.environ:
+            os.environ[key] = value
 
 
 def executable_candidates(name: str) -> list[str]:
@@ -7900,8 +7917,10 @@ def has_noninteractive_claude_args(passthrough: list[str]) -> bool:
     return any(arg == "-p" or arg == "--print" or arg.startswith("--print=") for arg in passthrough)
 
 
-def run_prelaunch_menu(passthrough: list[str], skip_menu: bool = False) -> int:
-    if skip_menu or has_noninteractive_claude_args(passthrough) or os.environ.get("CLAUDE_ANY_SKIP_MENU") == "1":
+def run_prelaunch_menu(passthrough: list[str], skip_menu: bool = False, force_menu: bool = False) -> int:
+    if not force_menu and (
+        skip_menu or has_noninteractive_claude_args(passthrough) or os.environ.get("CLAUDE_ANY_SKIP_MENU") == "1"
+    ):
         return 0
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         return 0
@@ -8040,11 +8059,12 @@ def run_claude_update_check(claude: str, enabled: bool = True) -> None:
 def launch_claude(
     passthrough: list[str],
     skip_menu: bool = False,
+    force_menu: bool = False,
     web_search_override: bool | None = None,
     disable_skills_override: bool | None = None,
     update_check: bool = True,
 ) -> int:
-    rc = run_prelaunch_menu(passthrough, skip_menu=skip_menu)
+    rc = run_prelaunch_menu(passthrough, skip_menu=skip_menu, force_menu=force_menu)
     if rc == 10:
         return 0
     if rc != 0:
@@ -8149,8 +8169,12 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
 
 Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-provider PROVIDER  Set provider, then launch
+  claude-any --ca-env-file PATH      Load CLAUDE_ANY_* values from a .env file
+  claude-any --ca-menu               Apply setup values, then open the menu
+  claude-any --ca-language en|ko|ja|zh
   claude-any --ca-base-url URL       Set current provider base URL, then launch
   claude-any --ca-model MODEL_ID     Set provider model, then launch
+  claude-any --ca-advisor-model MODEL_ID
   claude-any --ca-api-key KEY        Set current provider API key, then launch
   claude-any --ca-api-key-env ENVVAR Set current provider API key from env, then launch
   claude-any --ca-set-api-key PROVIDER KEY
@@ -8161,8 +8185,14 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-max-output-tokens VALUE
   claude-any --ca-context-window VALUE
   claude-any --ca-request-timeout-ms VALUE
+  claude-any --ca-rate-limit-rpm VALUE
+  claude-any --ca-rate-limit-status on|off
+  claude-any --ca-stream on|off
+  claude-any --ca-stream-word-chunking on|off
   claude-any --ca-web-search         Force DuckDuckGo MCP for this launch
   claude-any --ca-no-web-search      Disable DuckDuckGo MCP for this launch
+  claude-any --ca-web-fetch          Enable fetch MCP
+  claude-any --ca-no-web-fetch       Disable fetch MCP
   claude-any --ca-disable-skills     Disable Claude Code skills for this launch
   claude-any --ca-enable-skills      Keep Claude Code skills enabled for this launch
   claude-any --ca-no-update-check    Skip Claude Code update check for this launch
@@ -8174,10 +8204,107 @@ Any other arguments are passed through to claude. Use -- before Claude flags tha
 collide with claude-any setup flags."""
 
 
+def pop_headless_env_file_args(argv: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--ca-env-file" or arg.startswith("--ca-env-file="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing path for --ca-env-file")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            path = Path(value).expanduser()
+            if not path.exists():
+                raise SystemExit(f"--ca-env-file not found: {path}")
+            load_dotenv_into_environ(path, override=True)
+        else:
+            cleaned.append(arg)
+            i += 1
+    return cleaned
+
+
+def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | None, bool]:
+    skip_menu = os.environ.get("CLAUDE_ANY_SKIP_MENU") == "1"
+    force_menu = bool(env_bool(os.environ.get("CLAUDE_ANY_FORCE_MENU"), False))
+    web_search_override = env_bool(os.environ.get("CLAUDE_ANY_WEB_SEARCH"))
+    disable_skills_override = env_bool(os.environ.get("CLAUDE_ANY_DISABLE_SKILLS"))
+    update_check_override = env_bool(os.environ.get("CLAUDE_ANY_UPDATE_CHECK"))
+    language = os.environ.get("CLAUDE_ANY_LANGUAGE", "").strip()
+    if language:
+        cmd_language(argparse.Namespace(value=language))
+        skip_menu = True
+    web_fetch = env_bool(os.environ.get("CLAUDE_ANY_WEB_FETCH"))
+    if web_fetch is not None:
+        cmd_web_fetch(argparse.Namespace(value="on" if web_fetch else "off"))
+        skip_menu = True
+    provider = os.environ.get("CLAUDE_ANY_PROVIDER", "").strip()
+    if provider:
+        cmd_provider(argparse.Namespace(name=provider))
+        skip_menu = True
+    api_key_env = os.environ.get("CLAUDE_ANY_API_KEY_ENV", "").strip()
+    api_key = os.environ.get("CLAUDE_ANY_API_KEY", "").strip()
+    current_provider, _ = get_current_provider(load_config())
+    if api_key_env:
+        value = os.environ.get(api_key_env, "")
+        if not value:
+            raise SystemExit(f"Environment variable {api_key_env} is empty or not set")
+        cmd_set_api_key(argparse.Namespace(provider=current_provider, key=value))
+        skip_menu = True
+    elif api_key:
+        cmd_set_api_key(argparse.Namespace(provider=current_provider, key=api_key))
+        skip_menu = True
+    base_url = os.environ.get("CLAUDE_ANY_BASE_URL", "").strip()
+    if base_url:
+        current_provider, _ = get_current_provider(load_config())
+        cmd_base_url(argparse.Namespace(provider=current_provider, url=base_url))
+        skip_menu = True
+    model = os.environ.get("CLAUDE_ANY_MODEL", "").strip()
+    if model:
+        cmd_model(argparse.Namespace(value=[model]))
+        skip_menu = True
+    advisor_model = os.environ.get("CLAUDE_ANY_ADVISOR_MODEL", "").strip()
+    if advisor_model:
+        set_advisor_model_config(advisor_model)
+        skip_menu = True
+    provider_option_keys = {
+        "CLAUDE_ANY_MAX_OUTPUT_TOKENS": "max_output_tokens",
+        "CLAUDE_ANY_CONTEXT_WINDOW": "context_window",
+        "CLAUDE_ANY_REQUEST_TIMEOUT_MS": "request_timeout_ms",
+        "CLAUDE_ANY_RATE_LIMIT_RPM": "rate_limit_rpm",
+        "CLAUDE_ANY_RATE_LIMIT_STATUS": "rate_limit_status",
+        "CLAUDE_ANY_STREAM": "stream_enabled",
+        "CLAUDE_ANY_STREAM_WORD_CHUNKING": "stream_word_chunking",
+    }
+    provider_values = [
+        f"{option_key}={os.environ[env_key].strip()}"
+        for env_key, option_key in provider_option_keys.items()
+        if os.environ.get(env_key, "").strip()
+    ]
+    if provider_values:
+        cmd_provider_options(argparse.Namespace(values=provider_values))
+        skip_menu = True
+    ollama_values: list[str] = []
+    if os.environ.get("CLAUDE_ANY_OLLAMA_NUM_CTX", "").strip():
+        ollama_values.append(f"num_ctx={os.environ['CLAUDE_ANY_OLLAMA_NUM_CTX'].strip()}")
+    for item in os.environ.get("CLAUDE_ANY_OLLAMA_OPTIONS", "").replace(",", " ").split():
+        if item.strip():
+            ollama_values.append(item.strip())
+    if ollama_values:
+        cmd_ollama_options(argparse.Namespace(values=ollama_values))
+        skip_menu = True
+    return skip_menu, web_search_override, disable_skills_override, update_check_override, force_menu
+
+
 def run_cli(argv: list[str]) -> int:
     if argv and argv[0] in ("help", "--help", "-h"):
         print(cli_usage())
         return 0
+    argv = pop_headless_env_file_args(argv)
     if argv:
         head, rest = argv[0], argv[1:]
         if head in ("version", "--version", "-v"):
@@ -8264,14 +8391,28 @@ def run_cli(argv: list[str]) -> int:
             return 0
 
     passthrough: list[str] = []
-    skip_menu = False
-    web_search_override: bool | None = None
-    disable_skills_override: bool | None = None
+    skip_menu, web_search_override, disable_skills_override, update_check_override, force_menu = apply_headless_env_config()
     update_check = True
+    if update_check_override is not None:
+        update_check = update_check_override
     i = 0
     while i < len(argv):
         arg = argv[i]
-        if arg == "--ca-provider" or arg.startswith("--ca-provider="):
+        if arg in ("--ca-menu", "--ca-interactive"):
+            force_menu = True
+            i += 1
+        elif arg == "--ca-language" or arg.startswith("--ca-language="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing language for --ca-language")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            cmd_language(argparse.Namespace(value=value))
+            skip_menu = True
+        elif arg == "--ca-provider" or arg.startswith("--ca-provider="):
             provider_value = arg.split("=", 1)[1] if "=" in arg else None
             if provider_value:
                 cmd_provider(argparse.Namespace(name=provider_value))
@@ -8311,6 +8452,18 @@ def run_cli(argv: list[str]) -> int:
             else:
                 i += 1
             cmd_model(argparse.Namespace(value=[value]))
+            skip_menu = True
+        elif arg == "--ca-advisor-model" or arg.startswith("--ca-advisor-model="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing model id for --ca-advisor-model")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            for line in set_advisor_model_config(value):
+                print(line)
             skip_menu = True
         elif arg == "--ca-models":
             cmd_models(argparse.Namespace(provider=None))
@@ -8430,12 +8583,64 @@ def run_cli(argv: list[str]) -> int:
                 i += 1
             cmd_provider_options(argparse.Namespace(values=[f"request_timeout_ms={value}"]))
             skip_menu = True
+        elif arg == "--ca-rate-limit-rpm" or arg.startswith("--ca-rate-limit-rpm="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing value for --ca-rate-limit-rpm")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            cmd_provider_options(argparse.Namespace(values=[f"rate_limit_rpm={value}"]))
+            skip_menu = True
+        elif arg == "--ca-rate-limit-status" or arg.startswith("--ca-rate-limit-status="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing on/off for --ca-rate-limit-status")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            cmd_provider_options(argparse.Namespace(values=[f"rate_limit_status={value}"]))
+            skip_menu = True
+        elif arg == "--ca-stream" or arg.startswith("--ca-stream="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing on/off for --ca-stream")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            cmd_provider_options(argparse.Namespace(values=[f"stream_enabled={value}"]))
+            skip_menu = True
+        elif arg == "--ca-stream-word-chunking" or arg.startswith("--ca-stream-word-chunking="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing on/off for --ca-stream-word-chunking")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            cmd_provider_options(argparse.Namespace(values=[f"stream_word_chunking={value}"]))
+            skip_menu = True
         elif arg == "--ca-web-search":
             web_search_override = True
             skip_menu = True
             i += 1
         elif arg == "--ca-no-web-search":
             web_search_override = False
+            skip_menu = True
+            i += 1
+        elif arg == "--ca-web-fetch":
+            cmd_web_fetch(argparse.Namespace(value="on"))
+            skip_menu = True
+            i += 1
+        elif arg == "--ca-no-web-fetch":
+            cmd_web_fetch(argparse.Namespace(value="off"))
             skip_menu = True
             i += 1
         elif arg == "--ca-disable-skills":
@@ -8465,6 +8670,7 @@ def run_cli(argv: list[str]) -> int:
     return launch_claude(
         passthrough,
         skip_menu=skip_menu,
+        force_menu=force_menu,
         web_search_override=web_search_override,
         disable_skills_override=disable_skills_override,
         update_check=update_check,

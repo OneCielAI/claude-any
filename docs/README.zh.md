@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.33`
+当前版本: `0.1.34`
 
 ## 为什么存在
 
@@ -118,6 +118,46 @@ claude-any --ca-provider nvidia-hosted --ca-model z-ai/glm-4.7 --ca-no-update-ch
 ```sh
 CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-format text
 ```
+
+用 flags 传入全部启动选项:
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 300000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+```
+
+也可以用环境变量传入同样的值:
+
+```sh
+export CLAUDE_ANY_SKIP_MENU=1
+export CLAUDE_ANY_PROVIDER=nvidia-hosted
+export CLAUDE_ANY_BASE_URL=https://integrate.api.nvidia.com/v1
+export CLAUDE_ANY_MODEL=z-ai/glm-4.7
+export CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
+export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
+export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
+export CLAUDE_ANY_CONTEXT_WINDOW=65536
+export CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+export CLAUDE_ANY_RATE_LIMIT_RPM=40
+export CLAUDE_ANY_RATE_LIMIT_STATUS=on
+claude-any -p "Reply with OK only." --output-format text
+```
+
+`.env` 方式是把同样的 `CLAUDE_ANY_*` 值保存到文件，并显式加载:
+
+```sh
+claude-any --ca-env-file .env.claude-any -p "Reply with OK only." --output-format text
+```
+
+覆盖顺序是固定的: 菜单保存的最后一次用户选择是基线，随后依次由 OS 环境变量、
+`--ca-env-file` 的 `.env` 值、CLI `--ca-*` 参数覆盖；如果使用 `--ca-menu`
+重新打开界面，用户在界面中的最终选择会覆盖前面所有值。
+
+Headless 覆盖范围: provider、base URL、model、Advisor model、API key 或
+API-key 环境变量、max output、context window、request timeout、RPM limit、
+RPM status 显示、streaming、web search、web fetch、Claude skills、update check、
+language、Ollama context/options，以及普通 Claude Code passthrough 参数，都可以
+不打开菜单直接配置。API key 可以用 `--ca-api-key` 直接传入，但脚本中更推荐
+`--ca-api-key-env`，避免密钥进入 shell history。
 
 更多示例见 [manual](manual.md#headless-usage)。
 
@@ -296,6 +336,13 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.34
+
+- **完整 headless 配置路径**：新增 `--ca-env-file`、环境变量映射、Advisor
+  model、rate-limit、streaming、language、web-fetch headless 控制。
+- **记录覆盖顺序**：已保存菜单选择 < OS 环境变量 < `.env` 文件 < CLI 参数 <
+  通过 `--ca-menu` 直接选择的最终界面值。
 
 ### 0.1.33
 

@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.33`
+現在のバージョン: `0.1.34`
 
 ## 作られた理由
 
@@ -121,6 +121,46 @@ claude-any --ca-provider nvidia-hosted --ca-model z-ai/glm-4.7 --ca-no-update-ch
 ```sh
 CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-format text
 ```
+
+すべての起動オプションをフラグで渡す例:
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 300000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+```
+
+同じ値を環境変数で指定:
+
+```sh
+export CLAUDE_ANY_SKIP_MENU=1
+export CLAUDE_ANY_PROVIDER=nvidia-hosted
+export CLAUDE_ANY_BASE_URL=https://integrate.api.nvidia.com/v1
+export CLAUDE_ANY_MODEL=z-ai/glm-4.7
+export CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
+export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
+export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
+export CLAUDE_ANY_CONTEXT_WINDOW=65536
+export CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+export CLAUDE_ANY_RATE_LIMIT_RPM=40
+export CLAUDE_ANY_RATE_LIMIT_STATUS=on
+claude-any -p "Reply with OK only." --output-format text
+```
+
+`.env` 方式では、同じ `CLAUDE_ANY_*` 値をファイルに保存して明示的に読み込みます:
+
+```sh
+claude-any --ca-env-file .env.claude-any -p "Reply with OK only." --output-format text
+```
+
+上書き順序は固定です: メニューで保存された最後のユーザー選択が基準になり、
+OS 環境変数、`--ca-env-file` の `.env` 値、CLI `--ca-*` パラメータ、
+`--ca-menu` で再度開いた UI での最終選択の順に上書きされます。
+
+ヘッドレス対応範囲: provider、base URL、model、Advisor model、API key または
+API-key 環境変数、max output、context window、request timeout、RPM limit、
+RPM status 表示、streaming、web search、web fetch、Claude skills、update check、
+language、Ollama context/options、通常の Claude Code passthrough 引数をすべて
+メニューなしで設定できます。API key は `--ca-api-key` で直接渡せますが、
+スクリプトでは shell history に秘密値を残さない `--ca-api-key-env` を推奨します。
 
 その他の例は [manual](manual.md#headless-usage) を参照してください。
 
@@ -310,6 +350,13 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.34
+
+- **完全な headless 設定経路**: `--ca-env-file`、環境変数マッピング、Advisor
+  model、rate-limit、streaming、language、web-fetch の headless 制御を追加。
+- **上書き順序を文書化**: 保存済みメニュー選択 < OS 環境変数 < `.env` ファイル <
+  CLI パラメータ < `--ca-menu` で直接選んだ最終 UI 選択。
 
 ### 0.1.33
 

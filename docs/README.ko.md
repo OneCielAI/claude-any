@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.33`
+현재 버전: `0.1.34`
 
 ## 왜 만들었나
 
@@ -121,6 +121,46 @@ claude-any --ca-provider nvidia-hosted --ca-model z-ai/glm-4.7 --ca-no-update-ch
 ```sh
 CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-format text
 ```
+
+모든 실행 옵션을 플래그로 전달:
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 300000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+```
+
+같은 값을 환경변수로 설정:
+
+```sh
+export CLAUDE_ANY_SKIP_MENU=1
+export CLAUDE_ANY_PROVIDER=nvidia-hosted
+export CLAUDE_ANY_BASE_URL=https://integrate.api.nvidia.com/v1
+export CLAUDE_ANY_MODEL=z-ai/glm-4.7
+export CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
+export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
+export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
+export CLAUDE_ANY_CONTEXT_WINDOW=65536
+export CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+export CLAUDE_ANY_RATE_LIMIT_RPM=40
+export CLAUDE_ANY_RATE_LIMIT_STATUS=on
+claude-any -p "Reply with OK only." --output-format text
+```
+
+`.env` 방식은 같은 `CLAUDE_ANY_*` 값을 파일에 저장한 뒤 명시적으로 불러옵니다:
+
+```sh
+claude-any --ca-env-file .env.claude-any -p "Reply with OK only." --output-format text
+```
+
+오버라이드 순서는 고정되어 있습니다: 메뉴에서 저장된 최종 사용자 선택값이
+기본값이고, OS 환경변수, `--ca-env-file`의 `.env` 값, CLI `--ca-*` 파라미터,
+`--ca-menu`로 다시 연 인터페이스에서 사용자가 직접 고른 값 순서로 덮어씁니다.
+
+헤드리스 지원 범위: provider, base URL, model, Advisor model, API key 또는
+API-key 환경변수, max output, context window, request timeout, RPM limit,
+RPM status 표시, streaming, web search, web fetch, Claude skills, update check,
+language, Ollama context/options, 일반 Claude Code passthrough 인자를 모두 메뉴
+없이 설정할 수 있습니다. API key는 `--ca-api-key`로 직접 전달할 수 있지만,
+스크립트에서는 shell history에 비밀값이 남지 않는 `--ca-api-key-env`를 권장합니다.
 
 더 많은 예시는 [헤드리스 예제](#헤드리스-에이전트-채팅)와
 [전체 manual](manual.md#headless-usage)을 참고하세요.
@@ -310,6 +350,13 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.34
+
+- **완전한 headless 설정 경로**: `--ca-env-file`, 환경변수 매핑, Advisor model,
+  rate-limit, streaming, language, web-fetch headless 제어를 추가했습니다.
+- **오버라이드 순서 문서화**: 저장된 메뉴 선택값 < OS 환경변수 < `.env` 파일 <
+  CLI 파라미터 < `--ca-menu`로 직접 고른 최종 인터페이스 선택값.
 
 ### 0.1.33
 

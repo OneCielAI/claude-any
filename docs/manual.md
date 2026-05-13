@@ -10,7 +10,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.33`
+Current version: `0.1.34`
 
 ## Install
 
@@ -253,6 +253,17 @@ Basic pattern:
 claude-any --ca-provider PROVIDER --ca-model MODEL [claude-code args...]
 ```
 
+Configuration precedence is deterministic:
+
+1. Saved user choices from the interactive menu.
+2. OS environment variables such as `CLAUDE_ANY_PROVIDER`.
+3. Values loaded from `--ca-env-file .env.claude-any`.
+4. CLI `--ca-*` parameters.
+5. If `--ca-menu` is present, the final choice made in the interactive menu.
+
+That lets automation provide defaults while still allowing a human operator to
+make the final choice when needed.
+
 Direct Claude Code launch examples:
 
 ```sh
@@ -320,6 +331,89 @@ claude-any \
   --ca-api-key not-used
 ```
 
+Full headless configuration with flags:
+
+```sh
+claude-any \
+  --ca-language en \
+  --ca-provider nvidia-hosted \
+  --ca-base-url https://integrate.api.nvidia.com/v1 \
+  --ca-model z-ai/glm-4.7 \
+  --ca-advisor-model deepseek-ai/deepseek-v4-pro \
+  --ca-api-key-env NVIDIA_API_KEY \
+  --ca-max-output-tokens 4096 \
+  --ca-context-window 65536 \
+  --ca-request-timeout-ms 300000 \
+  --ca-rate-limit-rpm 40 \
+  --ca-rate-limit-status on \
+  --ca-stream on \
+  --ca-stream-word-chunking off \
+  --ca-web-search \
+  --ca-web-fetch \
+  --ca-enable-skills \
+  --ca-no-update-check \
+  -p "Reply with OK only." \
+  --output-format text
+```
+
+Full headless configuration with environment variables:
+
+```sh
+export CLAUDE_ANY_SKIP_MENU=1
+export CLAUDE_ANY_LANGUAGE=en
+export CLAUDE_ANY_PROVIDER=nvidia-hosted
+export CLAUDE_ANY_BASE_URL=https://integrate.api.nvidia.com/v1
+export CLAUDE_ANY_MODEL=z-ai/glm-4.7
+export CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
+export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
+export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
+export CLAUDE_ANY_CONTEXT_WINDOW=65536
+export CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+export CLAUDE_ANY_RATE_LIMIT_RPM=40
+export CLAUDE_ANY_RATE_LIMIT_STATUS=on
+export CLAUDE_ANY_STREAM=on
+export CLAUDE_ANY_STREAM_WORD_CHUNKING=off
+export CLAUDE_ANY_WEB_SEARCH=on
+export CLAUDE_ANY_WEB_FETCH=on
+export CLAUDE_ANY_DISABLE_SKILLS=off
+export CLAUDE_ANY_UPDATE_CHECK=off
+claude-any -p "Reply with OK only." --output-format text
+```
+
+The same values can be stored in a dotenv-style file and loaded explicitly:
+
+```dotenv
+CLAUDE_ANY_SKIP_MENU=1
+CLAUDE_ANY_LANGUAGE=en
+CLAUDE_ANY_PROVIDER=nvidia-hosted
+CLAUDE_ANY_BASE_URL=https://integrate.api.nvidia.com/v1
+CLAUDE_ANY_MODEL=z-ai/glm-4.7
+CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
+CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
+CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
+CLAUDE_ANY_CONTEXT_WINDOW=65536
+CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+CLAUDE_ANY_RATE_LIMIT_RPM=40
+CLAUDE_ANY_RATE_LIMIT_STATUS=on
+CLAUDE_ANY_STREAM=on
+CLAUDE_ANY_STREAM_WORD_CHUNKING=off
+CLAUDE_ANY_WEB_SEARCH=on
+CLAUDE_ANY_WEB_FETCH=on
+CLAUDE_ANY_DISABLE_SKILLS=off
+CLAUDE_ANY_UPDATE_CHECK=off
+```
+
+```sh
+claude-any --ca-env-file .env.claude-any -p "Reply with OK only." --output-format text
+```
+
+To let `.env` or CLI values prefill the menu while the user makes the final
+choice, add `--ca-menu`:
+
+```sh
+claude-any --ca-env-file .env.claude-any --ca-model z-ai/glm-4.7 --ca-menu
+```
+
 Passing Claude Code arguments:
 
 ```sh
@@ -354,8 +448,12 @@ Common Claude Any setup flags:
 
 | Flag | Purpose |
 | --- | --- |
+| `--ca-env-file PATH` | Load `CLAUDE_ANY_*` values from a dotenv-style file. |
+| `--ca-menu` | Apply env/flag values, then open the interactive menu for the final user choice. |
+| `--ca-language en|ko|ja|zh` | Set display language. |
 | `--ca-provider PROVIDER` | Set provider and skip the menu for this launch. |
 | `--ca-model MODEL` | Set the current provider model. |
+| `--ca-advisor-model MODEL` | Set the Advisor model; use `off` to disable it. |
 | `--ca-base-url URL` | Set the current provider base URL. |
 | `--ca-api-key KEY` | Store the current provider API key directly. Prefer env vars for scripts. |
 | `--ca-api-key-env ENVVAR` | Store the current provider API key from an environment variable. |
@@ -364,10 +462,15 @@ Common Claude Any setup flags:
 | `--ca-max-output-tokens VALUE` | Set provider output-token cap. |
 | `--ca-context-window VALUE` | Set provider/router context-window cap where supported. |
 | `--ca-request-timeout-ms VALUE` | Set upstream request timeout in milliseconds. |
+| `--ca-rate-limit-rpm VALUE` | Set provider RPM limit; `0` disables throttling but keeps usage display. |
+| `--ca-rate-limit-status on|off` | Show or hide RPM/rate-limit status in the Claude Code statusline. |
+| `--ca-stream on|off` | Enable or disable streaming through the router. |
+| `--ca-stream-word-chunking on|off` | Split streamed text into smaller word-like chunks when enabled. |
 | `--ca-ollama-num-ctx VALUE` | Set Ollama `num_ctx`. |
 | `--ca-ollama-ctx-range MIN MAX` | Set Ollama auto context range. |
 | `--ca-ollama-option KEY=VALUE` | Set an Ollama option such as `temperature=0.3`. |
 | `--ca-web-search` / `--ca-no-web-search` | Force-enable or disable web-search MCP for this launch. |
+| `--ca-web-fetch` / `--ca-no-web-fetch` | Enable or disable fetch MCP for web page content. |
 | `--ca-disable-skills` / `--ca-enable-skills` | Control Claude Code skills for this launch. |
 | `--ca-no-update-check` | Skip the Claude Code update check. |
 | `--ca-status` | Print status and exit. |
@@ -376,6 +479,8 @@ Common Claude Any setup flags:
 Notes for automation:
 
 - `--ca-api-key-env` avoids putting secrets directly in shell history.
+- `--ca-api-key` and `--ca-set-api-key` are available for direct key passing,
+  but prefer the environment-variable forms in shared scripts and terminals.
 - `claude-any stop` is safe to run before scripted tests to remove stale
   router/proxy processes.
 - Use `claude-any test 60 auto` for a quick readiness check and reserve

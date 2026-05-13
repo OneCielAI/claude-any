@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.33`
+Current version: `0.1.34`
 
 ## Why This Exists
 
@@ -126,6 +126,49 @@ Use the saved provider/model and only skip the menu:
 ```sh
 CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-format text
 ```
+
+Configure every launch option with flags:
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 300000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+```
+
+Or put the same values in environment variables:
+
+```sh
+export CLAUDE_ANY_SKIP_MENU=1
+export CLAUDE_ANY_PROVIDER=nvidia-hosted
+export CLAUDE_ANY_BASE_URL=https://integrate.api.nvidia.com/v1
+export CLAUDE_ANY_MODEL=z-ai/glm-4.7
+export CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
+export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
+export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
+export CLAUDE_ANY_CONTEXT_WINDOW=65536
+export CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+export CLAUDE_ANY_RATE_LIMIT_RPM=40
+export CLAUDE_ANY_RATE_LIMIT_STATUS=on
+claude-any -p "Reply with OK only." --output-format text
+```
+
+For `.env` driven runs, save the same `CLAUDE_ANY_*` values in a file and pass
+it explicitly:
+
+```sh
+claude-any --ca-env-file .env.claude-any -p "Reply with OK only." --output-format text
+```
+
+Override order is deterministic: saved user choices from the menu are the
+baseline, OS environment variables override them, `--ca-env-file` values
+override the OS environment, CLI `--ca-*` parameters override the env file, and
+`--ca-menu` lets the final interactive menu choice override everything.
+
+Headless coverage checklist: provider, base URL, model, Advisor model, API key
+or API-key environment variable, max output, context window, request timeout,
+RPM limit, RPM status display, streaming, web search, web fetch, Claude skills,
+update check, language, Ollama context/options, and normal Claude Code
+passthrough arguments are all configurable without opening the menu. API keys
+can be passed directly with `--ca-api-key`, but `--ca-api-key-env` is safer for
+scripts because the secret does not appear in shell history.
 
 More examples are in [Headless Examples](#headless-examples) and
 [the full manual](docs/manual.md#headless-usage).
@@ -337,6 +380,14 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.34
+
+- **Complete headless configuration path**: add `--ca-env-file`,
+  environment-variable mapping, Advisor model, rate-limit, streaming, language,
+  and web-fetch headless controls.
+- **Documented override order**: saved menu choices < OS environment <
+  `.env` file < CLI parameters < final interactive menu choice via `--ca-menu`.
 
 ### 0.1.33
 
