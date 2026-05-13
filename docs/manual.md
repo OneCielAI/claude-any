@@ -6,7 +6,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.30`
+Current version: `0.1.31`
 
 ## Install
 
@@ -306,7 +306,7 @@ claude-any \
   --ca-provider nvidia-hosted \
   --ca-api-key-env NVIDIA_API_KEY \
   --ca-model moonshotai/kimi-k2.6 \
-  --ca-request-timeout-ms 1800000
+  --ca-request-timeout-ms 300000
 
 # Self-hosted NIM Anthropic-compatible endpoint
 claude-any \

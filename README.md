@@ -44,7 +44,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.30`
+Current version: `0.1.31`
 
 ## Why This Exists
 
@@ -333,6 +333,13 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.31
+
+- **5-minute default upstream timeout**: existing saved 10/30-minute defaults
+  are migrated to 300000 ms so gateway stalls fail faster.
+- **Localized gateway retries**: 502/503/504 and socket timeout responses are
+  retried automatically, with retry progress shown in the selected UI language.
 
 ### 0.1.30
 

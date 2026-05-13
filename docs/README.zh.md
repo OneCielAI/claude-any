@@ -43,7 +43,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.30`
+当前版本: `0.1.31`
 
 ## 为什么存在
 
@@ -292,6 +292,13 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.31
+
+- **默认 upstream timeout 改为 5 分钟**：已保存配置中的 10/30 分钟默认
+  timeout 会迁移到 300000 ms，更快发现 gateway stall。
+- **按语言显示 gateway 重试**：502/503/504 和 socket timeout 会自动重试，并用
+  当前 UI 语言在聊天中显示重试进度。
 
 ### 0.1.30
 

@@ -43,7 +43,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.30`
+현재 버전: `0.1.31`
 
 ## 왜 만들었나
 
@@ -306,6 +306,13 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.31
+
+- **기본 upstream timeout 5분**: 기존 저장 설정의 10/30분 기본 timeout을
+  300000 ms로 마이그레이션하여 gateway stall을 더 빨리 감지합니다.
+- **언어별 gateway 재시도 표시**: 502/503/504 및 socket timeout 응답을 자동
+  재시도하고, 선택된 UI 언어로 재시도 진행 상황을 채팅에 표시합니다.
 
 ### 0.1.30
 

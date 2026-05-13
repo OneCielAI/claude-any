@@ -43,7 +43,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.30`
+現在のバージョン: `0.1.31`
 
 ## 作られた理由
 
@@ -306,6 +306,13 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.31
+
+- **既定 upstream timeout を 5 分へ変更**: 保存済み設定の 10/30 分既定
+  timeout を 300000 ms に移行し、gateway stall を早く検出します。
+- **言語別 gateway retry 表示**: 502/503/504 と socket timeout を自動再試行し、
+  選択中の UI 言語で retry 進行状況をチャットに表示します。
 
 ### 0.1.30
 

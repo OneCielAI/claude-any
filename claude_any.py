@@ -23,7 +23,7 @@ import urllib.request
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     sys.stdout.reconfigure(encoding="utf-8")
@@ -84,7 +84,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.30"
+VERSION = "0.1.31"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -663,7 +663,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "num_ctx_max": 131072,
             "keep_alive": "5m",
             "think": False,
-            "request_timeout_ms": 1800000,
+            "request_timeout_ms": 300000,
             "stream_enabled": True,
             "stream_word_chunking": False,
             "ollama_options": {
@@ -686,7 +686,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "num_ctx_max": 131072,
             "keep_alive": "5m",
             "think": False,
-            "request_timeout_ms": 1800000,
+            "request_timeout_ms": 300000,
             "stream_enabled": True,
             "stream_word_chunking": False,
             "ollama_options": {
@@ -708,7 +708,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "temperature": 0.7,
             "top_p": 0.8,
             "context_reserve_tokens": 1024,
-            "request_timeout_ms": 1800000,
+            "request_timeout_ms": 300000,
             "stream_enabled": True,
             "stream_word_chunking": False,
         },
@@ -724,7 +724,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_output_tokens": 4096,
             "temperature": 0.7,
             "top_p": 0.8,
-            "request_timeout_ms": 1800000,
+            "request_timeout_ms": 300000,
             "stream_enabled": True,
             "stream_word_chunking": False,
         },
@@ -742,7 +742,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "temperature": 0.7,
             "top_p": 0.8,
             "context_reserve_tokens": 1024,
-            "request_timeout_ms": 1800000,
+            "request_timeout_ms": 300000,
             "stream_enabled": True,
             "stream_word_chunking": False,
         },
@@ -771,6 +771,15 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
         pcfg = cfg.get("providers", {}).get("nvidia-hosted", {})
         if isinstance(pcfg, dict) and bool(pcfg.get("native_compat", False)):
             pcfg["native_compat"] = False
+        migrations[marker] = True
+
+    marker = "default_timeout_5m_20260513"
+    if not migrations.get(marker):
+        for pcfg in (cfg.get("providers") or {}).values():
+            if not isinstance(pcfg, dict):
+                continue
+            if positive_int(pcfg.get("request_timeout_ms")) in (600000, 1800000):
+                pcfg["request_timeout_ms"] = 300000
         migrations[marker] = True
 
 
@@ -3486,13 +3495,13 @@ def ollama_options_status(pcfg: dict[str, Any]) -> str:
 
 
 def ollama_request_timeout_seconds(pcfg: dict[str, Any]) -> float:
-    raw = pcfg.get("request_timeout_ms", pcfg.get("request_timeout", pcfg.get("timeout_ms", 600000)))
+    raw = pcfg.get("request_timeout_ms", pcfg.get("request_timeout", pcfg.get("timeout_ms", 300000)))
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        return 600.0
+        return 300.0
     if value <= 0:
-        return 600.0
+        return 300.0
     # Values above 10k are treated as milliseconds, matching common UI/API timeout notation.
     if value > 10000:
         return max(1.0, value / 1000.0)
@@ -4533,6 +4542,29 @@ def upstream_http_error_message(exc: urllib.error.HTTPError, raw: str | None = N
     return msg
 
 
+UPSTREAM_RETRY_HTTP_CODES: frozenset[int] = frozenset({502, 503, 504})
+
+
+def upstream_retry_message(attempt: int, total: int) -> str:
+    lang = str(load_config().get("language") or "en")
+    if lang == "ko":
+        return f"서버가 응답하지 않아 재시도합니다 ({attempt}/{total})."
+    if lang == "ja":
+        return f"サーバーが応答しないため再試行します ({attempt}/{total})。"
+    if lang == "zh":
+        return f"服务器未响应，正在重试 ({attempt}/{total})。"
+    return f"Upstream server did not respond; retrying ({attempt}/{total})."
+
+
+def upstream_retry_wait_seconds(attempt: int) -> float:
+    return min(20.0, 2.0 * max(1, attempt))
+
+
+def retryable_timeout_exception(exc: BaseException) -> bool:
+    text = f"{type(exc).__name__}: {exc}".lower()
+    return "timed out" in text or "timeout" in text
+
+
 def post_json_with_rate_retry(
     url: str,
     req_body: Any,
@@ -4541,8 +4573,11 @@ def post_json_with_rate_retry(
     provider: str,
     pcfg: dict[str, Any],
     model: str,
+    retry_notice: Callable[[str], None] | None = None,
 ) -> Any:
-    for attempt in range(2):
+    gateway_retries = positive_int(pcfg.get("gateway_retries")) or 2
+    max_attempts = max(1, gateway_retries + 1)
+    for attempt in range(max_attempts):
         try:
             data_bytes = json.dumps(req_body).encode("utf-8")
             req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
@@ -4556,7 +4591,21 @@ def post_json_with_rate_retry(
                 wait = register_router_rate_limit_backoff(provider, pcfg, model, exc.headers.get("Retry-After"))
                 time.sleep(wait)
                 continue
+            if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
+                if retry_notice:
+                    retry_notice(upstream_retry_message(retry_no, gateway_retries))
+                time.sleep(upstream_retry_wait_seconds(retry_no))
+                continue
             raise RuntimeError(upstream_http_error_message(exc, raw)) from exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            if retryable_timeout_exception(exc) and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
+                if retry_notice:
+                    retry_notice(upstream_retry_message(retry_no, gateway_retries))
+                time.sleep(upstream_retry_wait_seconds(retry_no))
+                continue
+            raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
     raise RuntimeError("upstream request failed")
 
 
@@ -4576,6 +4625,10 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
         if notice:
             index = write_anthropic_stream_blocks(handler, [{"type": "text", "text": notice}], index)
         try:
+            def emit_retry_notice(text: str) -> None:
+                nonlocal index
+                index = write_anthropic_stream_blocks(handler, [{"type": "text", "text": text + "\n"}], index)
+
             data = post_json_with_rate_retry(
                 url,
                 req_body,
@@ -4584,6 +4637,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
                 provider,
                 pcfg,
                 model,
+                emit_retry_notice,
             )
         except RuntimeError as exc:
             msg = str(exc)
@@ -4603,6 +4657,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
             provider,
             pcfg,
             model,
+            None,
         )
     except RuntimeError as exc:
         write_json(handler, {"type": "error", "error": {"type": "upstream_error", "message": str(exc)}}, 500)
@@ -5530,7 +5585,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=false",
                 "keep_alive=5m",
-                "timeout=600000",
+                "timeout=300000",
             ],
             "coding": [
                 "num_ctx=auto",
@@ -5542,7 +5597,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=false",
                 "keep_alive=5m",
-                "timeout=600000",
+                "timeout=300000",
             ],
             "fast": [
                 "num_ctx=32768",
@@ -5595,8 +5650,8 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
             apply_ollama_option(pcfg, token)
     elif provider == "anthropic":
         tokens_by_preset = {
-            "balanced": ["max_output_tokens=4096", "timeout=600000"],
-            "coding": ["max_output_tokens=4096", "timeout=600000"],
+            "balanced": ["max_output_tokens=4096", "timeout=300000"],
+            "coding": ["max_output_tokens=4096", "timeout=300000"],
             "fast": ["max_output_tokens=2048", "timeout=300000"],
             "long-context-65k": ["max_output_tokens=4096", "timeout=900000"],
             "large-output": ["max_output_tokens=8192", "timeout=1200000"],
@@ -5612,7 +5667,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=32768",
                 "reserve=2048",
                 "max_output_tokens=4096",
-                "timeout=600000",
+                "timeout=300000",
                 "temperature=0.3",
                 "unset:top_p",
                 "unset:top_k",
@@ -5622,7 +5677,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=32768",
                 "reserve=2048",
                 "max_output_tokens=4096",
-                "timeout=600000",
+                "timeout=300000",
                 "temperature=0.2",
                 "unset:top_p",
                 "unset:top_k",
@@ -5757,10 +5812,10 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "zh": "claude-any 限制 max_tokens 时为输入侧预留的 token。direct native 请求会忽略。",
     },
     "request_timeout_ms": {
-        "en": "Upstream wait timeout in milliseconds. 1800000 ms = 30 minutes.",
-        "ko": "업스트림 응답 대기 시간(ms). 1800000은 30분입니다.",
-        "ja": "上流応答待ちタイムアウト(ms)。1800000は30分です。",
-        "zh": "上游响应等待超时（毫秒）。1800000 表示 30 分钟。",
+        "en": "Upstream wait timeout in milliseconds. 300000 ms = 5 minutes.",
+        "ko": "업스트림 응답 대기 시간(ms). 300000은 5분입니다.",
+        "ja": "上流応答待ちタイムアウト(ms)。300000は5分です。",
+        "zh": "上游响应等待超时（毫秒）。300000 表示 5 分钟。",
     },
     "rate_limit_rpm": {
         "en": "Router-side upstream request limit per minute. NIM hosted defaults to 40 RPM; unset/0 disables waiting.",

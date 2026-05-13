@@ -1011,10 +1011,10 @@ OLLAMA_OPTION_DESCRIPTIONS = {
         "zh": "编辑最大输出 token（Ollama num_predict）。输入加预留输出必须放进上下文窗口。",
     },
     "__edit_timeout__": {
-        "en": "Edit upstream wait timeout in milliseconds. 1800000 means 30 minutes.",
-        "ko": "업스트림 응답 대기 시간(ms)입니다. 1800000은 30분입니다.",
-        "ja": "上流応答待ちタイムアウト(ms)です。1800000は30分です。",
-        "zh": "编辑上游响应等待超时（毫秒）。1800000 表示 30 分钟。",
+        "en": "Edit upstream wait timeout in milliseconds. 300000 means 5 minutes.",
+        "ko": "업스트림 응답 대기 시간(ms)입니다. 300000은 5분입니다.",
+        "ja": "上流応答待ちタイムアウト(ms)です。300000は5分です。",
+        "zh": "编辑上游响应等待超时（毫秒）。300000 表示 5 分钟。",
     },
     "__custom__": {
         "en": "Enter any Ollama option as KEY=VALUE, or unset:KEY to remove it.",
@@ -1129,7 +1129,7 @@ def build_ollama_options_submenu() -> dict:
         ("temperature=0.7", f"temperature 0.7 (current {options.get('temperature', 'unset')})", options.get("temperature") == 0.7),
         ("top_p=0.8", f"top_p 0.8 (current {options.get('top_p', 'unset')})", options.get("top_p") == 0.8),
         ("max_tokens=4096", f"max_tokens 4096 (current {options.get('num_predict', 'unset')})", options.get("num_predict") == 4096),
-        ("timeout=1800000", f"timeout 1800000ms (current {pcfg.get('request_timeout_ms', 'default')})", pcfg.get("request_timeout_ms") == 1800000),
+        ("timeout=300000", f"timeout 300000ms (current {pcfg.get('request_timeout_ms', 'default')})", pcfg.get("request_timeout_ms") == 300000),
     ]
     items = [
         {"value": value, "label": label, "current": current, "description": ollama_option_description(value)}
@@ -1227,7 +1227,7 @@ def provider_option_description(value: str) -> str:
 def build_provider_options_submenu() -> dict:
     provider, pcfg = current_provider_cfg()
     max_output = pcfg.get("max_output_tokens", "4096")
-    timeout = pcfg.get("request_timeout_ms", "1800000")
+    timeout = pcfg.get("request_timeout_ms", "300000")
     stream_on = bool(pcfg.get("stream_enabled", True))
     word_chunk_on = bool(pcfg.get("stream_word_chunking", False))
     choices = [
@@ -1250,7 +1250,7 @@ def build_provider_options_submenu() -> dict:
         ("__custom__", "Custom KEY=VALUE or unset:KEY...", False),
         ("max_output_tokens=4096", f"max_output_tokens 4096 (current {max_output})", str(max_output) == "4096"),
         ("max_output_tokens=8192", f"max_output_tokens 8192 (current {max_output})", str(max_output) == "8192"),
-        ("timeout=1800000", f"timeout 1800000ms (current {timeout})", str(timeout) == "1800000"),
+        ("timeout=300000", f"timeout 300000ms (current {timeout})", str(timeout) == "300000"),
     ])
     if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
         choices.extend([
@@ -1802,7 +1802,7 @@ def main() -> int:
                         entered = inline_prompt(None, "max_tokens / num_predict: ", row, default)
                         value = f"max_tokens={entered}" if entered else ""
                     elif action_value == "__edit_timeout__":
-                        default = str(pcfg_now.get("request_timeout_ms", "1800000"))
+                        default = str(pcfg_now.get("request_timeout_ms", "300000"))
                         entered = inline_prompt(None, "timeout ms: ", row, default)
                         value = f"timeout={entered}" if entered else ""
                     elif action_value == "__edit_rate_limit__":
@@ -1838,7 +1838,7 @@ def main() -> int:
                         entered = inline_prompt(None, "max_output_tokens: ", row, default)
                         value = f"max_output_tokens={entered}" if entered else ""
                     elif action_value == "__edit_timeout__":
-                        default = str(pcfg_now.get("request_timeout_ms", "1800000"))
+                        default = str(pcfg_now.get("request_timeout_ms", "300000"))
                         entered = inline_prompt(None, "timeout ms: ", row, default)
                         value = f"timeout={entered}" if entered else ""
                     elif action_value == "__edit_native__":
