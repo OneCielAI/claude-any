@@ -17,6 +17,12 @@
 >
 > プロバイダー、モデル、Base URL、API キー、ストリーミング動作、LLM オプションを Claude Code 起動 **前** にコンソールメニューで選択します。Claude Code 本体はそのまま — すべてのネイティブツール、slash コマンド、ワークフローが維持されます。
 
+## 今日追加されたトップ 3 ベネフィット
+
+1. **non-Anthropic モデルでも Plan Mode が動作** — NVIDIA hosted、Ollama Cloud、ローカル Ollama、vLLM、NIM などの provider でも Claude Code Plan Mode を使えます。
+2. **大きなモデルで Advisor レビュー** — 起動時に長コンテキスト Advisor Model を選び、Claude Code 内で `/advisor` を使って現在の作業、blocker、次の具体的な行動を確認できます。
+3. **無料モデルの RPM 制限をよりなめらかに利用** — router-side RPM pacing がファイル読み取りや tool 実行にかかる自然な時間を活用するため、NVIDIA hosted の無料モデルを分単位制限内で待ち時間を感じにくく使えます。
+
 ### デモ
 
 ![NVIDIA hosted NIM で Claude Code 駆動 (deepseek-4-flash)](assets/claude-any-nvidia-nim.gif)

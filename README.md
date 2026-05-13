@@ -17,6 +17,12 @@
 >
 > Provider, model, base URL, API key, streaming behavior, and LLM options are all selected from a console menu **before** Claude Code starts. Claude Code itself runs untouched with all of its native tooling, slash commands, and workflows.
 
+## Today's Top 3 Benefits
+
+1. **Plan Mode works on non-Anthropic models** — Claude Any keeps Claude Code's Plan Mode usable even when the upstream provider is NVIDIA hosted, Ollama Cloud, local Ollama, vLLM, or NIM.
+2. **Advisor review with a bigger model** — pick a long-context Advisor Model at launch, then use `/advisor` inside Claude Code to review the current task, blockers, and next concrete action.
+3. **Free-model RPM limits feel smoother** — router-side RPM pacing uses the natural time spent reading files and running tools, so NVIDIA hosted free models can stay within per-minute limits with less visible waiting.
+
 ### Demo
 
 ![NVIDIA hosted NIM driving Claude Code (deepseek-4-flash)](docs/assets/claude-any-nvidia-nim.gif)

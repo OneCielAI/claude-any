@@ -17,6 +17,12 @@
 >
 > 在 Claude Code 启动**之前**，通过控制台菜单选择 provider、模型、Base URL、API 密钥、流式行为以及 LLM 选项。Claude Code 本体保持原样运行 —— 所有原生工具、slash 命令和工作流都不受影响。
 
+## 今日新增的 3 个最大收益
+
+1. **non-Anthropic 模型也能使用 Plan Mode** — NVIDIA hosted、Ollama Cloud、本地 Ollama、vLLM、NIM 等 provider 也可以保留 Claude Code Plan Mode。
+2. **用更大的模型做 Advisor 审查** — 启动时选择长上下文 Advisor Model，然后在 Claude Code 中使用 `/advisor` 检查当前任务、blocker 和下一步具体行动。
+3. **免费模型 RPM 限制更平滑** — router-side RPM pacing 会利用文件读取和 tool 执行的自然耗时，让 NVIDIA hosted 免费模型在每分钟限制内运行时更少感到等待。
+
 ### 演示
 
 ![NVIDIA hosted NIM 驱动 Claude Code（deepseek-4-flash）](assets/claude-any-nvidia-nim.gif)
