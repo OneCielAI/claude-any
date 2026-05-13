@@ -1212,7 +1212,7 @@ def main():
         last_wait = float(entry.get("last_wait") or 0.0) if isinstance(entry, dict) else 0.0
     except Exception:
         last_wait = 0.0
-    used = len([ts for ts in (timestamps or []) if isinstance(ts, (int, float)) and now - float(ts) < 60.0])
+    used = len([ts for ts in (timestamps or []) if isinstance(ts, (int, float)) and 0.0 <= now - float(ts) < 60.0])
     model_name = ((session.get("model") or {}).get("display_name") if isinstance(session.get("model"), dict) else None) or model or "model"
     current_dir = ((session.get("workspace") or {}).get("current_dir") if isinstance(session.get("workspace"), dict) else None) or session.get("cwd") or ""
     dir_name = Path(current_dir).name if current_dir else ""
@@ -1966,7 +1966,7 @@ def router_rate_limit_usage(provider: str, pcfg: dict[str, Any], model: str | No
         timestamps = entry.get("timestamps") if isinstance(entry, dict) else ([float(entry)] if isinstance(entry, (int, float)) else [])
     except Exception:
         timestamps = []
-    used = len([ts for ts in (timestamps or []) if isinstance(ts, (int, float)) and now - float(ts) < 60.0])
+    used = len([ts for ts in (timestamps or []) if isinstance(ts, (int, float)) and 0.0 <= now - float(ts) < 60.0])
     return used, rpm
 
 
