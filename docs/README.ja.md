@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.43`
+現在のバージョン: `0.1.44`
 
 ## 作られた理由
 
@@ -350,6 +350,12 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.44
+
+- **Statusline split**: Rate Limit status を off にした場合、RPM、server-limit、
+  wait counter だけを非表示にします。Upstream 進捗、retry、error、token 診断は
+  引き続き表示されます。
 
 ### 0.1.43
 

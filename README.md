@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.43`
+Current version: `0.1.44`
 
 ## Why This Exists
 
@@ -380,6 +380,12 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.44
+
+- **Statusline split**: turning Rate Limit status off now hides only RPM,
+  server-limit, and wait counters. Upstream progress, retry, error, and token
+  diagnostics remain visible.
 
 ### 0.1.43
 

@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.43`
+当前版本: `0.1.44`
 
 ## 为什么存在
 
@@ -336,6 +336,11 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.44
+
+- **Statusline split**：关闭 Rate Limit status 后只隐藏 RPM、server-limit 和
+  wait 计数。Upstream 进度、retry、error 和 token 诊断仍会显示。
 
 ### 0.1.43
 

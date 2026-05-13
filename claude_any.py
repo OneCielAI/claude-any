@@ -85,7 +85,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.43"
+VERSION = "0.1.44"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -1252,6 +1252,7 @@ def main():
     providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
     provider = str(cfg.get("current_provider") or "")
     pcfg = providers.get(provider) if isinstance(providers.get(provider), dict) else {}
+    rpm_status = bool(pcfg.get("rate_limit_status", True))
     model = str(pcfg.get("current_model") or "")
     raw_rpm = pcfg.get("rate_limit_rpm")
     if raw_rpm is None and provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
@@ -1303,29 +1304,33 @@ def main():
     left = f"[{model_name}]"
     if dir_name:
         left += f" {dir_name}"
-    if rpm > 0:
-        shown_limit = display_capacity(rpm)
-        shown_used = min(used, shown_limit)
-        rpm_text = f"RPM used: {shown_used}/{shown_limit}"
-    else:
-        rpm_text = f"RPM used: {used}/min (unlimited)"
-    if server_rpm or server_remaining is not None or server_reset_seconds is not None:
-        parts = []
-        if server_remaining is not None:
-            parts.append(f"remaining {server_remaining}")
-        if server_rpm:
-            parts.append(f"limit {server_rpm}")
-        try:
-            if server_reset_seconds is not None and float(server_reset_seconds) > 0:
-                parts.append(f"reset {float(server_reset_seconds):.0f}s")
-        except Exception:
-            pass
-        if parts:
-            rpm_text += " | server " + ", ".join(parts)
-    if penalty_until > now:
-        rpm_text += f" | wait {max(0.0, penalty_until - now):.0f}s"
-    elif last_wait >= 0.5 and 0.0 <= now - updated_at < 60.0:
-        rpm_text += f" | wait {last_wait:.1f}s"
+    status_parts = []
+    if rpm_status:
+        if rpm > 0:
+            shown_limit = display_capacity(rpm)
+            shown_used = min(used, shown_limit)
+            rpm_text = f"RPM used: {shown_used}/{shown_limit}"
+        else:
+            rpm_text = f"RPM used: {used}/min (unlimited)"
+        if server_rpm or server_remaining is not None or server_reset_seconds is not None:
+            parts = []
+            if server_remaining is not None:
+                parts.append(f"remaining {server_remaining}")
+            if server_rpm:
+                parts.append(f"limit {server_rpm}")
+            try:
+                if server_reset_seconds is not None and float(server_reset_seconds) > 0:
+                    parts.append(f"reset {float(server_reset_seconds):.0f}s")
+            except Exception:
+                pass
+            if parts:
+                rpm_text += " | server " + ", ".join(parts)
+        if penalty_until > now:
+            rpm_text += f" | wait {max(0.0, penalty_until - now):.0f}s"
+        elif last_wait >= 0.5 and 0.0 <= now - updated_at < 60.0:
+            rpm_text += f" | wait {last_wait:.1f}s"
+        status_parts.append(rpm_text)
+    activity_text = ""
     if isinstance(activity, dict):
         try:
             age = now - float(activity.get("updated_at") or 0)
@@ -1334,30 +1339,48 @@ def main():
         if 0 <= age < 180:
             event = str(activity.get("event") or "")
             if event == "retry":
-                rpm_text += f" | retry {activity.get('attempt')}/{activity.get('total')}"
-            elif event == "request":
+                activity_text = f"retry {activity.get('attempt')}/{activity.get('total')}"
+                wait = activity.get("wait")
+                try:
+                    if wait is not None and float(wait) > 0:
+                        activity_text += f" wait {float(wait):.0f}s"
+                except Exception:
+                    pass
                 tokens = activity.get("tokens")
-                rpm_text += f" | upstream {age:.0f}s"
                 if tokens:
                     try:
-                        rpm_text += f" {int(tokens):,} tok"
+                        activity_text += f" last input {int(tokens):,} tok"
                     except Exception:
-                        rpm_text += f" {tokens} tok"
+                        activity_text += f" last input {tokens} tok"
+            elif event == "request":
+                tokens = activity.get("tokens")
+                activity_text = f"upstream {age:.0f}s"
+                if tokens:
+                    try:
+                        activity_text += f" {int(tokens):,} tok"
+                    except Exception:
+                        activity_text += f" {tokens} tok"
                 output_tokens = activity.get("output_tokens")
                 if output_tokens:
                     try:
-                        rpm_text += f" -> {int(output_tokens):,} tok"
+                        activity_text += f" -> {int(output_tokens):,} tok"
                     except Exception:
-                        rpm_text += f" -> {output_tokens} tok"
+                        activity_text += f" -> {output_tokens} tok"
                 chunks = activity.get("chunks")
                 if chunks:
                     try:
-                        rpm_text += f" ({int(chunks):,} chunks)"
+                        activity_text += f" ({int(chunks):,} chunks)"
                     except Exception:
-                        rpm_text += f" ({chunks} chunks)"
+                        activity_text += f" ({chunks} chunks)"
             elif event in ("success", "error"):
-                rpm_text += f" | {event} {age:.0f}s"
-    print(f"{left} | {color(rpm_text)}")
+                activity_text = f"{event} {age:.0f}s"
+    if activity_text:
+        status_parts.append(activity_text)
+    status_text = " | ".join(status_parts)
+    if status_text:
+        print(f"{left} | {color(status_text)}")
+    else:
+        print(left)
 
 
 if __name__ == "__main__":
