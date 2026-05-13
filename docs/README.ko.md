@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.34`
+현재 버전: `0.1.35`
 
 ## 왜 만들었나
 
@@ -350,6 +350,15 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.35
+
+- **NVIDIA router context guard**: NVIDIA hosted의 router context 기본값을 32K로
+  낮추고 LLM preset이 이 cap을 조정할 수 있게 하여, 긴 Claude Code 세션에서
+  payload가 커져 timeout이 나는 상황을 줄였습니다.
+- **Upstream activity status**: router가 현재 request/retry/success/error 상태와
+  추정 token/byte 크기를 기록하여, statusline에서 upstream 대기와 idle 상태를
+  구분할 수 있습니다.
 
 ### 0.1.34
 

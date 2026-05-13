@@ -40,6 +40,7 @@ REQUEST_DUMP_PATH = CONFIG_DIR / "requests.jsonl"
 RESPONSE_DUMP_PATH = CONFIG_DIR / "responses.jsonl"
 TOOL_CALL_LOG_PATH = CONFIG_DIR / "tool-calls.jsonl"
 RATE_LIMIT_STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
+ROUTER_ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
 CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
 CHAT_FILES_DIR = CONFIG_DIR / "chat-files"
 PLAN_ARTIFACTS_DIR = CONFIG_DIR / "plan-artifacts"
@@ -84,7 +85,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.34"
+VERSION = "0.1.35"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -721,6 +722,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "native_compat": False,
             "rate_limit_rpm": 40,
             "rate_limit_status": True,
+            "context_window": 32768,
             "max_output_tokens": 4096,
             "temperature": 0.7,
             "top_p": 0.8,
@@ -780,6 +782,13 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
                 continue
             if positive_int(pcfg.get("request_timeout_ms")) in (600000, 1800000):
                 pcfg["request_timeout_ms"] = 300000
+        migrations[marker] = True
+
+    marker = "nvidia_context_window_32k_20260513"
+    if not migrations.get(marker):
+        pcfg = cfg.get("providers", {}).get("nvidia-hosted", {})
+        if isinstance(pcfg, dict) and not positive_int(pcfg.get("context_window")):
+            pcfg["context_window"] = 32768
         migrations[marker] = True
 
 
@@ -1175,6 +1184,7 @@ HOME = Path.home()
 CONFIG_DIR = Path(os.environ.get("CLAUDE_ANY_CONFIG_DIR") or (HOME / ".config" / "claude-any"))
 CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
+ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
 PALETTE = (203, 209, 215, 221, 229, 187, 151, 116, 111, 147, 183, 219)
 
 
@@ -1226,6 +1236,7 @@ def main():
     except Exception:
         rpm = 40
     state = load_json(STATE_PATH, {})
+    activity = load_json(ACTIVITY_PATH, {})
     now = time.time()
     key = f"{provider}:__global__" if provider else ""
     entry = state.get(key) if key else None
@@ -1290,6 +1301,22 @@ def main():
         rpm_text += f" | wait {max(0.0, penalty_until - now):.0f}s"
     elif last_wait >= 0.5 and 0.0 <= now - updated_at < 60.0:
         rpm_text += f" | wait {last_wait:.1f}s"
+    if isinstance(activity, dict):
+        try:
+            age = now - float(activity.get("updated_at") or 0)
+        except Exception:
+            age = 999999
+        if 0 <= age < 180:
+            event = str(activity.get("event") or "")
+            if event == "retry":
+                rpm_text += f" | retry {activity.get('attempt')}/{activity.get('total')}"
+            elif event == "request":
+                tokens = activity.get("tokens")
+                rpm_text += f" | upstream {age:.0f}s"
+                if tokens:
+                    rpm_text += f" {tokens}tok"
+            elif event in ("success", "error"):
+                rpm_text += f" | {event} {age:.0f}s"
     print(f"{left} | {color(rpm_text)}")
 
 
@@ -2843,6 +2870,24 @@ def write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> 
     handler.wfile.write(body)
 
 
+def write_router_activity(event: str, provider: str, model: str | None = None, **fields: Any) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            "updated_at": time.time(),
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "event": event,
+            "provider": provider,
+            "model": model or "",
+        }
+        data.update(fields)
+        tmp = ROUTER_ACTIVITY_PATH.with_name(f"{ROUTER_ACTIVITY_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(ROUTER_ACTIVITY_PATH)
+    except Exception:
+        pass
+
+
 def write_text_response(handler: BaseHTTPRequestHandler, text: str, status: int = 200, content_type: str = "text/plain; charset=utf-8") -> None:
     body = text.encode("utf-8")
     handler.send_response(status)
@@ -3563,6 +3608,15 @@ def ollama_context_limit_for_budget(pcfg: dict[str, Any]) -> int:
     return positive_int(raw) or positive_int(pcfg.get("num_ctx_max")) or 65536
 
 
+def openai_context_limit_for_budget(provider: str, pcfg: dict[str, Any]) -> int:
+    configured = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
+    if configured:
+        return configured
+    if provider == "nvidia-hosted":
+        return 32768
+    return 65536
+
+
 def compact_ollama_messages_for_budget(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
@@ -3695,10 +3749,10 @@ def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], 
     return req
 
 
-def openai_compatible_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], stream: bool = False) -> dict[str, Any]:
+def openai_compatible_chat_request(provider: str, model: str, body: dict[str, Any], pcfg: dict[str, Any], stream: bool = False) -> dict[str, Any]:
     messages = anthropic_messages_to_openai(body)
     tools = anthropic_tools_to_ollama(body.get("tools"))
-    context_limit = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len")) or 65536
+    context_limit = openai_context_limit_for_budget(provider, pcfg)
     configured = configured_output_tokens(pcfg, body)
     reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
     output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
@@ -4594,13 +4648,28 @@ def post_json_with_rate_retry(
 ) -> Any:
     gateway_retries = positive_int(pcfg.get("gateway_retries")) or 2
     max_attempts = max(1, gateway_retries + 1)
+    token_estimate = estimate_tokens(req_body)
+    byte_estimate = len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))
     for attempt in range(max_attempts):
         try:
+            write_router_activity(
+                "request",
+                provider,
+                model,
+                attempt=attempt + 1,
+                total=max_attempts,
+                tokens=token_estimate,
+                bytes=byte_estimate,
+                timeout=timeout,
+            )
+            router_log("INFO", f"upstream_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={token_estimate} bytes={byte_estimate} timeout={timeout}")
             data_bytes = json.dumps(req_body).encode("utf-8")
             req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
-                return json.loads(resp.read().decode("utf-8"))
+                data = json.loads(resp.read().decode("utf-8"))
+                write_router_activity("success", provider, model, attempt=attempt + 1, tokens=token_estimate, bytes=byte_estimate)
+                return data
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="ignore")
             learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
@@ -4610,18 +4679,24 @@ def post_json_with_rate_retry(
                 continue
             if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
                 retry_no = attempt + 1
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, tokens=token_estimate, bytes=byte_estimate)
+                router_log("WARN", f"upstream_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} code={exc.code} tokens={token_estimate} bytes={byte_estimate}")
                 if retry_notice:
                     retry_notice(upstream_retry_message(retry_no, gateway_retries))
                 time.sleep(upstream_retry_wait_seconds(retry_no))
                 continue
+            write_router_activity("error", provider, model, code=exc.code, tokens=token_estimate, bytes=byte_estimate)
             raise RuntimeError(upstream_http_error_message(exc, raw)) from exc
         except (TimeoutError, urllib.error.URLError) as exc:
             if retryable_timeout_exception(exc) and attempt + 1 < max_attempts:
                 retry_no = attempt + 1
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, error=type(exc).__name__, tokens=token_estimate, bytes=byte_estimate)
+                router_log("WARN", f"upstream_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} error={type(exc).__name__} tokens={token_estimate} bytes={byte_estimate}")
                 if retry_notice:
                     retry_notice(upstream_retry_message(retry_no, gateway_retries))
                 time.sleep(upstream_retry_wait_seconds(retry_no))
                 continue
+            write_router_activity("error", provider, model, error=type(exc).__name__, tokens=token_estimate, bytes=byte_estimate)
             raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
     raise RuntimeError("upstream request failed")
 
@@ -4631,7 +4706,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     if provider == "nvidia-hosted":
         model = ncp_model_id_for_nvidia_hosted(model)
-    req_body = openai_compatible_chat_request(model, body, pcfg, stream=False)
+    req_body = openai_compatible_chat_request(provider, model, body, pcfg, stream=False)
     url = join_url(provider_upstream_request_base(provider, pcfg), "/chat/completions")
     waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
     stream = bool(body.get("stream", True))
@@ -5112,7 +5187,7 @@ def status_lines() -> list[str]:
         *([f"keep_alive: {pcfg.get('keep_alive', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"think: {bool(pcfg.get('think', False))}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
-        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "self-hosted-nim") else []),
+        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
         *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "self-hosted-nim") else []),
         *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
@@ -5421,7 +5496,7 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
             if limit is not None:
                 suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unlimited)"
                 parts.append(f"rpm_used={suffix}")
-    if provider in ("vllm", "self-hosted-nim"):
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
     if provider in ("vllm", "self-hosted-nim"):
@@ -5742,7 +5817,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
             ],
         }
         for token in tokens_by_preset[preset_id]:
-            if provider == "nvidia-hosted" and token.startswith(("context_window=", "reserve=", "native=")):
+            if provider == "nvidia-hosted" and token.startswith("native="):
                 continue
             apply_provider_option(provider, pcfg, token)
         if server_limit:

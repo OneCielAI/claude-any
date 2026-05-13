@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.34`
+当前版本: `0.1.35`
 
 ## 为什么存在
 
@@ -336,6 +336,14 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.35
+
+- **NVIDIA router context guard**：NVIDIA hosted 的 router context 默认值改为
+  32K，并允许 LLM preset 调整该 cap，减少长 Claude Code 会话中 payload 变大后
+  触发 timeout 的情况。
+- **Upstream activity status**：router 会记录当前 request/retry/success/error
+  状态和估算 token/byte 大小，statusline 可以区分正在等待 upstream 还是已 idle。
 
 ### 0.1.34
 

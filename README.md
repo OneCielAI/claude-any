@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.34`
+Current version: `0.1.35`
 
 ## Why This Exists
 
@@ -380,6 +380,15 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.35
+
+- **NVIDIA router context guard**: NVIDIA hosted now defaults to a 32K router
+  context window and LLM presets may tune that cap, reducing timeout-prone
+  payload growth in long Claude Code sessions.
+- **Upstream activity status**: the router records current request, retry,
+  success, and error state with estimated token/byte size so the statusline can
+  distinguish active upstream waits from idle sessions.
 
 ### 0.1.34
 

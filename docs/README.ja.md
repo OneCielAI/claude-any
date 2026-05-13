@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.34`
+現在のバージョン: `0.1.35`
 
 ## 作られた理由
 
@@ -350,6 +350,15 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.35
+
+- **NVIDIA router context guard**: NVIDIA hosted の router context 既定値を 32K
+  に下げ、LLM preset がこの cap を調整できるようにしました。長い Claude Code
+  セッションで payload が肥大して timeout する状況を減らします。
+- **Upstream activity status**: router が現在の request/retry/success/error
+  状態と推定 token/byte サイズを記録し、statusline で upstream 待機と idle を
+  判別できるようにしました。
 
 ### 0.1.34
 
