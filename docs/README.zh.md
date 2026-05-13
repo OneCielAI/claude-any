@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.38`
+当前版本: `0.1.39`
 
 ## 为什么存在
 
@@ -336,6 +336,14 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.39
+
+- **菜单输入修复**：在文本/数字提示前恢复 terminal line/echo mode，
+  prelaunch UI 中输入的数字现在可见。
+- **数字校验更稳**：数字选项输入非法字符时不再让菜单崩溃，而是显示提示消息。
+- **Preset 可见性**：应用 preset 后会显示实际 context、reserve、output、
+  timeout 值。
 
 ### 0.1.38
 

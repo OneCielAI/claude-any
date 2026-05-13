@@ -85,7 +85,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.38"
+VERSION = "0.1.39"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -6282,7 +6282,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
         f"{ui_text('apply_preset', lang)}: {label}",
         f"Provider: {provider}; {ui_text('model_family', lang)}: {model_family_text(family, lang)}",
     ]
-    if provider in ("vllm", "self-hosted-nim"):
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
         server_limit = upstream_model_context_limit(provider, pcfg)
         if server_limit:
             lines.append(f"Server max_model_len: {server_limit}")
@@ -6291,6 +6291,28 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 lines.append("Client settings were capped to the server-reported context length.")
         elif preset_id in ("long-context-65k", "large-output"):
             lines.append("Could not verify server max_model_len; vLLM/NIM must be started with a matching context limit.")
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+        lines.append(
+            "Applied options: "
+            f"context_window={pcfg.get('context_window', 'default')}, "
+            f"reserve={pcfg.get('context_reserve_tokens', 'default')}, "
+            f"max_output_tokens={pcfg.get('max_output_tokens', 'default')}, "
+            f"timeout={pcfg.get('request_timeout_ms', 'default')}ms"
+        )
+    elif provider in ("ollama", "ollama-cloud"):
+        opts = ollama_extra_options(pcfg)
+        lines.append(
+            "Applied options: "
+            f"num_ctx={ollama_num_ctx_status(pcfg)}, "
+            f"num_predict={opts.get('num_predict', 'default')}, "
+            f"timeout={pcfg.get('request_timeout_ms', 'default')}ms"
+        )
+    elif provider == "anthropic":
+        lines.append(
+            "Applied options: "
+            f"max_output_tokens={pcfg.get('max_output_tokens', 'default')}, "
+            f"timeout={pcfg.get('request_timeout_ms', 'default')}ms"
+        )
     return lines
 
 
@@ -6489,7 +6511,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 40))
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
     else:
-        if provider in ("vllm", "self-hosted-nim"):
+        if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
             add("Context reserve", "context_reserve_tokens", pcfg.get("context_reserve_tokens", "default"))
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
@@ -6538,6 +6560,31 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
     value = raw_value.strip()
     if not value:
         return ["Option unchanged."]
+    numeric_keys = {
+        "context_window",
+        "context",
+        "max_model_len",
+        "context_reserve_tokens",
+        "reserve",
+        "max_output_tokens",
+        "max_tokens",
+        "maxtoken",
+        "max_token",
+        "num_ctx_min",
+        "num_ctx_max",
+        "num_predict",
+        "timeout",
+        "timeout_ms",
+        "request_timeout",
+        "request_timeout_ms",
+        "rate_limit",
+        "rate_limit_rpm",
+        "rpm",
+        "top_k",
+    }
+    if key in numeric_keys and value.lower() not in ("default", "unset", "none", "null", "0"):
+        if not re.fullmatch(r"\d+", value):
+            return [f"{key}: enter digits only, or use default/unset to clear."]
     clear_words = ("default", "unset", "none", "null")
     token = f"unset:{key}" if value.lower() in clear_words else f"{key}={value}"
     if provider in ("ollama", "ollama-cloud"):
@@ -8116,11 +8163,13 @@ def render_prelaunch_screen(
     return False
 
 
-def prompt_menu_value(prompt: str, default: str = "", secret: bool = False) -> str:
+def prompt_menu_value(prompt: str, default: str = "", secret: bool = False, restore_tty: Callable[[], None] | None = None, raw_tty: Callable[[], None] | None = None) -> str:
     label = f"{prompt}"
     if default:
         label += f" [{default}]"
     label += ": "
+    if restore_tty:
+        restore_tty()
     if sys.stdout.isatty():
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
@@ -8135,6 +8184,8 @@ def prompt_menu_value(prompt: str, default: str = "", secret: bool = False) -> s
         if sys.stdout.isatty():
             sys.stdout.write("\033[?25l")
             sys.stdout.flush()
+        if raw_tty:
+            raw_tty()
     value = value.strip()
     return value or default
 
@@ -8171,6 +8222,7 @@ def portable_prelaunch_menu() -> int:
     panel_idx = 0
     panel_rows: list[str] = []
     panel_values: list[str] = []
+    panel_last_idx: dict[str, int] = {}
     checks = preflight_lines()
     messages: list[str] = []
     first_render = True
@@ -8180,7 +8232,7 @@ def portable_prelaunch_menu() -> int:
         cfg = load_config()
         provider, pcfg = get_current_provider(cfg)
         panel = name
-        panel_idx = 0
+        panel_idx = panel_last_idx.get(name, 0)
         if name == "language":
             panel_rows, panel_values = language_panel_rows(cfg)
             panel_idx = panel_values.index(cfg.get("language", "en"))
@@ -8209,9 +8261,13 @@ def portable_prelaunch_menu() -> int:
             panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
         elif name == "preset":
             panel_rows, panel_values = llm_preset_panel_rows(provider, pcfg, cfg.get("language", "en"))
+        if panel_rows:
+            panel_idx = max(0, min(panel_idx, len(panel_rows) - 1))
 
     def close_panel(next_idx: int | None = None) -> None:
         nonlocal panel, panel_idx, panel_rows, panel_values, main_idx
+        if panel:
+            panel_last_idx[panel] = panel_idx
         panel = None
         panel_idx = 0
         panel_rows = []
@@ -8239,16 +8295,39 @@ def portable_prelaunch_menu() -> int:
     if sys.stdout.isatty():
         sys.stdout.write("\033[?25l")
         sys.stdout.flush()
+    def restore_line_mode() -> None:
+        if old_settings is not None and fd >= 0:
+            try:
+                import termios
+                termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+            except Exception:
+                pass
+
+    def restore_raw_mode() -> None:
+        if old_settings is not None and fd >= 0:
+            try:
+                import termios
+                new = termios.tcgetattr(fd)
+                new[3] = new[3] & ~(termios.ECHO | termios.ICANON)
+                new[6][termios.VMIN] = 1
+                new[6][termios.VTIME] = 0
+                termios.tcsetattr(fd, termios.TCSANOW, new)
+            except Exception:
+                pass
+
     try:
         while True:
             first_render = render_prelaunch_screen(main_idx, panel, panel_idx, panel_rows, checks, messages, first_render)
             key = read_menu_key(fd) if fd >= 0 else read_menu_key()
             if panel:
+                panel_name = panel
                 if key in ("up", "k"):
                     panel_idx = (panel_idx - 1) % max(1, len(panel_rows))
+                    panel_last_idx[panel_name] = panel_idx
                     continue
                 if key in ("down", "j"):
                     panel_idx = (panel_idx + 1) % max(1, len(panel_rows))
+                    panel_last_idx[panel_name] = panel_idx
                     continue
                 if key in ("esc", "left", "q"):
                     close_panel()
@@ -8274,7 +8353,7 @@ def portable_prelaunch_menu() -> int:
                         close_panel()
                         continue
                     if value == "__custom__" or panel_idx >= len(panel_values):
-                        model_value = prompt_menu_value("Model id or alias")
+                        model_value = prompt_menu_value("Model id or alias", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                     else:
                         model_value = value
                     if model_value:
@@ -8286,7 +8365,7 @@ def portable_prelaunch_menu() -> int:
                         close_panel()
                         continue
                     if value == "__custom__" or panel_idx >= len(panel_values):
-                        advisor_value = prompt_menu_value("Advisor model id", "deepseek-v4-pro")
+                        advisor_value = prompt_menu_value("Advisor model id", "deepseek-v4-pro", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                     else:
                         advisor_value = value
                     messages = set_advisor_model_config(advisor_value)
@@ -8296,7 +8375,7 @@ def portable_prelaunch_menu() -> int:
                     if value == "back":
                         close_panel()
                     elif value == "input":
-                        key_value = prompt_menu_value(f"API key for {provider}", secret=True)
+                        key_value = prompt_menu_value(f"API key for {provider}", secret=True, restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                         if key_value:
                             messages = store_api_key_config(provider, key_value)
                             refresh_checks()
@@ -8307,7 +8386,7 @@ def portable_prelaunch_menu() -> int:
                             "nvidia-hosted": "NVIDIA_API_KEY",
                             "ollama-cloud": "OLLAMA_API_KEY",
                         }.get(provider, "API_KEY")
-                        env_name = prompt_menu_value("Environment variable name", default_env)
+                        env_name = prompt_menu_value("Environment variable name", default_env, restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                         key_value = os.environ.get(env_name, "").strip()
                         if key_value:
                             messages = store_api_key_config(provider, key_value)
@@ -8320,7 +8399,7 @@ def portable_prelaunch_menu() -> int:
                         if not key_value:
                             messages = ["Clipboard did not contain readable text."]
                         else:
-                            confirm = prompt_menu_value(f"Clipboard contains {mask_secret(key_value)}. Store it? y/N")
+                            confirm = prompt_menu_value(f"Clipboard contains {mask_secret(key_value)}. Store it? y/N", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                             if confirm.lower().startswith("y"):
                                 messages = store_api_key_config(provider, key_value)
                             else:
@@ -8336,7 +8415,7 @@ def portable_prelaunch_menu() -> int:
                         close_panel(4)
                     elif value == "edit":
                         default = pcfg.get("base_url") or default_base_url(provider)
-                        url = prompt_menu_value(f"Base URL for {provider}", default)
+                        url = prompt_menu_value(f"Base URL for {provider}", default, restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                         if url:
                             messages = set_base_url_config(provider, url)
                             refresh_checks()
@@ -8368,10 +8447,13 @@ def portable_prelaunch_menu() -> int:
                         refresh_checks()
                         cfg = load_config()
                         provider, pcfg = get_current_provider(cfg)
+                        old_idx = panel_idx
                         panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
+                        panel_idx = max(0, min(old_idx, len(panel_rows) - 1))
+                        panel_last_idx["options"] = panel_idx
                     else:
                         default = llm_option_prompt_default(provider, pcfg, value)
-                        entered = prompt_menu_value(f"{value} for {provider} (default/unset clears)", default)
+                        entered = prompt_menu_value(f"{value} for {provider} (default/unset clears)", default, restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                         try:
                             messages = set_llm_option_config(provider, value, entered)
                         except Exception as exc:
@@ -8379,7 +8461,10 @@ def portable_prelaunch_menu() -> int:
                         refresh_checks()
                         cfg = load_config()
                         provider, pcfg = get_current_provider(cfg)
+                        old_idx = panel_idx
                         panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
+                        panel_idx = max(0, min(old_idx, len(panel_rows) - 1))
+                        panel_last_idx["options"] = panel_idx
                 elif panel == "preset":
                     if value == "back":
                         open_panel("options")
@@ -8394,8 +8479,10 @@ def portable_prelaunch_menu() -> int:
                         cfg = load_config()
                         provider, pcfg = get_current_provider(cfg)
                         panel = "options"
-                        panel_idx = 0
+                        panel_idx = panel_last_idx.get("options", 0)
                         panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
+                        panel_idx = max(0, min(panel_idx, len(panel_rows) - 1))
+                        panel_last_idx["options"] = panel_idx
                 continue
 
             if key in ("up", "k"):

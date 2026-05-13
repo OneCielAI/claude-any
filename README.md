@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.38`
+Current version: `0.1.39`
 
 ## Why This Exists
 
@@ -380,6 +380,15 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.39
+
+- **Menu input fixes**: restores terminal line/echo mode before text or number
+  prompts, so typed numeric values are visible in the prelaunch UI.
+- **Safer numeric validation**: invalid numeric option input now shows an
+  inline message instead of crashing the menu.
+- **Preset visibility**: applied presets report the effective context, reserve,
+  output, and timeout values.
 
 ### 0.1.38
 
