@@ -1592,6 +1592,8 @@ def should_auto_enter_plan_mode(body: dict[str, Any], response_text: str, tool_c
         return False
     if has_plan_mode_exit(body):
         return False
+    if latest_tool_result_indicates_completed_work(body):
+        return False
     if not non_actionable_short_response(response_text):
         return False
     return likely_implementation_planning_request(latest_user_text(body))
@@ -1613,6 +1615,81 @@ WORK_CONTINUATION_RESULT_TOOLS: frozenset[str] = frozenset(
         "TaskStop",
     }
 )
+
+
+WORK_COMPLETION_RESULT_TOOLS: frozenset[str] = frozenset(
+    {
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "TaskUpdate",
+        "TaskStop",
+    }
+)
+
+
+def bash_command_looks_mutating(command: str) -> bool:
+    normalized = re.sub(r"\s+", " ", command or "").strip()
+    if not normalized:
+        return False
+    return bool(
+        re.search(
+            r"(^|[;&|]\s*|\b)(rm|rmdir|mv|cp|mkdir|touch|chmod|chown|ln|install|git\s+(commit|push|pull|merge|rebase|checkout|switch|restore|reset|clean)|npm\s+(install|update|run|publish)|pnpm\s+(install|update|run|publish)|yarn\s+(install|add|run|publish)|python\d*\s+-m\s+pip\s+install|pip\d*\s+install|docker\s+(run|compose|build|up|down|rm|rmi)|kubectl\s+(apply|delete|create|replace|patch))\b",
+            normalized,
+        )
+    )
+
+
+def latest_user_tool_result_details(body: dict[str, Any]) -> list[dict[str, Any]]:
+    tools_by_id: dict[str, tuple[str, dict[str, Any]]] = {}
+    latest: list[dict[str, Any]] = []
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if message.get("role") == "assistant" and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tool_id = str(block.get("id") or "")
+                name = str(block.get("name") or "")
+                tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                if tool_id and name:
+                    tools_by_id[tool_id] = (name, tool_input)
+        elif message.get("role") == "user" and isinstance(content, list):
+            current: list[dict[str, Any]] = []
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = str(block.get("tool_use_id") or "")
+                name, tool_input = tools_by_id.get(tool_use_id, ("tool", {}))
+                current.append(
+                    {
+                        "name": name,
+                        "input": tool_input,
+                        "text": anthropic_content_to_text(block.get("content", "")),
+                        "is_error": bool(block.get("is_error")),
+                    }
+                )
+            if current:
+                latest = current
+    return latest
+
+
+def latest_tool_result_indicates_completed_work(body: dict[str, Any]) -> bool:
+    details = latest_user_tool_result_details(body)
+    if not details:
+        return False
+    for item in details:
+        if item.get("is_error"):
+            continue
+        name = str(item.get("name") or "")
+        tool_input = item.get("input") if isinstance(item.get("input"), dict) else {}
+        if name in WORK_COMPLETION_RESULT_TOOLS:
+            return True
+        if name == "Bash" and bash_command_looks_mutating(str(tool_input.get("command") or "")):
+            return True
+    return False
 
 
 def latest_user_tool_result_names(body: dict[str, Any]) -> list[str]:
@@ -1713,6 +1790,8 @@ def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: st
     if "TaskList" in latest_names and recent_synthetic_tasklist_count(body) >= 2:
         return False
     if not any(name in WORK_CONTINUATION_RESULT_TOOLS for name in latest_names):
+        return False
+    if latest_tool_result_indicates_completed_work(body) and response_text.strip():
         return False
     return non_actionable_short_response(response_text)
 
@@ -2020,6 +2099,13 @@ def router_rate_limit_effective_rpm(provider: str, pcfg: dict[str, Any], model: 
     return configured
 
 
+def router_rate_limit_capacity(rpm: int) -> int:
+    if rpm <= 1:
+        return 1
+    reserve = 1 if rpm <= 20 else max(1, math.ceil(rpm * 0.05))
+    return max(1, rpm - reserve)
+
+
 def router_rate_limit_recent(timestamps: Any, now: float, window: float, *, include_future: bool) -> list[float]:
     recent: list[float] = []
     for ts in timestamps or []:
@@ -2239,6 +2325,9 @@ def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], mode
         ):
             inferred_rpm = max(1, len(actual_recent))
             rpm = inferred_rpm
+        capacity = router_rate_limit_capacity(int(rpm or 0)) if rpm and rpm > 0 else int(rpm or 0)
+        if capacity and capacity > 0 and len(actual_recent) >= capacity and actual_recent:
+            wait = max(wait, max(0.0, actual_recent[0] + 60.0 - now))
         penalty_until = max(float(entry.get("penalty_until") or 0.0) if isinstance(entry, dict) else 0.0, now + wait)
         state[key] = {
             "timestamps": recent[-max(int(rpm or 0), 240):],
@@ -2271,6 +2360,7 @@ def apply_router_rate_limit(provider: str, pcfg: dict[str, Any], model: str | No
         return 0.0, used, limit
     window = 60.0
     base_interval = window / float(rpm)
+    capacity = router_rate_limit_capacity(rpm)
     key = router_rate_limit_key(provider, pcfg, model)
     waited = 0.0
     while True:
@@ -2300,11 +2390,11 @@ def apply_router_rate_limit(provider: str, pcfg: dict[str, Any], model: str | No
                 penalty_until = 0.0
             recent = router_rate_limit_recent(timestamps, now, window, include_future=True)
             used = len(recent)
-            usage_ratio = min(1.0, used / float(rpm))
+            usage_ratio = min(1.0, used / float(capacity))
             wait = 0.0
             if penalty_until > now:
                 wait = max(wait, penalty_until - now)
-            if used >= rpm and recent:
+            if used >= capacity and recent:
                 wait = max(0.0, recent[0] + window - now)
             elif recent:
                 elapsed_since_last = max(0.0, now - recent[-1])
@@ -2322,7 +2412,7 @@ def apply_router_rate_limit(provider: str, pcfg: dict[str, Any], model: str | No
                 state[key] = new_entry
                 RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
                 return waited, len(recent), rpm
-            if used < rpm:
+            if used < capacity:
                 scheduled = now + wait
                 recent.append(scheduled)
                 new_entry = {"timestamps": recent[-rpm:], "rpm": rpm, "updated_at": scheduled, "last_wait": wait}
