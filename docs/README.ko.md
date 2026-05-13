@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.37`
+현재 버전: `0.1.38`
 
 ## 왜 만들었나
 
@@ -350,6 +350,14 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.38
+
+- **사용자 선택 context window 우선**: NVIDIA hosted 32K safety cap을 제거했습니다.
+  router는 LLM 옵션 또는 headless 설정에서 선택한 context window를 사용하고,
+  값이 없을 때만 모델별 fallback을 사용합니다.
+- **NVIDIA preset 업데이트**: NVIDIA hosted preset은 65K부터 시작하고,
+  large-output/reasoning 워크플로에서는 256K까지 사용합니다.
 
 ### 0.1.37
 

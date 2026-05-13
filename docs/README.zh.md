@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.37`
+当前版本: `0.1.38`
 
 ## 为什么存在
 
@@ -336,6 +336,14 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.38
+
+- **优先使用用户选择的 context window**：移除 NVIDIA hosted 的 32K safety cap。
+  router 会使用 LLM options 或 headless 配置中选择的 context window，
+  只有未配置时才使用按模型推断的 fallback。
+- **NVIDIA preset 更新**：NVIDIA hosted preset 从 65K 起步，
+  large-output/reasoning 工作流最高使用 256K。
 
 ### 0.1.37
 

@@ -85,7 +85,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.37"
+VERSION = "0.1.38"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -155,6 +155,17 @@ MODEL_PRESETS: dict[str, dict[str, Any]] = {
     "deepseek-r1": {"compat_max_tokens": 64, "thinking": True, "num_ctx_min": 32768, "num_ctx_max": 131072},
     "llama3.3:70b": {"compat_max_tokens": 16, "thinking": False, "num_ctx_min": 32768, "num_ctx_max": 131072},
 }
+
+
+def nvidia_hosted_context_default(model_id: str) -> int:
+    model = model_id.lower()
+    if "kimi-k2.6" in model or "kimi_k2.6" in model:
+        return 262144
+    if "deepseek" in model:
+        return 131072
+    if "glm" in model or "qwen" in model:
+        return 65536
+    return 65536
 
 
 def model_preset(model_id: str) -> dict[str, Any]:
@@ -722,7 +733,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "native_compat": False,
             "rate_limit_rpm": 40,
             "rate_limit_status": True,
-            "context_window": 32768,
+            "context_window": 65536,
             "max_output_tokens": 4096,
             "temperature": 0.7,
             "top_p": 0.8,
@@ -788,7 +799,14 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
     if not migrations.get(marker):
         pcfg = cfg.get("providers", {}).get("nvidia-hosted", {})
         if isinstance(pcfg, dict) and not positive_int(pcfg.get("context_window")):
-            pcfg["context_window"] = 32768
+            pcfg["context_window"] = nvidia_hosted_context_default(str(pcfg.get("current_model") or ""))
+        migrations[marker] = True
+
+    marker = "nvidia_context_window_unforce_32k_20260513"
+    if not migrations.get(marker):
+        pcfg = cfg.get("providers", {}).get("nvidia-hosted", {})
+        if isinstance(pcfg, dict) and positive_int(pcfg.get("context_window")) == 32768:
+            pcfg["context_window"] = nvidia_hosted_context_default(str(pcfg.get("current_model") or ""))
         migrations[marker] = True
 
     marker = "stream_enabled_default_true_20260513"
@@ -3620,7 +3638,7 @@ def openai_context_limit_for_budget(provider: str, pcfg: dict[str, Any]) -> int:
     if configured:
         return configured
     if provider == "nvidia-hosted":
-        return 32768
+        return nvidia_hosted_context_default(str(pcfg.get("current_model") or ""))
     return 65536
 
 
@@ -6127,7 +6145,65 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
     else:
         native_default = "false" if provider == "nvidia-hosted" else "true"
         server_limit = upstream_model_context_limit(provider, pcfg) if provider in ("vllm", "self-hosted-nim") else None
-        tokens_by_preset = {
+        if provider == "nvidia-hosted":
+            tokens_by_preset = {
+                "balanced": [
+                    "context_window=65536",
+                    "reserve=4096",
+                    "max_output_tokens=4096",
+                    "timeout=300000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
+                "coding": [
+                    "context_window=65536",
+                    "reserve=4096",
+                    "max_output_tokens=4096",
+                    "timeout=300000",
+                    "temperature=0.2",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
+                "fast": [
+                    "context_window=65536",
+                    "reserve=2048",
+                    "max_output_tokens=2048",
+                    "timeout=300000",
+                    "temperature=0.2",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
+                "long-context-65k": [
+                    "context_window=131072",
+                    "reserve=8192",
+                    "max_output_tokens=4096",
+                    "timeout=900000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
+                "large-output": [
+                    "context_window=262144",
+                    "reserve=8192",
+                    "max_output_tokens=8192",
+                    "timeout=1200000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
+                "reasoning": [
+                    "context_window=262144",
+                    "reserve=8192",
+                    "max_output_tokens=4096",
+                    "timeout=1800000",
+                    "temperature=0.6",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
+            }
+        else:
+            tokens_by_preset = {
             "balanced": [
                 "context_window=32768",
                 "reserve=2048",
@@ -6188,7 +6264,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "unset:top_k",
                 f"native={native_default}",
             ],
-        }
+            }
         for token in tokens_by_preset[preset_id]:
             if provider == "nvidia-hosted" and token.startswith("native="):
                 continue

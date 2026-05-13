@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.37`
+現在のバージョン: `0.1.38`
 
 ## 作られた理由
 
@@ -350,6 +350,14 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.38
+
+- **ユーザー選択の context window を優先**: NVIDIA hosted の 32K safety cap を
+  削除しました。router は LLM options または headless 設定で選ばれた
+  context window を使い、未設定の場合のみモデル別 fallback を使います。
+- **NVIDIA preset 更新**: NVIDIA hosted preset は 65K から開始し、
+  large-output/reasoning workflow では 256K まで使います。
 
 ### 0.1.37
 

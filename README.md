@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.37`
+Current version: `0.1.38`
 
 ## Why This Exists
 
@@ -380,6 +380,14 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.38
+
+- **User-selected context windows**: removes the NVIDIA hosted 32K safety cap.
+  The router now uses the context window selected in LLM options or headless
+  configuration, with model-aware fallback only when no value is configured.
+- **NVIDIA presets updated**: NVIDIA hosted presets now start at 65K and scale
+  up to 256K for large-output/reasoning workflows.
 
 ### 0.1.37
 
