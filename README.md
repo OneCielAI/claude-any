@@ -84,6 +84,9 @@ Requirements:
 
 ```sh
 npm install -g @oneciel-ai/claude-any
+```
+
+```sh
 claude-any
 ```
 
@@ -91,6 +94,9 @@ claude-any
 
 ```sh
 npm update -g @oneciel-ai/claude-any
+```
+
+```sh
 claude-any version
 ```
 
@@ -107,6 +113,9 @@ commits between npm publishes):
 
 ```sh
 npm install -g https://github.com/OneCielAI/claude-any.git
+```
+
+```sh
 claude-any
 ```
 
@@ -114,8 +123,17 @@ POSIX source install:
 
 ```sh
 git clone https://github.com/OneCielAI/claude-any.git
+```
+
+```sh
 cd claude-any
+```
+
+```sh
 ./install.sh
+```
+
+```sh
 claude-any
 ```
 
@@ -123,8 +141,17 @@ Windows PowerShell source install:
 
 ```powershell
 git clone https://github.com/OneCielAI/claude-any.git
+```
+
+```powershell
 cd claude-any
+```
+
+```powershell
 .\install.ps1
+```
+
+```powershell
 claude-any
 ```
 

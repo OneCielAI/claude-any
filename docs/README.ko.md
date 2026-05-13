@@ -79,6 +79,9 @@ macOS에서는 아직 충분히 테스트하지 않았지만, portable Python과
 
 ```sh
 npm install -g @oneciel-ai/claude-any
+```
+
+```sh
 claude-any
 ```
 
@@ -86,6 +89,9 @@ claude-any
 
 ```sh
 npm update -g @oneciel-ai/claude-any
+```
+
+```sh
 claude-any version
 ```
 
@@ -101,6 +107,9 @@ GitHub 저장소에서 직접 설치 (publish 사이의 미릴리스 커밋을 �
 
 ```sh
 npm install -g https://github.com/OneCielAI/claude-any.git
+```
+
+```sh
 claude-any
 ```
 
@@ -108,8 +117,17 @@ POSIX 소스 설치:
 
 ```sh
 git clone https://github.com/OneCielAI/claude-any.git
+```
+
+```sh
 cd claude-any
+```
+
+```sh
 ./install.sh
+```
+
+```sh
 claude-any
 ```
 
@@ -117,8 +135,17 @@ Windows PowerShell 소스 설치:
 
 ```powershell
 git clone https://github.com/OneCielAI/claude-any.git
+```
+
+```powershell
 cd claude-any
+```
+
+```powershell
 .\install.ps1
+```
+
+```powershell
 claude-any
 ```
 

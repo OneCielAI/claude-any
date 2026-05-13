@@ -77,6 +77,9 @@ macOS 尚未充分测试，但项目主要基于 portable Python 和 shell wrapp
 
 ```sh
 npm install -g @oneciel-ai/claude-any
+```
+
+```sh
 claude-any
 ```
 
@@ -84,6 +87,9 @@ claude-any
 
 ```sh
 npm update -g @oneciel-ai/claude-any
+```
+
+```sh
 claude-any version
 ```
 
@@ -99,6 +105,9 @@ npm uninstall -g @oneciel-ai/claude-any
 
 ```sh
 npm install -g https://github.com/OneCielAI/claude-any.git
+```
+
+```sh
 claude-any
 ```
 
@@ -106,8 +115,17 @@ POSIX 源码安装:
 
 ```sh
 git clone https://github.com/OneCielAI/claude-any.git
+```
+
+```sh
 cd claude-any
+```
+
+```sh
 ./install.sh
+```
+
+```sh
 claude-any
 ```
 
@@ -115,8 +133,17 @@ Windows PowerShell 源码安装:
 
 ```powershell
 git clone https://github.com/OneCielAI/claude-any.git
+```
+
+```powershell
 cd claude-any
+```
+
+```powershell
 .\install.ps1
+```
+
+```powershell
 claude-any
 ```
 

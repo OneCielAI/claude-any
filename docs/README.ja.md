@@ -79,6 +79,9 @@ macOS はまだ十分にテストしていませんが、portable Python と she
 
 ```sh
 npm install -g @oneciel-ai/claude-any
+```
+
+```sh
 claude-any
 ```
 
@@ -86,6 +89,9 @@ claude-any
 
 ```sh
 npm update -g @oneciel-ai/claude-any
+```
+
+```sh
 claude-any version
 ```
 
@@ -101,6 +107,9 @@ GitHub リポジトリから直接インストール (publish 間の未公開コ
 
 ```sh
 npm install -g https://github.com/OneCielAI/claude-any.git
+```
+
+```sh
 claude-any
 ```
 
@@ -108,8 +117,17 @@ POSIX 環境でソースからインストール:
 
 ```sh
 git clone https://github.com/OneCielAI/claude-any.git
+```
+
+```sh
 cd claude-any
+```
+
+```sh
 ./install.sh
+```
+
+```sh
 claude-any
 ```
 
@@ -117,8 +135,17 @@ Windows PowerShell でソースからインストール:
 
 ```powershell
 git clone https://github.com/OneCielAI/claude-any.git
+```
+
+```powershell
 cd claude-any
+```
+
+```powershell
 .\install.ps1
+```
+
+```powershell
 claude-any
 ```
 
