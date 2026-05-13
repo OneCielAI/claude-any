@@ -1173,6 +1173,13 @@ def color(text):
     return "".join(out)
 
 
+def display_capacity(rpm):
+    if rpm <= 1:
+        return rpm
+    reserve = 1 if rpm <= 20 else max(1, int((rpm * 0.05) + 0.999))
+    return max(1, rpm - reserve)
+
+
 def main():
     try:
         session = json.load(sys.stdin)
@@ -1235,7 +1242,9 @@ def main():
     if dir_name:
         left += f" {dir_name}"
     if rpm > 0:
-        rpm_text = f"RPM used: {used}/{rpm}"
+        shown_limit = display_capacity(rpm)
+        shown_used = min(used, shown_limit)
+        rpm_text = f"RPM used: {shown_used}/{shown_limit}"
     else:
         rpm_text = f"RPM used: {used}/min (unlimited)"
     if server_rpm or server_remaining is not None or server_reset_seconds is not None:
