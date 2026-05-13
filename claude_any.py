@@ -85,7 +85,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.36"
+VERSION = "0.1.37"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -789,6 +789,13 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
         pcfg = cfg.get("providers", {}).get("nvidia-hosted", {})
         if isinstance(pcfg, dict) and not positive_int(pcfg.get("context_window")):
             pcfg["context_window"] = 32768
+        migrations[marker] = True
+
+    marker = "stream_enabled_default_true_20260513"
+    if not migrations.get(marker):
+        for pcfg in (cfg.get("providers") or {}).values():
+            if isinstance(pcfg, dict) and "stream_enabled" not in pcfg:
+                pcfg["stream_enabled"] = True
         migrations[marker] = True
 
 
@@ -4006,14 +4013,83 @@ def normalize_tool_arguments(tool_name: str, args: Any) -> dict[str, Any]:
     return {}
 
 
+PSEUDO_TOOL_START = "<|tool_calls_section_begin|>"
+PSEUDO_TOOL_END = "<|tool_calls_section_end|>"
+PSEUDO_CALL_BEGIN = "<|tool_call_begin|>"
+PSEUDO_ARG_BEGIN = "<|tool_call_argument_begin|>"
+PSEUDO_CALL_END = "<|tool_call_end|>"
+
+
+def infer_tool_name_from_args(args: dict[str, Any]) -> str:
+    keys = set(args)
+    if "command" in keys:
+        return "Bash"
+    if {"file_path", "content"}.issubset(keys):
+        return "Write"
+    if {"file_path", "old_string", "new_string"}.issubset(keys):
+        return "Edit"
+    if "file_path" in keys:
+        return "Read"
+    if "taskId" in keys and "status" in keys:
+        return "TaskUpdate"
+    return "TaskList" if not args else "Write"
+
+
+def parse_pseudo_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    if PSEUDO_TOOL_START not in text:
+        return text, []
+    visible_parts: list[str] = []
+    calls: list[dict[str, Any]] = []
+    pos = 0
+    while True:
+        start = text.find(PSEUDO_TOOL_START, pos)
+        if start < 0:
+            visible_parts.append(text[pos:])
+            break
+        visible_parts.append(text[pos:start])
+        end = text.find(PSEUDO_TOOL_END, start)
+        if end < 0:
+            section = text[start + len(PSEUDO_TOOL_START):]
+            pos = len(text)
+        else:
+            section = text[start + len(PSEUDO_TOOL_START):end]
+            pos = end + len(PSEUDO_TOOL_END)
+        for match in re.finditer(
+            re.escape(PSEUDO_CALL_BEGIN) + r"(.*?)" + re.escape(PSEUDO_ARG_BEGIN) + r"(.*?)" + re.escape(PSEUDO_CALL_END),
+            section,
+            flags=re.DOTALL,
+        ):
+            raw_header = match.group(1).strip()
+            raw_args = match.group(2).strip()
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                continue
+            if not isinstance(args, dict):
+                continue
+            name = ""
+            for part in re.split(r"[\s:|,]+", raw_header):
+                candidate = _fuzzy_match_tool_name(part)
+                if candidate:
+                    name = candidate
+                    break
+            if not name:
+                name = infer_tool_name_from_args(args)
+            calls.append({"function": {"name": name, "arguments": args}, "id": raw_header})
+        if end < 0:
+            break
+    return "".join(visible_parts), calls
+
+
 def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict[str, Any] | None = None) -> dict[str, Any]:
     message = data.get("message") if isinstance(data.get("message"), dict) else {}
     content: list[dict[str, Any]] = []
     text = message.get("content") or ""
+    text, pseudo_tool_calls = parse_pseudo_tool_calls(text)
     if text:
         content.append({"type": "text", "text": text})
     tool_id_prefix = f"toolu_ollama_{int(time.time() * 1000)}_{os.getpid()}"
-    for i, call in enumerate(message.get("tool_calls") or []):
+    for i, call in enumerate(list(message.get("tool_calls") or []) + pseudo_tool_calls):
         fn = call.get("function") if isinstance(call, dict) else {}
         if not isinstance(fn, dict) or not fn.get("name"):
             continue
@@ -4609,6 +4685,8 @@ def stream_openai_chat_to_anthropic_sse(
     text_suppressed_for_plan = False
     text_index: int | None = None
     text_so_far = ""
+    pseudo_text = ""
+    pseudo_mode = False
     text_buffer = ""
     tool_fragments: dict[int, dict[str, Any]] = {}
     output_tokens = 0
@@ -4667,6 +4745,21 @@ def stream_openai_chat_to_anthropic_sse(
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
             text_chunk = delta.get("content") or ""
             if text_chunk:
+                if pseudo_mode or PSEUDO_TOOL_START in text_chunk:
+                    before, sep, after = text_chunk.partition(PSEUDO_TOOL_START)
+                    if before and not pseudo_mode:
+                        text_so_far += before
+                        if word_chunking:
+                            text_buffer += before
+                            to_flush, text_buffer = _split_word_buffer(text_buffer, force=False)
+                            emit_text_delta(to_flush)
+                        else:
+                            emit_text_delta(before)
+                    pseudo_mode = True
+                    pseudo_text += (sep + after) if sep else text_chunk
+                    if PSEUDO_TOOL_END in pseudo_text:
+                        pseudo_mode = False
+                    continue
                 if source_body is not None and not text_started and not tool_fragments and should_auto_enter_plan_mode(source_body, text_so_far + text_chunk, []):
                     text_so_far += text_chunk
                     text_suppressed_for_plan = True
@@ -4698,6 +4791,15 @@ def stream_openai_chat_to_anthropic_sse(
             emit_text_delta(to_flush)
 
         tool_calls: list[dict[str, Any]] = []
+        _, pseudo_tool_calls = parse_pseudo_tool_calls(pseudo_text)
+        for i, pseudo in enumerate(pseudo_tool_calls):
+            fn = pseudo.get("function") if isinstance(pseudo, dict) else {}
+            if isinstance(fn, dict):
+                tool_fragments.setdefault(100000 + i, {
+                    "id": str(pseudo.get("id") or ""),
+                    "name": str(fn.get("name") or ""),
+                    "arguments": json.dumps(fn.get("arguments") or {}, ensure_ascii=False),
+                })
         for _, fragment in sorted(tool_fragments.items()):
             raw_name = str(fragment.get("name") or "")
             if not raw_name:
@@ -4964,7 +5066,8 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
         model = ncp_model_id_for_nvidia_hosted(model)
     url = join_url(provider_upstream_request_base(provider, pcfg), "/chat/completions")
     waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
-    stream = bool(body.get("stream", True))
+    stream_enabled = bool(pcfg.get("stream_enabled", True))
+    stream = True if provider == "nvidia-hosted" else bool(body.get("stream", stream_enabled)) and stream_enabled
     notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", True)))
     if stream:
         req_body = openai_compatible_chat_request(provider, model, body, pcfg, stream=True)

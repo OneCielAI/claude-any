@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.36`
+Current version: `0.1.37`
 
 ## Why This Exists
 
@@ -380,6 +380,14 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.37
+
+- **Pseudo tool-call recovery**: the NVIDIA/OpenAI-compatible stream path now
+  suppresses `<|tool_calls_section_begin|>...` pseudo tool-call text and
+  converts it back into Claude `tool_use` blocks when possible.
+- **Streaming defaults**: provider streaming defaults to on; NVIDIA hosted
+  remains forced to the streaming upstream path for stability.
 
 ### 0.1.36
 

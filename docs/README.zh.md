@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.36`
+当前版本: `0.1.37`
 
 ## 为什么存在
 
@@ -336,6 +336,14 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.37
+
+- **Pseudo tool-call recovery**：NVIDIA/OpenAI-compatible stream 路径现在会
+  隐藏 `<|tool_calls_section_begin|>...` pseudo tool-call 文本，并尽可能恢复为
+  Claude `tool_use` block。
+- **Streaming defaults**：provider streaming 默认开启；NVIDIA hosted 为了稳定性
+  固定使用 upstream streaming 路径。
 
 ### 0.1.36
 

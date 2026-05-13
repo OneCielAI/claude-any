@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.36`
+현재 버전: `0.1.37`
 
 ## 왜 만들었나
 
@@ -350,6 +350,14 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.37
+
+- **Pseudo tool-call recovery**: NVIDIA/OpenAI-compatible stream 경로에서
+  `<|tool_calls_section_begin|>...` pseudo tool-call 텍스트를 화면에 출력하지
+  않고 가능한 경우 Claude `tool_use` 블록으로 복구합니다.
+- **Streaming defaults**: provider streaming 기본값은 on이며, NVIDIA hosted는
+  안정성을 위해 upstream streaming 경로로 고정됩니다.
 
 ### 0.1.36
 
