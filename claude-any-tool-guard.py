@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import hashlib
 import sys
 import time
 from pathlib import Path
@@ -194,6 +196,156 @@ def record_task_completed(event: dict[str, Any]) -> None:
     save_tasks(data)
 
 
+def task_dir(session_id: str) -> Path:
+    return Path.home() / ".claude" / "tasks" / session_id
+
+
+def has_in_progress_task(session_id: str | None) -> bool:
+    if not session_id:
+        return False
+    path = task_dir(session_id)
+    if not path.exists():
+        return False
+    for item in path.glob("*.json"):
+        try:
+            data = json.loads(item.read_text(encoding="utf-8", errors="ignore"))
+        except Exception:
+            continue
+        if isinstance(data, dict) and data.get("status") == "in_progress":
+            return True
+    return False
+
+
+def transcript_latest_user_text(transcript_path: str | None) -> str:
+    if not transcript_path:
+        return ""
+    path = Path(transcript_path)
+    if not path.exists():
+        return ""
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-80:]
+    except Exception:
+        return ""
+    for line in reversed(lines):
+        try:
+            data = json.loads(line)
+        except Exception:
+            continue
+        if data.get("type") != "user":
+            continue
+        message = data.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    parts.append(str(block.get("text") or ""))
+            return "\n".join(part for part in parts if part).strip()
+    return ""
+
+
+def transcript_plan_mode_active(transcript_path: str | None) -> bool:
+    if not transcript_path:
+        return False
+    path = Path(transcript_path)
+    if not path.exists():
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-240:]
+    except Exception:
+        return False
+    active = False
+    tool_names_by_id: dict[str, str] = {}
+    for line in lines:
+        try:
+            data = json.loads(line)
+        except Exception:
+            continue
+        attachment = data.get("attachment")
+        if isinstance(attachment, dict):
+            attachment_type = attachment.get("type")
+            if attachment_type in {"plan_mode", "plan_mode_reentry"}:
+                active = True
+            elif attachment_type == "plan_mode_exit":
+                active = False
+        message = data.get("message")
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        content = message.get("content")
+        blocks = content if isinstance(content, list) else []
+        if role == "assistant":
+            for block in blocks:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tool_id = str(block.get("id") or "")
+                name = str(block.get("name") or "")
+                if tool_id and name:
+                    tool_names_by_id[tool_id] = name
+        elif role == "user":
+            for block in blocks:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = str(block.get("tool_use_id") or "")
+                tool_name = tool_names_by_id.get(tool_use_id)
+                if tool_name == "EnterPlanMode":
+                    active = True
+                elif tool_name == "ExitPlanMode":
+                    active = False
+    return active
+
+
+def short_resume_prompt(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized or len(normalized) > 32:
+        return False
+    return not re.search(r"[?？`{};/\\\\]|https?://", normalized)
+
+
+def non_actionable_stop_text(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized or len(normalized) > 220:
+        return False
+    if "\n" in text:
+        return False
+    if re.search(r"[`{};/\\\\]|https?://", normalized):
+        return False
+    return True
+
+
+def stop_block_count_path(session_id: str) -> Path:
+    return cache_dir() / f"stop-block-{session_id or 'unknown'}.json"
+
+
+def increment_stop_block_count(session_id: str | None, text: str) -> int:
+    path = stop_block_count_path(session_id or "unknown")
+    key = hashlib.sha256(text.strip().encode("utf-8", errors="ignore")).hexdigest()[:16]
+    try:
+        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(data, dict):
+            data = {}
+    except Exception:
+        data = {}
+    count = int(data.get(key) or 0) + 1
+    path.write_text(json.dumps({key: count}, ensure_ascii=False) + "\n", encoding="utf-8")
+    return count
+
+
+def handle_stop(event: dict[str, Any]) -> int:
+    log_json_event(event)
+    # Claude Code 2.1.x records Stop hook stderr as a suggestion
+    # (`preventedContinuation: false`) in some interactive flows. That pollutes
+    # the transcript and can leak into the input buffer, so keep Stop events
+    # observational and do continuation control in the router instead.
+    session_id = str(event.get("session_id") or "")
+    log_event(f"Stop guard observed session={session_id}")
+    return 0
+
+
 def normalize_aliases(tool: str, tool_input: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     updated = dict(tool_input)
     changed: list[str] = []
@@ -335,14 +487,12 @@ OBSERVE_ONLY_EVENTS = {
     "Setup",
     "UserPromptSubmit",
     "UserPromptExpansion",
-    "Stop",
     "StopFailure",
     "InstructionsLoaded",
     "ConfigChange",
     "CwdChanged",
     "Notification",
     "SubagentStart",
-    "SubagentStop",
     "TeammateIdle",
     "PreCompact",
     "PostCompact",
@@ -404,6 +554,8 @@ def main() -> int:
         return handle_worktree_create(event)
     if name == "WorktreeRemove":
         return handle_worktree_remove(event)
+    if name in {"Stop", "SubagentStop"}:
+        return handle_stop(event)
 
     # Lightweight observation for events we do not act on. Skip when inactive
     # to avoid touching disk on every event.

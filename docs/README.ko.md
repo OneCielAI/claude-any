@@ -12,6 +12,8 @@
 > - **무료** — [NVIDIA hosted NIM](https://build.nvidia.com/) (qwen3-coder-480b, gpt-oss 등) 을 API Catalog 로 사용.
 > - **저비용** — [Ollama Cloud](https://ollama.com/cloud) 로 GLM, Qwen, DeepSeek 같은 오픈 가중치 모델을 frontier 모델 대비 매우 낮은 가격에 사용.
 > - **무료 + 로컬** — [Ollama](https://ollama.com/) 또는 [vLLM](https://github.com/vllm-project/vllm) 을 본인 GPU 에서 완전 오프라인으로 사용.
+> - **Plan Mode + Advisor 지원** — non-Anthropic provider 에서도 Claude Code Plan Mode 를 유지하고, 긴 컨텍스트 Advisor 모델로 작업 검토를 받을 수 있습니다.
+> - **무료 모델 RPM을 부드럽게 사용** — Claude Code 는 파일을 읽고 tool 을 실행하는 시간이 있고, Claude Any 는 그 자연스러운 간격을 RPM pacing 에 활용하므로 NVIDIA hosted 무료 모델의 분당 제한을 덜 체감하며 사용할 수 있습니다.
 >
 > 프로바이더, 모델, Base URL, API 키, 스트리밍 동작, LLM 옵션을 Claude Code 실행 **전에** 콘솔 메뉴에서 모두 선택합니다. Claude Code 본체는 그대로 — 모든 native 툴링, slash command, 워크플로우가 유지됩니다.
 
@@ -33,7 +35,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.27`
+현재 버전: `0.1.28`
 
 ## 왜 만들었나
 
@@ -207,6 +209,18 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 - 필요한 경우 provider-specific router 사용.
 - non-native provider용 DuckDuckGo/fetch MCP 연결.
 - `--ca-provider`, `--ca-model`, `--ca-base-url`, `--ca-api-key-env` 등 headless 플래그.
+- router 기반 non-Anthropic provider 에서 Claude Code Plan Mode 지원 —
+  `EnterPlanMode` 로컬 처리와 plan artifact 흐름을 포함합니다.
+- 선택한 Advisor Model 로 현재 작업 상태를 보내 검토받는 `/advisor` slash command.
+  긴 컨텍스트 리뷰와 다음 단계 확인에 유용합니다.
+- Claude Code `statusLine` 연동으로 router RPM 사용량과 wait 시간을 채팅 본문이
+  아니라 하단 상태 영역에 표시합니다.
+- NVIDIA hosted, self-hosted NIM, Ollama, Ollama Cloud 에 대한 router-side RPM 제어.
+  `rate_limit_rpm=0`이면 throttling 은 끄고 최근 60초 사용량만 표시합니다.
+- soft pacing 은 파일 읽기, 명령 실행, tool 결과 대기에 이미 소비된 시간을 지연
+  계산에서 뺍니다. 실제 코딩 세션에서는 이런 tool-call 간격이 RPM 간격을 자연스럽게
+  흡수하므로, NVIDIA hosted NIM 같은 무료 모델의 RPM 제한 안에서 동작하면서도 매
+  Claude Code turn 마다 rate limit 을 강하게 느끼지 않게 합니다.
 - Ollama/Ollama Cloud 라우터 경로의 스트리밍 프록시 — 전체 응답을 기다리지 않고
   토큰이 도착하는 즉시 Claude Code로 전달합니다.
 - 프로바이더별 `stream` on/off 토글과 `stream_word_chunking` 옵션으로 텍스트
@@ -223,6 +237,21 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.28
+
+- **Plan Mode + Advisor 헤드라인**: router 기반 non-Anthropic provider 의
+  Plan Mode 지원과, 선택한 긴 컨텍스트 Advisor Model 로 동작하는 `/advisor`
+  slash command 를 문서화했습니다.
+- **statusLine RPM 표시**: Claude Any 가 Claude Code `statusLine` command 를
+  설치해 router RPM 사용량과 최근 wait 시간을 하단 상태 영역에 표시합니다. rate-limit
+  정보가 채팅 본문을 오염시키지 않습니다.
+- **무료 hosted 모델을 위한 soft RPM pacing**: NVIDIA hosted, self-hosted NIM,
+  Ollama, Ollama Cloud 에 router-side RPM pacing 을 사용할 수 있습니다. 파일 읽기,
+  명령 실행, tool 결과 대기에 이미 쓰인 시간을 지연 계산에서 빼므로 실제 코딩 중
+  tool-call 간격이 RPM 간격을 자연스럽게 흡수합니다.
+- **무제한 사용량 표시**: `rate_limit_rpm=0`은 throttling 을 끄지만 최근 60초 요청
+  사용량은 계속 표시합니다.
 
 ### 0.1.27
 

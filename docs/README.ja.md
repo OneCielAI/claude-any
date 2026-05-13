@@ -12,6 +12,8 @@
 > - **無料** — [NVIDIA hosted NIM](https://build.nvidia.com/) (qwen3-coder-480b、gpt-oss など) を API Catalog から使用。
 > - **低コスト** — [Ollama Cloud](https://ollama.com/cloud) で GLM、Qwen、DeepSeek などのオープン重みモデルを、フロンティアモデル比でごく安価に。
 > - **無料 + ローカル** — [Ollama](https://ollama.com/) または [vLLM](https://github.com/vllm-project/vllm) を自分の GPU で完全オフライン実行。
+> - **Plan Mode + Advisor 対応** — non-Anthropic provider でも Claude Code Plan Mode を維持し、長コンテキスト Advisor モデルで作業レビューを受けられます。
+> - **無料モデルの RPM をなめらかに利用** — Claude Code はファイル読み取りや tool 実行に時間を使うため、Claude Any はその自然な間隔を RPM pacing に活用し、NVIDIA hosted の無料モデルでも分単位制限を感じにくく使えます。
 >
 > プロバイダー、モデル、Base URL、API キー、ストリーミング動作、LLM オプションを Claude Code 起動 **前** にコンソールメニューで選択します。Claude Code 本体はそのまま — すべてのネイティブツール、slash コマンド、ワークフローが維持されます。
 
@@ -33,7 +35,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.27`
+現在のバージョン: `0.1.28`
 
 ## 作られた理由
 
@@ -208,6 +210,19 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 - 必要に応じた provider-specific router。
 - non-native provider 向け DuckDuckGo/fetch MCP。
 - `--ca-provider`、`--ca-model`、`--ca-base-url` などの headless フラグ。
+- router 経由の non-Anthropic provider で Claude Code Plan Mode に対応 —
+  `EnterPlanMode` のローカル処理と plan artifact の流れを含みます。
+- 選択した Advisor Model に現在の作業状態を送り、レビューを受ける `/advisor`
+  slash command。長コンテキストの確認や次の一手の検証に便利です。
+- Claude Code `statusLine` 連携により、router の RPM 使用量と待機時間を
+  チャット本文ではなく下部ステータス領域に表示します。
+- NVIDIA hosted、self-hosted NIM、Ollama、Ollama Cloud の router-side RPM 制御。
+  `rate_limit_rpm=0` では throttling を無効化し、直近 60 秒の使用量だけを表示します。
+- soft pacing はファイル読み取り、コマンド実行、tool 結果待ちにすでに使われた
+  時間を待機計算から差し引きます。実際のコーディングセッションでは、こうした
+  tool-call の間隔が RPM 間隔を自然に吸収するため、NVIDIA hosted NIM のような
+  無料モデルの RPM 制限内に収めながら、各 Claude Code turn で rate limit を
+  強く感じにくくします。
 - Ollama/Ollama Cloud ルーター経路でのストリーミングプロキシ — トークンが届く
   すぐに Claude Code に転送し、レスポンス全体のバッファリングを待ちません。
 - プロバイダー毎の `stream` on/off トグルと `stream_word_chunking` オプションで、
@@ -223,6 +238,21 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.28
+
+- **Plan Mode + Advisor ヘッドライン**: router 経由の non-Anthropic provider での
+  Plan Mode 対応と、選択した長コンテキスト Advisor Model で動作する `/advisor`
+  slash command を文書化しました。
+- **statusLine RPM 表示**: Claude Any が Claude Code `statusLine` command を
+  インストールし、router の RPM 使用量と直近の待機時間を下部ステータス領域に表示します。
+  rate-limit 情報でチャット本文を汚しません。
+- **無料 hosted モデル向け soft RPM pacing**: NVIDIA hosted、self-hosted NIM、
+  Ollama、Ollama Cloud で router-side RPM pacing を使えます。ファイル読み取り、
+  コマンド実行、tool 結果待ちにすでに使われた時間を待機計算から差し引くため、
+  実際のコーディング中の tool-call 間隔が RPM 間隔を自然に吸収します。
+- **無制限時の使用量表示**: `rate_limit_rpm=0` は throttling を無効化しますが、
+  直近 60 秒のリクエスト使用量は引き続き表示します。
 
 ### 0.1.27
 

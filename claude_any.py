@@ -38,6 +38,7 @@ LOG_LEVEL_PATH = CONFIG_DIR / "log-level"
 REQUEST_DUMP_PATH = CONFIG_DIR / "requests.jsonl"
 RESPONSE_DUMP_PATH = CONFIG_DIR / "responses.jsonl"
 TOOL_CALL_LOG_PATH = CONFIG_DIR / "tool-calls.jsonl"
+RATE_LIMIT_STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
 CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
 CHAT_FILES_DIR = CONFIG_DIR / "chat-files"
 PLAN_ARTIFACTS_DIR = CONFIG_DIR / "plan-artifacts"
@@ -50,6 +51,8 @@ ROUTER_PORT = 8799
 ROUTER_BASE = f"http://{ROUTER_HOST}:{ROUTER_PORT}"
 CLAUDE_GATEWAY_CACHE = HOME / ".claude" / "cache" / "gateway-models.json"
 CLAUDE_SETTINGS_PATH = HOME / ".claude" / "settings.json"
+CLAUDE_COMMANDS_DIR = HOME / ".claude" / "commands"
+CLAUDE_ANY_STATUSLINE_PATH = HOME / ".local" / "bin" / "claude-any-statusline.py"
 NCP_ENV = HOME / ".config" / "nvd-claude-proxy" / ".env"
 NCP_LOG = HOME / ".config" / "nvd-claude-proxy" / "proxy.log"
 MODEL_CACHE_TTL_SECONDS = 300
@@ -80,7 +83,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.27"
+VERSION = "0.1.28"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -92,6 +95,7 @@ RESPONSE_DUMP_MAX_BYTES = 5_000_000
 RESPONSE_DUMP_TEXT_LIMIT = 16_000
 CHAT_MESSAGES_MAX_BYTES = 20_000_000
 _LOG_LEVEL_CACHE: dict[str, Any] = {"value": None, "checked_at": 0.0, "file_mtime": 0.0}
+_RATE_LIMIT_LOCK = threading.Lock()
 _CHAT_CONDITION = threading.Condition()
 _CHAT_NEXT_ID: int | None = None
 
@@ -118,6 +122,8 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
     "Do not stop after announcing what you plan to do. When the user asks you to create, edit, or run code, "
     "immediately use the available Claude Code tools such as Write, Edit, Read, and Bash as appropriate, "
+    "except while Claude Code is in Plan Mode. In Plan Mode, first explore/read as needed, write or update the plan file named "
+    "by the plan_mode attachment, and only then call ExitPlanMode to request approval; do not call EnterPlanMode again. "
     "then report the concrete result. If you decide not to use tools, provide the complete requested code or answer in the same turn. "
     "Use skills only when the user's request clearly matches that skill; never invoke keybindings-help unless the user asks about keybindings. "
     "Keep final answers concise and do not expose hidden chain-of-thought. "
@@ -424,6 +430,7 @@ UI_TEXT = {
         "api_key": "API key",
         "base_url": "Base URL",
         "model": "Model",
+        "advisor_model": "Advisor Model",
         "test": "Test compatibility",
         "options": "LLM options",
         "presets": "LLM presets",
@@ -441,6 +448,7 @@ UI_TEXT = {
         "api_key": "API 키",
         "base_url": "Base URL",
         "model": "모델",
+        "advisor_model": "Advisor Model",
         "test": "호환성 테스트",
         "options": "LLM 옵션",
         "presets": "LLM 프리셋",
@@ -458,6 +466,7 @@ UI_TEXT = {
         "api_key": "APIキー",
         "base_url": "Base URL",
         "model": "モデル",
+        "advisor_model": "Advisor Model",
         "test": "互換性テスト",
         "options": "LLMオプション",
         "presets": "LLMプリセット",
@@ -475,6 +484,7 @@ UI_TEXT = {
         "api_key": "API 密钥",
         "base_url": "Base URL",
         "model": "模型",
+        "advisor_model": "Advisor Model",
         "test": "兼容性测试",
         "options": "LLM 选项",
         "presets": "LLM 预设",
@@ -601,6 +611,14 @@ PROVIDER_NOTES = {
     },
 }
 
+DEFAULT_ADVISOR_MODELS: tuple[str, ...] = (
+    "",
+    "deepseek-v4-pro",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "glm-5.1",
+)
+
 DEFAULT_CONFIG: dict[str, Any] = {
     "current_provider": "nvidia-hosted",
     "language": "en",
@@ -627,14 +645,18 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "base_url": "https://api.anthropic.com",
             "api_key": "",
             "current_model": "claude-sonnet-4-6",
+            "advisor_model": "",
             "custom_models": [],
         },
         "ollama": {
             "base_url": "http://127.0.0.1:11434",
             "api_key": "ollama",
             "current_model": "qwen3-coder",
+            "advisor_model": "",
             "custom_models": ["qwen3-coder"],
             "native_compat": True,
+            "rate_limit_rpm": 40,
+            "rate_limit_status": True,
             "num_ctx": "auto",
             "num_ctx_min": 32768,
             "num_ctx_max": 131072,
@@ -654,7 +676,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "base_url": "https://ollama.com",
             "api_key": "",
             "current_model": "glm-5.1",
+            "advisor_model": "",
             "custom_models": ["glm-5.1"],
+            "rate_limit_rpm": 40,
+            "rate_limit_status": True,
             "num_ctx": "auto",
             "num_ctx_min": 32768,
             "num_ctx_max": 131072,
@@ -674,6 +699,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "base_url": "http://127.0.0.1:8000",
             "api_key": "dummy",
             "current_model": "my-model",
+            "advisor_model": "",
             "custom_models": ["my-model"],
             "native_compat": True,
             "context_window": 32768,
@@ -689,8 +715,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "base_url": "https://integrate.api.nvidia.com/v1",
             "api_key": "not-used",
             "current_model": "qwen/qwen3-coder-480b-a35b-instruct",
+            "advisor_model": "",
             "custom_models": [],
             "native_compat": False,
+            "rate_limit_rpm": 40,
+            "rate_limit_status": True,
             "max_output_tokens": 4096,
             "temperature": 0.7,
             "top_p": 0.8,
@@ -702,8 +731,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "base_url": "http://127.0.0.1:8000",
             "api_key": "not-used",
             "current_model": "model",
+            "advisor_model": "",
             "custom_models": ["model"],
             "native_compat": True,
+            "rate_limit_rpm": 40,
+            "rate_limit_status": True,
             "context_window": 32768,
             "max_output_tokens": 4096,
             "temperature": 0.7,
@@ -1105,6 +1137,171 @@ def install_tool_guard_hooks() -> None:
         tmp.replace(CLAUDE_SETTINGS_PATH)
 
 
+STATUSLINE_SCRIPT = r'''#!/usr/bin/env python3
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+HOME = Path.home()
+CONFIG_DIR = Path(os.environ.get("CLAUDE_ANY_CONFIG_DIR") or (HOME / ".config" / "claude-any"))
+CONFIG_PATH = CONFIG_DIR / "config.json"
+STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
+PALETTE = (203, 209, 215, 221, 229, 187, 151, 116, 111, 147, 183, 219)
+
+
+def load_json(path, default):
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        return value if isinstance(value, type(default)) else default
+    except Exception:
+        return default
+
+
+def color(text):
+    if os.environ.get("CLAUDE_ANY_STATUSLINE_ANSI", "1").lower() in ("0", "false", "no"):
+        return text
+    phase = int(time.monotonic() * 8)
+    out = []
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            out.append(ch)
+        else:
+            out.append(f"\033[1;38;5;{PALETTE[(phase + i) % len(PALETTE)]}m{ch}\033[0m")
+    return "".join(out)
+
+
+def main():
+    try:
+        session = json.load(sys.stdin)
+        if not isinstance(session, dict):
+            session = {}
+    except Exception:
+        session = {}
+    cfg = load_json(CONFIG_PATH, {})
+    providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+    provider = str(cfg.get("current_provider") or "")
+    pcfg = providers.get(provider) if isinstance(providers.get(provider), dict) else {}
+    model = str(pcfg.get("current_model") or "")
+    raw_rpm = pcfg.get("rate_limit_rpm")
+    if raw_rpm is None and provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+        raw_rpm = 40
+    try:
+        rpm = int(raw_rpm)
+    except Exception:
+        rpm = 40
+    state = load_json(STATE_PATH, {})
+    now = time.time()
+    key = f"{provider}:{model}" if provider and model else ""
+    entry = state.get(key) if key else None
+    if not isinstance(entry, dict):
+        prefix = f"{provider}:"
+        candidates = [(k, v) for k, v in state.items() if isinstance(k, str) and k.startswith(prefix) and isinstance(v, dict)]
+        if not candidates:
+            candidates = [(k, v) for k, v in state.items() if isinstance(v, dict)]
+        if candidates:
+            key, entry = max(candidates, key=lambda item: float(item[1].get("updated_at") or 0))
+    timestamps = entry.get("timestamps") if isinstance(entry, dict) else []
+    if isinstance(entry, dict):
+        try:
+            rpm = int(entry.get("rpm") or rpm)
+        except Exception:
+            pass
+    try:
+        last_wait = float(entry.get("last_wait") or 0.0) if isinstance(entry, dict) else 0.0
+    except Exception:
+        last_wait = 0.0
+    used = len([ts for ts in (timestamps or []) if isinstance(ts, (int, float)) and now - float(ts) < 60.0])
+    model_name = ((session.get("model") or {}).get("display_name") if isinstance(session.get("model"), dict) else None) or model or "model"
+    current_dir = ((session.get("workspace") or {}).get("current_dir") if isinstance(session.get("workspace"), dict) else None) or session.get("cwd") or ""
+    dir_name = Path(current_dir).name if current_dir else ""
+    left = f"[{model_name}]"
+    if dir_name:
+        left += f" {dir_name}"
+    if rpm > 0:
+        rpm_text = f"RPM used: {used}/{rpm}"
+    else:
+        rpm_text = f"RPM used: {used}/min (unlimited)"
+    if last_wait >= 0.5:
+        rpm_text += f" | wait {last_wait:.1f}s"
+    print(f"{left} | {color(rpm_text)}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+def install_claude_any_statusline() -> None:
+    try:
+        CLAUDE_ANY_STATUSLINE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if not CLAUDE_ANY_STATUSLINE_PATH.exists() or CLAUDE_ANY_STATUSLINE_PATH.read_text(encoding="utf-8") != STATUSLINE_SCRIPT:
+            CLAUDE_ANY_STATUSLINE_PATH.write_text(STATUSLINE_SCRIPT, encoding="utf-8")
+        try:
+            os.chmod(CLAUDE_ANY_STATUSLINE_PATH, 0o700)
+        except Exception:
+            pass
+        if CLAUDE_SETTINGS_PATH.exists():
+            try:
+                settings = json.loads(CLAUDE_SETTINGS_PATH.read_text(encoding="utf-8"))
+                if not isinstance(settings, dict):
+                    settings = {}
+            except Exception as exc:
+                print(f"Claude Any warning: could not read {CLAUDE_SETTINGS_PATH} ({type(exc).__name__}); status line was not installed.", flush=True)
+                return
+        else:
+            settings = {}
+        command = f"{shlex.quote(sys.executable)} {shlex.quote(str(CLAUDE_ANY_STATUSLINE_PATH))}"
+        current = settings.get("statusLine")
+        if isinstance(current, dict) and current.get("command") == command:
+            return
+        settings["statusLine"] = {
+            "type": "command",
+            "command": command,
+            "padding": 0,
+            "refreshInterval": 1000,
+        }
+        CLAUDE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CLAUDE_SETTINGS_PATH.with_name(f"{CLAUDE_SETTINGS_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        tmp.write_text(json.dumps(settings, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+        try:
+            os.chmod(tmp, 0o600)
+        except Exception:
+            pass
+        tmp.replace(CLAUDE_SETTINGS_PATH)
+    except Exception as exc:
+        print(f"Claude Any warning: could not install status line ({type(exc).__name__}: {exc}).", flush=True)
+
+
+ADVISOR_SLASH_COMMAND = """---
+description: Run the selected claude-any Advisor Model
+argument-hint: [question or focus]
+---
+
+CLAUDE_ANY_ADVISOR_CALL
+
+Focus: $ARGUMENTS
+
+Use the Advisor Model selected in the claude-any launch menu. If the Advisor Model is off, explain how to enable it. Otherwise review the current conversation, tool history, and task state. Return concise guidance with the blocker, next concrete action, and validation step.
+"""
+
+
+def install_claude_any_slash_commands() -> None:
+    try:
+        CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
+        path = CLAUDE_COMMANDS_DIR / "advisor.md"
+        if path.exists() and path.read_text(encoding="utf-8") == ADVISOR_SLASH_COMMAND:
+            return
+        path.write_text(ADVISOR_SLASH_COMMAND, encoding="utf-8")
+        try:
+            os.chmod(path, 0o600)
+        except Exception:
+            pass
+    except Exception as exc:
+        print(f"Claude Any warning: could not install /advisor slash command ({type(exc).__name__}: {exc}).", flush=True)
+
+
 def http_json(url: str, headers: dict[str, str] | None = None, timeout: float = 8.0) -> Any:
     req = urllib.request.Request(url, headers=headers or {})
     with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -1231,11 +1428,103 @@ def has_tool(body: dict[str, Any], name: str) -> bool:
     return name in tool_names_in_body(body)
 
 
+def _message_content_blocks(message: dict[str, Any]) -> list[Any]:
+    content = message.get("content")
+    if isinstance(content, list):
+        return content
+    if isinstance(content, str):
+        return [{"type": "text", "text": content}]
+    return []
+
+
+def plan_mode_active(body: dict[str, Any]) -> bool:
+    """Infer Claude Code Plan Mode from tool history and plan-mode attachments."""
+    active = False
+    tool_names_by_id: dict[str, str] = {}
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        attachment = message.get("attachment")
+        if isinstance(attachment, dict):
+            attachment_type = attachment.get("type")
+            if attachment_type in {"plan_mode", "plan_mode_reentry"}:
+                active = True
+            elif attachment_type == "plan_mode_exit":
+                active = False
+        if message.get("role") == "assistant":
+            for block in _message_content_blocks(message):
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tool_id = str(block.get("id") or "")
+                name = str(block.get("name") or "")
+                if tool_id and name:
+                    tool_names_by_id[tool_id] = name
+        elif message.get("role") == "user":
+            for block in _message_content_blocks(message):
+                if not isinstance(block, dict):
+                    continue
+                if block.get("type") == "tool_result":
+                    tool_use_id = str(block.get("tool_use_id") or "")
+                    tool_name = tool_names_by_id.get(tool_use_id)
+                    if tool_name == "EnterPlanMode":
+                        active = True
+                    elif tool_name == "ExitPlanMode":
+                        active = False
+                elif block.get("type") in {"plan_mode", "plan_mode_reentry"}:
+                    active = True
+                elif block.get("type") == "plan_mode_exit":
+                    active = False
+    return active
+
+
+def has_plan_mode_exit(body: dict[str, Any]) -> bool:
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        attachment = message.get("attachment")
+        if isinstance(attachment, dict) and attachment.get("type") == "plan_mode_exit":
+            return True
+        if message.get("role") != "assistant":
+            continue
+        for block in _message_content_blocks(message):
+            if isinstance(block, dict) and block.get("type") == "tool_use" and block.get("name") == "ExitPlanMode":
+                return True
+    return False
+
+
+def plan_mode_tool_name_for_emit(body: dict[str, Any], name: str, tool_input: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+    if name != "EnterPlanMode" or not plan_mode_active(body):
+        return name, tool_input
+    router_log("WARN", "dropped repeated EnterPlanMode while plan mode is active")
+    return None, tool_input
+
+
 def latest_user_text(body: dict[str, Any]) -> str:
     for message in reversed(body.get("messages") or []):
         if not isinstance(message, dict) or message.get("role") != "user":
             continue
-        return anthropic_content_to_text(message.get("content"))
+        if message.get("isMeta") is True:
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            if content.startswith("Stop hook feedback:"):
+                continue
+            return content
+        if not isinstance(content, list):
+            # Claude Code can inject user-role attachment records such as
+            # plan_mode_exit. They are state metadata, not new user intent.
+            continue
+        # Claude Code sends tool_result blocks as user-role messages. Those are
+        # not new user intent; treating them as prompts can repeatedly trigger
+        # synthetic self-tools such as EnterPlanMode.
+        text_blocks = [
+            block for block in content
+            if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
+        ]
+        text = anthropic_content_to_text(text_blocks)
+        if not text or text.startswith("Stop hook feedback:"):
+            continue
+        return text
     return ""
 
 
@@ -1269,9 +1558,133 @@ def should_auto_enter_plan_mode(body: dict[str, Any], response_text: str, tool_c
         return False
     if not has_tool(body, "EnterPlanMode"):
         return False
+    if plan_mode_active(body):
+        return False
+    if has_plan_mode_exit(body):
+        return False
     if not non_actionable_short_response(response_text):
         return False
     return likely_implementation_planning_request(latest_user_text(body))
+
+
+WORK_CONTINUATION_RESULT_TOOLS: frozenset[str] = frozenset(
+    {
+        "Bash",
+        "Glob",
+        "Grep",
+        "LS",
+        "Read",
+        "Write",
+        "Edit",
+        "MultiEdit",
+        "TaskCreate",
+        "TaskList",
+        "TaskUpdate",
+        "TaskStop",
+    }
+)
+
+
+def latest_user_tool_result_names(body: dict[str, Any]) -> list[str]:
+    tool_names_by_id: dict[str, str] = {}
+    latest: list[str] = []
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if message.get("role") == "assistant" and isinstance(content, list):
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tool_id = str(block.get("id") or "")
+                name = str(block.get("name") or "")
+                if tool_id and name:
+                    tool_names_by_id[tool_id] = name
+        elif message.get("role") == "user" and isinstance(content, list):
+            current: list[str] = []
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = str(block.get("tool_use_id") or "")
+                if tool_use_id:
+                    current.append(tool_names_by_id.get(tool_use_id, "tool"))
+            if current:
+                latest = current
+    return latest
+
+
+def latest_user_tool_result_text(body: dict[str, Any]) -> str:
+    latest = ""
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") != "user" or not isinstance(message.get("content"), list):
+            continue
+        parts: list[str] = []
+        for block in message.get("content") or []:
+            if not isinstance(block, dict) or block.get("type") != "tool_result":
+                continue
+            parts.append(anthropic_content_to_text(block.get("content", "")))
+        if parts:
+            latest = "\n".join(part for part in parts if part)
+    return latest
+
+
+def recent_synthetic_tasklist_count(body: dict[str, Any]) -> int:
+    count = 0
+    for message in reversed(body.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user" and isinstance(message.get("content"), str):
+            break
+        content = message.get("content")
+        if message.get("role") != "assistant" or not isinstance(content, list):
+            continue
+        found_keepalive = False
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            if block.get("name") == "TaskList" and str(block.get("id") or "").startswith("toolu_ollama_keepalive_"):
+                found_keepalive = True
+        if found_keepalive:
+            count += 1
+    return count
+
+
+def latest_assistant_text(body: dict[str, Any]) -> str:
+    for message in reversed(body.get("messages") or []):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        return anthropic_content_to_text(message.get("content"))
+    return ""
+
+
+def short_resume_prompt(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return False
+    if len(normalized) > 32:
+        return False
+    # Language-agnostic: a very short imperative with no question or code-like
+    # syntax after an unfinished assistant turn is a request to proceed.
+    return not re.search(r"[?？`{};/\\\\]|https?://", normalized)
+
+
+def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
+    if tool_calls:
+        return False
+    if not has_tool(body, "TaskList"):
+        return False
+    latest_names = latest_user_tool_result_names(body)
+    if not latest_names:
+        return False
+    if latest_names == ["TaskList"] and "No tasks found" in latest_user_tool_result_text(body):
+        return False
+    if "TaskList" in latest_names and recent_synthetic_tasklist_count(body) >= 2:
+        return False
+    if not any(name in WORK_CONTINUATION_RESULT_TOOLS for name in latest_names):
+        return False
+    return non_actionable_short_response(response_text)
 
 
 def maybe_handle_plan_mode_tool_choice(handler: BaseHTTPRequestHandler, provider: str, body: dict[str, Any]) -> bool:
@@ -1287,8 +1700,14 @@ def maybe_handle_plan_mode_tool_choice(handler: BaseHTTPRequestHandler, provider
     available = tool_names_in_body(body)
     if available and name not in available:
         return False
-    router_log("INFO", f"synthesized {name} tool_use for {provider} forced tool_choice")
-    write_json(handler, synthetic_tool_use_response(str(body.get("model") or ""), name))
+    emit_name = name
+    tool_input: dict[str, Any] = {}
+    if plan_mode_active(body):
+        router_log("WARN", f"ignored forced {name} tool_choice because plan mode is already active")
+        return False
+    else:
+        router_log("INFO", f"synthesized {name} tool_use for {provider} forced tool_choice")
+    write_json(handler, synthetic_tool_use_response(str(body.get("model") or ""), emit_name, tool_input))
     return True
 
 
@@ -1511,6 +1930,155 @@ def post_json(url: str, body: Any, headers: dict[str, str] | None = None, timeou
     req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
+
+
+def router_rate_limit_configured_rpm(provider: str, pcfg: dict[str, Any]) -> int | None:
+    raw = pcfg.get("rate_limit_rpm")
+    if raw is None and provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+        raw = 40
+    if raw is None:
+        return None
+    if isinstance(raw, str) and raw.strip().lower() in ("0", "false", "off", "disable", "disabled", "none", "unset"):
+        return 0
+    try:
+        if int(raw) == 0:
+            return 0
+    except Exception:
+        pass
+    rpm = positive_int(raw)
+    return rpm if rpm and rpm > 0 else None
+
+
+def router_rate_limit_rpm(provider: str, pcfg: dict[str, Any]) -> int | None:
+    rpm = router_rate_limit_configured_rpm(provider, pcfg)
+    return rpm if rpm and rpm > 0 else None
+
+
+def router_rate_limit_usage(provider: str, pcfg: dict[str, Any], model: str | None = None) -> tuple[int, int | None]:
+    rpm = router_rate_limit_configured_rpm(provider, pcfg)
+    if rpm is None:
+        return 0, None
+    key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+    now = time.time()
+    try:
+        state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
+        entry = state.get(key) if isinstance(state, dict) else None
+        timestamps = entry.get("timestamps") if isinstance(entry, dict) else ([float(entry)] if isinstance(entry, (int, float)) else [])
+    except Exception:
+        timestamps = []
+    used = len([ts for ts in (timestamps or []) if isinstance(ts, (int, float)) and now - float(ts) < 60.0])
+    return used, rpm
+
+
+def record_router_rate_usage(provider: str, pcfg: dict[str, Any], model: str | None, rpm: int | None) -> tuple[int, int | None]:
+    if rpm is None:
+        return 0, None
+    key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+    window = 60.0
+    with _RATE_LIMIT_LOCK:
+        try:
+            state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
+            if not isinstance(state, dict):
+                state = {}
+        except Exception:
+            state = {}
+        now = time.time()
+        entry = state.get(key)
+        timestamps = entry.get("timestamps") if isinstance(entry, dict) else ([float(entry)] if isinstance(entry, (int, float)) else [])
+        recent = sorted(
+            float(ts) for ts in (timestamps or [])
+            if isinstance(ts, (int, float)) and now - float(ts) < window
+        )
+        recent.append(now)
+        keep = max(int(rpm or 0), 240)
+        state[key] = {"timestamps": recent[-keep:], "rpm": int(rpm or 0), "updated_at": now, "last_wait": 0.0}
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
+        return len(recent), rpm
+
+
+def apply_router_rate_limit(provider: str, pcfg: dict[str, Any], model: str | None = None) -> tuple[float, int, int | None]:
+    rpm = router_rate_limit_configured_rpm(provider, pcfg)
+    if rpm is None:
+        return 0.0, 0, None
+    if rpm <= 0:
+        used, limit = record_router_rate_usage(provider, pcfg, model, rpm)
+        return 0.0, used, limit
+    window = 60.0
+    base_interval = window / float(rpm)
+    key = f"{provider}:{model or current_upstream_model_id(provider, pcfg)}"
+    waited = 0.0
+    while True:
+        with _RATE_LIMIT_LOCK:
+            try:
+                state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
+                if not isinstance(state, dict):
+                    state = {}
+            except Exception:
+                state = {}
+            now = time.time()
+            entry = state.get(key)
+            if isinstance(entry, dict):
+                timestamps = entry.get("timestamps")
+            elif isinstance(entry, (int, float)):
+                timestamps = [float(entry)]
+            else:
+                timestamps = []
+            recent = sorted(
+                float(ts) for ts in (timestamps or [])
+                if isinstance(ts, (int, float)) and now - float(ts) < window
+            )
+            used = len(recent)
+            usage_ratio = min(1.0, used / float(rpm))
+            wait = 0.0
+            if used >= rpm and recent:
+                wait = max(0.0, recent[0] + window - now)
+            elif recent:
+                elapsed_since_last = max(0.0, now - recent[-1])
+                wait = max(0.0, base_interval - elapsed_since_last)
+                if usage_ratio >= 0.70:
+                    pressure = (usage_ratio - 0.70) / 0.30
+                    target_interval = base_interval * (1.0 + max(0.0, min(1.0, pressure)) * 3.0)
+                    wait = max(wait, target_interval - elapsed_since_last)
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            if wait <= 0.001:
+                recent.append(now)
+                state[key] = {"timestamps": recent[-rpm:], "rpm": rpm, "updated_at": now, "last_wait": waited}
+                RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
+                return waited, len(recent), rpm
+            if used < rpm:
+                scheduled = now + wait
+                recent.append(scheduled)
+                state[key] = {"timestamps": recent[-rpm:], "rpm": rpm, "updated_at": scheduled, "last_wait": wait}
+                RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
+                router_log("INFO", f"rate_limit_soft_wait provider={provider} model={model or ''} rpm={rpm} wait={wait:.2f}s")
+                time.sleep(wait)
+                return waited + wait, len(recent), rpm
+        sleep_for = min(wait, 10.0)
+        router_log("INFO", f"rate_limit_wait provider={provider} model={model or ''} rpm={rpm} wait={wait:.2f}s waited={waited:.2f}s")
+        time.sleep(sleep_for)
+        waited += sleep_for
+
+
+RATE_LIMIT_NOTICE_PALETTE = (203, 209, 215, 221, 229, 187, 151, 116, 111, 147, 183, 219)
+
+
+def colorize_status_text(text: str) -> str:
+    if os.environ.get("CLAUDE_ANY_RATE_LIMIT_ANSI", "1").lower() in ("0", "false", "no"):
+        return text
+    parts: list[str] = []
+    phase = int(time.monotonic() * 8)
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            parts.append(ch)
+            continue
+        color = RATE_LIMIT_NOTICE_PALETTE[(phase + i) % len(RATE_LIMIT_NOTICE_PALETTE)]
+        parts.append(f"\033[1;38;5;{color}m{ch}\033[0m")
+    return "".join(parts)
+
+
+def rate_limit_notice(waited: float, used: int = 0, rpm: int | None = None, show_status: bool = False) -> str:
+    return ""
 
 
 def is_url_up(url: str) -> bool:
@@ -1791,7 +2359,11 @@ def nim_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
 
 
 def nvidia_hosted_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
-    return provider == "nvidia-hosted" and bool(pcfg.get("native_compat", False))
+    # NVIDIA's self-hosted NIM server exposes Anthropic-compatible /v1/messages.
+    # The hosted API Catalog endpoint at integrate.api.nvidia.com currently
+    # exposes OpenAI-compatible /v1/chat/completions instead, so keep it on the
+    # claude-any router conversion path even if an old config has native=true.
+    return False
 
 
 def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
@@ -1848,8 +2420,6 @@ def list_model_objects(provider: str, pcfg: dict[str, Any]) -> list[dict[str, An
 
 
 def provider_upstream_request_base(provider: str, pcfg: dict[str, Any]) -> str:
-    if provider == "nvidia-hosted":
-        return nvidia_proxy_base_url()
     return pcfg.get("base_url", "").rstrip("/")
 
 
@@ -2177,6 +2747,57 @@ def anthropic_content_to_text(content: Any) -> str:
     return "\n".join(part for part in parts if part)
 
 
+PROMPT_TOOL_INPUT_FIELD_LIMIT = 1200
+PROMPT_TOOL_RESULT_LIMIT = 12000
+PROMPT_MESSAGE_TEXT_LIMIT = 20000
+
+
+def truncate_for_prompt(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    omitted = len(text) - limit
+    return text[:limit] + f"\n...[truncated {omitted} chars]..."
+
+
+def compact_tool_value_for_prompt(value: Any, limit: int = PROMPT_TOOL_INPUT_FIELD_LIMIT) -> Any:
+    if isinstance(value, str):
+        return truncate_for_prompt(value, limit)
+    if isinstance(value, list):
+        return [compact_tool_value_for_prompt(item, limit) for item in value[:20]]
+    if isinstance(value, dict):
+        compact: dict[str, Any] = {}
+        for key, item in value.items():
+            if key in {"content", "old_string", "new_string", "command"} and isinstance(item, str):
+                compact[key] = truncate_for_prompt(item, limit)
+            else:
+                compact[key] = compact_tool_value_for_prompt(item, limit)
+        return compact
+    return value
+
+
+def tool_input_for_prompt(tool_input: Any) -> str:
+    if not tool_input:
+        return "{}"
+    compact = compact_tool_value_for_prompt(tool_input)
+    return json.dumps(compact, ensure_ascii=False, sort_keys=True)
+
+
+def compact_message_text_for_prompt(text: str) -> str:
+    return truncate_for_prompt(text, PROMPT_MESSAGE_TEXT_LIMIT)
+
+
+def is_advisor_request(body: dict[str, Any]) -> bool:
+    return "CLAUDE_ANY_ADVISOR_CALL" in latest_user_text(body)
+
+
+def advisor_focus_from_body(body: dict[str, Any]) -> str:
+    text = latest_user_text(body)
+    marker = "CLAUDE_ANY_ADVISOR_CALL"
+    if marker not in text:
+        return ""
+    return text.split(marker, 1)[1].strip()
+
+
 def anthropic_system_to_ollama_messages(system: Any) -> list[dict[str, Any]]:
     if not system:
         return []
@@ -2199,6 +2820,19 @@ def ollama_claude_code_reminder() -> dict[str, str]:
     }
 
 
+def should_skip_upstream_message(message: dict[str, Any]) -> bool:
+    role = message.get("role")
+    content = message.get("content", "")
+    if role == "user" and message.get("isMeta") is True:
+        return True
+    text = anthropic_content_to_text(content).strip()
+    if role == "user" and text.startswith("Stop hook feedback:"):
+        return True
+    if role == "assistant" and text == "No response requested.":
+        return True
+    return False
+
+
 def anthropic_messages_to_ollama(body: dict[str, Any]) -> list[dict[str, Any]]:
     messages = anthropic_system_to_ollama_messages(body.get("system"))
     messages.append(ollama_claude_code_reminder())
@@ -2206,6 +2840,8 @@ def anthropic_messages_to_ollama(body: dict[str, Any]) -> list[dict[str, Any]]:
     tool_inputs_by_id: dict[str, Any] = {}
     for message in body.get("messages", []) or []:
         if not isinstance(message, dict):
+            continue
+        if should_skip_upstream_message(message):
             continue
         role = message.get("role", "user")
         content = message.get("content", "")
@@ -2220,13 +2856,13 @@ def anthropic_messages_to_ollama(body: dict[str, Any]) -> list[dict[str, Any]]:
                     text_blocks.append(block)
             text = anthropic_content_to_text(text_blocks)
             if text:
-                messages.append({"role": "user", "content": text})
+                messages.append({"role": "user", "content": compact_message_text_for_prompt(text)})
             for block in tool_blocks:
                 tool_use_id = str(block.get("tool_use_id") or "")
                 tool_name = tool_names_by_id.get(tool_use_id, "tool")
                 tool_input = tool_inputs_by_id.get(tool_use_id)
-                tool_input_text = json.dumps(tool_input, ensure_ascii=False, sort_keys=True) if tool_input else "{}"
-                result_text = anthropic_content_to_text(block.get("content", ""))
+                tool_input_text = tool_input_for_prompt(tool_input)
+                result_text = truncate_for_prompt(anthropic_content_to_text(block.get("content", "")), PROMPT_TOOL_RESULT_LIMIT)
                 if not block.get("is_error"):
                     tool_text = (
                         f"Tool `{tool_name}` completed successfully.\n"
@@ -2237,10 +2873,17 @@ def anthropic_messages_to_ollama(body: dict[str, Any]) -> list[dict[str, Any]]:
                     )
                     tool_summary = (
                         f"The `{tool_name}` tool call above already completed successfully. "
-                        f"Its input was {tool_input_text}. Its result was:\n{result_text}\n\n"
-                        f"Treat this as authoritative tool output. Do not repeat the same or equivalent "
-                        f"`{tool_name}` call; continue with the next required step or final answer."
+                        f"Treat its tool output as authoritative. Do not repeat the same or equivalent "
+                        f"`{tool_name}` call; continue with the next required concrete tool call or final answer."
                     )
+                    if tool_name == "TaskList":
+                        tool_summary = (
+                            f"The task list is current:\n{result_text}\n\n"
+                            "If any task is in_progress and the user's request is not finished, your next response "
+                            "must call a concrete work tool such as Write, Edit, Read, or Bash. Do not respond with "
+                            "another progress announcement like 'I will write the files now'. If everything is "
+                            "actually complete, provide the final answer."
+                        )
                 else:
                     tool_text = (
                         f"Tool `{tool_name}` failed.\n"
@@ -2256,7 +2899,7 @@ def anthropic_messages_to_ollama(body: dict[str, Any]) -> list[dict[str, Any]]:
             continue
 
         text = anthropic_content_to_text(content)
-        out: dict[str, Any] = {"role": role, "content": text}
+        out: dict[str, Any] = {"role": role, "content": compact_message_text_for_prompt(text)}
         if role == "assistant" and isinstance(content, list):
             calls = []
             for block in content:
@@ -2291,6 +2934,74 @@ def anthropic_tools_to_ollama(tools: Any) -> list[dict[str, Any]]:
             }
         )
     return out
+
+
+def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
+    messages = anthropic_system_to_ollama_messages(body.get("system"))
+    messages.append(ollama_claude_code_reminder())
+    for message in body.get("messages", []) or []:
+        if not isinstance(message, dict):
+            continue
+        if should_skip_upstream_message(message):
+            continue
+        role = message.get("role", "user")
+        content = message.get("content", "")
+        if role == "assistant" and isinstance(content, list):
+            text_blocks: list[Any] = []
+            tool_calls: list[dict[str, Any]] = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_id = str(block.get("id") or f"call_{len(tool_calls) + 1}")
+                    name = str(block.get("name") or "tool")
+                    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    tool_calls.append({
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(tool_input, ensure_ascii=False),
+                        },
+                    })
+                else:
+                    text_blocks.append(block)
+            out: dict[str, Any] = {"role": "assistant", "content": compact_message_text_for_prompt(anthropic_content_to_text(text_blocks))}
+            if tool_calls:
+                out["tool_calls"] = tool_calls
+            messages.append(out)
+            continue
+        if role == "user" and isinstance(content, list):
+            text_blocks = []
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool_id = str(block.get("tool_use_id") or "call_tool")
+                    result_text = truncate_for_prompt(anthropic_content_to_text(block.get("content", "")), PROMPT_TOOL_RESULT_LIMIT)
+                    messages.append({
+                        "role": "tool",
+                        "tool_call_id": tool_id,
+                        "id": tool_id,
+                        "content": result_text,
+                    })
+                else:
+                    text_blocks.append(block)
+            text = anthropic_content_to_text(text_blocks)
+            if text:
+                messages.append({"role": "user", "content": compact_message_text_for_prompt(text)})
+            continue
+        messages.append({"role": role, "content": compact_message_text_for_prompt(anthropic_content_to_text(content))})
+    return messages
+
+
+def anthropic_tool_choice_to_openai(tool_choice: Any) -> Any:
+    if not isinstance(tool_choice, dict):
+        return tool_choice
+    choice_type = tool_choice.get("type")
+    if choice_type == "tool" and tool_choice.get("name"):
+        return {"type": "function", "function": {"name": str(tool_choice["name"])}}
+    if choice_type == "any":
+        return "required"
+    if choice_type == "auto":
+        return "auto"
+    return tool_choice
 
 
 def positive_int(value: Any) -> int | None:
@@ -2441,6 +3152,75 @@ def cap_output_tokens_for_context(
     return max(1, min(configured, available))
 
 
+def ollama_context_limit_for_budget(pcfg: dict[str, Any]) -> int:
+    raw = pcfg.get("num_ctx", "auto")
+    if isinstance(raw, str) and raw.strip().lower() == "auto":
+        return positive_int(pcfg.get("num_ctx_max")) or 65536
+    return positive_int(raw) or positive_int(pcfg.get("num_ctx_max")) or 65536
+
+
+def compact_ollama_messages_for_budget(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    budget_tokens: int,
+) -> list[dict[str, Any]]:
+    if not messages:
+        return messages
+    budget_tokens = max(8192, budget_tokens)
+    payload = {"messages": messages, "tools": tools}
+    initial_tokens = estimate_tokens(payload)
+    if initial_tokens <= budget_tokens:
+        return messages
+
+    system_messages = [m for m in messages if m.get("role") == "system"]
+    non_system = [m for m in messages if m.get("role") != "system"]
+    first_user: dict[str, Any] | None = next((m for m in non_system if m.get("role") == "user"), None)
+
+    preserved_tail: list[dict[str, Any]] = []
+    omitted = 0
+    omitted_tokens = 0
+    summary: dict[str, Any] = {
+        "role": "user",
+        "content": (
+            "[claude-any context guard: older conversation messages were omitted because the provider context "
+            "budget would be exceeded. Large file contents and prior Write/Edit inputs were truncated. "
+            "Use Read on specific files if exact old content is needed.]"
+        ),
+    }
+
+    fixed_prefix = list(system_messages)
+    if first_user is not None:
+        fixed_prefix.append(first_user)
+    fixed_prefix.append(summary)
+
+    for msg in reversed(non_system):
+        if first_user is not None and msg is first_user:
+            continue
+        candidate = fixed_prefix + list(reversed(preserved_tail + [msg]))
+        if estimate_tokens({"messages": candidate, "tools": tools}) <= budget_tokens:
+            preserved_tail.append(msg)
+        else:
+            omitted += 1
+            omitted_tokens += estimate_tokens(msg)
+
+    if first_user is None:
+        fixed_prefix = list(system_messages)
+        fixed_prefix.append(summary)
+
+    summary["content"] = (
+        f"[claude-any context guard: omitted {omitted} older messages, approx {omitted_tokens} tokens, "
+        f"because the provider context budget is {budget_tokens} tokens. Large file contents and prior "
+        "Write/Edit inputs were truncated. Continue from the current task list and recent tool results; "
+        "use Read on specific files if exact old content is needed.]"
+    )
+    compacted = fixed_prefix + list(reversed(preserved_tail))
+    router_log(
+        "WARN",
+        f"compacted ollama payload messages {len(messages)}->{len(compacted)} tokens {initial_tokens}->{estimate_tokens({'messages': compacted, 'tools': tools})} budget={budget_tokens}",
+    )
+    return compacted
+
+
 def provider_request_timeout_seconds(pcfg: dict[str, Any]) -> float:
     return ollama_request_timeout_seconds(pcfg)
 
@@ -2474,6 +3254,12 @@ def apply_provider_request_options(provider: str, pcfg: dict[str, Any], body: di
 def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], stream: bool = True) -> dict[str, Any]:
     messages = anthropic_messages_to_ollama(body)
     tools = anthropic_tools_to_ollama(body.get("tools"))
+    context_limit = ollama_context_limit_for_budget(pcfg)
+    configured = configured_output_tokens(pcfg, body, "num_predict")
+    reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
+    output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
+    input_budget = max(8192, context_limit - output_reserve - reserve)
+    messages = compact_ollama_messages_for_budget(messages, tools, input_budget)
     req: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -2493,7 +3279,7 @@ def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], 
         body,
         payload_for_est,
         num_ctx,
-        configured_output_tokens(pcfg, body, "num_predict"),
+        configured,
         _token_cache=token_cache,
     )
     if num_predict:
@@ -2503,6 +3289,245 @@ def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], 
     if options:
         req["options"] = options
     return req
+
+
+def openai_compatible_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], stream: bool = False) -> dict[str, Any]:
+    messages = anthropic_messages_to_openai(body)
+    tools = anthropic_tools_to_ollama(body.get("tools"))
+    context_limit = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len")) or 65536
+    configured = configured_output_tokens(pcfg, body)
+    reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
+    output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
+    messages = compact_ollama_messages_for_budget(messages, tools, max(8192, context_limit - output_reserve - reserve))
+    req: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    }
+    if tools:
+        req["tools"] = tools
+    if body.get("tool_choice") is not None:
+        req["tool_choice"] = anthropic_tool_choice_to_openai(body.get("tool_choice"))
+    max_tokens = configured_output_tokens(pcfg, body)
+    if max_tokens:
+        req["max_tokens"] = max_tokens
+    for key in ("temperature", "top_p"):
+        if pcfg.get(key) is not None:
+            req[key] = pcfg[key]
+    return req
+
+
+def advisor_ollama_request(model: str, body: dict[str, Any], pcfg: dict[str, Any]) -> dict[str, Any]:
+    messages = anthropic_messages_to_ollama(body)
+    focus = advisor_focus_from_body(body)
+    messages.append({
+        "role": "system",
+        "content": (
+            "You are claude-any Advisor, a stronger reviewer model. Review the current task state and provide "
+            "concise, actionable guidance for the executor model. Do not write code unless a small exact patch is "
+            "the clearest advice. Include: Current blocker, Next concrete action, Validation step. "
+            "If the executor is stuck after progress announcements, tell it the exact next Claude Code tool to call."
+        ),
+    })
+    if focus:
+        messages.append({"role": "user", "content": f"Advisor focus:\n{compact_message_text_for_prompt(focus)}"})
+    context_limit = ollama_context_limit_for_budget(pcfg)
+    input_budget = max(8192, context_limit - 4096 - (positive_int(pcfg.get("context_reserve_tokens")) or 1024))
+    messages = compact_ollama_messages_for_budget(messages, [], input_budget)
+    req: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "think": bool(pcfg.get("think", False)),
+    }
+    options = ollama_extra_options(pcfg)
+    options.setdefault("num_predict", min(4096, positive_int(options.get("num_predict")) or 4096))
+    num_ctx = ollama_num_ctx_for_payload(pcfg, {"messages": messages, "tools": []})
+    if num_ctx:
+        options.setdefault("num_ctx", num_ctx)
+    if options:
+        req["options"] = options
+    return req
+
+
+def anthropic_text_response(model: str, text: str, stop_reason: str = "end_turn") -> dict[str, Any]:
+    return {
+        "id": f"msg_ollama_advisor_{int(time.time() * 1000)}",
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": text}],
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": max(1, len(text) // 4)},
+    }
+
+
+def write_anthropic_text_response(handler: BaseHTTPRequestHandler, model: str, text: str, stream: bool) -> None:
+    if not stream:
+        write_json(handler, anthropic_text_response(model, text))
+        return
+    handler.send_response(200)
+    handler.send_header("content-type", "text/event-stream")
+    handler.send_header("cache-control", "no-cache")
+    handler.send_header("connection", "close")
+    handler.end_headers()
+    msg_id = f"msg_ollama_advisor_{int(time.time() * 1000)}"
+    events = [
+        ("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            },
+        }),
+        ("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}),
+        ("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": text}}),
+        ("content_block_stop", {"type": "content_block_stop", "index": 0}),
+        ("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": max(1, len(text) // 4)}}),
+        ("message_stop", {"type": "message_stop"}),
+    ]
+    for event_name, payload in events:
+        handler.wfile.write(f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+    handler.wfile.flush()
+
+
+def write_anthropic_message_response(handler: BaseHTTPRequestHandler, message: dict[str, Any], stream: bool) -> None:
+    if not stream:
+        write_json(handler, message)
+        return
+    handler.send_response(200)
+    handler.send_header("content-type", "text/event-stream")
+    handler.send_header("cache-control", "no-cache")
+    handler.send_header("connection", "close")
+    handler.end_headers()
+    handler.wfile.write(f"event: message_start\ndata: {json.dumps({'type': 'message_start', 'message': {**message, 'content': [], 'stop_reason': None}}, ensure_ascii=False)}\n\n".encode())
+    for index, block in enumerate(message.get("content") or []):
+        btype = block.get("type")
+        if btype == "text":
+            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': index, 'content_block': {'type': 'text', 'text': ''}}, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'text_delta', 'text': block.get('text', '')}}, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
+        elif btype == "tool_use":
+            tool_input = block.get("input") or {}
+            start = {"type": "content_block_start", "index": index, "content_block": {**block, "input": {}}}
+            delta = {"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_input, ensure_ascii=False)}}
+            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(start, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
+    handler.wfile.write(f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': message.get('stop_reason') or 'end_turn', 'stop_sequence': None}, 'usage': message.get('usage') or {'output_tokens': 1}}, ensure_ascii=False)}\n\n".encode())
+    handler.wfile.write(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+    handler.wfile.flush()
+
+
+def _write_anthropic_stream_block(handler: BaseHTTPRequestHandler, index: int, block: dict[str, Any]) -> None:
+    btype = block.get("type")
+    if btype == "text":
+        handler.wfile.write(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': index, 'content_block': {'type': 'text', 'text': ''}}, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'text_delta', 'text': block.get('text', '')}}, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
+    elif btype == "tool_use":
+        tool_input = block.get("input") or {}
+        start = {"type": "content_block_start", "index": index, "content_block": {**block, "input": {}}}
+        delta = {"type": "content_block_delta", "index": index, "delta": {"type": "input_json_delta", "partial_json": json.dumps(tool_input, ensure_ascii=False)}}
+        handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(start, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
+
+
+def write_anthropic_open_stream_start(handler: BaseHTTPRequestHandler, model: str) -> None:
+    handler.send_response(200)
+    handler.send_header("content-type", "text/event-stream")
+    handler.send_header("cache-control", "no-cache")
+    handler.send_header("connection", "close")
+    handler.end_headers()
+    msg_id = f"msg_claude_any_{int(time.time() * 1000)}"
+    payload = {
+        "type": "message_start",
+        "message": {
+            "id": msg_id,
+            "type": "message",
+            "role": "assistant",
+            "content": [],
+            "model": model,
+            "stop_reason": None,
+            "stop_sequence": None,
+            "usage": {"input_tokens": 0, "output_tokens": 0},
+        },
+    }
+    handler.wfile.write(f"event: message_start\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+    handler.wfile.flush()
+
+
+def write_anthropic_stream_blocks(handler: BaseHTTPRequestHandler, blocks: list[dict[str, Any]], start_index: int = 0) -> int:
+    index = start_index
+    for block in blocks:
+        _write_anthropic_stream_block(handler, index, block)
+        index += 1
+    handler.wfile.flush()
+    return index
+
+
+def write_anthropic_open_stream_stop(handler: BaseHTTPRequestHandler, message: dict[str, Any] | None = None) -> None:
+    message = message or {}
+    stop_reason = message.get("stop_reason") or "end_turn"
+    usage = message.get("usage") or {"output_tokens": 1}
+    handler.wfile.write(f"event: message_delta\ndata: {json.dumps({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None}, 'usage': usage}, ensure_ascii=False)}\n\n".encode())
+    handler.wfile.write(b"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+    handler.wfile.flush()
+
+
+def prepend_anthropic_text(message: dict[str, Any], text: str) -> dict[str, Any]:
+    if not text:
+        return message
+    out = dict(message)
+    content = out.get("content")
+    blocks = list(content) if isinstance(content, list) else []
+    blocks.insert(0, {"type": "text", "text": text})
+    out["content"] = blocks
+    return out
+
+
+def maybe_handle_advisor_request(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> bool:
+    if not is_advisor_request(body):
+        return False
+    advisor_model = str(pcfg.get("advisor_model") or "").strip()
+    stream = bool(body.get("stream", True))
+    if not advisor_model:
+        write_anthropic_text_response(
+            handler,
+            str(body.get("model") or current_alias(load_config())),
+            "Advisor is off. Choose an Advisor Model in the claude-any launch menu, or run `claude-anyctl advisor-model deepseek-v4-pro`, then use `/advisor` again.",
+            stream,
+        )
+        return True
+    if provider not in ("ollama", "ollama-cloud"):
+        write_anthropic_text_response(
+            handler,
+            advisor_model,
+            f"Advisor Model is configured as `{advisor_model}`, but claude-any advisor calling is currently implemented for ollama/ollama-cloud providers. Current provider: `{provider}`.",
+            stream,
+        )
+        return True
+    base = pcfg.get("base_url", "").rstrip("/")
+    req_body = advisor_ollama_request(advisor_model, body, pcfg, )
+    headers = provider_headers(provider, pcfg)
+    try:
+        data = post_json(join_url(base, "/api/chat"), req_body, headers=headers, timeout=ollama_request_timeout_seconds(pcfg))
+        message = data.get("message") if isinstance(data, dict) else {}
+        text = str((message or {}).get("content") or "").strip()
+        if not text:
+            text = "Advisor returned no text."
+    except Exception as exc:
+        text = f"Advisor request failed: {type(exc).__name__}: {exc}"
+    write_anthropic_text_response(handler, advisor_model, "Advisor guidance:\n\n" + text, stream)
+    return True
 
 
 def normalize_tool_arguments(tool_name: str, args: Any) -> dict[str, Any]:
@@ -2539,6 +3564,10 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
         raw_args = fn.get("arguments")
         normalized_args = normalize_tool_arguments(matched_name, raw_args)
         fixed_input = _validate_and_fix_tool_input(matched_name, normalized_args)
+        if source_body is not None:
+            matched_name, fixed_input = plan_mode_tool_name_for_emit(source_body, matched_name, fixed_input)
+            if matched_name is None:
+                continue
         append_tool_call_log(
             "ollama_nonstream_tool_call",
             {
@@ -2561,6 +3590,16 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
     if source_body is not None and should_auto_enter_plan_mode(source_body, text, message.get("tool_calls") or []):
         router_log("WARN", "auto-synthesized EnterPlanMode from short/empty upstream response")
         return synthetic_tool_use_response(model, "EnterPlanMode")
+    if source_body is not None and should_keep_work_alive_with_tasklist(source_body, text, message.get("tool_calls") or []):
+        router_log("WARN", "auto-synthesized TaskList to keep work moving after tool result")
+        content.append(
+            {
+                "type": "tool_use",
+                "id": f"{tool_id_prefix}_keepalive",
+                "name": "TaskList",
+                "input": {},
+            }
+        )
     done_reason = data.get("done_reason")
     stop_reason = "tool_use" if any(block.get("type") == "tool_use" for block in content) else "end_turn"
     if done_reason == "length":
@@ -2724,6 +3763,27 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
     input_tokens = 0
     output_tokens = 0
     chunk: dict[str, Any] = {}
+    def ensure_message_started() -> None:
+        nonlocal started
+        if started:
+            return
+        started = True
+        event = {
+            "type": "message_start",
+            "message": {
+                "id": msg_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": model,
+                "stop_reason": None,
+                "stop_sequence": None,
+                "usage": {"input_tokens": input_tokens, "output_tokens": 0},
+            },
+        }
+        handler.wfile.write(f"event: message_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.flush()
+
     try:
         for line in resp:
             line = line.decode("utf-8", errors="ignore").strip()
@@ -2739,23 +3799,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             input_tokens = max(input_tokens, int(chunk.get("prompt_eval_count") or 0))
             output_tokens = max(output_tokens, int(chunk.get("eval_count") or 0))
             if not started:
-                started = True
-                # Send message_start event
-                event = {
-                    "type": "message_start",
-                    "message": {
-                        "id": msg_id,
-                        "type": "message",
-                        "role": "assistant",
-                        "content": [],
-                        "model": model,
-                        "stop_reason": None,
-                        "stop_sequence": None,
-                        "usage": {"input_tokens": input_tokens, "output_tokens": 0},
-                    },
-                }
-                handler.wfile.write(f"event: message_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-                handler.wfile.flush()
+                ensure_message_started()
             # Handle text content
             text_chunk = message.get("content") or ""
             if text_chunk:
@@ -2799,13 +3843,17 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 fn = call.get("function") if isinstance(call.get("function"), dict) else {}
                 if not isinstance(fn, dict) or not fn.get("name"):
                     continue
-                tool_calls.append(call)
-                tool_id = f"toolu_ollama_{int(time.time() * 1000)}_{len(tool_calls) - 1}"
                 raw_name = str(fn["name"])
                 matched_name = _fuzzy_match_tool_name(raw_name) or raw_name
                 raw_args = fn.get("arguments")
                 normalized_args = normalize_tool_arguments(matched_name, raw_args)
                 fixed_input = _validate_and_fix_tool_input(matched_name, normalized_args)
+                if source_body is not None:
+                    matched_name, fixed_input = plan_mode_tool_name_for_emit(source_body, matched_name, fixed_input)
+                    if matched_name is None:
+                        continue
+                tool_calls.append({"function": {"name": matched_name, "arguments": fixed_input}})
+                tool_id = f"toolu_ollama_{int(time.time() * 1000)}_{len(tool_calls) - 1}"
                 tool_index = next_content_index
                 next_content_index += 1
                 tool_indices.append(tool_index)
@@ -2845,6 +3893,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 handler.wfile.flush()
         # Flush any remaining buffered text when word-chunking is active
         if source_body is not None and should_auto_enter_plan_mode(source_body, text_so_far, tool_calls):
+            ensure_message_started()
             router_log("WARN", "auto-synthesized EnterPlanMode from short/empty upstream stream")
             tool_calls.append({"function": {"name": "EnterPlanMode", "arguments": {}}})
             tool_id = f"toolu_ollama_plan_{int(time.time() * 1000)}"
@@ -2898,6 +3947,33 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 }
                 handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
                 handler.wfile.flush()
+        if source_body is not None and should_keep_work_alive_with_tasklist(source_body, text_so_far, tool_calls):
+            ensure_message_started()
+            router_log("WARN", "auto-synthesized TaskList to keep work moving after tool result stream")
+            tool_calls.append({"function": {"name": "TaskList", "arguments": {}}})
+            tool_id = f"toolu_ollama_keepalive_{int(time.time() * 1000)}"
+            tool_index = next_content_index
+            next_content_index += 1
+            tool_indices.append(tool_index)
+            tool_event = {
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": "TaskList",
+                    "input": {},
+                },
+            }
+            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
+            delta_event = {
+                "type": "content_block_delta",
+                "index": tool_index,
+                "delta": {"type": "input_json_delta", "partial_json": "{}"},
+            }
+            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
         # Send content_block_stop for text if any
         if text_started:
             event = {"type": "content_block_stop", "index": text_index}
@@ -2963,6 +4039,8 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     req_body = ollama_chat_request(model, body, pcfg, stream=stream_requested)
     headers = provider_headers(provider, pcfg)
     url = join_url(base, "/api/chat")
+    waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
+    rpm_status = bool(pcfg.get("rate_limit_status", True))
     if stream_requested:
         # Stream Ollama response through as Anthropic SSE
         data_bytes = json.dumps(req_body).encode("utf-8")
@@ -3013,7 +4091,8 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                     continue
             if data is None:
                 data = {"message": {"content": ""}, "done": True, "done_reason": "end_turn"}
-            write_json(handler, ollama_chat_to_anthropic(data, model, source_body=body))
+            message = prepend_anthropic_text(ollama_chat_to_anthropic(data, model, source_body=body), rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
+            write_json(handler, message)
         return
     # Non-streaming fallback
     try:
@@ -3038,7 +4117,87 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
             exc.code,
         )
         return
-    write_json(handler, ollama_chat_to_anthropic(data, model, source_body=body))
+    message = prepend_anthropic_text(ollama_chat_to_anthropic(data, model, source_body=body), rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
+    write_json(handler, message)
+
+
+def openai_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict[str, Any] | None = None) -> dict[str, Any]:
+    choice = {}
+    choices = data.get("choices")
+    if isinstance(choices, list) and choices:
+        choice = choices[0] if isinstance(choices[0], dict) else {}
+    message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+    wrapped = {
+        "message": {
+            "content": message.get("content") or "",
+            "tool_calls": message.get("tool_calls") or [],
+        },
+        "done_reason": "length" if choice.get("finish_reason") == "length" else "stop",
+    }
+    return ollama_chat_to_anthropic(wrapped, model, source_body=source_body)
+
+
+def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
+    _update_tool_schema_registry(body.get("tools"))
+    model = resolve_requested_model(provider, pcfg, body.get("model"))
+    if provider == "nvidia-hosted":
+        model = ncp_model_id_for_nvidia_hosted(model)
+    req_body = openai_compatible_chat_request(model, body, pcfg, stream=False)
+    url = join_url(provider_upstream_request_base(provider, pcfg), "/chat/completions")
+    waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
+    stream = bool(body.get("stream", True))
+    notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", True)))
+    if stream:
+        write_anthropic_open_stream_start(handler, model)
+        index = 0
+        if notice:
+            index = write_anthropic_stream_blocks(handler, [{"type": "text", "text": notice}], index)
+        try:
+            data = post_json(url, req_body, headers=provider_headers(provider, pcfg), timeout=provider_request_timeout_seconds(pcfg))
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="ignore")
+            msg = raw.strip() or str(exc)
+            try:
+                err = json.loads(raw)
+                if isinstance(err, dict):
+                    if isinstance(err.get("error"), dict):
+                        msg = str(err["error"].get("message") or err["error"])
+                    elif err.get("error"):
+                        msg = str(err["error"])
+                    elif err.get("message"):
+                        msg = str(err["message"])
+            except Exception:
+                pass
+            write_anthropic_stream_blocks(handler, [{"type": "text", "text": f"Upstream error: {msg}"}], index)
+            write_anthropic_open_stream_stop(handler)
+            return
+        message = openai_chat_to_anthropic(data, model, source_body=body)
+        write_anthropic_stream_blocks(handler, list(message.get("content") or []), index)
+        write_anthropic_open_stream_stop(handler, message)
+        return
+    try:
+        data = post_json(url, req_body, headers=provider_headers(provider, pcfg), timeout=provider_request_timeout_seconds(pcfg))
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", errors="ignore")
+        msg = raw.strip() or str(exc)
+        try:
+            err = json.loads(raw)
+            if isinstance(err, dict):
+                if isinstance(err.get("error"), dict):
+                    msg = str(err["error"].get("message") or err["error"])
+                elif err.get("error"):
+                    msg = str(err["error"])
+                elif err.get("message"):
+                    msg = str(err["message"])
+        except Exception:
+            pass
+        write_json(handler, {"type": "error", "error": {"type": "upstream_error", "message": msg}}, exc.code)
+        return
+    message = prepend_anthropic_text(
+        openai_chat_to_anthropic(data, model, source_body=body),
+        notice,
+    )
+    write_anthropic_message_response(handler, message, stream)
 
 
 class RouterHandler(BaseHTTPRequestHandler):
@@ -3095,12 +4254,15 @@ class RouterHandler(BaseHTTPRequestHandler):
         if maybe_handle_plan_mode_tool_choice(self, provider, body):
             return
         body = filter_blocked_tools(provider, pcfg, body)
+        if maybe_handle_advisor_request(self, provider, pcfg, body):
+            return
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
         try:
-            if provider == "nvidia-hosted":
-                ensure_ncp()
             if provider in ("ollama", "ollama-cloud"):
                 forward_ollama_api_chat(self, provider, pcfg, body)
+                return
+            if provider == "nvidia-hosted":
+                forward_openai_compatible_chat(self, provider, pcfg, body)
                 return
             body = cap_anthropic_body_for_provider(provider, pcfg, body)
             body = apply_provider_request_options(provider, pcfg, body)
@@ -3119,6 +4281,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             for h in ("anthropic-beta", "anthropic-dangerous-direct-browser-access"):
                 if self.headers.get(h):
                     headers[h] = self.headers[h]
+            waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, upstream_model)
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             try:
                 resp = urllib.request.urlopen(req, timeout=provider_request_timeout_seconds(pcfg))
@@ -3135,12 +4298,17 @@ class RouterHandler(BaseHTTPRequestHandler):
                     self.send_response(status)
                     self.send_header("content-type", ctype)
                     self.end_headers()
-                    while True:
-                        chunk = resp.read(65536)
-                        if not chunk:
-                            break
-                        self.wfile.write(chunk)
-                        self.wfile.flush()
+                    raw_resp = resp.read()
+                    notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", True)))
+                    if notice and "application/json" in ctype:
+                        try:
+                            payload = json.loads(raw_resp.decode("utf-8", errors="replace"))
+                            if isinstance(payload, dict):
+                                raw_resp = json.dumps(prepend_anthropic_text(payload, notice), ensure_ascii=False).encode("utf-8")
+                        except Exception:
+                            pass
+                    self.wfile.write(raw_resp)
+                    self.wfile.flush()
             except urllib.error.HTTPError as e:
                 err = e.read()
                 self.send_response(e.code)
@@ -3249,6 +4417,23 @@ def set_model_config(value: str) -> list[str]:
     if preset.get("thinking"):
         msgs.append("Note: this is a thinking model; compatibility test uses extended token budget.")
     return msgs
+
+
+def set_advisor_model_config(value: str) -> list[str]:
+    cfg = load_config()
+    provider, pcfg = get_current_provider(cfg)
+    model_id = normalize_model_id(provider, value.strip()) if value.strip() else ""
+    pcfg["advisor_model"] = model_id
+    if model_id:
+        known = read_model_list_cache(provider, pcfg) or []
+        custom = pcfg.setdefault("custom_models", [])
+        if model_id not in custom and model_id not in known:
+            custom.append(model_id)
+    save_config(cfg)
+    clear_model_cache()
+    if not model_id:
+        return [f"Advisor Model for {provider} disabled."]
+    return [f"Advisor Model for {provider} set to {model_id}."]
 
 
 def store_api_key_config(provider: str, key: str) -> list[str]:
@@ -3384,6 +4569,22 @@ def cmd_model(args: argparse.Namespace) -> None:
     for line in set_model_config(value):
         print(line)
     print("Gateway model cache cleared. Run /model to refresh if needed.")
+
+
+def cmd_advisor_model(args: argparse.Namespace) -> None:
+    if not args.value:
+        cfg = load_config()
+        provider, pcfg = get_current_provider(cfg)
+        current = pcfg.get("advisor_model") or "off"
+        print(f"Advisor Model for {provider}: {current}")
+        print("Set with: claude-anyctl advisor-model deepseek-v4-pro")
+        print("Disable with: claude-anyctl advisor-model off")
+        return
+    value = " ".join(args.value).strip()
+    if value.lower() in ("off", "unset", "disable", "disabled", "none", "null"):
+        value = ""
+    for line in set_advisor_model_config(value):
+        print(line)
 
 
 def cmd_models(args: argparse.Namespace) -> None:
@@ -3560,6 +4761,10 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
             pcfg["stream_enabled"] = True
         elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
             pcfg["stream_word_chunking"] = False
+        elif key in ("rate_limit", "rate_limit_rpm", "rpm"):
+            pcfg.pop("rate_limit_rpm", None)
+        elif key in ("rate_limit_status", "rpm_status"):
+            pcfg["rate_limit_status"] = True
         else:
             pcfg.setdefault("ollama_options", {}).pop(key, None)
         return
@@ -3616,6 +4821,18 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
     if key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
         pcfg["stream_word_chunking"] = parse_bool(value, default=False)
         return
+    if key in ("rate_limit", "rate_limit_rpm", "rpm"):
+        fixed = positive_int(value)
+        if not fixed:
+            if str(value).lower() in ("0", "false", "off", "disable", "disabled", "none", "unset"):
+                pcfg["rate_limit_rpm"] = 0
+                return
+            raise SystemExit("rate_limit_rpm must be a positive integer, or 0 to disable")
+        pcfg["rate_limit_rpm"] = fixed
+        return
+    if key in ("rate_limit_status", "rpm_status"):
+        pcfg["rate_limit_status"] = parse_bool(value, default=True)
+        return
     opts = pcfg.setdefault("ollama_options", {})
     if value is None:
         opts.pop(key, None)
@@ -3649,6 +4866,12 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print(f"keep_alive: {pcfg.get('keep_alive', 'default')}")
     print(f"think: {bool(pcfg.get('think', False))}")
     print(f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}")
+    used, limit = router_rate_limit_usage(provider, pcfg)
+    if limit is not None:
+        print(f"rate_limit_rpm: {limit}")
+        if bool(pcfg.get("rate_limit_status", True)):
+            suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min (unlimited)"
+            print(f"rpm_used: {suffix}")
     print(f"ollama_options: {ollama_options_status(pcfg)}")
     print("Examples:")
     print("  claude-anyctl ollama-options num_ctx=auto min=32768 max=131072")
@@ -3656,7 +4879,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print("  claude-any --ca-ollama-option temperature=0.7 --ca-ollama-num-ctx 65536")
 
 
-PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "nvidia-hosted", "self-hosted-nim")
+PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud")
 PROVIDER_SAMPLING_OPTION_PROVIDERS = ("vllm", "nvidia-hosted", "self-hosted-nim")
 PROVIDER_SAMPLING_OPTIONS = ("temperature", "top_p", "top_k")
 
@@ -3705,10 +4928,17 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
         f"max_output_tokens={pcfg.get('max_output_tokens', 'default')}",
         f"timeout={timeout_text}",
     ]
+    if provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+        parts.append(f"rate_limit_rpm={pcfg.get('rate_limit_rpm', 40)}")
+        if bool(pcfg.get("rate_limit_status", True)):
+            used, limit = router_rate_limit_usage(provider, pcfg)
+            if limit is not None:
+                suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unlimited)"
+                parts.append(f"rpm_used={suffix}")
     if provider in ("vllm", "self-hosted-nim"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "self-hosted-nim"):
         native_default = False if provider == "nvidia-hosted" else True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
@@ -4118,6 +5348,18 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ja": "上流応答待ちタイムアウト(ms)。1800000は30分です。",
         "zh": "上游响应等待超时（毫秒）。1800000 表示 30 分钟。",
     },
+    "rate_limit_rpm": {
+        "en": "Router-side upstream request limit per minute. NIM hosted defaults to 40 RPM; unset/0 disables waiting.",
+        "ko": "라우터가 업스트림 요청 수를 분당 제한합니다. NIM hosted 기본값은 40 RPM입니다. unset/0이면 대기하지 않습니다.",
+        "ja": "ルーター側の上流リクエスト数/分の制限。NIM hosted は既定で 40 RPM。unset/0 で待機なし。",
+        "zh": "路由器侧上游每分钟请求限制。NIM hosted 默认 40 RPM；unset/0 表示不等待。",
+    },
+    "rate_limit_status": {
+        "en": "Show optional colored RPM usage status in Claude responses.",
+        "ko": "Claude 응답에 RPM 사용량 상태를 색상 텍스트로 표시합니다.",
+        "ja": "Claude応答にRPM使用量状態を色付きテキストで表示します。",
+        "zh": "在 Claude 响应中显示彩色 RPM 使用量状态。",
+    },
     "temperature": {
         "en": "Sampling temperature (0..2). Higher is more varied; lower is more deterministic.",
         "ko": "샘플링 temperature (0~2). 높을수록 다양, 낮을수록 결정적.",
@@ -4191,6 +5433,7 @@ LLM_OPTION_TOGGLE_KEYS = {
     "stream_word_chunking",
     "native_compat",
     "think",
+    "rate_limit_status",
 }
 
 
@@ -4204,6 +5447,8 @@ def llm_option_current_bool(provider: str, pcfg: dict[str, Any], key: str) -> bo
         return bool(pcfg.get("native_compat", default))
     if key == "think":
         return bool(pcfg.get("think", False))
+    if key == "rate_limit_status":
+        return bool(pcfg.get("rate_limit_status", True))
     return bool(pcfg.get(key, False))
 
 
@@ -4231,6 +5476,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
         add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
         add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
+        add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 40))
+        add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
     else:
         if provider in ("vllm", "self-hosted-nim"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
@@ -4238,10 +5485,13 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
         if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
+            add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", "default"))
+            add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
             add("Temperature", "temperature", pcfg.get("temperature", "default"))
             add("Top P", "top_p", pcfg.get("top_p", "default"))
             add("Top K", "top_k", pcfg.get("top_k", "default"))
-            add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", False)))
+            if provider in ("vllm", "self-hosted-nim"):
+                add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", True)))
             add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
             add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
         elif provider == "anthropic":
@@ -4257,6 +5507,8 @@ def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> 
         return "true" if bool(pcfg.get("stream_enabled", True)) else "false"
     if key == "stream_word_chunking":
         return "true" if bool(pcfg.get("stream_word_chunking", False)) else "false"
+    if key == "rate_limit_status":
+        return "true" if bool(pcfg.get("rate_limit_status", True)) else "false"
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         if key == "num_ctx":
@@ -4305,7 +5557,16 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg.pop("max_output_tokens", None)
         elif key in ("timeout", "timeout_ms", "request_timeout", "request_timeout_ms"):
             pcfg.pop("request_timeout_ms", None)
+        elif key in ("rate_limit", "rate_limit_rpm", "rpm"):
+            pcfg.pop("rate_limit_rpm", None)
+        elif key in ("rate_limit_status", "rpm_status"):
+            pcfg["rate_limit_status"] = True
         elif key in ("native", "native_compat"):
+            if provider == "nvidia-hosted":
+                raise SystemExit(
+                    "nvidia-hosted does not expose Anthropic /v1/messages; use router mode. "
+                    "Use self-hosted-nim for native NIM /v1/messages."
+                )
             pcfg["native_compat"] = True
         elif key in ("stream", "stream_enabled"):
             pcfg["stream_enabled"] = True
@@ -4345,7 +5606,21 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             raise SystemExit("timeout must be a positive integer; values above 10000 are treated as milliseconds")
         pcfg["request_timeout_ms"] = fixed if key.endswith("_ms") or fixed > 10000 else fixed * 1000
         return
+    if key in ("rate_limit", "rate_limit_rpm", "rpm"):
+        fixed = positive_int(value)
+        if value in (0, "0", False, None):
+            pcfg.pop("rate_limit_rpm", None)
+            return
+        if not fixed:
+            raise SystemExit("rate_limit_rpm must be a positive integer, or 0/unset to disable")
+        pcfg["rate_limit_rpm"] = fixed
+        return
     if key in ("native", "native_compat"):
+        if provider == "nvidia-hosted":
+            raise SystemExit(
+                "nvidia-hosted does not expose Anthropic /v1/messages; use router mode. "
+                "Use self-hosted-nim for native NIM /v1/messages."
+            )
         pcfg["native_compat"] = bool(value)
         return
     if key in ("stream", "stream_enabled"):
@@ -4353,6 +5628,9 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         return
     if key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
         pcfg["stream_word_chunking"] = parse_bool(value, default=False)
+        return
+    if key in ("rate_limit_status", "rpm_status"):
+        pcfg["rate_limit_status"] = parse_bool(value, default=False)
         return
     sample_key = sampling_option_key(key)
     if sample_key:
@@ -4377,7 +5655,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
         except SystemExit:
             pass
     if provider not in PROVIDER_OPTION_PROVIDERS:
-        raise SystemExit("Provider options are available for anthropic, vllm, nvidia-hosted, and self-hosted-nim.")
+        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, vllm, nvidia-hosted, and self-hosted-nim.")
     pcfg = cfg["providers"][provider]
     if values:
         for token in values:
@@ -4392,7 +5670,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
     print("  context_window is a claude-any/router cap; native mode still cannot raise the real server limit.")
     print("  temperature/top_p/top_k are injected by claude-any router mode when the provider supports them.")
     print("Examples:")
-    print("  claude-anyctl provider-options nvidia-hosted max_output_tokens=4096 temperature=0.7 top_p=0.8 timeout=120000 native=false")
+    print("  claude-anyctl provider-options nvidia-hosted max_output_tokens=4096 temperature=0.7 top_p=0.8 timeout=120000 rate_limit_rpm=40")
     print("  claude-anyctl provider-options vllm max_output_tokens=4096 context_window=65536 timeout=1800000")
     print("  claude-anyctl provider-options self-hosted-nim native=true max_output_tokens=4096")
 
@@ -4840,9 +6118,16 @@ def claude_code_output_token_limit(provider: str, pcfg: dict[str, Any]) -> int |
 
 
 def apply_common_claude_env(provider: str, pcfg: dict[str, Any], env: dict[str, str]) -> dict[str, str]:
+    # Claude Code's AI-generated terminal/session title can be persisted as
+    # ai-title records and, in some resume/queued-command states, visually bleed
+    # into the prompt area. Disable that side path for claude-any launches.
+    env["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"] = "1"
     output_tokens = claude_code_output_token_limit(provider, pcfg)
     if output_tokens:
         env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(output_tokens)
+    advisor_model = str(pcfg.get("advisor_model") or "").strip()
+    if advisor_model:
+        env["CLAUDE_ANY_ADVISOR_MODEL"] = advisor_model
     return env
 
 
@@ -4883,11 +6168,13 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         return apply_common_claude_env(provider, pcfg, {
             "CLAUDE_ANY_PROVIDER": provider,
             "ANTHROPIC_BASE_URL": native_anthropic_base_url(provider, pcfg),
+            "ANTHROPIC_API_KEY": token,
             "ANTHROPIC_AUTH_TOKEN": token,
             "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
             "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
             "ANTHROPIC_MODEL": model,
+            "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
@@ -4928,6 +6215,7 @@ def cmd_env(_: argparse.Namespace) -> None:
         "CLAUDE_CODE_ATTRIBUTION_HEADER",
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
         "ANTHROPIC_MODEL",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
@@ -5326,6 +6614,26 @@ def ansi(text: str, code: str) -> str:
     return f"\033[{code}m{text}\033[0m" if sys.stdout.isatty() else text
 
 
+ANIMATED_TEXT_PALETTE = (203, 209, 215, 221, 229, 187, 151, 116, 111, 147, 183, 219)
+
+
+def animated_ansi_text(text: str, *, phase: int | None = None, bold: bool = True) -> str:
+    if not sys.stdout.isatty():
+        return text
+    if phase is None:
+        phase = int(time.monotonic() * 8)
+    parts: list[str] = []
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            parts.append(ch)
+            continue
+        code = f"38;5;{ANIMATED_TEXT_PALETTE[(phase + i) % len(ANIMATED_TEXT_PALETTE)]}"
+        if bold:
+            code = "1;" + code
+        parts.append(ansi(ch, code))
+    return "".join(parts)
+
+
 def cell_width(text: str) -> int:
     width = 0
     for ch in text:
@@ -5569,9 +6877,10 @@ def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lan
         f"2. {ui_text('api_key', lang)}  [{stored_api_key_mask(provider, pcfg)}]",
         f"3. {ui_text('base_url', lang)}  [{compact_text(pcfg.get('base_url', 'unset'), 62)}]",
         f"4. {ui_text('model', lang)}  [{compact_text(pcfg.get('current_model', 'unset'), 62)}]",
-        f"5. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
-        f"6. {ui_text('test', lang)}",
-        f"7. {ui_text('launch', lang)}",
+        f"5. {ui_text('advisor_model', lang)}  [{compact_text(pcfg.get('advisor_model') or 'off', 62)}]",
+        f"6. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
+        f"7. {ui_text('test', lang)}",
+        f"8. {ui_text('launch', lang)}",
         ui_text("quit", lang),
     ]
 
@@ -5615,6 +6924,28 @@ def model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], li
         mark = "*" if mid == current else " "
         rows.append(f"{mark} {mid}  {alias}")
     rows.append("+ Custom model id...")
+    deduped_values.append("__custom__")
+    rows.append("Back")
+    deduped_values.append("back")
+    return rows, deduped_values
+
+
+def advisor_model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    values = unique_model_ids(provider, [m for m in DEFAULT_ADVISOR_MODELS if m] + upstream_model_ids(provider, pcfg))
+    rows: list[str] = []
+    current = pcfg.get("advisor_model", "")
+    rows.append(("* Disable Advisor Model" if not current else "  Disable Advisor Model"))
+    deduped_values = [""]
+    seen: set[str] = set()
+    for mid in values:
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        mark = "*" if mid == current else " "
+        suffix = "  recommended for long context" if mid == "deepseek-v4-pro" else ""
+        rows.append(f"{mark} {mid}{suffix}")
+        deduped_values.append(mid)
+    rows.append("+ Custom advisor model id...")
     deduped_values.append("__custom__")
     rows.append("Back")
     deduped_values.append("back")
@@ -5681,8 +7012,14 @@ def render_prelaunch_screen(
         fitted = pad_cells(text, render_width)
         screen.append(ansi(fitted, code) if code else fitted)
 
+    def add_rendered(visible_text: str, rendered_text: str) -> None:
+        visible = fit_cells(visible_text, render_width)
+        padding = " " * max(0, render_width - cell_width(visible))
+        screen.append(rendered_text + padding)
+
     mode_line = next((line for line in status_lines() if line.startswith("mode:")), "mode: claude-any-router")
-    add(f"Claude Any v{VERSION}", "1;31")
+    title_text = f"Claude Any v{VERSION}"
+    add_rendered(title_text, animated_ansi_text(title_text))
     add(CREDITS, "2")
     add("")
     add(f"provider: {provider}    language: {lang}    {mode_line}", "32")
@@ -5708,6 +7045,7 @@ def render_prelaunch_screen(
             "api-key": "API key",
             "base-url": "Base URL",
             "model": "Model",
+            "advisor-model": "Advisor Model",
             "test": "Compatibility test",
             "options": ui_text("options", lang),
             "preset": ui_text("presets", lang),
@@ -5847,6 +7185,11 @@ def portable_prelaunch_menu() -> int:
                 panel_rows, panel_values = model_panel_rows(provider, pcfg)
             except Exception as exc:
                 panel_rows, panel_values = [f"Model list failed: {type(exc).__name__}: {exc}", "+ Custom model id..."], []
+        elif name == "advisor-model":
+            try:
+                panel_rows, panel_values = advisor_model_panel_rows(provider, pcfg)
+            except Exception as exc:
+                panel_rows, panel_values = [f"Advisor model list failed: {type(exc).__name__}: {exc}", "+ Custom advisor model id..."], []
         elif name == "test":
             panel_rows, panel_values = ["Run compatibility test", "Back"], ["run", "back"]
         elif name == "options":
@@ -5924,6 +7267,17 @@ def portable_prelaunch_menu() -> int:
                     if model_value:
                         messages = set_model_config(model_value)
                         refresh_checks()
+                    close_panel(5)
+                elif panel == "advisor-model":
+                    if value == "back":
+                        close_panel()
+                        continue
+                    if value == "__custom__" or panel_idx >= len(panel_values):
+                        advisor_value = prompt_menu_value("Advisor model id", "deepseek-v4-pro")
+                    else:
+                        advisor_value = value
+                    messages = set_advisor_model_config(advisor_value)
+                    refresh_checks()
                     close_panel(6)
                 elif panel == "api-key":
                     if value == "back":
@@ -5985,7 +7339,7 @@ def portable_prelaunch_menu() -> int:
                         messages = lines[-8:] if lines else ["Test produced no output."]
                         panel_rows, panel_values = ["Run compatibility test again", "Back"], ["run", "back"]
                         refresh_checks()
-                        main_idx = 7 if "Compatibility: OK" in out else 4
+                        main_idx = 8 if "Compatibility: OK" in out else 4
                 elif panel == "options":
                     if value == "back":
                         close_panel()
@@ -6032,13 +7386,13 @@ def portable_prelaunch_menu() -> int:
                 continue
 
             if key in ("up", "k"):
-                main_idx = (main_idx - 1) % 9
+                main_idx = (main_idx - 1) % 10
             elif key in ("down", "j"):
-                main_idx = (main_idx + 1) % 9
+                main_idx = (main_idx + 1) % 10
             elif key in ("esc", "q"):
                 return 10
             elif key == "enter":
-                actions = ["language", "provider", "api-key", "base-url", "model", "options", "test", "launch", "quit"]
+                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "test", "launch", "quit"]
                 action = actions[main_idx]
                 if action == "launch":
                     blockers = launch_readiness_errors()
@@ -6260,7 +7614,9 @@ def launch_claude(
         for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
             if key not in launch_env:
                 env.pop(key, None)
+        install_claude_any_slash_commands()
         install_tool_guard_hooks()
+        install_claude_any_statusline()
     claude = find_executable("claude")
     if not claude:
         raise RuntimeError("claude executable was not found in PATH or ~/.local/bin")
@@ -6305,6 +7661,7 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
   claude-any provider PROVIDER       Set provider
   claude-any base-url PROVIDER URL   Set provider base URL
   claude-any model MODEL_ID          Set current provider model
+  claude-any advisor-model MODEL_ID  Set current provider advisor model (off disables)
   claude-any models [PROVIDER]       List models
   claude-any api-key PROVIDER        Store API key securely
   claude-any set-api-key PROVIDER KEY
@@ -6370,6 +7727,9 @@ def run_cli(argv: list[str]) -> int:
             if not rest:
                 raise SystemExit("Missing model id")
             cmd_model(argparse.Namespace(value=rest))
+            return 0
+        if head in ("advisor-model", "advisormodel", "advisor"):
+            cmd_advisor_model(argparse.Namespace(value=rest))
             return 0
         if head == "base-url":
             if len(rest) < 2:
@@ -6704,6 +8064,9 @@ def build_parser() -> argparse.ArgumentParser:
     mo = sub.add_parser("model")
     mo.add_argument("value", nargs="*")
     mo.set_defaults(func=cmd_model)
+    am = sub.add_parser("advisor-model")
+    am.add_argument("value", nargs="*")
+    am.set_defaults(func=cmd_advisor_model)
     ml = sub.add_parser("models")
     ml.add_argument("provider", nargs="?")
     ml.set_defaults(func=cmd_models)

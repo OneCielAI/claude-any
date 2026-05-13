@@ -12,6 +12,8 @@
 > - **免费** — [NVIDIA hosted NIM](https://build.nvidia.com/)（qwen3-coder-480b、gpt-oss 等），通过 API Catalog 使用。
 > - **低成本** — [Ollama Cloud](https://ollama.com/cloud) 提供 GLM、Qwen、DeepSeek 等开源权重模型，价格远低于前沿模型。
 > - **免费 + 本地** — 在自己的 GPU 上使用 [Ollama](https://ollama.com/) 或 [vLLM](https://github.com/vllm-project/vllm)，完全离线。
+> - **支持 Plan Mode + Advisor** — 在 non-Anthropic provider 上保留 Claude Code Plan Mode，并可使用长上下文 Advisor 模型进行工作审查。
+> - **平滑使用免费模型 RPM** — Claude Code 会花时间读取文件和执行 tool，Claude Any 会利用这些自然间隔进行 RPM pacing，让 NVIDIA hosted 免费模型在严格的每分钟限制下也更容易使用。
 >
 > 在 Claude Code 启动**之前**，通过控制台菜单选择 provider、模型、Base URL、API 密钥、流式行为以及 LLM 选项。Claude Code 本体保持原样运行 —— 所有原生工具、slash 命令和工作流都不受影响。
 
@@ -33,7 +35,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.27`
+当前版本: `0.1.28`
 
 ## 为什么存在
 
@@ -196,6 +198,18 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 - 必要时使用 provider-specific router。
 - 为 non-native provider 连接 DuckDuckGo/fetch MCP。
 - 支持 `--ca-provider`、`--ca-model`、`--ca-base-url` 等 headless 参数。
+- 在 router-backed non-Anthropic provider 上支持 Claude Code Plan Mode，
+  包括本地处理 `EnterPlanMode` 和 plan artifact 流程。
+- 可选 `/advisor` slash command，可把当前任务状态发送给选定的 Advisor Model，
+  适合长上下文审查和下一步检查。
+- 集成 Claude Code `statusLine`，在底部状态区域显示 router RPM 使用量和等待时间，
+  不再污染聊天正文。
+- 针对 NVIDIA hosted、self-hosted NIM、Ollama、Ollama Cloud 的 router-side RPM 控制。
+  `rate_limit_rpm=0` 会关闭 throttling，但仍显示最近 60 秒使用量。
+- soft pacing 会扣除已经花在文件读取、命令执行和等待 tool 结果上的时间。在真实
+  编码会话中，这些 tool-call 间隔会自然吸收很多 RPM 间隔，因此可以在 NVIDIA
+  hosted NIM 等免费模型的 RPM 限制内运行，同时不会让每个 Claude Code turn 都
+  明显感觉到 rate limit。
 - Ollama/Ollama Cloud 路由路径的流式代理 — token 到达后立即转发给 Claude Code，
   不再等待完整响应。
 - 按 provider 的 `stream` on/off 开关和 `stream_word_chunking` 选项，可将文本
@@ -211,6 +225,19 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.28
+
+- **Plan Mode + Advisor 标题**: 文档现在强调 router-backed non-Anthropic
+  provider 的 Plan Mode 支持，以及由选定长上下文 Advisor Model 驱动的 `/advisor`
+  slash command。
+- **statusLine RPM 显示**: Claude Any 会安装 Claude Code `statusLine` command，
+  在底部状态区域显示 router RPM 使用量和最近等待时间，避免 rate-limit 信息污染聊天正文。
+- **面向免费 hosted 模型的 soft RPM pacing**: NVIDIA hosted、self-hosted NIM、
+  Ollama、Ollama Cloud 都可使用 router-side RPM pacing。它会扣除已经花在文件读取、
+  命令执行和等待 tool 结果上的时间，因此真实编码中的 tool-call 间隔会自然吸收 RPM 间隔。
+- **无限制时的使用量显示**: `rate_limit_rpm=0` 会关闭 throttling，但仍显示最近
+  60 秒的请求使用量。
 
 ### 0.1.27
 

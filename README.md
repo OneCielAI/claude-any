@@ -12,6 +12,8 @@
 > - **Free** — [NVIDIA hosted NIM](https://build.nvidia.com/) (qwen3-coder-480b, gpt-oss, and friends) through the API Catalog.
 > - **Low-cost** — [Ollama Cloud](https://ollama.com/cloud) for GLM, Qwen, DeepSeek, and other open-weight models at a fraction of frontier-model pricing.
 > - **Free + local** — [Ollama](https://ollama.com/) or [vLLM](https://github.com/vllm-project/vllm) on your own GPU, fully offline.
+> - **Plan Mode + Advisor ready** — Claude Any preserves Claude Code Plan Mode on non-Anthropic providers and adds an optional long-context Advisor model for review.
+> - **Smooth free-model pacing** — Claude Code spends time reading files and running tools, and Claude Any uses that natural gap for RPM pacing so NVIDIA hosted free models feel usable even with strict per-minute limits.
 >
 > Provider, model, base URL, API key, streaming behavior, and LLM options are all selected from a console menu **before** Claude Code starts. Claude Code itself runs untouched with all of its native tooling, slash commands, and workflows.
 
@@ -34,7 +36,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.27`
+Current version: `0.1.28`
 
 ## Why This Exists
 
@@ -228,6 +230,20 @@ steps under that larger model's supervision.
 - DuckDuckGo and fetch MCP wiring for non-native providers.
 - Headless setup flags such as `--ca-provider`, `--ca-model`, `--ca-base-url`,
   `--ca-api-key-env`, `--ca-ollama-option`, and `--ca-max-output-tokens`.
+- Claude Code Plan Mode support on router-backed non-Anthropic providers,
+  including local handling for `EnterPlanMode` and plan artifacts.
+- Optional `/advisor` slash command that routes the current task state to a
+  selected Advisor Model, useful for long-context review and next-step checks.
+- Claude Code `statusLine` integration showing router RPM usage and wait time
+  in the bottom status area instead of polluting the chat transcript.
+- Router-side RPM control for NVIDIA hosted, self-hosted NIM, Ollama, and
+  Ollama Cloud. `rate_limit_rpm=0` disables throttling while still showing the
+  last-60-seconds usage rate.
+- Soft pacing subtracts time already spent reading files, running commands, and
+  waiting for tool results. In real coding sessions, those tool-call gaps absorb
+  much of the RPM spacing naturally, so providers such as NVIDIA hosted NIM can
+  stay within free-model limits without making every Claude Code turn feel
+  rate-limited.
 - Streaming proxy for Ollama/Ollama Cloud router path — tokens are delivered
   to Claude Code as they arrive instead of waiting for the full response.
 - Per-provider `stream` on/off toggle and `stream_word_chunking` option to
@@ -248,6 +264,21 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.28
+
+- **Plan Mode + Advisor headline**: document Claude Any's Plan Mode support for
+  router-backed non-Anthropic providers and the `/advisor` slash command backed
+  by a selected long-context Advisor Model.
+- **Status-line RPM telemetry**: Claude Any installs a Claude Code `statusLine`
+  command that shows router RPM usage and the latest wait time in the bottom
+  status area, keeping rate-limit telemetry out of the chat transcript.
+- **Soft RPM pacing for free hosted models**: NVIDIA hosted, self-hosted NIM,
+  Ollama, and Ollama Cloud can use router-side RPM pacing. The pacing subtracts
+  time already spent in file reads, command execution, and tool-result waits, so
+  normal coding tool-call gaps naturally absorb much of the RPM spacing.
+- **Unlimited usage display**: `rate_limit_rpm=0` disables throttling while
+  still displaying the last-60-seconds request rate.
 
 ### 0.1.27
 

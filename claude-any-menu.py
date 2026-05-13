@@ -165,6 +165,25 @@ def _reset() -> str:
     return "\033[0m"
 
 
+ANIMATED_TEXT_PALETTE = (203, 209, 215, 221, 229, 187, 151, 116, 111, 147, 183, 219)
+
+
+def animated_text(text: str, *, phase: int | None = None, bold: bool = True) -> str:
+    if not sys.stdout.isatty():
+        return text
+    if phase is None:
+        phase = int(time.monotonic() * 8)
+    parts: list[str] = []
+    for i, ch in enumerate(text):
+        if ch.isspace():
+            parts.append(ch)
+            continue
+        color = ANIMATED_TEXT_PALETTE[(phase + i) % len(ANIMATED_TEXT_PALETTE)]
+        parts.append(_style(fg=color, bold=bold) + ch)
+    parts.append(_reset())
+    return "".join(parts)
+
+
 def _write(row: int, col: int, text: str, style: str = "") -> None:
     if row < 0 or col < 0:
         return
@@ -210,6 +229,7 @@ UI_TEXT = {
         "api_key": "API key",
         "base_url": "Base URL",
         "model": "Model",
+        "advisor_model": "Advisor Model",
         "ollama_options": "Ollama options",
         "provider_options": "Provider options",
         "test": "Test compatibility",
@@ -219,6 +239,7 @@ UI_TEXT = {
         "select_language": "Enter selects language. Up/Down moves inside submenu. Esc closes submenu.",
         "select_provider": "Enter selects provider. Up/Down moves inside submenu. Esc closes submenu.",
         "select_model": "Enter selects model. Up/Down moves inside submenu. Esc closes submenu. Custom input is at the end.",
+        "select_advisor_model": "Enter selects advisor model. Use a long-context model such as deepseek-v4-pro.",
         "select_ollama_options": "Enter applies this Ollama option. Custom input accepts KEY=VALUE or unset:KEY.",
         "select_provider_options": "Enter applies this provider option. Custom input accepts KEY=VALUE or unset:KEY.",
         "test_result": "Compatibility result is shown inline. Esc closes the result. Enter runs the test again.",
@@ -227,6 +248,7 @@ UI_TEXT = {
         "help_language": "Enter expands language submenu inline.",
         "help_provider": "Enter expands provider submenu inline.",
         "help_model": "Enter expands model submenu inline when the provider endpoint is reachable.",
+        "help_advisor_model": "Enter selects the larger model used by claude-any advisor routing.",
         "help_ollama_options": "Enter expands Ollama context and generation options.",
         "help_provider_options": "Enter expands provider output/context/timeout options.",
         "help_api_key": "Enter opens secure API key setup in the terminal. Keys are not pasted into Claude Code.",
@@ -244,6 +266,7 @@ UI_TEXT = {
         "api_key": "API 키",
         "base_url": "Base URL",
         "model": "모델",
+        "advisor_model": "Advisor Model",
         "ollama_options": "Ollama 옵션",
         "provider_options": "프로바이더 옵션",
         "test": "호환성 테스트",
@@ -253,6 +276,7 @@ UI_TEXT = {
         "select_language": "Enter로 언어를 선택합니다. 위/아래로 이동, Esc로 닫기.",
         "select_provider": "Enter로 프로바이더를 선택합니다. 위/아래로 이동, Esc로 닫기.",
         "select_model": "Enter로 모델을 선택합니다. 위/아래로 이동, Esc로 닫기. 마지막 항목은 직접 입력입니다.",
+        "select_advisor_model": "Advisor Model을 선택합니다. deepseek-v4-pro 같은 긴 컨텍스트 모델을 권장합니다.",
         "select_ollama_options": "Enter로 Ollama 옵션을 적용합니다. 직접 입력은 KEY=VALUE 또는 unset:KEY를 받습니다.",
         "select_provider_options": "Enter로 프로바이더 옵션을 적용합니다. 직접 입력은 KEY=VALUE 또는 unset:KEY를 받습니다.",
         "test_result": "호환성 결과가 메뉴 안에 표시됩니다. Esc로 닫고 Enter로 다시 테스트합니다.",
@@ -261,6 +285,7 @@ UI_TEXT = {
         "help_language": "언어 선택 메뉴를 펼칩니다.",
         "help_provider": "프로바이더 선택 메뉴를 펼칩니다.",
         "help_model": "프로바이더 엔드포인트가 유효하면 모델 선택 메뉴를 펼칩니다.",
+        "help_advisor_model": "claude-any advisor 라우팅에 사용할 더 큰 모델을 선택합니다.",
         "help_ollama_options": "Ollama 컨텍스트 크기와 생성 파라미터 메뉴를 펼칩니다.",
         "help_provider_options": "프로바이더의 출력 토큰, 컨텍스트, 타임아웃 옵션 메뉴를 펼칩니다.",
         "help_api_key": "API 키 입력을 이 터미널에서 안전하게 엽니다. 키는 Claude Code 채팅에 붙여넣지 않습니다.",
@@ -278,6 +303,7 @@ UI_TEXT = {
         "api_key": "APIキー",
         "base_url": "Base URL",
         "model": "モデル",
+        "advisor_model": "Advisor Model",
         "ollama_options": "Ollamaオプション",
         "provider_options": "プロバイダーオプション",
         "test": "互換性テスト",
@@ -287,6 +313,7 @@ UI_TEXT = {
         "select_language": "Enterで言語を選択します。上下で移動、Escで閉じます。",
         "select_provider": "Enterでプロバイダーを選択します。上下で移動、Escで閉じます。",
         "select_model": "Enterでモデルを選択します。上下で移動、Escで閉じます。最後は手入力です。",
+        "select_advisor_model": "Advisor Modelを選択します。deepseek-v4-proのような長コンテキストモデルを推奨します。",
         "select_ollama_options": "EnterでOllamaオプションを適用します。手入力はKEY=VALUEまたはunset:KEYです。",
         "select_provider_options": "Enterでプロバイダーオプションを適用します。手入力はKEY=VALUEまたはunset:KEYです。",
         "test_result": "互換性結果はメニュー内に表示されます。Escで閉じ、Enterで再テストします。",
@@ -295,6 +322,7 @@ UI_TEXT = {
         "help_language": "言語選択メニューを展開します。",
         "help_provider": "プロバイダー選択メニューを展開します。",
         "help_model": "プロバイダーのエンドポイントが有効な場合、モデル選択メニューを展開します。",
+        "help_advisor_model": "claude-any advisorルーティングで使う大きなモデルを選択します。",
         "help_ollama_options": "Ollamaのコンテキストサイズと生成パラメータを開きます。",
         "help_provider_options": "プロバイダーの出力トークン、コンテキスト、タイムアウト設定を開きます。",
         "help_api_key": "APIキー入力をこの端末で安全に開きます。キーはClaude Codeチャットに貼り付けません。",
@@ -312,6 +340,7 @@ UI_TEXT = {
         "api_key": "API 密钥",
         "base_url": "Base URL",
         "model": "模型",
+        "advisor_model": "Advisor Model",
         "ollama_options": "Ollama 选项",
         "provider_options": "提供商选项",
         "test": "兼容性测试",
@@ -321,6 +350,7 @@ UI_TEXT = {
         "select_language": "按 Enter 选择语言。上下移动，Esc 关闭。",
         "select_provider": "按 Enter 选择提供商。上下移动，Esc 关闭。",
         "select_model": "按 Enter 选择模型。上下移动，Esc 关闭。最后一项可手动输入。",
+        "select_advisor_model": "选择 Advisor Model。建议使用 deepseek-v4-pro 等长上下文模型。",
         "select_ollama_options": "按 Enter 应用 Ollama 选项。手动输入支持 KEY=VALUE 或 unset:KEY。",
         "select_provider_options": "按 Enter 应用提供商选项。手动输入支持 KEY=VALUE 或 unset:KEY。",
         "test_result": "兼容性结果会在菜单内显示。Esc 关闭，Enter 重新测试。",
@@ -329,6 +359,7 @@ UI_TEXT = {
         "help_language": "展开语言选择菜单。",
         "help_provider": "展开提供商选择菜单。",
         "help_model": "当提供商端点可用时展开模型选择菜单。",
+        "help_advisor_model": "选择 claude-any advisor 路由使用的更大模型。",
         "help_ollama_options": "展开 Ollama 上下文大小和生成参数。",
         "help_provider_options": "展开提供商输出 token、上下文和超时选项。",
         "help_api_key": "在此终端安全输入 API 密钥。不要把密钥粘贴到 Claude Code 聊天中。",
@@ -483,6 +514,7 @@ def load_cfg() -> dict:
 KNOWN_NVIDIA_MODEL_STATUS = {
     "claude-nvidia-llama-3.1-nemotron-ultra-253b-v1": ("FAIL 404", "listed but not callable for this NVIDIA account"),
 }
+DEFAULT_ADVISOR_MODELS = ["deepseek-v4-pro", "claude-opus-4-6", "claude-sonnet-4-6", "glm-5.1"]
 COMPAT_OK_TTL_SECONDS = 24 * 60 * 60
 COMPAT_FAIL_TTL_SECONDS = 5 * 60
 
@@ -711,7 +743,7 @@ def is_ollama_provider(provider: str) -> bool:
 
 
 def has_provider_options(provider: str) -> bool:
-    return provider in ("vllm", "nvidia-hosted", "self-hosted-nim")
+    return provider in ("vllm", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud")
 
 
 def ollama_ctx_text(pcfg: dict) -> str:
@@ -727,8 +759,11 @@ def ollama_options_summary(pcfg: dict) -> str:
         f"keep {pcfg.get('keep_alive', 'default')}",
         f"think {str(bool(pcfg.get('think', False))).lower()}",
         f"timeout {pcfg.get('request_timeout_ms', 'default')}ms",
+        f"rpm {pcfg.get('rate_limit_rpm', 40)}",
         f"stream {'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}",
     ]
+    if bool(pcfg.get("rate_limit_status", True)):
+        parts.append("rpm_status on")
     if bool(pcfg.get("stream_word_chunking", False)):
         parts.append("word_chunk on")
     opts = pcfg.get("ollama_options") or {}
@@ -745,6 +780,10 @@ def provider_options_summary(provider: str, pcfg: dict) -> str:
         f"max {pcfg.get('max_output_tokens', 'default')}",
         f"timeout {timeout_text}",
     ]
+    if provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+        parts.append(f"rpm {pcfg.get('rate_limit_rpm', 40)}")
+        if bool(pcfg.get("rate_limit_status", True)):
+            parts.append("rpm_status on")
     if provider in ("vllm", "self-hosted-nim"):
         parts.insert(0, f"ctx {pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve {pcfg.get('context_reserve_tokens', 'default')}")
@@ -760,6 +799,7 @@ def main_items() -> list[tuple[str, str]]:
     provider, pcfg = current_provider_cfg()
     lang = current_language()
     model = pcfg.get("current_model", "unset")
+    advisor_model = pcfg.get("advisor_model") or "off"
     base = pcfg.get("base_url", "unset")
     rows: list[tuple[str, str]] = []
 
@@ -771,6 +811,7 @@ def main_items() -> list[tuple[str, str]]:
     add("api-key", t("api_key"))
     add("base-url", f"{t('base_url')}  [{base}]")
     add("model", f"{t('model')}  [{model}]")
+    add("advisor-model", f"{t('advisor_model')}  [{advisor_model}]")
     if is_ollama_provider(provider):
         add("ollama-options", f"{t('ollama_options')}  [{ollama_options_summary(pcfg)}]")
     if has_provider_options(provider):
@@ -805,6 +846,8 @@ def help_for_action(action: str, sub_kind: str | None = None) -> str:
         return t("select_provider")
     if sub_kind == "model":
         return t("select_model")
+    if sub_kind == "advisor-model":
+        return t("select_advisor_model")
     if sub_kind == "ollama-options":
         return t("select_ollama_options")
     if sub_kind == "provider-options":
@@ -817,6 +860,7 @@ def help_for_action(action: str, sub_kind: str | None = None) -> str:
         "language": t("help_language"),
         "provider": t("help_provider"),
         "model": t("help_model"),
+        "advisor-model": t("help_advisor_model"),
         "ollama-options": t("help_ollama_options"),
         "provider-options": t("help_provider_options"),
         "api-key": t("help_api_key"),
@@ -902,6 +946,25 @@ def build_model_submenu() -> tuple[dict | None, list[str]]:
         })
     items.append({"value": "__custom__", "label": "Custom model id...", "current": False})
     return {"kind": "model", "parent": "model", "items": items, "idx": idx, "offset": 0}, []
+
+
+def build_advisor_model_submenu() -> dict:
+    provider, pcfg = current_provider_cfg()
+    current = pcfg.get("advisor_model") or ""
+    values: list[str] = []
+    for mid in DEFAULT_ADVISOR_MODELS + [upstream for upstream, _ in get_models_for_current_provider()[0]]:
+        if mid and mid not in values:
+            values.append(mid)
+    items = [{"value": "", "label": "Disable Advisor Model", "current": not current, "description": "Disable claude-any advisor routing."}]
+    idx = 0
+    for i, mid in enumerate(values, 1):
+        is_current = mid == current
+        if is_current:
+            idx = i
+        desc = "Recommended long-context advisor model." if mid == "deepseek-v4-pro" else ""
+        items.append({"value": mid, "label": mid, "current": is_current, "description": desc})
+    items.append({"value": "__custom__", "label": "Custom advisor model id...", "current": False})
+    return {"kind": "advisor-model", "parent": "advisor-model", "items": items, "idx": idx, "offset": 0}
 
 
 OLLAMA_OPTION_DESCRIPTIONS = {
@@ -1128,6 +1191,20 @@ def provider_option_description(value: str) -> str:
         return PROVIDER_OPTION_DESCRIPTIONS["__edit_max_output__"].get(lang, PROVIDER_OPTION_DESCRIPTIONS["__edit_max_output__"]["en"])
     if value.startswith(("timeout=", "request_timeout_ms=")):
         return PROVIDER_OPTION_DESCRIPTIONS["__edit_timeout__"].get(lang, PROVIDER_OPTION_DESCRIPTIONS["__edit_timeout__"]["en"])
+    if value.startswith(("rate_limit=", "rate_limit_rpm=", "rpm=")) or value == "__edit_rate_limit__":
+        return {
+            "en": "Router-side upstream requests per minute. NIM hosted defaults to 40 RPM; 0 disables waiting.",
+            "ko": "라우터가 업스트림 요청 수를 분당 제한합니다. NIM hosted 기본값은 40 RPM이고, 0이면 대기하지 않습니다.",
+            "ja": "ルーター側の上流リクエスト数/分。NIM hosted は既定 40 RPM、0 で待機なし。",
+            "zh": "路由器侧上游每分钟请求限制。NIM hosted 默认 40 RPM；0 表示不等待。",
+        }.get(lang, "Router-side upstream requests per minute.")
+    if value.startswith(("rate_limit_status=", "rpm_status=")):
+        return {
+            "en": "Show optional colored RPM usage status in Claude responses.",
+            "ko": "Claude 응답에 RPM 사용량 상태를 색상 텍스트로 표시합니다.",
+            "ja": "Claude応答にRPM使用量状態を色付きテキストで表示します。",
+            "zh": "在 Claude 响应中显示彩色 RPM 使用量状态。",
+        }.get(lang, "Show optional colored RPM usage status.")
     if value.startswith(("native=", "native_compat=")):
         return PROVIDER_OPTION_DESCRIPTIONS["__edit_native__"].get(lang, PROVIDER_OPTION_DESCRIPTIONS["__edit_native__"]["en"])
     if value.startswith("stream="):
@@ -1157,6 +1234,10 @@ def build_provider_options_submenu() -> dict:
         ("__edit_max_output__", f"Edit max_output_tokens [{max_output}]", False),
         ("__edit_timeout__", f"Edit timeout ms [{timeout}]", False),
     ]
+    if provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+        choices.append(("__edit_rate_limit__", f"Edit rate_limit_rpm [{pcfg.get('rate_limit_rpm', 40)}]", False))
+        choices.append(("rate_limit_status=true", "rate_limit_status on", bool(pcfg.get("rate_limit_status", True))))
+        choices.append(("rate_limit_status=false", "rate_limit_status off", not bool(pcfg.get("rate_limit_status", True))))
     if provider in ("vllm", "self-hosted-nim"):
         native = bool(pcfg.get("native_compat", True))
         choices = [
@@ -1398,15 +1479,14 @@ def add(stdscr, y: int, x: int, text: str, style: str = "") -> None:
 def draw_intro_panel(stdscr) -> int:
     h, w = _term_size()
     if h < 20:
-        add(stdscr, 0, 0, f"{APP_NAME} - {CREDITS}", _style(bold=True))
+        _write(0, 0, animated_text(APP_NAME) + f" - {CREDITS}")
         return 1
 
     panel_w = max(40, w - 2)
     panel_h = 8 if h >= 24 else 7
     border = cp(4)
-    title = f" {APP_NAME} "
     add(stdscr, 0, 0, "+" + "-" * (panel_w - 2) + "+", border)
-    add(stdscr, 0, 4, title, border + _style(bold=True))
+    _write(0, 4, " " + animated_text(APP_NAME) + " ", border)
     for y in range(1, panel_h - 1):
         add(stdscr, y, 0, "|", border)
         add(stdscr, y, panel_w - 1, "|", border)
@@ -1417,8 +1497,8 @@ def draw_intro_panel(stdscr) -> int:
         for y in range(1, panel_h - 1):
             add(stdscr, y, split, "|", border)
         add(stdscr, 1, 8, "Welcome back!", _style(bold=True) + cp(5))
-        add(stdscr, 3, 9, "CLAUDE", _style(bold=True) + cp(2))
-        add(stdscr, 4, 12, "ANY", _style(bold=True) + cp(3))
+        _write(3, 9, animated_text("CLAUDE"))
+        _write(4, 12, animated_text("ANY", phase=int(time.monotonic() * 8) + 4))
         add(stdscr, 6, 6, CREDITS, _style(bold=True) + cp(5))
 
         right = split + 3
@@ -1470,7 +1550,7 @@ def render(stdscr, idx: int, sub: dict | None, notice: list[str], checks: list[s
             style = cp(3) + _style(bold=True)
         elif key == "quit":
             style = cp(4)
-        elif key in ("language", "provider", "model", "ollama-options", "provider-options", "api-key", "base-url"):
+        elif key in ("language", "provider", "model", "advisor-model", "ollama-options", "provider-options", "api-key", "base-url"):
             style = cp(3)
         else:
             style = ""
@@ -1673,6 +1753,17 @@ def main() -> int:
                         checks = preflight_checks()
                         sub = None
                         idx = index_for_action(after_model_action())
+                elif sub["kind"] == "advisor-model":
+                    row = row_by_action.get("__sub_selected__", row_by_action.get("advisor-model", 10))
+                    if item["value"] == "__custom__":
+                        value = inline_prompt(None, "Advisor model id: ", row, "deepseek-v4-pro")
+                    else:
+                        value = item["value"] or "off"
+                    _, out = run_cmd([CTL, "advisor-model", value])
+                    notice = (out.strip().splitlines() or [value])[:2]
+                    checks = preflight_checks()
+                    sub = None
+                    idx = index_for_action("ollama-options" if is_ollama_provider(current_provider()) else ("provider-options" if has_provider_options(current_provider()) else "test"))
                 elif sub["kind"] == "ollama-options":
                     provider = current_provider()
                     row = row_by_action.get("__sub_selected__", row_by_action.get("ollama-options", 10))
@@ -1714,6 +1805,10 @@ def main() -> int:
                         default = str(pcfg_now.get("request_timeout_ms", "1800000"))
                         entered = inline_prompt(None, "timeout ms: ", row, default)
                         value = f"timeout={entered}" if entered else ""
+                    elif action_value == "__edit_rate_limit__":
+                        default = str(pcfg_now.get("rate_limit_rpm", "40"))
+                        entered = inline_prompt(None, "rate_limit_rpm (0 disables): ", row, default)
+                        value = f"rate_limit_rpm={entered}" if entered else ""
                     elif action_value == "__custom__":
                         value = inline_prompt(None, "Ollama option KEY=VALUE: ", row, "temperature=0.7")
                     else:
@@ -1807,6 +1902,9 @@ def main() -> int:
                     notice = (out.strip().splitlines() or [value])[:2]
                     checks = preflight_checks()
                     idx = index_for_action(after_model_action())
+        elif action == "advisor-model":
+            notice = []
+            sub = build_advisor_model_submenu()
         elif action == "ollama-options":
             provider = current_provider()
             if is_ollama_provider(provider):
