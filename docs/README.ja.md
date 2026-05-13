@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.42`
+現在のバージョン: `0.1.43`
 
 ## 作られた理由
 
@@ -350,6 +350,11 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.43
+
+- **429 backoff retry**: upstream `429 Too Many Requests` 応答を初回 backoff 後に
+  raw error として漏らさず、すべての retry attempt で backoff/retry event として処理します。
 
 ### 0.1.42
 

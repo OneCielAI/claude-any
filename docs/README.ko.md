@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.42`
+현재 버전: `0.1.43`
 
 ## 왜 만들었나
 
@@ -350,6 +350,11 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.43
+
+- **429 backoff retry**: upstream `429 Too Many Requests` 응답을 첫 backoff 이후
+  raw error로 흘리지 않고, 모든 retry attempt에서 backoff/retry 이벤트로 처리합니다.
 
 ### 0.1.42
 

@@ -85,7 +85,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.42"
+VERSION = "0.1.43"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -4982,6 +4982,17 @@ def upstream_retry_message(attempt: int, total: int) -> str:
     return f"Upstream server did not respond; retrying ({attempt}/{total})."
 
 
+def upstream_rate_limit_retry_message(attempt: int, total: int) -> str:
+    lang = str(load_config().get("language") or "en")
+    if lang == "ko":
+        return f"Upstream rate limit에 도달해 대기 후 재시도합니다 ({attempt}/{total})."
+    if lang == "ja":
+        return f"Upstream rate limit に達したため、待機して再試行します ({attempt}/{total})。"
+    if lang == "zh":
+        return f"已达到 upstream rate limit，等待后重试 ({attempt}/{total})。"
+    return f"Upstream rate limit reached; waiting before retry ({attempt}/{total})."
+
+
 def upstream_retry_wait_seconds(attempt: int) -> float:
     return min(20.0, 2.0 * max(1, attempt))
 
@@ -5028,8 +5039,13 @@ def post_json_with_rate_retry(
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="ignore")
             learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
-            if exc.code == 429 and attempt == 0:
+            if exc.code == 429 and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
                 wait = register_router_rate_limit_backoff(provider, pcfg, model, exc.headers.get("Retry-After"))
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, wait=wait, tokens=token_estimate, bytes=byte_estimate)
+                router_log("WARN", f"upstream_rate_limit_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} wait={wait:.2f}s tokens={token_estimate} bytes={byte_estimate}")
+                if retry_notice:
+                    retry_notice(upstream_rate_limit_retry_message(retry_no, gateway_retries))
                 time.sleep(wait)
                 continue
             if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
@@ -5092,8 +5108,13 @@ def open_openai_stream_with_rate_retry(
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="ignore")
             learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
-            if exc.code == 429 and attempt == 0:
+            if exc.code == 429 and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
                 wait = register_router_rate_limit_backoff(provider, pcfg, model, exc.headers.get("Retry-After"))
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, wait=wait, tokens=token_estimate, bytes=byte_estimate, stream=True)
+                router_log("WARN", f"upstream_stream_rate_limit_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} wait={wait:.2f}s tokens={token_estimate} bytes={byte_estimate}")
+                if retry_notice:
+                    retry_notice(upstream_rate_limit_retry_message(retry_no, gateway_retries))
                 time.sleep(wait)
                 continue
             if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:

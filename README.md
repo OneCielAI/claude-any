@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.42`
+Current version: `0.1.43`
 
 ## Why This Exists
 
@@ -380,6 +380,12 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.43
+
+- **429 backoff retry**: upstream `429 Too Many Requests` responses are now
+  handled as retry/backoff events across all retry attempts instead of leaking
+  the raw upstream error after the first backoff.
 
 ### 0.1.42
 

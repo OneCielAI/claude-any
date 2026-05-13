@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.42`
+当前版本: `0.1.43`
 
 ## 为什么存在
 
@@ -336,6 +336,11 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.43
+
+- **429 backoff retry**：upstream `429 Too Many Requests` 响应现在会在所有 retry
+  attempt 中作为 backoff/retry event 处理，不再在首次 backoff 后泄漏 raw error。
 
 ### 0.1.42
 
