@@ -84,7 +84,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.28"
+VERSION = "0.1.29"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -6378,6 +6378,10 @@ def _cmd_test(args: argparse.Namespace) -> None:
     model = current_upstream_model_id(provider, pcfg) if provider_native else (launch_model_id(provider, pcfg) if ollama_native else current_alias(cfg))
     base = native_anthropic_base_url(provider, pcfg) if native else ROUTER_BASE
     if not native:
+        # Compatibility tests must exercise the currently installed router.
+        # Older long-running routers can keep stale NVIDIA proxy code alive
+        # across npm upgrades, producing false nvd-claude-proxy failures.
+        stop_router_processes(quiet=True)
         start_router_if_needed()
     url = join_url(base, "/v1/messages")
     headers = provider_headers(provider, pcfg)
@@ -6931,9 +6935,8 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
     if provider == "nvidia-hosted":
         if nvidia_hosted_native_compat_enabled(provider, pcfg):
             return f"Base URL: NVIDIA hosted native ({native_anthropic_base_url(provider, pcfg)}/v1/messages)"
-        proxy = nvidia_proxy_base_url()
-        state = "ready" if is_url_up(f"{proxy}/v1/models") else "starts on launch"
-        return f"Base URL: NVIDIA hosted ({base}); local proxy {proxy} {state}"
+        state = "ready" if router_up() else "starts on launch"
+        return f"Base URL: NVIDIA hosted ({base}); local router {ROUTER_BASE} {state}"
     path = "/api/tags" if provider in ("ollama", "ollama-cloud") else "/v1/models"
     headers: dict[str, str] = {}
     key = pcfg.get("api_key")

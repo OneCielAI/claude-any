@@ -43,7 +43,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.28`
+当前版本: `0.1.29`
 
 ## 为什么存在
 
@@ -260,6 +260,14 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.29
+
+- **NVIDIA 兼容性测试修复**：`claude-any test` 现在会在 router mode 测试前
+  重启本地 router，避免 npm upgrade 后仍连接到旧的常驻 router 并错误要求
+  `nvd-claude-proxy`。
+- **NVIDIA router 状态文案更新**：菜单状态现在显示 claude-any local router，
+  不再提示已废弃的 local proxy 路径。
 
 ### 0.1.28
 

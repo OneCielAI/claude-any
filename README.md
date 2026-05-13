@@ -44,7 +44,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.28`
+Current version: `0.1.29`
 
 ## Why This Exists
 
@@ -299,6 +299,14 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.29
+
+- **NVIDIA compatibility test fix**: `claude-any test` now restarts the local
+  router before router-mode tests, so upgraded installs do not accidentally use
+  an old long-running router that still expects `nvd-claude-proxy`.
+- **Clear NVIDIA router wording**: menu status now describes NVIDIA hosted as
+  using the local claude-any router instead of the retired local proxy path.
 
 ### 0.1.28
 

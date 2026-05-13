@@ -43,7 +43,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.28`
+現在のバージョン: `0.1.29`
 
 ## 作られた理由
 
@@ -273,6 +273,14 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.29
+
+- **NVIDIA 互換性テストの修正**: `claude-any test` は router mode のテスト前に
+  local router を再起動します。npm upgrade 後も古い常駐 router が
+  `nvd-claude-proxy` を要求する問題を避けます。
+- **NVIDIA router 表示の整理**: メニューの状態表示を、廃止した local proxy
+  経路ではなく claude-any local router 基準に更新しました。
 
 ### 0.1.28
 

@@ -43,7 +43,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.28`
+현재 버전: `0.1.29`
 
 ## 왜 만들었나
 
@@ -272,6 +272,14 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.29
+
+- **NVIDIA 호환성 테스트 수정**: `claude-any test`가 router mode 테스트 전에
+  로컬 router를 재시작하므로, 업그레이드 후에도 오래 떠 있던 예전 router가
+  `nvd-claude-proxy`를 찾는 문제가 사라집니다.
+- **NVIDIA router 안내 정리**: 메뉴 상태 문구를 더 이상 사용하지 않는 local proxy
+  경로가 아니라 claude-any local router 기준으로 표시합니다.
 
 ### 0.1.28
 

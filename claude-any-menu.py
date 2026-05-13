@@ -656,7 +656,7 @@ def probe_base_url(provider: str, pcfg: dict) -> str:
     if "your-" in base:
         return f"Base URL: placeholder ({base})"
     if provider == "nvidia-hosted":
-        return f"Base URL: NVIDIA hosted ({base}); proxy starts on launch"
+        return f"Base URL: NVIDIA hosted ({base}); local router http://127.0.0.1:8799 starts on launch"
     path = "/api/tags" if provider in ("ollama", "ollama-cloud") else "/v1/models"
     url = join_url(base, path)
     headers = {}
