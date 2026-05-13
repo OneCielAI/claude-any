@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.39`
+현재 버전: `0.1.42`
 
 ## 왜 만들었나
 
@@ -350,6 +350,21 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.42
+
+- **실시간 스트림 진행 표시**: statusline이 upstream streaming 출력 진행을
+  입력/출력 token 추정치와 chunk 수로 계속 갱신합니다.
+
+### 0.1.41
+
+- **Statusline 표시 개선**: upstream token 수에 천 단위 구분자와 `tok` 앞 공백을
+  넣어 `27,501 tok`처럼 표시합니다.
+
+### 0.1.40
+
+- **RPM 0 유지**: `rate_limit_rpm=0` 설정이 provider 기본값으로 되돌아가지 않고
+  명시적인 무제한 모드로 저장됩니다.
 
 ### 0.1.39
 

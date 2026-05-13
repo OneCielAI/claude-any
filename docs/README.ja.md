@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.39`
+現在のバージョン: `0.1.42`
 
 ## 作られた理由
 
@@ -350,6 +350,21 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.42
+
+- **ライブストリーム進捗**: statusline が upstream streaming の出力進捗を
+  入力/出力 token 推定値と chunk 数で継続更新します。
+
+### 0.1.41
+
+- **Statusline 表示改善**: upstream token 数に桁区切りと `tok` 前の空白を入れ、
+  `27,501 tok` のように表示します。
+
+### 0.1.40
+
+- **RPM 0 を保持**: `rate_limit_rpm=0` の設定が provider 既定値に戻らず、
+  明示的な無制限モードとして保存されます。
 
 ### 0.1.39
 

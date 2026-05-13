@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.39`
+当前版本: `0.1.42`
 
 ## 为什么存在
 
@@ -336,6 +336,21 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.42
+
+- **实时流式进度**：statusline 会持续更新 upstream streaming 输出进度，
+  显示输入/输出 token 估算值和 chunk 数。
+
+### 0.1.41
+
+- **Statusline 格式优化**：upstream token 数现在带千位分隔符，并在 `tok` 前加入空格，
+  例如 `27,501 tok`。
+
+### 0.1.40
+
+- **保留 RPM 0**：`rate_limit_rpm=0` 现在会保存为明确的无限制模式，
+  不会回退到 provider 默认值。
 
 ### 0.1.39
 

@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.39`
+Current version: `0.1.42`
 
 ## Why This Exists
 
@@ -380,6 +380,21 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.42
+
+- **Live stream progress**: the statusline now updates streamed upstream output
+  progress with formatted input/output token estimates and chunk counts.
+
+### 0.1.41
+
+- **Statusline formatting**: upstream token counts now use thousands separators
+  and a space before `tok`, for example `27,501 tok`.
+
+### 0.1.40
+
+- **RPM 0 is preserved**: setting `rate_limit_rpm=0` now stores an explicit
+  unlimited mode instead of falling back to the provider default.
 
 ### 0.1.39
 

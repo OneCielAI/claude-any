@@ -85,7 +85,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.39"
+VERSION = "0.1.42"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -1339,7 +1339,22 @@ def main():
                 tokens = activity.get("tokens")
                 rpm_text += f" | upstream {age:.0f}s"
                 if tokens:
-                    rpm_text += f" {tokens}tok"
+                    try:
+                        rpm_text += f" {int(tokens):,} tok"
+                    except Exception:
+                        rpm_text += f" {tokens} tok"
+                output_tokens = activity.get("output_tokens")
+                if output_tokens:
+                    try:
+                        rpm_text += f" -> {int(output_tokens):,} tok"
+                    except Exception:
+                        rpm_text += f" -> {output_tokens} tok"
+                chunks = activity.get("chunks")
+                if chunks:
+                    try:
+                        rpm_text += f" ({int(chunks):,} chunks)"
+                    except Exception:
+                        rpm_text += f" ({chunks} chunks)"
             elif event in ("success", "error"):
                 rpm_text += f" | {event} {age:.0f}s"
     print(f"{left} | {color(rpm_text)}")
@@ -2209,6 +2224,8 @@ def router_rate_limit_usage(provider: str, pcfg: dict[str, Any], model: str | No
     rpm = router_rate_limit_effective_rpm(provider, pcfg, model)
     if rpm is None:
         return 0, None
+    if rpm == 0:
+        return 0, 0
     key = router_rate_limit_key(provider, pcfg, model)
     now = time.time()
     try:
@@ -4697,6 +4714,8 @@ def stream_openai_chat_to_anthropic_sse(
     source_body: dict[str, Any] | None = None,
     start_index: int = 0,
     word_chunking: bool = False,
+    input_tokens: int | None = None,
+    input_bytes: int | None = None,
 ) -> None:
     next_content_index = start_index
     text_started = False
@@ -4709,6 +4728,8 @@ def stream_openai_chat_to_anthropic_sse(
     tool_fragments: dict[int, dict[str, Any]] = {}
     output_tokens = 0
     finish_reason = "stop"
+    chunks_seen = 0
+    last_activity_update = 0.0
 
     def emit(event_name: str, payload: dict[str, Any]) -> None:
         handler.wfile.write(f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
@@ -4736,8 +4757,27 @@ def stream_openai_chat_to_anthropic_sse(
             {"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": text}},
         )
 
+    def update_stream_activity(force: bool = False) -> None:
+        nonlocal last_activity_update
+        now = time.time()
+        if not force and now - last_activity_update < 0.5:
+            return
+        last_activity_update = now
+        estimated_output = output_tokens or max(0, len(text_so_far) // 4)
+        write_router_activity(
+            "request",
+            provider,
+            model,
+            tokens=input_tokens,
+            bytes=input_bytes,
+            output_tokens=estimated_output,
+            chunks=chunks_seen,
+            stream=True,
+        )
+
     try:
         for raw_line in resp:
+            chunks_seen += 1
             line = raw_line.decode("utf-8", errors="ignore").strip()
             if not line or line.startswith(":"):
                 continue
@@ -4789,6 +4829,7 @@ def stream_openai_chat_to_anthropic_sse(
                     emit_text_delta(to_flush)
                 else:
                     emit_text_delta(text_chunk)
+                update_stream_activity()
             for call in delta.get("tool_calls") or []:
                 if not isinstance(call, dict):
                     continue
@@ -4804,6 +4845,8 @@ def stream_openai_chat_to_anthropic_sse(
                     slot["name"] += str(fn.get("name"))
                 if fn.get("arguments"):
                     slot["arguments"] += str(fn.get("arguments"))
+                update_stream_activity()
+        update_stream_activity(force=True)
         if word_chunking and text_buffer:
             to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
             emit_text_delta(to_flush)
@@ -5108,6 +5151,8 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
                 model,
                 emit_retry_notice,
             )
+            req_tokens = estimate_tokens(req_body)
+            req_bytes = len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))
             stream_openai_chat_to_anthropic_sse(
                 handler,
                 resp,
@@ -5116,8 +5161,10 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
                 source_body=body,
                 start_index=index,
                 word_chunking=bool(pcfg.get("stream_word_chunking", False)),
+                input_tokens=req_tokens,
+                input_bytes=req_bytes,
             )
-            write_router_activity("success", provider, model, tokens=estimate_tokens(req_body), bytes=len(json.dumps(req_body, ensure_ascii=False).encode("utf-8")), stream=True)
+            write_router_activity("success", provider, model, tokens=req_tokens, bytes=req_bytes, stream=True)
         except RuntimeError as exc:
             msg = str(exc)
             write_anthropic_stream_blocks(handler, [{"type": "text", "text": f"Upstream error: {msg}"}], index)
@@ -6666,7 +6713,7 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
     if key in ("rate_limit", "rate_limit_rpm", "rpm"):
         fixed = positive_int(value)
         if value in (0, "0", False, None):
-            pcfg.pop("rate_limit_rpm", None)
+            pcfg["rate_limit_rpm"] = 0
             return
         if not fixed:
             raise SystemExit("rate_limit_rpm must be a positive integer, or 0/unset to disable")
