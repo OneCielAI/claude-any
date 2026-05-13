@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.35`
+当前版本: `0.1.36`
 
 ## 为什么存在
 
@@ -336,6 +336,13 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.36
+
+- **NVIDIA upstream streaming**：NVIDIA hosted router 调用现在也会向 upstream
+  使用 `stream=true`，长响应可以按 chunk 流出，不再等待完整的非流式 completion。
+- **Stream retry diagnostics**：streaming NVIDIA 调用也保留 statusline 使用的
+  retry/request size activity 状态。
 
 ### 0.1.35
 

@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.35`
+現在のバージョン: `0.1.36`
 
 ## 作られた理由
 
@@ -350,6 +350,14 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.36
+
+- **NVIDIA upstream streaming**: NVIDIA hosted router 呼び出しは upstream にも
+  `stream=true` を使用します。長い応答を完全な non-streaming completion まで
+  待たず、chunk として流せます。
+- **Stream retry diagnostics**: streaming NVIDIA 呼び出しでも statusline 用の
+  retry/request size activity 状態を維持します。
 
 ### 0.1.35
 

@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.35`
+Current version: `0.1.36`
 
 ## Why This Exists
 
@@ -380,6 +380,14 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.36
+
+- **NVIDIA upstream streaming**: NVIDIA hosted router calls now use upstream
+  `stream=true`, so long responses can flow as chunks instead of waiting for a
+  full non-streaming completion.
+- **Stream retry diagnostics**: streamed NVIDIA calls keep the same retry and
+  request-size activity status used by the statusline.
 
 ### 0.1.35
 

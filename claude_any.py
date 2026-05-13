@@ -85,7 +85,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.35"
+VERSION = "0.1.36"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -4595,6 +4595,198 @@ def openai_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
     return ollama_chat_to_anthropic(wrapped, model, source_body=source_body)
 
 
+def stream_openai_chat_to_anthropic_sse(
+    handler: BaseHTTPRequestHandler,
+    resp: Any,
+    model: str,
+    provider: str,
+    source_body: dict[str, Any] | None = None,
+    start_index: int = 0,
+    word_chunking: bool = False,
+) -> None:
+    next_content_index = start_index
+    text_started = False
+    text_suppressed_for_plan = False
+    text_index: int | None = None
+    text_so_far = ""
+    text_buffer = ""
+    tool_fragments: dict[int, dict[str, Any]] = {}
+    output_tokens = 0
+    finish_reason = "stop"
+
+    def emit(event_name: str, payload: dict[str, Any]) -> None:
+        handler.wfile.write(f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.flush()
+
+    def ensure_text_started() -> int:
+        nonlocal text_started, text_index, next_content_index
+        if text_started and text_index is not None:
+            return text_index
+        text_started = True
+        text_index = next_content_index
+        next_content_index += 1
+        emit(
+            "content_block_start",
+            {"type": "content_block_start", "index": text_index, "content_block": {"type": "text", "text": ""}},
+        )
+        return text_index
+
+    def emit_text_delta(text: str) -> None:
+        if not text:
+            return
+        idx = ensure_text_started()
+        emit(
+            "content_block_delta",
+            {"type": "content_block_delta", "index": idx, "delta": {"type": "text_delta", "text": text}},
+        )
+
+    try:
+        for raw_line in resp:
+            line = raw_line.decode("utf-8", errors="ignore").strip()
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("data:"):
+                line = line[5:].strip()
+            if not line or line == "[DONE]":
+                break
+            try:
+                event = json.loads(line)
+            except Exception:
+                continue
+            if not isinstance(event, dict):
+                continue
+            usage = event.get("usage")
+            if isinstance(usage, dict):
+                output_tokens = max(output_tokens, positive_int(usage.get("completion_tokens")) or 0)
+            choices = event.get("choices")
+            if not isinstance(choices, list) or not choices:
+                continue
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            if choice.get("finish_reason"):
+                finish_reason = str(choice.get("finish_reason"))
+            delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            text_chunk = delta.get("content") or ""
+            if text_chunk:
+                if source_body is not None and not text_started and not tool_fragments and should_auto_enter_plan_mode(source_body, text_so_far + text_chunk, []):
+                    text_so_far += text_chunk
+                    text_suppressed_for_plan = True
+                    continue
+                text_so_far += text_chunk
+                if word_chunking:
+                    text_buffer += text_chunk
+                    to_flush, text_buffer = _split_word_buffer(text_buffer, force=False)
+                    emit_text_delta(to_flush)
+                else:
+                    emit_text_delta(text_chunk)
+            for call in delta.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                try:
+                    call_index = int(call.get("index"))
+                except Exception:
+                    call_index = len(tool_fragments)
+                slot = tool_fragments.setdefault(call_index, {"id": "", "name": "", "arguments": ""})
+                if call.get("id"):
+                    slot["id"] = str(call.get("id"))
+                fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+                if fn.get("name"):
+                    slot["name"] += str(fn.get("name"))
+                if fn.get("arguments"):
+                    slot["arguments"] += str(fn.get("arguments"))
+        if word_chunking and text_buffer:
+            to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
+            emit_text_delta(to_flush)
+
+        tool_calls: list[dict[str, Any]] = []
+        for _, fragment in sorted(tool_fragments.items()):
+            raw_name = str(fragment.get("name") or "")
+            if not raw_name:
+                continue
+            matched_name = _fuzzy_match_tool_name(raw_name) or raw_name
+            normalized_args = normalize_tool_arguments(matched_name, fragment.get("arguments") or {})
+            fixed_input = _validate_and_fix_tool_input(matched_name, normalized_args)
+            if source_body is not None:
+                matched_name, fixed_input = plan_mode_tool_name_for_emit(source_body, matched_name, fixed_input)
+                if matched_name is None:
+                    continue
+            tool_calls.append({"function": {"name": matched_name, "arguments": fixed_input}})
+            tool_index = next_content_index
+            next_content_index += 1
+            tool_id = str(fragment.get("id") or f"toolu_openai_{int(time.time() * 1000)}_{tool_index}")
+            append_tool_call_log(
+                "openai_stream_tool_call",
+                {
+                    "model": model,
+                    "raw_name": raw_name,
+                    "matched_name": matched_name,
+                    "raw_arguments": fragment.get("arguments"),
+                    "emitted_input": fixed_input,
+                    "sse_index": tool_index,
+                },
+            )
+            emit(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": tool_index,
+                    "content_block": {"type": "tool_use", "id": tool_id, "name": matched_name, "input": {}},
+                },
+            )
+            emit(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": tool_index,
+                    "delta": {"type": "input_json_delta", "partial_json": json.dumps(fixed_input, ensure_ascii=False)},
+                },
+            )
+            emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
+
+        if source_body is not None and should_auto_enter_plan_mode(source_body, text_so_far, tool_calls):
+            router_log("WARN", "auto-synthesized EnterPlanMode from short/empty upstream OpenAI stream")
+            tool_index = next_content_index
+            next_content_index += 1
+            tool_calls.append({"function": {"name": "EnterPlanMode", "arguments": {}}})
+            emit(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": tool_index,
+                    "content_block": {"type": "tool_use", "id": f"toolu_openai_plan_{int(time.time() * 1000)}", "name": "EnterPlanMode", "input": {}},
+                },
+            )
+            emit("content_block_delta", {"type": "content_block_delta", "index": tool_index, "delta": {"type": "input_json_delta", "partial_json": "{}"}})
+            emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
+        elif text_suppressed_for_plan and text_so_far:
+            emit_text_delta(text_so_far)
+
+        if source_body is not None and should_keep_work_alive_with_tasklist(source_body, text_so_far, tool_calls):
+            router_log("WARN", "auto-synthesized TaskList to keep work moving after OpenAI stream")
+            tool_index = next_content_index
+            next_content_index += 1
+            tool_calls.append({"function": {"name": "TaskList", "arguments": {}}})
+            emit(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": tool_index,
+                    "content_block": {"type": "tool_use", "id": f"toolu_openai_keepalive_{int(time.time() * 1000)}", "name": "TaskList", "input": {}},
+                },
+            )
+            emit("content_block_delta", {"type": "content_block_delta", "index": tool_index, "delta": {"type": "input_json_delta", "partial_json": "{}"}})
+            emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
+
+        if text_started and text_index is not None:
+            emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
+        stop_reason = "tool_use" if tool_calls else ("max_tokens" if finish_reason == "length" else "end_turn")
+        write_anthropic_open_stream_stop(handler, {"stop_reason": stop_reason, "usage": {"output_tokens": output_tokens or max(1, len(text_so_far) // 4)}})
+    finally:
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+
 def upstream_http_error_message(exc: urllib.error.HTTPError, raw: str | None = None) -> str:
     if raw is None:
         raw = exc.read().decode("utf-8", errors="ignore")
@@ -4701,17 +4893,81 @@ def post_json_with_rate_retry(
     raise RuntimeError("upstream request failed")
 
 
+def open_openai_stream_with_rate_retry(
+    url: str,
+    req_body: Any,
+    headers: dict[str, str],
+    timeout: float,
+    provider: str,
+    pcfg: dict[str, Any],
+    model: str,
+    retry_notice: Callable[[str], None] | None = None,
+) -> Any:
+    gateway_retries = positive_int(pcfg.get("gateway_retries")) or 2
+    max_attempts = max(1, gateway_retries + 1)
+    token_estimate = estimate_tokens(req_body)
+    byte_estimate = len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))
+    data_bytes = json.dumps(req_body).encode("utf-8")
+    for attempt in range(max_attempts):
+        try:
+            write_router_activity(
+                "request",
+                provider,
+                model,
+                attempt=attempt + 1,
+                total=max_attempts,
+                tokens=token_estimate,
+                bytes=byte_estimate,
+                timeout=timeout,
+                stream=True,
+            )
+            router_log("INFO", f"upstream_stream_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={token_estimate} bytes={byte_estimate} timeout={timeout}")
+            req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+            resp = urllib.request.urlopen(req, timeout=timeout)
+            learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
+            return resp
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="ignore")
+            learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
+            if exc.code == 429 and attempt == 0:
+                wait = register_router_rate_limit_backoff(provider, pcfg, model, exc.headers.get("Retry-After"))
+                time.sleep(wait)
+                continue
+            if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, tokens=token_estimate, bytes=byte_estimate, stream=True)
+                router_log("WARN", f"upstream_stream_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} code={exc.code} tokens={token_estimate} bytes={byte_estimate}")
+                if retry_notice:
+                    retry_notice(upstream_retry_message(retry_no, gateway_retries))
+                time.sleep(upstream_retry_wait_seconds(retry_no))
+                continue
+            write_router_activity("error", provider, model, code=exc.code, tokens=token_estimate, bytes=byte_estimate, stream=True)
+            raise RuntimeError(upstream_http_error_message(exc, raw)) from exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            if retryable_timeout_exception(exc) and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, error=type(exc).__name__, tokens=token_estimate, bytes=byte_estimate, stream=True)
+                router_log("WARN", f"upstream_stream_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} error={type(exc).__name__} tokens={token_estimate} bytes={byte_estimate}")
+                if retry_notice:
+                    retry_notice(upstream_retry_message(retry_no, gateway_retries))
+                time.sleep(upstream_retry_wait_seconds(retry_no))
+                continue
+            write_router_activity("error", provider, model, error=type(exc).__name__, tokens=token_estimate, bytes=byte_estimate, stream=True)
+            raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    raise RuntimeError("upstream stream request failed")
+
+
 def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
     _update_tool_schema_registry(body.get("tools"))
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     if provider == "nvidia-hosted":
         model = ncp_model_id_for_nvidia_hosted(model)
-    req_body = openai_compatible_chat_request(provider, model, body, pcfg, stream=False)
     url = join_url(provider_upstream_request_base(provider, pcfg), "/chat/completions")
     waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
     stream = bool(body.get("stream", True))
     notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", True)))
     if stream:
+        req_body = openai_compatible_chat_request(provider, model, body, pcfg, stream=True)
         write_anthropic_open_stream_start(handler, model)
         index = 0
         if notice:
@@ -4721,7 +4977,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
                 nonlocal index
                 index = write_anthropic_stream_blocks(handler, [{"type": "text", "text": text + "\n"}], index)
 
-            data = post_json_with_rate_retry(
+            resp = open_openai_stream_with_rate_retry(
                 url,
                 req_body,
                 provider_headers(provider, pcfg),
@@ -4731,15 +4987,29 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
                 model,
                 emit_retry_notice,
             )
+            stream_openai_chat_to_anthropic_sse(
+                handler,
+                resp,
+                model,
+                provider,
+                source_body=body,
+                start_index=index,
+                word_chunking=bool(pcfg.get("stream_word_chunking", False)),
+            )
+            write_router_activity("success", provider, model, tokens=estimate_tokens(req_body), bytes=len(json.dumps(req_body, ensure_ascii=False).encode("utf-8")), stream=True)
         except RuntimeError as exc:
             msg = str(exc)
             write_anthropic_stream_blocks(handler, [{"type": "text", "text": f"Upstream error: {msg}"}], index)
             write_anthropic_open_stream_stop(handler)
             return
-        message = openai_chat_to_anthropic(data, model, source_body=body)
-        write_anthropic_stream_blocks(handler, list(message.get("content") or []), index)
-        write_anthropic_open_stream_stop(handler, message)
+        except Exception as exc:
+            msg = f"{type(exc).__name__}: {exc}"
+            write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
+            write_anthropic_stream_blocks(handler, [{"type": "text", "text": f"Upstream error: {msg}"}], index)
+            write_anthropic_open_stream_stop(handler)
+            return
         return
+    req_body = openai_compatible_chat_request(provider, model, body, pcfg, stream=False)
     try:
         data = post_json_with_rate_retry(
             url,

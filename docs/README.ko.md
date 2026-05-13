@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.35`
+현재 버전: `0.1.36`
 
 ## 왜 만들었나
 
@@ -350,6 +350,14 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.36
+
+- **NVIDIA upstream streaming**: NVIDIA hosted router 호출은 이제 upstream에도
+  `stream=true`를 사용합니다. 긴 응답을 전체 완료까지 기다리지 않고 chunk로
+  흘려보내 timeout 가능성을 낮춥니다.
+- **Stream retry diagnostics**: streaming NVIDIA 호출도 statusline에서 쓰는
+  retry/request size activity 상태를 유지합니다.
 
 ### 0.1.35
 
