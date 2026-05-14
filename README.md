@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.46`
+Current version: `0.1.62`
 
 ## Why This Exists
 
@@ -340,6 +340,10 @@ steps under that larger model's supervision.
   tool-result round trip checks.
 - Runtime context reporting for vLLM/NIM when `/v1/models` exposes
   `max_model_len`.
+- Ollama model-context catalog: `claude-any ollama-catalog` downloads
+  `https://ollama.com/api/tags` and Ollama library tag pages, then caches real
+  context windows such as 256K Kimi and 1M DeepSeek models for preset filtering
+  and status display.
 - Console-first pre-launch menu for SSH and terminal workflows.
 - Native paths where providers expose Claude/Anthropic-compatible endpoints.
 - Router mode for providers that need request/response adaptation.
@@ -381,6 +385,51 @@ steps under that larger model's supervision.
 
 ## Changelog
 
+### 0.1.62
+
+- **Ollama context catalog**: added `claude-any ollama-catalog`, which downloads
+  Ollama's model list and library tag pages, strips suffixes such as `:cloud`
+  and `:latest`, and caches per-model context windows under
+  `~/.config/claude-any/ollama-model-catalog.json`.
+- **Context-aware presets**: the pre-launch menu now uses the selected model's
+  known context capacity to hide impossible presets and expose 1M-context
+  presets only for models that can actually use them.
+- **Native Claude Code compacting preserved**: removed the
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW` override so Claude Code's own compact
+  behavior stays in control instead of being capped too early by claude-any.
+- **Live context/status accounting**: the statusline prefers Claude Code's
+  current session context-window telemetry when available, while router mode
+  continues to report upstream request tokens, retries, RPM usage, and errors.
+- **Advisor and plan-mode hardening**: kept Advisor review support, stale
+  `ExitPlanMode` recovery, queued-command handling, and broader Claude Code hook
+  coverage for agent/task/team workflows on non-Anthropic providers.
+
+### 0.1.50
+
+- **Dynamic timeout help**: the LLM options panel now describes
+  `request_timeout_ms` using the currently selected value instead of always
+  showing the old `300000 ms = 5 minutes` example.
+
+### 0.1.49
+
+- **Streaming buffer fix**: Ollama/OpenAI-compatible streams now flush any
+  briefly held plan-detection text as soon as normal text streaming resumes,
+  instead of replaying it at the end of the response.
+- **Plan mode guard**: `ExitPlanMode` tool calls are dropped when Claude Code is
+  no longer in plan mode, avoiding the “You are not in plan mode” dead end.
+
+### 0.1.48
+
+- **Unreachable model list fix**: when a provider model endpoint cannot be
+  reached, the model picker no longer repopulates stale `current_model` or
+  `custom_models` entries from config as if they came from the new endpoint.
+
+### 0.1.47
+
+- **Base URL model reset**: changing a provider Base URL now clears stale
+  custom/current model entries and refreshes model caches, so the model picker
+  cannot keep showing models from the previous endpoint.
+
 ### 0.1.46
 
 - **Cleaner stream options**: the LLM options menu now hides `Stream word
@@ -419,7 +468,9 @@ steps under that larger model's supervision.
 ### 0.1.40
 
 - **RPM 0 is preserved**: setting `rate_limit_rpm=0` now stores an explicit
-  unlimited mode instead of falling back to the provider default.
+  unmanaged router mode instead of falling back to the provider default.
+  Claude Any still shows recent 60-second request usage when enabled, but it
+  does not claim the upstream provider is unlimited.
 
 ### 0.1.39
 

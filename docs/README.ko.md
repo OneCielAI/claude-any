@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.46`
+현재 버전: `0.1.62`
 
 ## 왜 만들었나
 
@@ -351,6 +351,50 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 ## 변경 이력
 
+### 0.1.62
+
+- **Ollama 컨텍스트 카탈로그**: `claude-any ollama-catalog` 명령을 추가했습니다.
+  Ollama 모델 목록과 library tag 페이지를 내려받고, `:cloud`, `:latest` 같은
+  suffix를 제거한 base 모델 기준으로 실제 context window를
+  `~/.config/claude-any/ollama-model-catalog.json`에 캐시합니다.
+- **컨텍스트 인식 프리셋**: 선택된 모델의 실제 context capacity를 기준으로
+  불가능한 프리셋은 숨기고, 1M 컨텍스트 프리셋은 1M 모델에서만 보이게 했습니다.
+- **Claude Code native compact 유지**: `CLAUDE_CODE_AUTO_COMPACT_WINDOW` override를
+  제거해 Claude Code 자체 compact 동작이 claude-any의 조기 cap에 방해받지 않게
+  했습니다.
+- **실시간 context/status 계산**: statusline은 가능한 경우 Claude Code session의
+  context-window telemetry를 우선 사용하고, router mode에서는 upstream token,
+  retry, RPM 사용량, error 상태를 계속 표시합니다.
+- **Advisor/Plan Mode 안정화**: Advisor review, stale `ExitPlanMode` 복구,
+  queued command 처리, agent/task/team workflow용 Claude Code hook coverage를
+  non-Anthropic provider에서 더 안정화했습니다.
+
+### 0.1.50
+
+- **동적 timeout help**: LLM 옵션 패널의 `request_timeout_ms` 설명이 더 이상
+  고정 예시 `300000 ms = 5 minutes`를 보여주지 않고, 현재 선택된 값을 기준으로
+  표시됩니다.
+
+### 0.1.49
+
+- **Streaming buffer 수정**: Ollama/OpenAI-compatible stream에서 plan 감지를 위해
+  잠깐 보류한 텍스트를 일반 텍스트 스트리밍이 재개되는 즉시 flush합니다. 응답 끝에서
+  한꺼번에 replay하지 않습니다.
+- **Plan mode guard**: Claude Code가 더 이상 plan mode가 아닐 때 `ExitPlanMode`
+  tool call을 드롭해 “You are not in plan mode” 정지 상태를 피합니다.
+
+### 0.1.48
+
+- **Unreachable 모델 목록 수정**: provider 모델 endpoint에 연결할 수 없을 때
+  config에 남아 있는 `current_model` 또는 `custom_models`를 새 endpoint에서
+  가져온 모델처럼 다시 표시하지 않습니다.
+
+### 0.1.47
+
+- **Base URL 모델 초기화**: provider Base URL을 변경하면 이전 endpoint의
+  custom/current model 항목과 모델 캐시를 지웁니다. 그래서 모델 선택 화면이
+  이전 endpoint의 모델을 계속 보여주지 않습니다.
+
 ### 0.1.46
 
 - **Stream 옵션 정리**: `Stream`이 off일 때는 `Stream word chunking` 항목을
@@ -387,7 +431,8 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 ### 0.1.40
 
 - **RPM 0 유지**: `rate_limit_rpm=0` 설정이 provider 기본값으로 되돌아가지 않고
-  명시적인 무제한 모드로 저장됩니다.
+  명시적인 라우터 미관리 모드로 저장됩니다. 최근 60초 요청 사용량은 표시할 수
+  있지만, upstream provider가 무제한이라는 뜻은 아닙니다.
 
 ### 0.1.39
 
@@ -486,8 +531,8 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   Ollama, Ollama Cloud 에 router-side RPM pacing 을 사용할 수 있습니다. 파일 읽기,
   명령 실행, tool 결과 대기에 이미 쓰인 시간을 지연 계산에서 빼므로 실제 코딩 중
   tool-call 간격이 RPM 간격을 자연스럽게 흡수합니다.
-- **무제한 사용량 표시**: `rate_limit_rpm=0`은 throttling 을 끄지만 최근 60초 요청
-  사용량은 계속 표시합니다.
+- **미관리 RPM 사용량 표시**: `rate_limit_rpm=0`은 router-side throttling 을 끄지만
+  최근 60초 요청 사용량은 계속 표시합니다. provider 제한이 없다는 뜻은 아닙니다.
 
 ### 0.1.27
 

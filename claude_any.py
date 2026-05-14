@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
+import html as html_lib
 import importlib.util
 import json
 import math
@@ -41,6 +42,8 @@ RESPONSE_DUMP_PATH = CONFIG_DIR / "responses.jsonl"
 TOOL_CALL_LOG_PATH = CONFIG_DIR / "tool-calls.jsonl"
 RATE_LIMIT_STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
 ROUTER_ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
+CONTEXT_USAGE_PATH = CONFIG_DIR / "context-usage.json"
+OLLAMA_MODEL_CATALOG_PATH = CONFIG_DIR / "ollama-model-catalog.json"
 CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
 CHAT_FILES_DIR = CONFIG_DIR / "chat-files"
 PLAN_ARTIFACTS_DIR = CONFIG_DIR / "plan-artifacts"
@@ -58,6 +61,8 @@ CLAUDE_ANY_STATUSLINE_PATH = HOME / ".local" / "bin" / "claude-any-statusline.py
 NCP_ENV = HOME / ".config" / "nvd-claude-proxy" / ".env"
 NCP_LOG = HOME / ".config" / "nvd-claude-proxy" / "proxy.log"
 MODEL_CACHE_TTL_SECONDS = 300
+OLLAMA_MODEL_CATALOG_URL = "https://ollama.com/api/tags"
+OLLAMA_MODEL_CATALOG_TTL_SECONDS = 24 * 60 * 60
 NCP_PYPI_PACKAGE = "nvd-claude-proxy"
 
 PROVIDER_ALIASES = {
@@ -85,7 +90,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.46"
+VERSION = "0.1.62"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -100,6 +105,7 @@ _LOG_LEVEL_CACHE: dict[str, Any] = {"value": None, "checked_at": 0.0, "file_mtim
 _RATE_LIMIT_LOCK = threading.Lock()
 _CHAT_CONDITION = threading.Condition()
 _CHAT_NEXT_ID: int | None = None
+ADVISOR_FEEDBACK_MARKER = "CLAUDE_ANY_ADVISOR_FEEDBACK"
 
 # Tools Claude Code injects into every model's tool list that misfire when called
 # by non-Anthropic models. See docs/notes from anthropics/claude-code issues
@@ -180,6 +186,367 @@ def model_preset(model_id: str) -> dict[str, Any]:
 
 def compat_max_tokens_for_model(model_id: str) -> int:
     return model_preset(model_id).get("compat_max_tokens", 16)
+
+
+def ollama_library_model_parts(model_id: str) -> tuple[str, str] | None:
+    model = (model_id or "").strip()
+    if not model:
+        return None
+    base, tag = (model.split(":", 1) + ["latest"])[:2] if ":" in model else (model, "latest")
+    base = base.strip()
+    tag = tag.strip() or "latest"
+    # Ollama library pages are /library/<model>/tags. Skip custom namespaces
+    # such as hf.co/... or registry paths that do not map cleanly to this URL.
+    if "/" in base or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", base):
+        return None
+    return base, tag
+
+
+def context_label_to_tokens(number: str, unit: str | None) -> int | None:
+    try:
+        value = float(number)
+    except Exception:
+        return None
+    if value <= 0 or not math.isfinite(value):
+        return None
+    unit = (unit or "").strip().lower()
+    multiplier = {"k": 1024, "m": 1024 * 1024, "g": 1024 * 1024 * 1024}.get(unit, 1)
+    return int(round(value * multiplier))
+
+
+def ollama_model_catalog_key(model_id: str) -> tuple[str, str, str] | None:
+    parts = ollama_library_model_parts(model_id)
+    if not parts:
+        return None
+    base, tag = parts
+    return base.lower(), base, tag.lower()
+
+
+def load_ollama_model_catalog() -> dict[str, Any]:
+    try:
+        data = json.loads(OLLAMA_MODEL_CATALOG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def save_ollama_model_catalog(catalog: dict[str, Any]) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = OLLAMA_MODEL_CATALOG_PATH.with_name(f"{OLLAMA_MODEL_CATALOG_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        tmp.write_text(json.dumps(catalog, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(OLLAMA_MODEL_CATALOG_PATH)
+    except Exception as exc:
+        router_log("WARN", f"ollama catalog: failed to save cache: {exc}")
+
+
+def ollama_catalog_is_stale(catalog: dict[str, Any], ttl_seconds: int = OLLAMA_MODEL_CATALOG_TTL_SECONDS) -> bool:
+    if not isinstance(catalog, dict) or not isinstance(catalog.get("models"), dict):
+        return True
+    try:
+        updated_at = float(catalog.get("updated_at") or 0)
+    except Exception:
+        updated_at = 0.0
+    return updated_at <= 0 or time.time() - updated_at > ttl_seconds
+
+
+def fetch_json_url(url: str, timeout: float = 12.0) -> Any:
+    req = urllib.request.Request(url, headers={"user-agent": f"claude-any/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read(5_000_000).decode("utf-8", errors="replace"))
+
+
+def context_tokens_from_ollama_snippet(snippet: str, table_fallback: bool = True) -> int | None:
+    match = re.search(r"\b(\d+(?:\.\d+)?)\s*([KMG])\s+context\s+window\b", snippet, re.IGNORECASE)
+    if match:
+        return context_label_to_tokens(match.group(1), match.group(2))
+    if table_fallback:
+        match = re.search(r">\s*(\d+(?:\.\d+)?)\s*([KM])\s*</p>", snippet, re.IGNORECASE)
+        if match:
+            return context_label_to_tokens(match.group(1), match.group(2))
+    return None
+
+
+def parse_ollama_library_context_map(page_html: str, base_model: str) -> dict[str, int]:
+    text = html_lib.unescape(page_html or "")
+    base = (base_model or "").strip()
+    if not text or not base:
+        return {}
+    contexts: dict[str, int] = {}
+    pattern = re.compile(r"(?<![A-Za-z0-9._/-])" + re.escape(base) + r":([A-Za-z0-9][A-Za-z0-9._-]*)", re.IGNORECASE)
+    for match in pattern.finditer(text):
+        tag = match.group(1).strip().lower()
+        if not tag:
+            continue
+        snippet = text[max(0, match.start() - 700): match.end() + 3000]
+        tokens = context_tokens_from_ollama_snippet(snippet)
+        if tokens:
+            contexts[tag] = max(contexts.get(tag, 0), tokens)
+
+    if not contexts:
+        match = re.search(r"\b(\d+(?:\.\d+)?)\s*([KMG])\s+context\s+window\b", text, re.IGNORECASE)
+        tokens = context_label_to_tokens(match.group(1), match.group(2)) if match else None
+        if tokens:
+            contexts["latest"] = tokens
+    return contexts
+
+
+def fetch_ollama_library_context_map(base_model: str, timeout: float = 10.0) -> tuple[dict[str, int], str | None]:
+    parts = ollama_library_model_parts(base_model)
+    if not parts:
+        return {}, None
+    base, _ = parts
+    urls = [
+        f"https://ollama.com/library/{urllib.parse.quote(base, safe='')}/tags",
+        f"https://ollama.com/library/{urllib.parse.quote(base, safe='')}",
+    ]
+    merged: dict[str, int] = {}
+    source_url: str | None = None
+    for url in urls:
+        req = urllib.request.Request(url, headers={"user-agent": f"claude-any/{VERSION}"})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read(3_000_000)
+        except Exception:
+            continue
+        page_map = parse_ollama_library_context_map(raw.decode("utf-8", errors="replace"), base)
+        for tag, tokens in page_map.items():
+            merged[tag] = max(merged.get(tag, 0), tokens)
+        if page_map and not source_url:
+            source_url = url
+    return merged, source_url
+
+
+def refresh_ollama_model_catalog(include_contexts: bool = True, timeout: float = 10.0) -> dict[str, Any]:
+    old_catalog = load_ollama_model_catalog()
+    old_models = old_catalog.get("models") if isinstance(old_catalog.get("models"), dict) else {}
+    data = fetch_json_url(OLLAMA_MODEL_CATALOG_URL, timeout=timeout)
+    raw_models = data.get("models") if isinstance(data, dict) else None
+    if raw_models is None and isinstance(data, dict):
+        raw_models = data.get("data")
+    if not isinstance(raw_models, list):
+        raw_models = []
+
+    models: dict[str, dict[str, Any]] = {}
+    for item in raw_models:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name") or item.get("model") or item.get("id") or "").strip()
+        parts = ollama_model_catalog_key(name)
+        if not parts:
+            continue
+        key, base, tag = parts
+        entry = models.setdefault(
+            key,
+            {
+                "id": base,
+                "models": [],
+                "tags": [],
+                "raw": [],
+                "context_windows": {},
+                "context_source": None,
+            },
+        )
+        if name not in entry["models"]:
+            entry["models"].append(name)
+        if tag not in entry["tags"]:
+            entry["tags"].append(tag)
+        entry["raw"].append(item)
+
+    if not include_contexts and isinstance(old_models, dict):
+        for key, entry in models.items():
+            old_entry = old_models.get(key)
+            if not isinstance(old_entry, dict):
+                continue
+            old_windows = old_entry.get("context_windows")
+            if isinstance(old_windows, dict) and old_windows:
+                entry["context_windows"] = old_windows
+                entry["context_window"] = positive_int(old_entry.get("context_window")) or max(
+                    positive_int(v) or 0 for v in old_windows.values()
+                )
+                entry["context_source"] = old_entry.get("context_source")
+
+    if include_contexts:
+        for key in sorted(models):
+            entry = models[key]
+            context_map, source = fetch_ollama_library_context_map(str(entry["id"]), timeout=timeout)
+            if context_map:
+                entry["context_windows"] = context_map
+                entry["context_window"] = max(context_map.values())
+                entry["context_source"] = source
+
+    catalog = {
+        "schema": 1,
+        "source": OLLAMA_MODEL_CATALOG_URL,
+        "updated_at": time.time(),
+        "model_count": len(raw_models),
+        "base_model_count": len(models),
+        "models": models,
+    }
+    save_ollama_model_catalog(catalog)
+    return catalog
+
+
+def ollama_catalog_context_for_model(model_id: str) -> tuple[int | None, str | None, str | None]:
+    parts = ollama_model_catalog_key(model_id)
+    if not parts:
+        return None, None, None
+    key, base, tag = parts
+    catalog = load_ollama_model_catalog()
+    entry = catalog.get("models", {}).get(key) if isinstance(catalog.get("models"), dict) else None
+    if not isinstance(entry, dict):
+        return None, None, None
+    windows = entry.get("context_windows")
+    source = str(entry.get("context_source") or catalog.get("source") or "")
+    if isinstance(windows, dict):
+        candidates = [tag]
+        if tag in ("latest", ""):
+            candidates.extend(["cloud", "latest"])
+        candidates.extend(["cloud", "latest"])
+        for candidate in candidates:
+            value = positive_int(windows.get(candidate))
+            if value:
+                return value, f"{base}:{candidate}", source or None
+    value = positive_int(entry.get("context_window"))
+    if value:
+        return value, base, source or None
+    return None, None, None
+
+
+def update_ollama_catalog_context(model_id: str, limit: int, matched_model: str | None, source_url: str | None) -> None:
+    parts = ollama_model_catalog_key(model_id)
+    if not parts or not limit:
+        return
+    key, base, tag = parts
+    catalog = load_ollama_model_catalog()
+    if not isinstance(catalog.get("models"), dict):
+        catalog = {
+            "schema": 1,
+            "source": OLLAMA_MODEL_CATALOG_URL,
+            "updated_at": time.time(),
+            "model_count": 0,
+            "base_model_count": 0,
+            "models": {},
+        }
+    entry = catalog["models"].setdefault(
+        key,
+        {"id": base, "models": [], "tags": [], "raw": [], "context_windows": {}, "context_source": None},
+    )
+    if model_id not in entry["models"]:
+        entry["models"].append(model_id)
+    tag_to_store = tag
+    matched_parts = ollama_model_catalog_key(matched_model or "")
+    if matched_parts:
+        tag_to_store = matched_parts[2]
+    entry.setdefault("tags", [])
+    if tag_to_store not in entry["tags"]:
+        entry["tags"].append(tag_to_store)
+    windows = entry.setdefault("context_windows", {})
+    if isinstance(windows, dict):
+        windows[tag_to_store] = int(limit)
+    entry["context_window"] = max([positive_int(v) or 0 for v in entry.get("context_windows", {}).values()] + [int(limit)])
+    entry["context_source"] = source_url or entry.get("context_source")
+    catalog["updated_at"] = time.time()
+    catalog["base_model_count"] = len(catalog.get("models", {}))
+    save_ollama_model_catalog(catalog)
+
+
+def parse_ollama_library_context_limit(tags_html: str, full_model_id: str) -> int | None:
+    text = html_lib.unescape(tags_html or "")
+    target = (full_model_id or "").strip()
+    if not text or not target:
+        return None
+    lower = text.lower()
+    target_lower = target.lower()
+    positions: list[int] = []
+    start = 0
+    while True:
+        idx = lower.find(target_lower, start)
+        if idx < 0:
+            break
+        positions.append(idx)
+        start = idx + len(target_lower)
+    for idx in positions:
+        snippet = text[max(0, idx - 500): idx + 2500]
+        tokens = context_tokens_from_ollama_snippet(snippet)
+        if tokens:
+            return tokens
+    return None
+
+
+def fetch_ollama_library_context_limit(model_id: str, timeout: float = 6.0) -> tuple[int | None, str | None, str | None]:
+    parts = ollama_library_model_parts(model_id)
+    if not parts:
+        return None, None, None
+    base, tag = parts
+    full_model = f"{base}:{tag}"
+    context_map, url = fetch_ollama_library_context_map(base, timeout=timeout)
+    limit = positive_int(context_map.get(tag.lower()))
+    if not limit and tag == "latest":
+        cloud_limit = positive_int(context_map.get("cloud"))
+        if cloud_limit:
+            return cloud_limit, f"{base}:cloud", url
+    return limit, full_model, url
+
+
+def ollama_context_model_matches(current_model: str, cached_model: str | None) -> bool:
+    current = (current_model or "").strip().lower()
+    cached = (cached_model or "").strip().lower()
+    if not current or not cached:
+        return False
+
+    def aliases(value: str) -> set[str]:
+        result = {value}
+        if ":" not in value:
+            result.add(f"{value}:latest")
+            result.add(f"{value}:cloud")
+        if value.endswith(":latest") or value.endswith(":cloud"):
+            result.add(value.rsplit(":", 1)[0])
+        return result
+
+    return bool(aliases(current) & aliases(cached))
+
+
+def sync_ollama_library_context_limit(provider: str, pcfg: dict[str, Any], model_id: str) -> list[str]:
+    if provider not in ("ollama", "ollama-cloud"):
+        return []
+    catalog = load_ollama_model_catalog()
+    if ollama_catalog_is_stale(catalog):
+        try:
+            catalog = refresh_ollama_model_catalog(include_contexts=False)
+        except Exception as exc:
+            router_log("WARN", f"ollama catalog: api refresh failed: {exc}")
+    limit, matched_model, url = ollama_catalog_context_for_model(model_id)
+    if not limit:
+        limit, matched_model, url = fetch_ollama_library_context_limit(model_id)
+        if limit:
+            update_ollama_catalog_context(model_id, limit, matched_model, url)
+    if not limit:
+        hint = model_context_hint_from_model_id(model_id)
+        if hint:
+            limit = hint
+            matched_model = normalize_model_id(provider, model_id)
+        else:
+            if not ollama_context_model_matches(model_id, str(pcfg.get("model_context_model") or "")):
+                pcfg.pop("model_context_max", None)
+                pcfg.pop("model_context_model", None)
+            return []
+    old_max = positive_int(pcfg.get("num_ctx_max"))
+    pcfg["model_context_max"] = limit
+    pcfg["model_context_model"] = matched_model
+    pcfg["num_ctx_max"] = limit
+    minimum = positive_int(pcfg.get("num_ctx_min"))
+    if minimum and minimum > limit:
+        pcfg["num_ctx_min"] = limit
+    fixed_ctx = positive_int(pcfg.get("num_ctx"))
+    if fixed_ctx and fixed_ctx > limit:
+        pcfg["num_ctx"] = limit
+    label = f"{limit:,}"
+    if old_max and old_max == limit:
+        return [f"Ollama library context verified: {matched_model} -> {label} tokens."]
+    detail = f" from {url}" if url else ""
+    return [f"Ollama library context detected: {matched_model} -> {label} tokens{detail}."]
 
 
 # ---------------------------------------------------------------------------
@@ -447,6 +814,7 @@ UI_TEXT = {
         "test": "Test compatibility",
         "options": "LLM options",
         "presets": "LLM presets",
+        "context_setup": "Context setup",
         "apply_preset": "Apply preset",
         "model_family": "Model family",
         "recommended_preset_is": "recommended preset is",
@@ -465,6 +833,7 @@ UI_TEXT = {
         "test": "호환성 테스트",
         "options": "LLM 옵션",
         "presets": "LLM 프리셋",
+        "context_setup": "컨텍스트 설정",
         "apply_preset": "프리셋 적용",
         "model_family": "모델 계열",
         "recommended_preset_is": "추천 프리셋",
@@ -483,6 +852,7 @@ UI_TEXT = {
         "test": "互換性テスト",
         "options": "LLMオプション",
         "presets": "LLMプリセット",
+        "context_setup": "コンテキスト設定",
         "apply_preset": "プリセットを適用",
         "model_family": "モデル系統",
         "recommended_preset_is": "推奨プリセット",
@@ -501,6 +871,7 @@ UI_TEXT = {
         "test": "兼容性测试",
         "options": "LLM 选项",
         "presets": "LLM 预设",
+        "context_setup": "上下文设置",
         "apply_preset": "应用预设",
         "model_family": "模型类型",
         "recommended_preset_is": "推荐预设",
@@ -920,10 +1291,15 @@ def unique_model_ids(provider: str, ids: list[str]) -> list[str]:
 
 
 def normalize_model_id(provider: str, model_id: str) -> str:
-    model_id = model_id.strip()
+    model_id = strip_claude_context_suffix(model_id).strip()
     if provider == "ollama-cloud" and model_id.endswith(":cloud"):
         return model_id[:-6]
     return model_id
+
+
+def strip_claude_context_suffix(model_id: str | None) -> str:
+    text = str(model_id or "").strip()
+    return re.sub(r"\[(?:1m)\]\s*$", "", text, flags=re.IGNORECASE)
 
 
 def alias_for(provider: str, model_id: str) -> str:
@@ -933,6 +1309,7 @@ def alias_for(provider: str, model_id: str) -> str:
 
 
 def unslug_provider_alias(provider: str, alias: str, model_map: dict[str, str]) -> str | None:
+    alias = strip_claude_context_suffix(alias)
     if alias in model_map:
         return model_map[alias]
     prefix = f"claude-any-{provider}-"
@@ -1210,6 +1587,7 @@ CONFIG_DIR = Path(os.environ.get("CLAUDE_ANY_CONFIG_DIR") or (HOME / ".config" /
 CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
 ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
+CONTEXT_PATH = CONFIG_DIR / "context-usage.json"
 PALETTE = (203, 209, 215, 221, 229, 187, 151, 116, 111, 147, 183, 219)
 
 
@@ -1232,6 +1610,87 @@ def color(text):
         else:
             out.append(f"\033[1;38;5;{PALETTE[(phase + i) % len(PALETTE)]}m{ch}\033[0m")
     return "".join(out)
+
+
+def gray(text):
+    if os.environ.get("CLAUDE_ANY_STATUSLINE_ANSI", "1").lower() in ("0", "false", "no"):
+        return text
+    return f"\033[38;5;245m{text}\033[0m"
+
+
+def token_text(value):
+    try:
+        return f"{int(value):,} tok"
+    except Exception:
+        return f"{value} tok"
+
+
+def token_part(value, muted=False):
+    text = token_text(value)
+    return gray(text) if muted else color(text)
+
+
+def context_status_text(context, provider, model):
+    if not isinstance(context, dict):
+        return ""
+    if str(context.get("provider") or "") != str(provider or ""):
+        return ""
+    try:
+        age = time.time() - float(context.get("updated_at") or 0)
+    except Exception:
+        age = 999999
+    if age < 0 or age > 3600:
+        return ""
+    try:
+        tokens = int(context.get("tokens") or 0)
+    except Exception:
+        tokens = 0
+    if tokens <= 0:
+        return ""
+    try:
+        limit = int(context.get("context_limit") or 0)
+    except Exception:
+        limit = 0
+    if limit > 0:
+        pct = (tokens / limit) * 100.0
+        return f"ctx {tokens:,}/{limit:,} tok ({pct:.1f}%)"
+    return f"ctx {tokens:,} tok"
+
+
+def _as_int(value, default=0):
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def session_context_status_text(session):
+    if not isinstance(session, dict):
+        return ""
+    context_window = session.get("context_window")
+    if not isinstance(context_window, dict):
+        return ""
+    usage = context_window.get("current_usage")
+    if not isinstance(usage, dict):
+        return ""
+    tokens = (
+        _as_int(usage.get("input_tokens"))
+        + _as_int(usage.get("cache_creation_input_tokens"))
+        + _as_int(usage.get("cache_read_input_tokens"))
+    )
+    if tokens <= 0:
+        tokens = _as_int(context_window.get("total_input_tokens"))
+    if tokens <= 0:
+        return ""
+    limit = _as_int(context_window.get("context_window_size"))
+    pct = context_window.get("used_percentage")
+    if limit > 0:
+        try:
+            pct_value = float(pct) if pct is not None else (tokens / limit) * 100.0
+        except Exception:
+            pct_value = (tokens / limit) * 100.0
+        return f"ctx {tokens:,}/{limit:,} tok ({pct_value:.1f}%)"
+    return f"ctx {tokens:,} tok"
 
 
 def display_capacity(rpm):
@@ -1263,6 +1722,7 @@ def main():
         rpm = 40
     state = load_json(STATE_PATH, {})
     activity = load_json(ACTIVITY_PATH, {})
+    context = load_json(CONTEXT_PATH, {})
     now = time.time()
     key = f"{provider}:__global__" if provider else ""
     entry = state.get(key) if key else None
@@ -1305,13 +1765,16 @@ def main():
     if dir_name:
         left += f" {dir_name}"
     status_parts = []
+    ctx_text = session_context_status_text(session) or context_status_text(context, provider, model)
+    if ctx_text:
+        status_parts.append(gray(ctx_text))
     if rpm_status:
         if rpm > 0:
             shown_limit = display_capacity(rpm)
             shown_used = min(used, shown_limit)
             rpm_text = f"RPM used: {shown_used}/{shown_limit}"
         else:
-            rpm_text = f"RPM used: {used}/min (unlimited)"
+            rpm_text = f"RPM used: {used}/min (unmanaged)"
         if server_rpm or server_remaining is not None or server_reset_seconds is not None:
             parts = []
             if server_remaining is not None:
@@ -1329,7 +1792,7 @@ def main():
             rpm_text += f" | wait {max(0.0, penalty_until - now):.0f}s"
         elif last_wait >= 0.5 and 0.0 <= now - updated_at < 60.0:
             rpm_text += f" | wait {last_wait:.1f}s"
-        status_parts.append(rpm_text)
+        status_parts.append(color(rpm_text))
     activity_text = ""
     if isinstance(activity, dict):
         try:
@@ -1339,46 +1802,37 @@ def main():
         if 0 <= age < 180:
             event = str(activity.get("event") or "")
             if event == "retry":
-                activity_text = f"retry {activity.get('attempt')}/{activity.get('total')}"
+                activity_text = color(f"retry {activity.get('attempt')}/{activity.get('total')}")
                 wait = activity.get("wait")
                 try:
-                    if wait is not None and float(wait) > 0:
-                        activity_text += f" wait {float(wait):.0f}s"
+                    if rpm_status and wait is not None and float(wait) > 0:
+                        activity_text += " " + color(f"wait {float(wait):.0f}s")
                 except Exception:
                     pass
                 tokens = activity.get("tokens")
                 if tokens:
-                    try:
-                        activity_text += f" last input {int(tokens):,} tok"
-                    except Exception:
-                        activity_text += f" last input {tokens} tok"
+                    activity_text += " " + color("last input") + " " + token_part(tokens, muted=rpm_status)
             elif event == "request":
                 tokens = activity.get("tokens")
-                activity_text = f"upstream {age:.0f}s"
+                activity_text = color(f"upstream {age:.0f}s")
                 if tokens:
-                    try:
-                        activity_text += f" {int(tokens):,} tok"
-                    except Exception:
-                        activity_text += f" {tokens} tok"
+                    activity_text += " " + token_part(tokens, muted=rpm_status)
                 output_tokens = activity.get("output_tokens")
                 if output_tokens:
-                    try:
-                        activity_text += f" -> {int(output_tokens):,} tok"
-                    except Exception:
-                        activity_text += f" -> {output_tokens} tok"
+                    activity_text += " " + color("->") + " " + token_part(output_tokens, muted=rpm_status)
                 chunks = activity.get("chunks")
                 if chunks:
                     try:
-                        activity_text += f" ({int(chunks):,} chunks)"
+                        activity_text += " " + color(f"({int(chunks):,} chunks)")
                     except Exception:
-                        activity_text += f" ({chunks} chunks)"
+                        activity_text += " " + color(f"({chunks} chunks)")
             elif event in ("success", "error"):
-                activity_text = f"{event} {age:.0f}s"
+                activity_text = color(f"{event} {age:.0f}s")
     if activity_text:
         status_parts.append(activity_text)
     status_text = " | ".join(status_parts)
     if status_text:
-        print(f"{left} | {color(status_text)}")
+        print(f"{left} | {status_text}")
     else:
         print(left)
 
@@ -1648,10 +2102,14 @@ def has_plan_mode_exit(body: dict[str, Any]) -> bool:
 
 
 def plan_mode_tool_name_for_emit(body: dict[str, Any], name: str, tool_input: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
-    if name != "EnterPlanMode" or not plan_mode_active(body):
-        return name, tool_input
-    router_log("WARN", "dropped repeated EnterPlanMode while plan mode is active")
-    return None, tool_input
+    active = plan_mode_active(body)
+    if name == "EnterPlanMode" and active:
+        router_log("WARN", "dropped repeated EnterPlanMode while plan mode is active")
+        return None, tool_input
+    if name == "ExitPlanMode" and not active:
+        router_log("WARN", "dropped ExitPlanMode while plan mode is not active")
+        return None, tool_input
+    return name, tool_input
 
 
 def latest_user_text(body: dict[str, Any]) -> str:
@@ -1883,6 +2341,18 @@ def recent_synthetic_tasklist_count(body: dict[str, Any]) -> int:
     return count
 
 
+def tasklist_result_has_active_work(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip().lower()
+    if not normalized:
+        return False
+    # This parses Claude Code's task-list tool output, not user-facing prose.
+    for label in ("in progress", "open", "pending"):
+        for match in re.finditer(rf"\b(\d+)\s+{re.escape(label)}\b", normalized):
+            if int(match.group(1)) > 0:
+                return True
+    return False
+
+
 def latest_assistant_text(body: dict[str, Any]) -> str:
     for message in reversed(body.get("messages") or []):
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -1910,10 +2380,13 @@ def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: st
     latest_names = latest_user_tool_result_names(body)
     if not latest_names:
         return False
-    if latest_names == ["TaskList"] and "No tasks found" in latest_user_tool_result_text(body):
+    latest_result_text = latest_user_tool_result_text(body)
+    if latest_names == ["TaskList"] and "No tasks found" in latest_result_text:
         return False
-    if "TaskList" in latest_names and recent_synthetic_tasklist_count(body) >= 2:
-        return False
+    if "TaskList" in latest_names:
+        max_keepalive = 6 if tasklist_result_has_active_work(latest_result_text) else 2
+        if recent_synthetic_tasklist_count(body) >= max_keepalive:
+            return False
     if not any(name in WORK_CONTINUATION_RESULT_TOOLS for name in latest_names):
         return False
     if latest_tool_result_indicates_completed_work(body) and response_text.strip():
@@ -2736,29 +3209,36 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
     else:
         base = provider_upstream_request_base(provider, pcfg)
     ids: list[str] = []
+    fetched = False
     try:
         if provider in ("ollama", "ollama-cloud"):
             try:
                 data = http_json(join_url(base, "/api/tags"), headers=provider_model_list_headers(provider, pcfg), timeout=4.0)
                 ids = [normalize_model_id(provider, mid) for mid in model_ids_from_response(data)]
+                fetched = True
             except Exception:
                 data = http_json(join_url(base, "/v1/models"), headers=provider_model_list_headers(provider, pcfg), timeout=4.0)
                 ids = [normalize_model_id(provider, mid) for mid in model_ids_from_response(data)]
+                fetched = True
         elif provider == "nvidia-hosted":
             data = http_json(join_url(base, "/v1/models"), headers=nvidia_hosted_list_headers(), timeout=8.0)
             ids = model_ids_from_response(data)
+            fetched = True
         else:
             headers = provider_model_list_headers(provider, pcfg)
             for path in ("/v1/models", "/models"):
                 try:
                     data = http_json(join_url(base, path), headers=headers, timeout=6.0)
                     ids = model_ids_from_response(data)
+                    fetched = True
                     if ids:
                         break
                 except Exception:
                     continue
     except Exception:
         ids = []
+    if not fetched:
+        return []
     for mid in pcfg.get("custom_models", []) or []:
         mid = normalize_model_id(provider, mid)
         if mid and mid not in ids:
@@ -2893,6 +3373,7 @@ def launch_model_id(provider: str, pcfg: dict[str, Any]) -> str:
 
 
 def resolve_requested_model(provider: str, pcfg: dict[str, Any], requested: str | None) -> str:
+    requested = strip_claude_context_suffix(requested)
     fallback = normalize_model_id(provider, pcfg.get("current_model") or "model")
     if provider == "nvidia-hosted":
         if requested and requested.startswith("claude-nvidia-"):
@@ -2949,6 +3430,39 @@ def write_router_activity(event: str, provider: str, model: str | None = None, *
         tmp = ROUTER_ACTIVITY_PATH.with_name(f"{ROUTER_ACTIVITY_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         tmp.replace(ROUTER_ACTIVITY_PATH)
+    except Exception:
+        pass
+
+
+def context_limit_for_status(provider: str, pcfg: dict[str, Any]) -> int | None:
+    if provider in ("ollama", "ollama-cloud"):
+        return ollama_context_limit_for_budget(pcfg)
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+        return openai_context_limit_for_budget(provider, pcfg)
+    return positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
+
+
+def write_context_usage(provider: str, pcfg: dict[str, Any], body: dict[str, Any], source: str) -> None:
+    try:
+        tokens = estimate_tokens(body)
+        limit = context_limit_for_status(provider, pcfg)
+        percent = round((tokens / limit) * 100.0, 1) if limit else None
+        data = {
+            "updated_at": time.time(),
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "provider": provider,
+            "model": str(body.get("model") or pcfg.get("current_model") or ""),
+            "source": source,
+            "tokens": tokens,
+            "context_limit": limit,
+            "percent": percent,
+            "messages": len(body.get("messages") or []),
+            "tools": len(body.get("tools") or []),
+        }
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = CONTEXT_USAGE_PATH.with_name(f"{CONTEXT_USAGE_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(CONTEXT_USAGE_PATH)
     except Exception:
         pass
 
@@ -3312,6 +3826,62 @@ def advisor_focus_from_body(body: dict[str, Any]) -> str:
     return text.split(marker, 1)[1].strip()
 
 
+def advisor_model_enabled(pcfg: dict[str, Any]) -> str:
+    return str(pcfg.get("advisor_model") or "").strip()
+
+
+def advisor_provider_supported(provider: str) -> bool:
+    return provider in ("ollama", "ollama-cloud")
+
+
+def body_has_advisor_feedback(body: dict[str, Any]) -> bool:
+    for message in reversed(body.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        text = anthropic_content_to_text(message.get("content"))
+        if ADVISOR_FEEDBACK_MARKER in text:
+            return True
+    return False
+
+
+def anthropic_message_tool_names(message: dict[str, Any]) -> list[str]:
+    names: list[str] = []
+    content = message.get("content")
+    if not isinstance(content, list):
+        return names
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            name = block.get("name")
+            if isinstance(name, str) and name:
+                names.append(name)
+    return names
+
+
+def advisor_trigger_for_message(body: dict[str, Any], message: dict[str, Any]) -> str | None:
+    names = set(anthropic_message_tool_names(message))
+    if "ExitPlanMode" in names:
+        return "before ExitPlanMode plan approval"
+    if names:
+        return None
+    text = anthropic_content_to_text(message.get("content")).strip()
+    if (
+        text
+        and message.get("stop_reason") == "end_turn"
+        and latest_tool_result_indicates_completed_work(body)
+        and not non_actionable_short_response(text)
+    ):
+        return "before completion/final response"
+    return None
+
+
+def advisor_gate_possible_for_body(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> bool:
+    if not advisor_model_enabled(pcfg) or not advisor_provider_supported(provider):
+        return False
+    if is_advisor_request(body) or body_has_advisor_feedback(body):
+        return False
+    return plan_mode_active(body) or latest_tool_result_indicates_completed_work(body)
+
+
 def anthropic_system_to_ollama_messages(system: Any) -> list[dict[str, Any]]:
     if not system:
         return []
@@ -3341,6 +3911,16 @@ def should_skip_upstream_message(message: dict[str, Any]) -> bool:
         return True
     text = anthropic_content_to_text(content).strip()
     if role == "user" and text.startswith("Stop hook feedback:"):
+        return True
+    # Router diagnostics must never be fed back to the upstream model. In Claude
+    # Code they can also appear in the prompt input after a malformed/empty turn.
+    router_diagnostics = (
+        "Upstream returned an empty stream.",
+        "Upstream returned no stream data.",
+    )
+    if role in ("assistant", "user") and (
+        text in router_diagnostics or text.startswith("Upstream stream error:")
+    ):
         return True
     if role == "assistant" and text == "No response requested.":
         return True
@@ -3748,6 +4328,29 @@ def provider_request_timeout_seconds(pcfg: dict[str, Any]) -> float:
     return ollama_request_timeout_seconds(pcfg)
 
 
+def provider_stream_idle_timeout_seconds(pcfg: dict[str, Any]) -> float:
+    raw = positive_int(pcfg.get("stream_idle_timeout_ms"))
+    if raw:
+        return max(5.0, raw / 1000.0)
+    return max(30.0, min(provider_request_timeout_seconds(pcfg), 300.0))
+
+
+def set_upstream_stream_read_timeout(resp: Any, timeout: float) -> None:
+    """Keep one stalled upstream read from holding Claude Code's prompt queue forever."""
+    try:
+        if hasattr(resp, "fp") and getattr(resp, "fp") is not None:
+            raw = getattr(resp.fp, "raw", None)
+            sock = getattr(raw, "_sock", None)
+            if sock is not None and hasattr(sock, "settimeout"):
+                sock.settimeout(timeout)
+                return
+        sock = getattr(resp, "sock", None)
+        if sock is not None and hasattr(sock, "settimeout"):
+            sock.settimeout(timeout)
+    except Exception:
+        pass
+
+
 def cap_anthropic_body_for_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     capped = dict(body)
     if provider not in ("vllm", "nvidia-hosted", "self-hosted-nim"):
@@ -3840,9 +4443,9 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
     return req
 
 
-def advisor_ollama_request(model: str, body: dict[str, Any], pcfg: dict[str, Any]) -> dict[str, Any]:
+def advisor_ollama_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], focus_override: str = "") -> dict[str, Any]:
     messages = anthropic_messages_to_ollama(body)
-    focus = advisor_focus_from_body(body)
+    focus = focus_override or advisor_focus_from_body(body)
     messages.append({
         "role": "system",
         "content": (
@@ -3871,6 +4474,88 @@ def advisor_ollama_request(model: str, body: dict[str, Any], pcfg: dict[str, Any
     if options:
         req["options"] = options
     return req
+
+
+def call_advisor_ollama_text(provider: str, pcfg: dict[str, Any], body: dict[str, Any], focus: str = "") -> str:
+    advisor_model = advisor_model_enabled(pcfg)
+    if not advisor_model or not advisor_provider_supported(provider):
+        return ""
+    base = pcfg.get("base_url", "").rstrip("/")
+    req_body = advisor_ollama_request(advisor_model, body, pcfg, focus_override=focus)
+    try:
+        apply_router_rate_limit(provider, pcfg, advisor_model)
+        write_router_activity("advisor", provider, advisor_model, tokens=estimate_tokens(req_body))
+        data = post_json(join_url(base, "/api/chat"), req_body, headers=provider_headers(provider, pcfg), timeout=ollama_request_timeout_seconds(pcfg))
+        message = data.get("message") if isinstance(data, dict) else {}
+        text = str((message or {}).get("content") or "").strip()
+        if text:
+            router_log("INFO", f"advisor_feedback provider={provider} advisor_model={advisor_model} chars={len(text)}")
+        return text
+    except Exception as exc:
+        router_log("WARN", f"advisor_request_failed provider={provider} advisor_model={advisor_model} error={type(exc).__name__}: {exc}")
+        write_router_activity("advisor_error", provider, advisor_model, error=type(exc).__name__)
+        return ""
+
+
+def body_with_internal_advisor_feedback(body: dict[str, Any], assistant_message: dict[str, Any], advisor_text: str, trigger: str) -> dict[str, Any]:
+    messages = [m for m in body.get("messages", []) if isinstance(m, dict)]
+    assistant_text = anthropic_content_to_text(assistant_message.get("content")).strip()
+    tool_names = anthropic_message_tool_names(assistant_message)
+    if assistant_text:
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": compact_message_text_for_prompt(assistant_text)}]})
+    elif tool_names:
+        messages.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": f"I was about to call Claude Code tool(s): {', '.join(tool_names)}."}],
+        })
+    feedback = (
+        f"{ADVISOR_FEEDBACK_MARKER}\n"
+        f"Advisor review trigger: {trigger}.\n\n"
+        f"{advisor_text}\n\n"
+        "Apply this advisor feedback now. If the plan is still ready, call ExitPlanMode with the improved plan. "
+        "If the task is complete, provide the final answer. If the advisor found a gap, continue with concrete "
+        "Claude Code tool calls instead of stopping after an announcement."
+    )
+    messages.append({"role": "user", "content": [{"type": "text", "text": feedback}]})
+    follow_body = dict(body)
+    follow_body["messages"] = messages
+    follow_body.pop("tool_choice", None)
+    return follow_body
+
+
+def refine_ollama_message_with_advisor(
+    provider: str,
+    pcfg: dict[str, Any],
+    original_body: dict[str, Any],
+    message: dict[str, Any],
+    main_model: str,
+) -> dict[str, Any]:
+    if not advisor_model_enabled(pcfg):
+        return message
+    if not advisor_provider_supported(provider):
+        return message
+    if is_advisor_request(original_body) or body_has_advisor_feedback(original_body):
+        return message
+    trigger = advisor_trigger_for_message(original_body, message)
+    if not trigger:
+        return message
+    advisor_text = call_advisor_ollama_text(provider, pcfg, original_body, focus=trigger)
+    if not advisor_text:
+        return message
+    follow_body = body_with_internal_advisor_feedback(original_body, message, advisor_text, trigger)
+    base = pcfg.get("base_url", "").rstrip("/")
+    req_body = ollama_chat_request(main_model, follow_body, pcfg, stream=False)
+    try:
+        apply_router_rate_limit(provider, pcfg, main_model)
+        router_log("INFO", f"advisor_refinement_call trigger={trigger} main_model={main_model}")
+        data = post_json(join_url(base, "/api/chat"), req_body, headers=provider_headers(provider, pcfg), timeout=ollama_request_timeout_seconds(pcfg))
+        refined = ollama_chat_to_anthropic(data, main_model, source_body=follow_body)
+        router_log("INFO", f"advisor_refinement_done trigger={trigger} stop_reason={refined.get('stop_reason')}")
+        return refined
+    except Exception as exc:
+        router_log("WARN", f"advisor_refinement_failed trigger={trigger} model={main_model} error={type(exc).__name__}: {exc}")
+        write_router_activity("advisor_refinement_error", provider, main_model, error=type(exc).__name__)
+        return message
 
 
 def anthropic_text_response(model: str, text: str, stop_reason: str = "end_turn") -> dict[str, Any]:
@@ -3964,7 +4649,7 @@ def _write_anthropic_stream_block(handler: BaseHTTPRequestHandler, index: int, b
         handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
 
 
-def write_anthropic_open_stream_start(handler: BaseHTTPRequestHandler, model: str) -> None:
+def write_anthropic_open_stream_start(handler: BaseHTTPRequestHandler, model: str, input_tokens: int = 0) -> None:
     handler.send_response(200)
     handler.send_header("content-type", "text/event-stream")
     handler.send_header("cache-control", "no-cache")
@@ -3981,7 +4666,7 @@ def write_anthropic_open_stream_start(handler: BaseHTTPRequestHandler, model: st
             "model": model,
             "stop_reason": None,
             "stop_sequence": None,
-            "usage": {"input_tokens": 0, "output_tokens": 0},
+            "usage": {"input_tokens": max(0, int(input_tokens or 0)), "output_tokens": 0},
         },
     }
     handler.wfile.write(f"event: message_start\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
@@ -4196,6 +4881,12 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
     stop_reason = "tool_use" if any(block.get("type") == "tool_use" for block in content) else "end_turn"
     if done_reason == "length":
         stop_reason = "max_tokens"
+    input_tokens = int(data.get("prompt_eval_count") or 0)
+    if input_tokens <= 0 and isinstance(source_body, dict):
+        input_tokens = estimate_tokens(source_body)
+    output_tokens = int(data.get("eval_count") or 0)
+    if output_tokens <= 0:
+        output_tokens = max(1, len(text) // 4)
     return {
         "id": f"msg_ollama_{int(time.time() * 1000)}",
         "type": "message",
@@ -4205,8 +4896,8 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
         "stop_reason": stop_reason,
         "stop_sequence": None,
         "usage": {
-            "input_tokens": int(data.get("prompt_eval_count") or 0),
-            "output_tokens": int(data.get("eval_count") or 0),
+            "input_tokens": input_tokens,
+            "output_tokens": output_tokens,
         },
     }
 
@@ -4240,7 +4931,7 @@ def _split_word_buffer(buf: str, force: bool = False, max_buffer: int = STREAM_W
     return "", buf
 
 
-def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any) -> None:
+def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any, model: str = "claude-any-upstream", word_chunking: bool = True) -> None:
     """
     Parse upstream Anthropic SSE and re-emit it with text_delta events buffered
     to word boundaries. Non-text events (message_start/stop, content_block_start/
@@ -4250,6 +4941,9 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any) -> N
     text_buffers: dict[int, str] = {}
     pending_event_type: str | None = None
     pending_event_lines: list[str] = []
+    saw_message_start = False
+    saw_message_stop = False
+    open_content_blocks: set[int] = set()
 
     def emit_raw(event_type: str | None, data_str: str) -> None:
         if event_type:
@@ -4277,6 +4971,7 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any) -> N
         emit_text_delta(index, to_flush)
 
     def process_event(event_type: str | None, data_str: str) -> None:
+        nonlocal saw_message_start, saw_message_stop
         try:
             event = json.loads(data_str)
         except Exception:
@@ -4286,12 +4981,27 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any) -> N
             emit_raw(event_type, data_str)
             return
         evt_type = event.get("type") or event_type
+        if evt_type == "message_start":
+            saw_message_start = True
+        elif evt_type == "message_stop":
+            saw_message_stop = True
+        elif evt_type == "content_block_start":
+            index = event.get("index")
+            if isinstance(index, int):
+                open_content_blocks.add(index)
+        elif evt_type == "content_block_stop":
+            index = event.get("index")
+            if isinstance(index, int):
+                open_content_blocks.discard(index)
         if evt_type == "content_block_delta":
             delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
             index = event.get("index")
             if isinstance(index, int) and delta.get("type") == "text_delta":
                 text = delta.get("text") or ""
                 if not text:
+                    return
+                if not word_chunking:
+                    emit_raw(event_type, data_str)
                     return
                 text_buffers[index] = text_buffers.get(index, "") + text
                 flush_buffer(index, force=False)
@@ -4300,7 +5010,7 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any) -> N
             return
         if evt_type == "content_block_stop":
             index = event.get("index")
-            if isinstance(index, int):
+            if isinstance(index, int) and word_chunking:
                 flush_buffer(index, force=True)
             emit_raw(event_type, data_str)
             return
@@ -4328,6 +5038,48 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any) -> N
             process_event(pending_event_type, data_str)
         for index in list(text_buffers.keys()):
             flush_buffer(index, force=True)
+    except Exception as exc:
+        router_log("ERROR", f"anthropic_sse_forward_error model={model} error={type(exc).__name__}: {exc}")
+        try:
+            if pending_event_lines:
+                data_str = "\n".join(pending_event_lines)
+                process_event(pending_event_type, data_str)
+                pending_event_lines = []
+                pending_event_type = None
+            for index in list(text_buffers.keys()):
+                flush_buffer(index, force=True)
+            for index in sorted(open_content_blocks):
+                emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": index}, ensure_ascii=False))
+            open_content_blocks.clear()
+            if not saw_message_stop:
+                if not saw_message_start:
+                    payload = {
+                        "type": "message_start",
+                        "message": {
+                            "id": f"msg_claude_any_forward_{int(time.time() * 1000)}",
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [],
+                            "model": model,
+                            "stop_reason": None,
+                            "stop_sequence": None,
+                            "usage": {"input_tokens": 0, "output_tokens": 0},
+                        },
+                    }
+                    emit_raw("message_start", json.dumps(payload, ensure_ascii=False))
+                    emit_raw(
+                        "content_block_start",
+                        json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}}, ensure_ascii=False),
+                    )
+                    emit_text_delta(0, f"Upstream stream error: {type(exc).__name__}: {exc}")
+                    emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": 0}, ensure_ascii=False))
+                emit_raw(
+                    "message_delta",
+                    json.dumps({"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 1}}, ensure_ascii=False),
+                )
+                emit_raw("message_stop", "{\"type\":\"message_stop\"}")
+        except Exception:
+            pass
     finally:
         try:
             resp.close()
@@ -4352,9 +5104,17 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
     text_buffer = ""
     tool_calls: list[dict[str, Any]] = []
     tool_indices: list[int] = []
-    input_tokens = 0
+    stopped_tool_indices: set[int] = set()
+    input_tokens = estimate_tokens(source_body) if isinstance(source_body, dict) else 0
     output_tokens = 0
     chunk: dict[str, Any] = {}
+    chunks_seen = 0
+    text_stopped = False
+
+    def emit(event_name: str, payload: dict[str, Any]) -> None:
+        handler.wfile.write(f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.flush()
+
     def ensure_message_started() -> None:
         nonlocal started
         if started:
@@ -4373,11 +5133,17 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 "usage": {"input_tokens": input_tokens, "output_tokens": 0},
             },
         }
-        handler.wfile.write(f"event: message_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-        handler.wfile.flush()
+        emit("message_start", event)
+
+    def emit_text_block(index: int, text: str) -> None:
+        emit("content_block_start", {"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}})
+        if text:
+            emit("content_block_delta", {"type": "content_block_delta", "index": index, "delta": {"type": "text_delta", "text": text}})
+        emit("content_block_stop", {"type": "content_block_stop", "index": index})
 
     try:
         for line in resp:
+            chunks_seen += 1
             line = line.decode("utf-8", errors="ignore").strip()
             if not line:
                 continue
@@ -4398,6 +5164,40 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 if source_body is not None and not text_started and not tool_calls and should_auto_enter_plan_mode(source_body, text_so_far + text_chunk, []):
                     text_so_far += text_chunk
                     text_suppressed_for_plan = True
+                    continue
+                if text_suppressed_for_plan and not text_started and text_so_far:
+                    pending_text = text_so_far + text_chunk
+                    text_so_far = pending_text
+                    text_suppressed_for_plan = False
+                    text_started = True
+                    text_index = next_content_index
+                    next_content_index += 1
+                    event = {
+                        "type": "content_block_start",
+                        "index": text_index,
+                        "content_block": {"type": "text", "text": ""},
+                    }
+                    handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+                    handler.wfile.flush()
+                    if word_chunking:
+                        text_buffer += pending_text
+                        to_flush, text_buffer = _split_word_buffer(text_buffer, force=False)
+                        if to_flush:
+                            event = {
+                                "type": "content_block_delta",
+                                "index": text_index,
+                                "delta": {"type": "text_delta", "text": to_flush},
+                            }
+                            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+                            handler.wfile.flush()
+                    else:
+                        event = {
+                            "type": "content_block_delta",
+                            "index": text_index,
+                            "delta": {"type": "text_delta", "text": pending_text},
+                        }
+                        handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
+                        handler.wfile.flush()
                     continue
                 if not text_started:
                     text_started = True
@@ -4511,7 +5311,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             }
             handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
             handler.wfile.flush()
-        elif text_suppressed_for_plan and text_so_far:
+        elif text_suppressed_for_plan and not text_started and text_so_far:
             text_started = True
             text_index = next_content_index
             next_content_index += 1
@@ -4569,13 +5369,21 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
         # Send content_block_stop for text if any
         if text_started:
             event = {"type": "content_block_stop", "index": text_index}
-            handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_stop", event)
+            text_stopped = True
         # Send content_block_stop for each tool call
         for tool_index in tool_indices:
             event = {"type": "content_block_stop", "index": tool_index}
-            handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_stop", event)
+            stopped_tool_indices.add(tool_index)
+        if not started:
+            ensure_message_started()
+        if not text_started and not tool_indices:
+            router_log("WARN", f"ollama_empty_stream provider={provider} model={model} chunks={chunks_seen}")
+            write_router_activity("error", provider, model, error="empty_stream", stream=True)
+            empty_index = next_content_index
+            next_content_index += 1
+            emit_text_block(empty_index, "")
         # Determine stop reason
         stop_reason = "tool_use" if tool_calls else "end_turn"
         if chunk.get("done_reason") == "length":
@@ -4586,17 +5394,39 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             "delta": {"stop_reason": stop_reason, "stop_sequence": None},
             "usage": {"output_tokens": output_tokens},
         }
-        handler.wfile.write(f"event: message_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-        handler.wfile.flush()
+        emit("message_delta", event)
         # Send message_stop
-        event = {"type": "message_stop"}
-        handler.wfile.write(f"event: message_stop\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-        handler.wfile.flush()
-    except Exception:
-        # On error, try to send a minimal message_stop
+        emit("message_stop", {"type": "message_stop"})
+        if text_started or tool_indices:
+            write_router_activity(
+                "success",
+                provider,
+                model,
+                tokens=input_tokens,
+                output_tokens=output_tokens or max(1, len(text_so_far) // 4),
+                chunks=chunks_seen,
+                stream=True,
+            )
+    except Exception as exc:
+        router_log("ERROR", f"ollama_stream_error provider={provider} model={model} error={type(exc).__name__}: {exc}")
+        write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
         try:
-            handler.wfile.write(b"event: message_stop\ndata: {}\n\n")
-            handler.wfile.flush()
+            ensure_message_started()
+            if word_chunking and text_started and text_buffer:
+                to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
+                if to_flush and text_index is not None:
+                    emit("content_block_delta", {"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": to_flush}})
+            if text_started and text_index is not None and not text_stopped:
+                emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
+            for tool_index in tool_indices:
+                if tool_index not in stopped_tool_indices:
+                    emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
+            if not text_started and not tool_indices:
+                error_index = next_content_index
+                next_content_index += 1
+                emit_text_block(error_index, "")
+            emit("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": max(1, output_tokens or len(text_so_far) // 4)}})
+            emit("message_stop", {"type": "message_stop"})
         except Exception:
             pass
     finally:
@@ -4627,6 +5457,9 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     stream_requested = body.get("stream", True)
     if not bool(pcfg.get("stream_enabled", True)):
         stream_requested = False
+    if stream_requested and advisor_gate_possible_for_body(provider, pcfg, body):
+        stream_requested = False
+        router_log("INFO", "advisor gate enabled; collecting this turn before returning it to Claude Code")
     word_chunking = bool(pcfg.get("stream_word_chunking", False))
     req_body = ollama_chat_request(model, body, pcfg, stream=stream_requested)
     headers = provider_headers(provider, pcfg)
@@ -4639,6 +5472,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
         req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
         try:
             resp = urllib.request.urlopen(req, timeout=ollama_request_timeout_seconds(pcfg))
+            set_upstream_stream_read_timeout(resp, provider_stream_idle_timeout_seconds(pcfg))
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="ignore")
             msg = raw.strip() or str(exc)
@@ -4683,7 +5517,9 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                     continue
             if data is None:
                 data = {"message": {"content": ""}, "done": True, "done_reason": "end_turn"}
-            message = prepend_anthropic_text(ollama_chat_to_anthropic(data, model, source_body=body), rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
+            message = ollama_chat_to_anthropic(data, model, source_body=body)
+            message = refine_ollama_message_with_advisor(provider, pcfg, body, message, model)
+            message = prepend_anthropic_text(message, rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
             write_json(handler, message)
         return
     # Non-streaming fallback
@@ -4709,7 +5545,9 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
             exc.code,
         )
         return
-    message = prepend_anthropic_text(ollama_chat_to_anthropic(data, model, source_body=body), rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
+    message = ollama_chat_to_anthropic(data, model, source_body=body)
+    message = refine_ollama_message_with_advisor(provider, pcfg, body, message, model)
+    message = prepend_anthropic_text(message, rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
     write_json(handler, message)
 
 
@@ -4726,6 +5564,9 @@ def openai_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
         },
         "done_reason": "length" if choice.get("finish_reason") == "length" else "stop",
     }
+    usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
+    wrapped["prompt_eval_count"] = positive_int(usage.get("prompt_tokens")) or (estimate_tokens(source_body) if isinstance(source_body, dict) else 0)
+    wrapped["eval_count"] = positive_int(usage.get("completion_tokens")) or 0
     return ollama_chat_to_anthropic(wrapped, model, source_body=source_body)
 
 
@@ -4739,7 +5580,7 @@ def stream_openai_chat_to_anthropic_sse(
     word_chunking: bool = False,
     input_tokens: int | None = None,
     input_bytes: int | None = None,
-) -> None:
+) -> bool:
     next_content_index = start_index
     text_started = False
     text_suppressed_for_plan = False
@@ -4748,6 +5589,7 @@ def stream_openai_chat_to_anthropic_sse(
     pseudo_text = ""
     pseudo_mode = False
     text_buffer = ""
+    text_stopped = False
     tool_fragments: dict[int, dict[str, Any]] = {}
     output_tokens = 0
     finish_reason = "stop"
@@ -4759,10 +5601,11 @@ def stream_openai_chat_to_anthropic_sse(
         handler.wfile.flush()
 
     def ensure_text_started() -> int:
-        nonlocal text_started, text_index, next_content_index
+        nonlocal text_started, text_index, next_content_index, text_stopped
         if text_started and text_index is not None:
             return text_index
         text_started = True
+        text_stopped = False
         text_index = next_content_index
         next_content_index += 1
         emit(
@@ -4844,6 +5687,18 @@ def stream_openai_chat_to_anthropic_sse(
                 if source_body is not None and not text_started and not tool_fragments and should_auto_enter_plan_mode(source_body, text_so_far + text_chunk, []):
                     text_so_far += text_chunk
                     text_suppressed_for_plan = True
+                    continue
+                if text_suppressed_for_plan and not text_started and text_so_far:
+                    pending_text = text_so_far + text_chunk
+                    text_so_far = pending_text
+                    text_suppressed_for_plan = False
+                    if word_chunking:
+                        text_buffer += pending_text
+                        to_flush, text_buffer = _split_word_buffer(text_buffer, force=False)
+                        emit_text_delta(to_flush)
+                    else:
+                        emit_text_delta(pending_text)
+                    update_stream_activity()
                     continue
                 text_so_far += text_chunk
                 if word_chunking:
@@ -4943,7 +5798,7 @@ def stream_openai_chat_to_anthropic_sse(
             )
             emit("content_block_delta", {"type": "content_block_delta", "index": tool_index, "delta": {"type": "input_json_delta", "partial_json": "{}"}})
             emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
-        elif text_suppressed_for_plan and text_so_far:
+        elif text_suppressed_for_plan and not text_started and text_so_far:
             emit_text_delta(text_so_far)
 
         if source_body is not None and should_keep_work_alive_with_tasklist(source_body, text_so_far, tool_calls):
@@ -4964,8 +5819,29 @@ def stream_openai_chat_to_anthropic_sse(
 
         if text_started and text_index is not None:
             emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
+            text_stopped = True
         stop_reason = "tool_use" if tool_calls else ("max_tokens" if finish_reason == "length" else "end_turn")
         write_anthropic_open_stream_stop(handler, {"stop_reason": stop_reason, "usage": {"output_tokens": output_tokens or max(1, len(text_so_far) // 4)}})
+        return True
+    except Exception as exc:
+        router_log("ERROR", f"openai_stream_error provider={provider} model={model} error={type(exc).__name__}: {exc}")
+        write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
+        try:
+            if word_chunking and text_buffer:
+                to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
+                emit_text_delta(to_flush)
+            if not text_started:
+                emit_text_delta(f"Upstream stream error: {type(exc).__name__}: {exc}")
+            if text_started and text_index is not None and not text_stopped:
+                emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
+                text_stopped = True
+            write_anthropic_open_stream_stop(
+                handler,
+                {"stop_reason": "end_turn", "usage": {"output_tokens": output_tokens or max(1, len(text_so_far) // 4)}},
+            )
+        except Exception:
+            pass
+        return False
     finally:
         try:
             resp.close()
@@ -5126,6 +6002,7 @@ def open_openai_stream_with_rate_retry(
             router_log("INFO", f"upstream_stream_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={token_estimate} bytes={byte_estimate} timeout={timeout}")
             req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
             resp = urllib.request.urlopen(req, timeout=timeout)
+            set_upstream_stream_read_timeout(resp, provider_stream_idle_timeout_seconds(pcfg))
             learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
             return resp
         except urllib.error.HTTPError as exc:
@@ -5176,7 +6053,9 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
     notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", True)))
     if stream:
         req_body = openai_compatible_chat_request(provider, model, body, pcfg, stream=True)
-        write_anthropic_open_stream_start(handler, model)
+        req_tokens = estimate_tokens(req_body)
+        req_bytes = len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))
+        write_anthropic_open_stream_start(handler, model, input_tokens=req_tokens)
         index = 0
         if notice:
             index = write_anthropic_stream_blocks(handler, [{"type": "text", "text": notice}], index)
@@ -5195,9 +6074,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
                 model,
                 emit_retry_notice,
             )
-            req_tokens = estimate_tokens(req_body)
-            req_bytes = len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))
-            stream_openai_chat_to_anthropic_sse(
+            stream_ok = stream_openai_chat_to_anthropic_sse(
                 handler,
                 resp,
                 model,
@@ -5208,7 +6085,8 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
                 input_tokens=req_tokens,
                 input_bytes=req_bytes,
             )
-            write_router_activity("success", provider, model, tokens=req_tokens, bytes=req_bytes, stream=True)
+            if stream_ok:
+                write_router_activity("success", provider, model, tokens=req_tokens, bytes=req_bytes, stream=True)
         except RuntimeError as exc:
             msg = str(exc)
             write_anthropic_stream_blocks(handler, [{"type": "text", "text": f"Upstream error: {msg}"}], index)
@@ -5288,7 +6166,9 @@ class RouterHandler(BaseHTTPRequestHandler):
         cfg = load_config()
         provider, pcfg = get_current_provider(cfg)
         if path == "/v1/messages/count_tokens":
-            write_json(self, {"input_tokens": estimate_tokens(body)})
+            tokens = estimate_tokens(body)
+            write_context_usage(provider, pcfg, body, "count_tokens")
+            write_json(self, {"input_tokens": tokens})
             return
         if path != "/v1/messages":
             write_json(self, {"type": "error", "error": {"type": "not_found_error", "message": path}}, 404)
@@ -5297,6 +6177,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         if maybe_handle_plan_mode_tool_choice(self, provider, body):
             return
         body = filter_blocked_tools(provider, pcfg, body)
+        write_context_usage(provider, pcfg, body, "messages")
         if maybe_handle_advisor_request(self, provider, pcfg, body):
             return
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
@@ -5328,15 +6209,17 @@ class RouterHandler(BaseHTTPRequestHandler):
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             try:
                 resp = urllib.request.urlopen(req, timeout=provider_request_timeout_seconds(pcfg))
+                if bool(body.get("stream", stream_enabled)):
+                    set_upstream_stream_read_timeout(resp, provider_stream_idle_timeout_seconds(pcfg))
                 status = getattr(resp, "status", 200)
                 ctype = resp.headers.get("content-type", "application/json")
-                if word_chunking and stream_enabled and "text/event-stream" in ctype:
+                if stream_enabled and "text/event-stream" in ctype:
                     self.send_response(status)
                     self.send_header("content-type", ctype)
                     self.send_header("cache-control", "no-cache")
                     self.send_header("connection", "close")
                     self.end_headers()
-                    _rebatch_anthropic_sse_text(self, resp)
+                    _rebatch_anthropic_sse_text(self, resp, upstream_model, word_chunking=word_chunking)
                 else:
                     self.send_response(status)
                     self.send_header("content-type", ctype)
@@ -5433,10 +6316,19 @@ def set_base_url_config(provider: str, url: str) -> list[str]:
     pcfg = cfg["providers"][provider]
     if provider == "nvidia-hosted" and invalid_nvidia_hosted_base_url(url):
         url = nvidia_upstream_base_url()
-    pcfg["base_url"] = url.rstrip("/")
+    old_url = str(pcfg.get("base_url") or "").rstrip("/")
+    new_url = url.rstrip("/")
+    pcfg["base_url"] = new_url
+    reset_model = old_url != new_url
+    if reset_model:
+        pcfg["current_model"] = ""
+        pcfg["custom_models"] = []
     save_config(cfg)
     clear_model_cache()
-    return [f"Base URL for {provider} set to {pcfg['base_url']}."]
+    lines = [f"Base URL for {provider} set to {pcfg['base_url']}."]
+    if reset_model:
+        lines.append("Model selection was reset because the provider endpoint changed.")
+    return lines
 
 
 def set_model_config(value: str) -> list[str]:
@@ -5450,6 +6342,8 @@ def set_model_config(value: str) -> list[str]:
         pcfg["num_ctx_min"] = preset["num_ctx_min"]
     if preset.get("num_ctx_max"):
         pcfg["num_ctx_max"] = preset["num_ctx_max"]
+    context_msgs = sync_ollama_library_context_limit(provider, pcfg, model_id)
+    context_msgs.extend(cap_context_settings_to_model_capacity(provider, pcfg))
     known = read_model_list_cache(provider, pcfg) or []
     custom = pcfg.setdefault("custom_models", [])
     if model_id not in custom and model_id not in known:
@@ -5457,6 +6351,7 @@ def set_model_config(value: str) -> list[str]:
     save_config(cfg)
     clear_model_cache()
     msgs = [f"Model for {provider} set to {model_id}.", f"Claude Code alias: {alias_for(provider, model_id)}"]
+    msgs.extend(context_msgs)
     if preset.get("thinking"):
         msgs.append("Note: this is a thinking model; compatibility test uses extended token budget.")
     return msgs
@@ -5640,6 +6535,20 @@ def cmd_models(args: argparse.Namespace) -> None:
     print(f"{provider}: {len(models)} models")
     for mid in models:
         print(f"{alias_for(provider, mid)}\t{mid}")
+
+
+def cmd_ollama_catalog(args: argparse.Namespace) -> None:
+    include_contexts = not bool(getattr(args, "no_contexts", False))
+    catalog = refresh_ollama_model_catalog(include_contexts=include_contexts, timeout=float(getattr(args, "timeout", 10.0)))
+    models = catalog.get("models") if isinstance(catalog.get("models"), dict) else {}
+    context_count = 0
+    for entry in models.values():
+        if isinstance(entry, dict) and isinstance(entry.get("context_windows"), dict) and entry["context_windows"]:
+            context_count += 1
+    print(f"Ollama catalog saved: {OLLAMA_MODEL_CATALOG_PATH}")
+    print(f"API models: {catalog.get('model_count', 0)}")
+    print(f"Base models: {len(models)}")
+    print(f"Context windows: {context_count}/{len(models)}")
 
 
 def status_lines() -> list[str]:
@@ -5913,7 +6822,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     if limit is not None:
         print(f"rate_limit_rpm: {limit}")
         if bool(pcfg.get("rate_limit_status", True)):
-            suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min (unlimited)"
+            suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min (unmanaged)"
             print(f"rpm_used: {suffix}")
     print(f"ollama_options: {ollama_options_status(pcfg)}")
     print("Examples:")
@@ -5976,7 +6885,7 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
         if bool(pcfg.get("rate_limit_status", True)):
             used, limit = router_rate_limit_usage(provider, pcfg)
             if limit is not None:
-                suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unlimited)"
+                suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unmanaged)"
                 parts.append(f"rpm_used={suffix}")
     if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
@@ -6022,15 +6931,21 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
         return "coding"
     if any(marker in model for marker in ("reason", "thinking", "r1", "qwq")):
         return "reasoning"
+    if any(marker in model for marker in ("1m", "v4-pro", "million")):
+        return "million-context"
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
     if provider in ("vllm", "self-hosted-nim"):
         server_limit = upstream_model_context_limit(provider, pcfg, timeout=1.5) or 0
         ctx = server_limit or positive_int(pcfg.get("context_window")) or 0
+        if ctx >= 524288:
+            return "million-context"
         if ctx >= 65536:
             return "long-context"
     if provider in ("ollama", "ollama-cloud"):
         ctx = positive_int(pcfg.get("num_ctx_max")) or positive_int(pcfg.get("num_ctx")) or 0
+        if ctx >= 524288:
+            return "million-context"
         if ctx >= 65536:
             return "long-context"
     return "general"
@@ -6042,6 +6957,8 @@ def recommended_preset_id(provider: str, pcfg: dict[str, Any]) -> str:
         return "reasoning"
     if family == "coding":
         return "coding"
+    if family == "million-context":
+        return "million-context-1m"
     if family == "long-context":
         return "long-context-65k"
     if family == "large":
@@ -6054,8 +6971,14 @@ LLM_PRESETS: dict[str, tuple[str, str]] = {
     "coding": ("Coding deterministic", "lower randomness for edits, scripts, reviews"),
     "fast": ("Fast short tasks", "shorter output and timeout for quick jobs"),
     "long-context-65k": ("Long context 65K", "65K context target, 4K output reserve"),
+    "million-context-1m": ("Ultra context 1M", "1M context target for high-capacity models"),
     "large-output": ("Large output/report", "larger 8K output for summaries/reports"),
     "reasoning": ("Reasoning model", "higher timeout and reasoning-friendly sampling"),
+    "novelist": ("Novelist", "creative prose, voice, scenes, and narrative continuity"),
+    "humanities-researcher": ("Humanities researcher", "interpretive research, close reading, and long evidence chains"),
+    "mathematician": ("Mathematician", "careful derivations, proofs, and low-randomness reasoning"),
+    "product-architect": ("Product architect", "requirements, system structure, tradeoffs, and implementation plans"),
+    "teacher": ("Teacher / tutor", "clear explanations, examples, and step-by-step learning"),
 }
 
 
@@ -6065,32 +6988,311 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "coding": ("코딩 결정형", "편집, 스크립트, 코드 리뷰용 낮은 무작위성"),
         "fast": ("빠른 짧은 작업", "짧은 출력과 짧은 타임아웃"),
         "long-context-65k": ("긴 컨텍스트 65K", "65K 컨텍스트 목표, 4K 출력 여유"),
+        "million-context-1m": ("초장문 컨텍스트 1M", "고용량 모델용 1M 컨텍스트 목표"),
         "large-output": ("긴 출력/리포트", "요약과 리포트용 8K 출력"),
         "reasoning": ("추론 모델", "긴 타임아웃과 추론 친화 샘플링"),
+        "novelist": ("소설가", "문체, 서사, 장면 전개를 위한 창작 설정"),
+        "humanities-researcher": ("인문연구자", "해석, 근거 정리, 긴 문헌 맥락"),
+        "mathematician": ("수학자", "낮은 무작위성과 단계적 증명/유도"),
+        "product-architect": ("제품 설계자", "요구사항, 구조, 트레이드오프, 구현 계획"),
+        "teacher": ("교사/튜터", "쉬운 설명, 예제, 단계별 학습"),
     },
     "ja": {
         "balanced": ("バランス型 Claude Code", "4K 出力、安定したコーディング/チャット既定値"),
         "coding": ("コーディング決定型", "編集、スクリプト、コードレビュー向けの低いランダム性"),
         "fast": ("高速な短い作業", "短い出力と短いタイムアウト"),
         "long-context-65k": ("長いコンテキスト 65K", "65K コンテキスト目標、4K 出力予約"),
+        "million-context-1m": ("超長文コンテキスト 1M", "大容量モデル向けの 1M コンテキスト目標"),
         "large-output": ("長い出力/レポート", "要約とレポート向けの 8K 出力"),
         "reasoning": ("推論モデル", "長いタイムアウトと推論向けサンプリング"),
+        "novelist": ("小説家", "文体、物語、場面展開向けの創作設定"),
+        "humanities-researcher": ("人文学研究者", "解釈、根拠整理、長い文献文脈"),
+        "mathematician": ("数学者", "低いランダム性と段階的な証明/導出"),
+        "product-architect": ("プロダクト設計者", "要件、構造、トレードオフ、実装計画"),
+        "teacher": ("教師/チューター", "分かりやすい説明、例、段階的学習"),
     },
     "zh": {
         "balanced": ("均衡型 Claude Code", "4K 输出，稳定的编码/聊天默认值"),
         "coding": ("编码确定型", "用于编辑、脚本和代码审查的低随机性"),
         "fast": ("快速短任务", "较短输出和较短超时"),
         "long-context-65k": ("长上下文 65K", "65K 上下文目标，4K 输出预留"),
+        "million-context-1m": ("超长上下文 1M", "面向高容量模型的 1M 上下文目标"),
         "large-output": ("长输出/报告", "用于摘要和报告的 8K 输出"),
         "reasoning": ("推理模型", "更长超时和适合推理的采样"),
+        "novelist": ("小说家", "面向文风、叙事、场景推进的创作设置"),
+        "humanities-researcher": ("人文学研究者", "解释性研究、证据整理和长文献上下文"),
+        "mathematician": ("数学家", "低随机性、逐步证明和推导"),
+        "product-architect": ("产品架构师", "需求、系统结构、取舍和实现计划"),
+        "teacher": ("教师/导师", "清晰解释、示例和分步学习"),
     },
 }
+
+
+CONTEXT_HEAVY_PRESETS = {
+    "long-context-65k",
+    "million-context-1m",
+    "large-output",
+    "reasoning",
+    "novelist",
+    "humanities-researcher",
+    "mathematician",
+    "product-architect",
+    "teacher",
+}
+
+
+def model_context_hint_from_model_id(model_id: str) -> int | None:
+    model = (model_id or "").lower()
+    if not model:
+        return None
+    catalog_limit, _, _ = ollama_catalog_context_for_model(model_id)
+    if catalog_limit:
+        return catalog_limit
+    if any(marker in model for marker in ("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4", "v4-pro", "v4-flash", "1m", "million")):
+        return 1048576
+    if any(marker in model for marker in ("kimi-k2.6", "kimi_k2.6", "kimi2.6", "kimi-k2")):
+        return 262144
+    if "qwen3.6" in model:
+        return 262144
+    if "glm-4.7" in model or "glm-5.1" in model:
+        return 131072
+    if "deepseek-r1" in model or "llama3.3" in model:
+        return 131072
+    preset = model_preset(model_id)
+    return positive_int(preset.get("num_ctx_max"))
+
+
+def provider_model_context_capacity(provider: str, pcfg: dict[str, Any]) -> int | None:
+    model = str(pcfg.get("current_model") or "")
+    if provider == "anthropic":
+        return None
+    if provider == "nvidia-hosted":
+        return nvidia_hosted_context_default(model)
+    hint = model_context_hint_from_model_id(model)
+    if hint:
+        return hint
+    if provider in ("vllm", "self-hosted-nim"):
+        return (
+            upstream_model_context_limit(provider, pcfg, timeout=1.0)
+            or positive_int(pcfg.get("context_window"))
+            or positive_int(pcfg.get("max_model_len"))
+        )
+    if provider in ("ollama", "ollama-cloud"):
+        if ollama_context_model_matches(model, str(pcfg.get("model_context_model") or "")):
+            cached = positive_int(pcfg.get("model_context_max"))
+            if cached:
+                return cached
+        return positive_int(pcfg.get("num_ctx_max")) or positive_int(pcfg.get("num_ctx"))
+    return positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
+
+
+def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    capacity = provider_model_context_capacity(provider, pcfg)
+    if not capacity:
+        return []
+    messages: list[str] = []
+    if provider in ("ollama", "ollama-cloud"):
+        maximum = positive_int(pcfg.get("num_ctx_max"))
+        if maximum and maximum > capacity:
+            pcfg["num_ctx_max"] = capacity
+            messages.append(f"Context max capped to selected model limit: {capacity:,} tokens.")
+        minimum = positive_int(pcfg.get("num_ctx_min"))
+        if minimum and minimum > capacity:
+            pcfg["num_ctx_min"] = capacity
+        fixed_ctx = positive_int(pcfg.get("num_ctx"))
+        if fixed_ctx and fixed_ctx > capacity:
+            pcfg["num_ctx"] = capacity
+        return messages
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+        context_window = positive_int(pcfg.get("context_window"))
+        if context_window and context_window > capacity:
+            pcfg["context_window"] = capacity
+            messages.append(f"Context window capped to selected model limit: {capacity:,} tokens.")
+    return messages
+
+
+def required_context_for_preset(preset_id: str, provider: str | None = None) -> int | None:
+    provider = provider or ""
+    if preset_id == "million-context-1m":
+        return 1048576
+    if preset_id == "humanities-researcher":
+        return 524288 if provider in ("ollama", "ollama-cloud") else 262144
+    if preset_id in ("novelist", "mathematician", "product-architect"):
+        return 262144
+    if preset_id == "teacher":
+        return 131072
+    if preset_id == "reasoning":
+        return 262144 if provider == "nvidia-hosted" else 131072
+    if preset_id == "large-output":
+        if provider == "nvidia-hosted":
+            return 262144
+        if provider in ("ollama", "ollama-cloud"):
+            return 131072
+        return 65536
+    if preset_id == "long-context-65k":
+        return 131072 if provider == "nvidia-hosted" else 65536
+    return None
+
+
+def preset_available_for_model(provider: str, pcfg: dict[str, Any], preset_id: str) -> bool:
+    required = required_context_for_preset(preset_id, provider)
+    if not required:
+        return True
+    capacity = provider_model_context_capacity(provider, pcfg)
+    if not capacity:
+        return True
+    return required <= capacity
+
+
+def format_context_tokens(value: int | None) -> str:
+    if not value:
+        return "unknown"
+    if value >= 1024 * 1024 and value % (1024 * 1024) == 0:
+        return f"{value // (1024 * 1024)}M"
+    if value >= 1024 and value % 1024 == 0:
+        return f"{value // 1024}K"
+    return f"{value:,}"
+
+
+def context_setting_status(provider: str, pcfg: dict[str, Any]) -> str:
+    capacity = provider_model_context_capacity(provider, pcfg)
+    cap_text = format_context_tokens(capacity)
+    if provider in ("ollama", "ollama-cloud"):
+        return f"model max {cap_text}; {ollama_num_ctx_status(pcfg)}"
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+        window = positive_int(pcfg.get("context_window"))
+        reserve = positive_int(pcfg.get("context_reserve_tokens"))
+        reserve_text = f"; reserve {format_context_tokens(reserve)}" if reserve else ""
+        return f"model max {cap_text}; window {format_context_tokens(window)}{reserve_text}"
+    if provider == "anthropic":
+        return "managed by Claude Code"
+    return f"model max {cap_text}"
+
+
+def context_mode_values_for_capacity(capacity: int | None) -> dict[str, tuple[int, int, int]]:
+    cap = capacity or 131072
+
+    def clamp(value: int) -> int:
+        return max(8192, min(cap, value))
+
+    compact = clamp(32768)
+    balanced = clamp(65536 if cap <= 131072 else 131072)
+    project = clamp(262144 if cap >= 262144 else cap)
+    full = clamp(cap)
+    return {
+        "context-compact": (compact, min(2048, max(1024, compact // 16)), 4096),
+        "context-balanced": (balanced, min(4096, max(2048, balanced // 16)), 4096),
+        "context-project": (project, min(8192, max(4096, project // 16)), 8192),
+        "context-full": (full, min(16384, max(4096, full // 16)), 8192),
+    }
+
+
+def context_setup_text(key: str, lang: str | None = None) -> tuple[str, str]:
+    lang = lang or load_config().get("language", "en")
+    entries = {
+        "en": {
+            "context-compact": ("Compact / fast", "small context, faster and cheaper"),
+            "context-balanced": ("Balanced", "good default for normal coding sessions"),
+            "context-project": ("Large project", "more files/history, slower but safer for big work"),
+            "context-full": ("Full model window", "use the selected model's maximum context"),
+        },
+        "ko": {
+            "context-compact": ("컴팩트/빠름", "작은 컨텍스트, 빠르고 가벼움"),
+            "context-balanced": ("균형형", "일반 코딩 세션의 권장 기본값"),
+            "context-project": ("대형 프로젝트", "파일/히스토리를 더 많이 사용, 큰 작업에 안정적"),
+            "context-full": ("모델 최대 컨텍스트", "선택한 모델의 최대 컨텍스트 사용"),
+        },
+        "ja": {
+            "context-compact": ("コンパクト/高速", "小さなコンテキストで高速かつ軽量"),
+            "context-balanced": ("バランス", "通常のコーディングセッション向けの既定値"),
+            "context-project": ("大規模プロジェクト", "より多くのファイル/履歴を使う大型作業向け"),
+            "context-full": ("モデル最大コンテキスト", "選択モデルの最大コンテキストを使用"),
+        },
+        "zh": {
+            "context-compact": ("紧凑/快速", "较小上下文，更快更轻"),
+            "context-balanced": ("均衡", "普通编码会话的推荐默认值"),
+            "context-project": ("大型项目", "使用更多文件/历史，适合大任务"),
+            "context-full": ("模型最大上下文", "使用所选模型的最大上下文"),
+        },
+    }
+    return entries.get(lang, entries["en"]).get(key, entries["en"][key])
+
+
+def context_setup_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None = None) -> tuple[list[str], list[str]]:
+    lang = lang or load_config().get("language", "en")
+    capacity = provider_model_context_capacity(provider, pcfg)
+    rows = [f"Model context capacity: {format_context_tokens(capacity)}"]
+    values = ["__info__"]
+    if provider == "anthropic":
+        rows.append("Claude Code manages Anthropic context automatically.")
+        values.append("__info__")
+        rows.append(ui_text("back", lang))
+        values.append("back")
+        return rows, values
+    current_window = positive_int(pcfg.get("num_ctx_max" if provider in ("ollama", "ollama-cloud") else "context_window"))
+    choices = context_mode_values_for_capacity(capacity)
+    ordered_keys = ["context-compact", "context-balanced", "context-project", "context-full"]
+    visible_keys: list[str] = []
+    seen_windows: set[int] = set()
+    for key in reversed(ordered_keys):
+        window = choices[key][0]
+        if window in seen_windows:
+            continue
+        seen_windows.add(window)
+        visible_keys.append(key)
+    for key in reversed(visible_keys):
+        window, reserve, output = choices[key]
+        label, description = context_setup_text(key, lang)
+        mark = "*" if current_window == window else " "
+        rows.append(
+            f"{mark} {pad_cells(label, 22)} "
+            f"{format_context_tokens(window):>6}  out {format_context_tokens(output):>5}  {description}"
+        )
+        values.append(key)
+    rows.append(ui_text("back", lang))
+    values.append("back")
+    return rows, values
+
+
+def apply_context_setup_to_provider(provider: str, pcfg: dict[str, Any], mode: str, lang: str | None = None) -> list[str]:
+    choices = context_mode_values_for_capacity(provider_model_context_capacity(provider, pcfg))
+    if mode not in choices:
+        raise SystemExit(f"Unknown context mode: {mode}")
+    window, reserve, output = choices[mode]
+    label = context_setup_text(mode, lang)[0]
+    if provider in ("ollama", "ollama-cloud"):
+        pcfg["num_ctx"] = "auto"
+        pcfg["num_ctx_max"] = window
+        pcfg["num_ctx_min"] = min(window, 32768 if window <= 65536 else 65536)
+        pcfg.setdefault("ollama_options", {})["num_predict"] = output
+    elif provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+        pcfg["context_window"] = window
+        pcfg["context_reserve_tokens"] = reserve
+        pcfg["max_output_tokens"] = output
+    else:
+        return ["Context setup is managed by Claude Code for this provider."]
+    messages = cap_context_settings_to_model_capacity(provider, pcfg)
+    return [
+        f"{ui_text('context_setup', lang)}: {label}",
+        f"Applied context: {context_setting_status(provider, pcfg)}",
+        *messages,
+    ]
+
+
+def apply_context_setup_config(provider: str, mode: str) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    lines = apply_context_setup_to_provider(provider, pcfg, mode, cfg.get("language", "en"))
+    save_config(cfg)
+    clear_model_cache()
+    return lines
 
 
 MODEL_FAMILY_I18N: dict[str, dict[str, str]] = {
     "ko": {
         "coding": "코딩",
         "reasoning": "추론",
+        "million-context": "1M 컨텍스트",
         "large": "대형 모델",
         "long-context": "긴 컨텍스트",
         "general": "일반",
@@ -6098,6 +7300,7 @@ MODEL_FAMILY_I18N: dict[str, dict[str, str]] = {
     "ja": {
         "coding": "コーディング",
         "reasoning": "推論",
+        "million-context": "1M コンテキスト",
         "large": "大型モデル",
         "long-context": "長いコンテキスト",
         "general": "汎用",
@@ -6105,11 +7308,61 @@ MODEL_FAMILY_I18N: dict[str, dict[str, str]] = {
     "zh": {
         "coding": "编码",
         "reasoning": "推理",
+        "million-context": "1M 上下文",
         "large": "大型模型",
         "long-context": "长上下文",
         "general": "通用",
     },
 }
+
+
+def applied_preset_id(provider: str, pcfg: dict[str, Any]) -> str:
+    preset_id = str(pcfg.get("llm_preset") or "").strip()
+    if preset_id in LLM_PRESETS and preset_available_for_model(provider, pcfg, preset_id):
+        return preset_id
+    inferred = infer_preset_id_from_options(provider, pcfg)
+    if inferred and preset_available_for_model(provider, pcfg, inferred):
+        return inferred
+    recommended = recommended_preset_id(provider, pcfg)
+    if preset_available_for_model(provider, pcfg, recommended):
+        return recommended
+    return "balanced"
+
+
+def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | None:
+    if provider in ("ollama", "ollama-cloud"):
+        opts = ollama_extra_options(pcfg)
+        num_predict = positive_int(opts.get("num_predict")) or 0
+        timeout = positive_int(pcfg.get("request_timeout_ms")) or 0
+        num_ctx = positive_int(pcfg.get("num_ctx")) or 0
+        num_ctx_min = positive_int(pcfg.get("num_ctx_min")) or 0
+        num_ctx_max = positive_int(pcfg.get("num_ctx_max")) or 0
+        if bool(pcfg.get("think", False)) and timeout >= 1800000:
+            return "reasoning"
+        if num_ctx_max >= 524288:
+            return "million-context-1m"
+        if num_predict >= 8192 or timeout >= 1200000:
+            return "large-output"
+        if timeout >= 900000 or num_ctx_min >= 65536 or num_ctx_max >= 131072:
+            return "long-context-65k"
+        if num_ctx and num_ctx <= 32768 and num_predict and num_predict <= 2048:
+            return "fast"
+        return None
+    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim", "anthropic"):
+        max_output = positive_int(pcfg.get("max_output_tokens")) or 0
+        timeout = positive_int(pcfg.get("request_timeout_ms")) or 0
+        context_window = positive_int(pcfg.get("context_window")) or 0
+        if bool(pcfg.get("think", False)) and timeout >= 1800000:
+            return "reasoning"
+        if context_window >= 524288:
+            return "million-context-1m"
+        if max_output >= 8192 or timeout >= 1200000:
+            return "large-output"
+        if timeout >= 900000 or context_window >= 65536:
+            return "long-context-65k"
+        if max_output and max_output <= 2048:
+            return "fast"
+    return None
 
 
 def llm_preset_text(preset_id: str, lang: str | None = None) -> tuple[str, str]:
@@ -6125,6 +7378,7 @@ def model_family_text(family: str, lang: str | None = None) -> str:
 def llm_preset_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None = None) -> tuple[list[str], list[str]]:
     lang = lang or load_config().get("language", "en")
     recommended = recommended_preset_id(provider, pcfg)
+    applied = applied_preset_id(provider, pcfg)
     family = model_option_family(provider, pcfg)
     recommended_label, _ = llm_preset_text(recommended, lang)
     rows = [
@@ -6133,8 +7387,10 @@ def llm_preset_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
     ]
     values = ["__info__"]
     for preset_id in LLM_PRESETS:
+        if not preset_available_for_model(provider, pcfg, preset_id):
+            continue
         label, description = llm_preset_text(preset_id, lang)
-        mark = "*" if preset_id == recommended else " "
+        mark = "*" if preset_id == applied else " "
         rows.append(f"{mark} {pad_cells(label, 24)} {description}")
         values.append(preset_id)
     rows.append(ui_text("back", lang))
@@ -6147,6 +7403,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
         raise SystemExit(f"Unknown preset: {preset_id}")
     lang = lang or load_config().get("language", "en")
     label = llm_preset_text(preset_id, lang)[0]
+    context_msgs: list[str] = []
     if provider in ("ollama", "ollama-cloud"):
         tokens_by_preset = {
             "balanced": [
@@ -6195,6 +7452,18 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "keep_alive=10m",
                 "timeout=900000",
             ],
+            "million-context-1m": [
+                "num_ctx=auto",
+                "num_ctx_min=262144",
+                "num_ctx_max=1048576",
+                "num_predict=8192",
+                "temperature=0.3",
+                "top_p=0.9",
+                "top_k=40",
+                "think=false",
+                "keep_alive=15m",
+                "timeout=3600000",
+            ],
             "large-output": [
                 "num_ctx=auto",
                 "num_ctx_min=65536",
@@ -6219,17 +7488,86 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "keep_alive=10m",
                 "timeout=1800000",
             ],
+            "novelist": [
+                "num_ctx=auto",
+                "num_ctx_min=65536",
+                "num_ctx_max=262144",
+                "num_predict=8192",
+                "temperature=0.85",
+                "top_p=0.95",
+                "top_k=80",
+                "think=false",
+                "keep_alive=10m",
+                "timeout=1800000",
+            ],
+            "humanities-researcher": [
+                "num_ctx=auto",
+                "num_ctx_min=131072",
+                "num_ctx_max=524288",
+                "num_predict=8192",
+                "temperature=0.45",
+                "top_p=0.9",
+                "top_k=50",
+                "think=false",
+                "keep_alive=15m",
+                "timeout=2400000",
+            ],
+            "mathematician": [
+                "num_ctx=auto",
+                "num_ctx_min=65536",
+                "num_ctx_max=262144",
+                "num_predict=8192",
+                "temperature=0.15",
+                "top_p=0.85",
+                "top_k=40",
+                "think=true",
+                "keep_alive=15m",
+                "timeout=2400000",
+            ],
+            "product-architect": [
+                "num_ctx=auto",
+                "num_ctx_min=65536",
+                "num_ctx_max=262144",
+                "num_predict=8192",
+                "temperature=0.25",
+                "top_p=0.85",
+                "top_k=40",
+                "think=false",
+                "keep_alive=10m",
+                "timeout=1800000",
+            ],
+            "teacher": [
+                "num_ctx=auto",
+                "num_ctx_min=32768",
+                "num_ctx_max=131072",
+                "num_predict=6144",
+                "temperature=0.55",
+                "top_p=0.9",
+                "top_k=60",
+                "think=false",
+                "keep_alive=10m",
+                "timeout=1200000",
+            ],
         }
         for token in tokens_by_preset[preset_id]:
             apply_ollama_option(pcfg, token)
+        model_id = str(pcfg.get("current_model") or "").strip()
+        if model_id:
+            context_msgs = sync_ollama_library_context_limit(provider, pcfg, model_id)
     elif provider == "anthropic":
         tokens_by_preset = {
             "balanced": ["max_output_tokens=4096", "timeout=300000"],
             "coding": ["max_output_tokens=4096", "timeout=300000"],
             "fast": ["max_output_tokens=2048", "timeout=300000"],
             "long-context-65k": ["max_output_tokens=4096", "timeout=900000"],
+            "million-context-1m": ["max_output_tokens=8192", "timeout=3600000"],
             "large-output": ["max_output_tokens=8192", "timeout=1200000"],
             "reasoning": ["max_output_tokens=4096", "timeout=1800000"],
+            "novelist": ["max_output_tokens=8192", "timeout=1800000"],
+            "humanities-researcher": ["max_output_tokens=8192", "timeout=2400000"],
+            "mathematician": ["max_output_tokens=8192", "timeout=2400000"],
+            "product-architect": ["max_output_tokens=8192", "timeout=1800000"],
+            "teacher": ["max_output_tokens=6144", "timeout=1200000"],
         }
         for token in tokens_by_preset[preset_id]:
             apply_provider_option(provider, pcfg, token)
@@ -6274,6 +7612,15 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "unset:top_p",
                     "unset:top_k",
                 ],
+                "million-context-1m": [
+                    "context_window=1048576",
+                    "reserve=16384",
+                    "max_output_tokens=8192",
+                    "timeout=3600000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
                 "large-output": [
                     "context_window=262144",
                     "reserve=8192",
@@ -6291,6 +7638,51 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "temperature=0.6",
                     "unset:top_p",
                     "unset:top_k",
+                ],
+                "novelist": [
+                    "context_window=262144",
+                    "reserve=8192",
+                    "max_output_tokens=8192",
+                    "timeout=1800000",
+                    "temperature=0.85",
+                    "top_p=0.95",
+                    "top_k=80",
+                ],
+                "humanities-researcher": [
+                    "context_window=262144",
+                    "reserve=8192",
+                    "max_output_tokens=8192",
+                    "timeout=2400000",
+                    "temperature=0.45",
+                    "top_p=0.9",
+                    "top_k=50",
+                ],
+                "mathematician": [
+                    "context_window=262144",
+                    "reserve=8192",
+                    "max_output_tokens=8192",
+                    "timeout=2400000",
+                    "temperature=0.15",
+                    "top_p=0.85",
+                    "top_k=40",
+                ],
+                "product-architect": [
+                    "context_window=262144",
+                    "reserve=8192",
+                    "max_output_tokens=8192",
+                    "timeout=1800000",
+                    "temperature=0.25",
+                    "top_p=0.85",
+                    "top_k=40",
+                ],
+                "teacher": [
+                    "context_window=131072",
+                    "reserve=4096",
+                    "max_output_tokens=6144",
+                    "timeout=1200000",
+                    "temperature=0.55",
+                    "top_p=0.9",
+                    "top_k=60",
                 ],
             }
         else:
@@ -6335,6 +7727,16 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "unset:top_k",
                 f"native={native_default}",
             ],
+            "million-context-1m": [
+                "context_window=1048576",
+                "reserve=16384",
+                "max_output_tokens=8192",
+                "timeout=3600000",
+                "temperature=0.3",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
             "large-output": [
                 "context_window=65536",
                 "reserve=4096",
@@ -6355,6 +7757,56 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "unset:top_k",
                 f"native={native_default}",
             ],
+            "novelist": [
+                "context_window=262144",
+                "reserve=8192",
+                "max_output_tokens=8192",
+                "timeout=1800000",
+                "temperature=0.85",
+                "top_p=0.95",
+                "top_k=80",
+                f"native={native_default}",
+            ],
+            "humanities-researcher": [
+                "context_window=262144",
+                "reserve=8192",
+                "max_output_tokens=8192",
+                "timeout=2400000",
+                "temperature=0.45",
+                "top_p=0.9",
+                "top_k=50",
+                f"native={native_default}",
+            ],
+            "mathematician": [
+                "context_window=262144",
+                "reserve=8192",
+                "max_output_tokens=8192",
+                "timeout=2400000",
+                "temperature=0.15",
+                "top_p=0.85",
+                "top_k=40",
+                f"native={native_default}",
+            ],
+            "product-architect": [
+                "context_window=262144",
+                "reserve=8192",
+                "max_output_tokens=8192",
+                "timeout=1800000",
+                "temperature=0.25",
+                "top_p=0.85",
+                "top_k=40",
+                f"native={native_default}",
+            ],
+            "teacher": [
+                "context_window=131072",
+                "reserve=4096",
+                "max_output_tokens=6144",
+                "timeout=1200000",
+                "temperature=0.55",
+                "top_p=0.9",
+                "top_k=60",
+                f"native={native_default}",
+            ],
             }
         for token in tokens_by_preset[preset_id]:
             if provider == "nvidia-hosted" and token.startswith("native="):
@@ -6368,19 +7820,23 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     pcfg["max_output_tokens"] = min(positive_int(pcfg.get("max_output_tokens")) or 2048, 2048)
                 else:
                     pcfg["max_output_tokens"] = min(positive_int(pcfg.get("max_output_tokens")) or 4096, max(1024, server_limit // 8))
+    context_msgs.extend(cap_context_settings_to_model_capacity(provider, pcfg))
+    pcfg["llm_preset"] = preset_id
     family = model_option_family(provider, pcfg)
     lines = [
         f"{ui_text('apply_preset', lang)}: {label}",
         f"Provider: {provider}; {ui_text('model_family', lang)}: {model_family_text(family, lang)}",
     ]
+    lines.extend(context_msgs)
     if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
         server_limit = upstream_model_context_limit(provider, pcfg)
+        required_context = required_context_for_preset(preset_id, provider) or 65536
         if server_limit:
             lines.append(f"Server max_model_len: {server_limit}")
-            if preset_id in ("long-context-65k", "large-output") and server_limit < 65536:
-                lines.append("Long-context preset requires restarting the server with --max-model-len 65536 or higher.")
+            if preset_id in CONTEXT_HEAVY_PRESETS and server_limit < required_context:
+                lines.append(f"This preset requires restarting the server with --max-model-len {required_context} or higher.")
                 lines.append("Client settings were capped to the server-reported context length.")
-        elif preset_id in ("long-context-65k", "large-output"):
+        elif preset_id in CONTEXT_HEAVY_PRESETS:
             lines.append("Could not verify server max_model_len; vLLM/NIM must be started with a matching context limit.")
     if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
         lines.append(
@@ -6422,6 +7878,12 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ko": "현재 provider/모델 계열에 맞춘 LLM 프리셋(출력 토큰, 샘플링, 타임아웃)을 한 번에 적용합니다.",
         "ja": "現在のprovider/モデル系列向けに調整されたLLMプリセット(出力トークン、サンプリング、タイムアウト)を一括適用します。",
         "zh": "应用为当前 provider/模型系列调优的 LLM 预设（输出 token、采样、超时）。",
+    },
+    "context_setup": {
+        "en": "Begin here: choose how much of the selected model's context window claude-any may use. Larger windows read more files/history but cost more time and provider quota.",
+        "ko": "처음엔 여기부터 설정하세요. 선택한 모델의 컨텍스트 창을 claude-any가 얼마나 사용할지 고릅니다. 클수록 파일/히스토리를 더 많이 읽지만 느리고 provider 한도를 더 씁니다.",
+        "ja": "まずここから設定します。選択モデルのコンテキスト窓をclaude-anyがどれだけ使うかを選びます。大きいほど多くのファイル/履歴を読めますが、遅くなりprovider枠を使います。",
+        "zh": "先从这里设置：选择 claude-any 可使用所选模型多少上下文窗口。越大可读更多文件/历史，但更慢并消耗 provider 配额。",
     },
     "num_ctx": {
         "en": "Ollama context window (num_ctx). Use 'auto' to size per-request between min/max, or a fixed integer like 65536.",
@@ -6466,10 +7928,10 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "zh": "claude-any 限制 max_tokens 时为输入侧预留的 token。direct native 请求会忽略。",
     },
     "request_timeout_ms": {
-        "en": "Upstream wait timeout in milliseconds. 300000 ms = 5 minutes.",
-        "ko": "업스트림 응답 대기 시간(ms). 300000은 5분입니다.",
-        "ja": "上流応答待ちタイムアウト(ms)。300000は5分です。",
-        "zh": "上游响应等待超时（毫秒）。300000 表示 5 分钟。",
+        "en": "Upstream wait timeout in milliseconds.",
+        "ko": "업스트림 응답 대기 시간(ms).",
+        "ja": "上流応答待ちタイムアウト(ms)。",
+        "zh": "上游响应等待超时（毫秒）。",
     },
     "rate_limit_rpm": {
         "en": "Router-side upstream request limit per minute. NIM hosted defaults to 40 RPM; unset/0 disables waiting.",
@@ -6548,6 +8010,36 @@ def llm_option_description(provider: str, key: str, lang: str | None = None) -> 
     return entry.get(lang) or entry.get("en", "")
 
 
+def format_timeout_minutes(ms: int, lang: str = "en") -> str:
+    seconds = ms / 1000
+    minutes = seconds / 60
+    labels = {
+        "ko": "분",
+        "ja": "分",
+        "zh": "分钟",
+    }
+    label = labels.get(lang, "minutes")
+    if abs(minutes - round(minutes)) < 0.01:
+        return f"{int(round(minutes))}{label if lang in labels else ' ' + label}"
+    return f"{minutes:.1f}{label if lang in labels else ' ' + label}"
+
+
+def llm_option_description_for_value(provider: str, pcfg: dict[str, Any], key: str, lang: str | None = None) -> str:
+    text = llm_option_description(provider, key, lang)
+    if key != "request_timeout_ms":
+        return text
+    value = positive_int(pcfg.get("request_timeout_ms"))
+    if not value:
+        return text
+    lang = lang or load_config().get("language", "en")
+    suffix = {
+        "ko": f" 현재값: {value} ms = {format_timeout_minutes(value, lang)}.",
+        "ja": f" 現在値: {value} ms = {format_timeout_minutes(value, lang)}.",
+        "zh": f" 当前值：{value} ms = {format_timeout_minutes(value, lang)}。",
+    }.get(lang, f" Current value: {value} ms = {format_timeout_minutes(value, lang)}.")
+    return text + suffix
+
+
 # Boolean keys whose Enter handler should flip on/off in place instead of
 # prompting for a value. Covers both on/off labels (stream_*) and True/False
 # labels (native_compat, think).
@@ -6584,7 +8076,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         rows.append(f"{label:<24} [{compact_text(value, 56)}]")
         values.append(key)
 
-    add(ui_text("apply_preset", lang), "preset", llm_preset_text(recommended_preset_id(provider, pcfg), lang)[0])
+    add(ui_text("context_setup", lang), "context_setup", context_setting_status(provider, pcfg))
+    add(ui_text("apply_preset", lang), "preset", llm_preset_text(applied_preset_id(provider, pcfg), lang)[0])
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         add("Context window", "num_ctx", ollama_num_ctx_status(pcfg))
@@ -7271,6 +8764,14 @@ def claude_code_output_token_limit(provider: str, pcfg: dict[str, Any]) -> int |
     return None
 
 
+def claude_code_context_model_alias(provider: str, pcfg: dict[str, Any], model: str) -> str:
+    model = strip_claude_context_suffix(model)
+    limit = context_limit_for_status(provider, pcfg)
+    if limit and limit >= 1000000 and "[1m]" not in model.lower():
+        return f"{model}[1m]"
+    return model
+
+
 def apply_common_claude_env(provider: str, pcfg: dict[str, Any], env: dict[str, str]) -> dict[str, str]:
     # Claude Code's AI-generated terminal/session title can be persisted as
     # ai-title records and, in some resume/queued-command states, visually bleed
@@ -7336,6 +8837,7 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
             "CLAUDE_ANY_MODEL_ALIAS": model,
         })
     alias = current_alias(cfg)
+    claude_model = claude_code_context_model_alias(provider, pcfg, alias)
     return apply_common_claude_env(provider, pcfg, {
         "CLAUDE_ANY_PROVIDER": provider,
         "ANTHROPIC_BASE_URL": ROUTER_BASE,
@@ -7343,12 +8845,12 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-        "ANTHROPIC_MODEL": alias,
-        "ANTHROPIC_DEFAULT_HAIKU_MODEL": alias,
-        "ANTHROPIC_DEFAULT_OPUS_MODEL": alias,
-        "ANTHROPIC_DEFAULT_SONNET_MODEL": alias,
-        "CLAUDE_CODE_SUBAGENT_MODEL": alias,
-        "CLAUDE_ANY_MODEL_ALIAS": alias,
+        "ANTHROPIC_MODEL": claude_model,
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL": claude_model,
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": claude_model,
+        "ANTHROPIC_DEFAULT_SONNET_MODEL": claude_model,
+        "CLAUDE_CODE_SUBAGENT_MODEL": claude_model,
+        "CLAUDE_ANY_MODEL_ALIAS": claude_model,
     })
 
 
@@ -8201,12 +9703,13 @@ def render_prelaunch_screen(
             "advisor-model": "Advisor Model",
             "test": "Compatibility test",
             "options": ui_text("options", lang),
+            "context": ui_text("context_setup", lang),
             "preset": ui_text("presets", lang),
         }
         add("")
         add("-" * render_width, "38;5;208")
         panel_title = titles.get(panel, panel)
-        title_suffix = "" if panel_title.lower().endswith(("options", "presets", "옵션", "프리셋", "オプション", "プリセット", "选项", "预设")) else " options"
+        title_suffix = "" if panel_title.lower().endswith(("options", "presets", "setup", "설정", "옵션", "프리셋", "設定", "オプション", "プリセット", "设置", "选项", "预设")) else " options"
         add(f"{panel_title}{title_suffix}", "1;38;5;208")
         # Reserve an extra line for the per-row description when shown.
         description_reserve = 2 if panel == "options" else 0
@@ -8228,7 +9731,7 @@ def render_prelaunch_screen(
             except Exception:
                 panel_values = []
             current_key = panel_values[panel_idx] if 0 <= panel_idx < len(panel_values) else ""
-            description = llm_option_description(provider, current_key, lang) if current_key else ""
+            description = llm_option_description_for_value(provider, pcfg, current_key, lang) if current_key else ""
             add("")
             if description:
                 add("  " + description, "2")
@@ -8352,6 +9855,8 @@ def portable_prelaunch_menu() -> int:
             panel_rows, panel_values = ["Run compatibility test", "Back"], ["run", "back"]
         elif name == "options":
             panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
+        elif name == "context":
+            panel_rows, panel_values = context_setup_panel_rows(provider, pcfg, cfg.get("language", "en"))
         elif name == "preset":
             panel_rows, panel_values = llm_preset_panel_rows(provider, pcfg, cfg.get("language", "en"))
         if panel_rows:
@@ -8528,6 +10033,8 @@ def portable_prelaunch_menu() -> int:
                 elif panel == "options":
                     if value == "back":
                         close_panel()
+                    elif value == "context_setup":
+                        open_panel("context")
                     elif value == "preset":
                         open_panel("preset")
                     elif value in LLM_OPTION_TOGGLE_KEYS:
@@ -8557,6 +10064,24 @@ def portable_prelaunch_menu() -> int:
                         old_idx = panel_idx
                         panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
                         panel_idx = max(0, min(old_idx, len(panel_rows) - 1))
+                        panel_last_idx["options"] = panel_idx
+                elif panel == "context":
+                    if value == "back":
+                        open_panel("options")
+                    elif value == "__info__":
+                        continue
+                    else:
+                        try:
+                            messages = apply_context_setup_config(provider, value)
+                        except Exception as exc:
+                            messages = [f"Context setup failed: {type(exc).__name__}: {exc}"]
+                        refresh_checks()
+                        cfg = load_config()
+                        provider, pcfg = get_current_provider(cfg)
+                        panel = "options"
+                        panel_idx = panel_last_idx.get("options", 0)
+                        panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
+                        panel_idx = max(0, min(panel_idx, len(panel_rows) - 1))
                         panel_last_idx["options"] = panel_idx
                 elif panel == "preset":
                     if value == "back":
@@ -8956,6 +10481,7 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
                                       Set Ollama num_ctx/options/keep_alive/think
   claude-any provider-options [provider] [key=value ...]
                                       Set vLLM/NIM/NVIDIA output/context/timeouts
+  claude-any ollama-catalog          Download Ollama model/context catalog
   claude-any test [seconds] [mode]   Test compatibility; mode is auto, quick, smoke, or full
   claude-any stop                    Stop router/proxy
 
@@ -9157,6 +10683,17 @@ def run_cli(argv: list[str]) -> int:
             return 0
         if head in ("provider-options", "provider-option", "provider-opts", "vllm-options", "nim-options"):
             cmd_provider_options(argparse.Namespace(values=rest))
+            return 0
+        if head in ("ollama-catalog", "ollama-catalog-refresh"):
+            no_contexts = "--no-contexts" in rest
+            timeout = 10.0
+            for item in rest:
+                if item.startswith("--timeout="):
+                    try:
+                        timeout = float(item.split("=", 1)[1])
+                    except ValueError:
+                        raise SystemExit("Usage: claude-any ollama-catalog [--no-contexts] [--timeout=SECONDS]")
+            cmd_ollama_catalog(argparse.Namespace(no_contexts=no_contexts, timeout=timeout))
             return 0
         if head in ("test", "compat", "compatibility"):
             timeout = 60.0
@@ -9524,6 +11061,10 @@ def build_parser() -> argparse.ArgumentParser:
     po = sub.add_parser("provider-options")
     po.add_argument("values", nargs="*")
     po.set_defaults(func=cmd_provider_options)
+    oc = sub.add_parser("ollama-catalog")
+    oc.add_argument("--no-contexts", action="store_true")
+    oc.add_argument("--timeout", type=float, default=10.0)
+    oc.set_defaults(func=cmd_ollama_catalog)
     test = sub.add_parser("test")
     test.add_argument("timeout", nargs="?", type=float, default=120.0)
     test.add_argument("mode", nargs="?", choices=("auto", "quick", "smoke", "full"), default="auto")

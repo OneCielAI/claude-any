@@ -41,3 +41,9 @@ Thumbs.db
 # Claude Code local state
 .claude/
 *.bak*
+
+# Local analysis wiki
+.obsidian-claude-code-wiki/
+
+# Local scratch checkouts / SDK inspections
+.tmp-*/

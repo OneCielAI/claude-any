@@ -413,6 +413,25 @@ def handle_pre_tool(event: dict[str, Any]) -> None:
         )
         return
 
+    if tool in {"EnterPlanMode", "ExitPlanMode"}:
+        transcript_path = str(event.get("transcript_path") or "")
+        if transcript_path:
+            in_plan_mode = transcript_plan_mode_active(transcript_path)
+            if tool == "EnterPlanMode" and in_plan_mode:
+                log_event(f"PreToolUse denied repeated EnterPlanMode transcript={transcript_path}")
+                pre_deny(
+                    "Claude Code is already in plan mode.",
+                    "Continue the current plan-mode exploration. Do not call EnterPlanMode again.",
+                )
+                return
+            if tool == "ExitPlanMode" and not in_plan_mode:
+                log_event(f"PreToolUse denied stale ExitPlanMode transcript={transcript_path}")
+                pre_deny(
+                    "Claude Code is not currently in plan mode.",
+                    "If the plan was already approved or plan mode was exited, continue with concrete work instead of calling ExitPlanMode. If planning is required again, enter plan mode first.",
+                )
+                return
+
     if tool == "TaskUpdate":
         task_id = raw.get("taskId")
         status = raw.get("status")

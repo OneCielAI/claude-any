@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.46`
+当前版本: `0.1.62`
 
 ## 为什么存在
 
@@ -337,6 +337,47 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 ## 更新日志
 
+### 0.1.62
+
+- **Ollama 上下文目录**：新增 `claude-any ollama-catalog` 命令。它会下载
+  Ollama model list 和 library tag 页面，去掉 `:cloud`、`:latest` 等 suffix，
+  按 base model 缓存真实 context window 到
+  `~/.config/claude-any/ollama-model-catalog.json`。
+- **按上下文能力显示 preset**：菜单会使用所选模型的真实 context capacity，
+  隐藏不可用 preset，并且只在 1M 模型上显示 1M context preset。
+- **保留 Claude Code 原生 compact**：移除 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+  override，让 Claude Code 自身的 compact 行为不再被 claude-any 过早 cap。
+- **实时 context/status 统计**：statusline 会优先使用 Claude Code session 的
+  context-window telemetry；router mode 仍会显示 upstream token、retry、RPM
+  使用量和 error 状态。
+- **Advisor/Plan Mode 强化**：继续强化 Advisor review、stale `ExitPlanMode`
+  恢复、queued command 处理，以及 agent/task/team workflow 所需的 Claude Code
+  hook coverage。
+
+### 0.1.50
+
+- **Dynamic timeout help**：LLM options panel 中 `request_timeout_ms` 的说明不再
+  固定显示 `300000 ms = 5 minutes` 示例，而是显示当前选择的值。
+
+### 0.1.49
+
+- **Streaming buffer fix**：Ollama/OpenAI-compatible stream 会在普通文本流恢复时
+  立即 flush 为 plan 检测短暂保留的文本，不再等到响应末尾集中 replay。
+- **Plan mode guard**：当 Claude Code 已不在 plan mode 时，丢弃 `ExitPlanMode`
+  tool call，避免卡在 “You are not in plan mode” 状态。
+
+### 0.1.48
+
+- **Unreachable model list fix**：当 provider model endpoint 无法连接时，不再把
+  config 中残留的 `current_model` 或 `custom_models` 当作新 endpoint 返回的模型
+  重新显示。
+
+### 0.1.47
+
+- **Base URL model reset**：修改 provider Base URL 时会清除旧 endpoint 的
+  custom/current model 和 model cache，避免 model picker 继续显示上一个
+  endpoint 的模型。
+
 ### 0.1.46
 
 - **Stream options 更清晰**：当 `Stream` 关闭时，LLM options menu 会隐藏
@@ -371,8 +412,9 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 ### 0.1.40
 
-- **保留 RPM 0**：`rate_limit_rpm=0` 现在会保存为明确的无限制模式，
-  不会回退到 provider 默认值。
+- **保留 RPM 0**：`rate_limit_rpm=0` 现在会保存为明确的 router 不管理模式，
+  不会回退到 provider 默认值。仍可显示最近 60 秒的请求使用量，但这并不表示
+  upstream provider 没有限制。
 
 ### 0.1.39
 
@@ -466,8 +508,8 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 - **面向免费 hosted 模型的 soft RPM pacing**: NVIDIA hosted、self-hosted NIM、
   Ollama、Ollama Cloud 都可使用 router-side RPM pacing。它会扣除已经花在文件读取、
   命令执行和等待 tool 结果上的时间，因此真实编码中的 tool-call 间隔会自然吸收 RPM 间隔。
-- **无限制时的使用量显示**: `rate_limit_rpm=0` 会关闭 throttling，但仍显示最近
-  60 秒的请求使用量。
+- **未管理 RPM 的使用量显示**: `rate_limit_rpm=0` 会关闭 router-side throttling，
+  但仍显示最近 60 秒的请求使用量；这不表示 provider 侧没有限制。
 
 ### 0.1.27
 

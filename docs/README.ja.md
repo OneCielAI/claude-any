@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.46`
+現在のバージョン: `0.1.62`
 
 ## 作られた理由
 
@@ -351,6 +351,49 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 
 ## 変更履歴
 
+### 0.1.62
+
+- **Ollama context catalog**: `claude-any ollama-catalog` を追加しました。
+  Ollama の model list と library tag page を取得し、`:cloud` や `:latest`
+  などの suffix を外した base model 単位で実際の context window を
+  `~/.config/claude-any/ollama-model-catalog.json` にキャッシュします。
+- **Context-aware presets**: 選択モデルの実際の context capacity を使い、
+  不可能な preset を隠し、1M context preset は 1M 対応モデルでだけ表示します。
+- **Claude Code native compact を維持**: `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+  override を削除し、Claude Code 自身の compact 動作が claude-any の早すぎる
+  cap に邪魔されないようにしました。
+- **Live context/status accounting**: statusline は利用可能な場合 Claude Code
+  session の context-window telemetry を優先し、router mode では upstream
+  token、retry、RPM 使用量、error 状態を表示し続けます。
+- **Advisor/Plan Mode hardening**: Advisor review、stale `ExitPlanMode` 復旧、
+  queued command 処理、agent/task/team workflow 向け Claude Code hook coverage
+  を non-Anthropic provider でより安定させました。
+
+### 0.1.50
+
+- **Dynamic timeout help**: LLM options panel の `request_timeout_ms` 説明は、
+  固定例 `300000 ms = 5 minutes` ではなく、現在選択されている値を表示します。
+
+### 0.1.49
+
+- **Streaming buffer fix**: Ollama/OpenAI-compatible stream で plan 検出のために
+  一時的に保留した text を、通常の text streaming が再開した時点で flush します。
+  応答末尾でまとめて replay しません。
+- **Plan mode guard**: Claude Code が plan mode ではない場合、`ExitPlanMode`
+  tool call を drop し、“You are not in plan mode” の停止状態を避けます。
+
+### 0.1.48
+
+- **Unreachable model list fix**: provider model endpoint に接続できない場合、
+  config に残っている `current_model` や `custom_models` を新しい endpoint から
+  取得した model のように再表示しません。
+
+### 0.1.47
+
+- **Base URL model reset**: provider Base URL を変更すると、以前の endpoint の
+  custom/current model と model cache をクリアします。これにより model picker が
+  古い endpoint の model を表示し続けることを防ぎます。
+
 ### 0.1.46
 
 - **Stream options の整理**: `Stream` が off の場合、`Stream word chunking` を
@@ -387,7 +430,8 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 ### 0.1.40
 
 - **RPM 0 を保持**: `rate_limit_rpm=0` の設定が provider 既定値に戻らず、
-  明示的な無制限モードとして保存されます。
+  明示的な router 未管理モードとして保存されます。直近 60 秒の request 使用量は
+  表示できますが、upstream provider が無制限という意味ではありません。
 
 ### 0.1.39
 
@@ -487,8 +531,9 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   Ollama、Ollama Cloud で router-side RPM pacing を使えます。ファイル読み取り、
   コマンド実行、tool 結果待ちにすでに使われた時間を待機計算から差し引くため、
   実際のコーディング中の tool-call 間隔が RPM 間隔を自然に吸収します。
-- **無制限時の使用量表示**: `rate_limit_rpm=0` は throttling を無効化しますが、
-  直近 60 秒のリクエスト使用量は引き続き表示します。
+- **未管理 RPM の使用量表示**: `rate_limit_rpm=0` は router-side throttling を
+  無効化しますが、直近 60 秒のリクエスト使用量は引き続き表示します。provider 側に
+  制限がないという意味ではありません。
 
 ### 0.1.27
 
