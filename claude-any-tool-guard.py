@@ -57,6 +57,7 @@ TOOL_HINTS = {
     "Grep": "Use Grep with pattern, path, glob, type, output_mode, context, head_limit, or multiline only.",
     "TaskUpdate": "Use TaskUpdate with taskId and status.",
 }
+PLAN_GUARD_MARKER = "[claude-any-plan-guard]"
 
 
 def active() -> bool:
@@ -299,6 +300,82 @@ def transcript_plan_mode_active(transcript_path: str | None) -> bool:
     return active
 
 
+def message_text(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip()
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            parts.append(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text") or ""))
+    return "\n".join(part for part in parts if part).strip()
+
+
+def message_has_tool_use(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return False
+    return any(isinstance(block, dict) and block.get("type") == "tool_use" for block in content)
+
+
+def transcript_latest_turn(transcript_path: str | None) -> dict[str, Any]:
+    if not transcript_path:
+        return {}
+    path = Path(transcript_path)
+    if not path.exists():
+        return {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="ignore").splitlines()[-160:]
+    except Exception:
+        return {}
+
+    latest_assistant: dict[str, Any] | None = None
+    latest_assistant_index = -1
+    parsed: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            data = json.loads(line)
+        except Exception:
+            continue
+        parsed.append(data)
+        message = data.get("message")
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            latest_assistant = message
+            latest_assistant_index = len(parsed) - 1
+
+    if not latest_assistant:
+        return {}
+
+    latest_user_text = ""
+    for data in reversed(parsed[:latest_assistant_index]):
+        if data.get("type") != "user":
+            continue
+        message = data.get("message")
+        if not isinstance(message, dict):
+            continue
+        if message.get("isMeta") is True:
+            continue
+        text = message_text(message)
+        if not text:
+            continue
+        if text.startswith("Stop hook feedback:") or PLAN_GUARD_MARKER in text:
+            continue
+        if text.startswith("Claude Any plan guard:"):
+            continue
+        latest_user_text = text
+        break
+
+    return {
+        "assistant_text": message_text(latest_assistant),
+        "assistant_has_tool_use": message_has_tool_use(latest_assistant),
+        "user_text": latest_user_text,
+    }
+
+
 def short_resume_prompt(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text or "").strip()
     if not normalized or len(normalized) > 32:
@@ -307,14 +384,41 @@ def short_resume_prompt(text: str) -> bool:
 
 
 def non_actionable_stop_text(text: str) -> bool:
-    normalized = re.sub(r"\s+", " ", text or "").strip()
+    stripped = (text or "").strip()
+    normalized = re.sub(r"\s+", " ", stripped).strip()
     if not normalized or len(normalized) > 220:
         return False
-    if "\n" in text:
+    if "\n" in stripped:
         return False
     if re.search(r"[`{};/\\\\]|https?://", normalized):
         return False
     return True
+
+
+def should_block_plan_stop(transcript_path: str | None) -> tuple[bool, str]:
+    if not transcript_plan_mode_active(transcript_path):
+        return False, ""
+    turn = transcript_latest_turn(transcript_path)
+    assistant_text = str(turn.get("assistant_text") or "")
+    user_text = str(turn.get("user_text") or "")
+    if turn.get("assistant_has_tool_use"):
+        return False, ""
+    if not non_actionable_stop_text(assistant_text):
+        return False, ""
+    if re.search(r"[?？]", assistant_text):
+        return False, ""
+    if not short_resume_prompt(user_text):
+        return False, ""
+    reason = (
+        f"{PLAN_GUARD_MARKER} Claude Any plan guard: Claude Code is still in plan mode, "
+        "but the latest response ended as a short "
+        "acknowledgement without any concrete tool call. Continue now by calling the next required Claude Code "
+        "plan-mode-safe tool, such as Read, Glob, Grep, or ExitPlanMode. Use TaskUpdate only when an existing "
+        "task is being updated. If mutation is required, call ExitPlanMode with the plan first. Do not put the "
+        "next step into the user input box and do not wait for the user unless you are asking a real "
+        "clarification question."
+    )
+    return True, reason
 
 
 def stop_block_count_path(session_id: str) -> Path:
@@ -331,17 +435,41 @@ def increment_stop_block_count(session_id: str | None, text: str) -> int:
     except Exception:
         data = {}
     count = int(data.get(key) or 0) + 1
-    path.write_text(json.dumps({key: count}, ensure_ascii=False) + "\n", encoding="utf-8")
+    data[key] = count
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(path)
     return count
+
+
+def reset_stop_block_count(session_id: str | None) -> None:
+    if not session_id:
+        return
+    path = stop_block_count_path(session_id)
+    try:
+        path.unlink(missing_ok=True)
+    except Exception:
+        pass
 
 
 def handle_stop(event: dict[str, Any]) -> int:
     log_json_event(event)
-    # Claude Code 2.1.x records Stop hook stderr as a suggestion
-    # (`preventedContinuation: false`) in some interactive flows. That pollutes
-    # the transcript and can leak into the input buffer, so keep Stop events
-    # observational and do continuation control in the router instead.
+    if str(event.get("hook_event_name") or "") == "SubagentStop":
+        log_event(f"SubagentStop guard observed session={event.get('session_id') or ''}")
+        return 0
     session_id = str(event.get("session_id") or "")
+    transcript_path = str(event.get("transcript_path") or "")
+    if active():
+        should_block, reason = should_block_plan_stop(transcript_path)
+        if should_block:
+            count = increment_stop_block_count(session_id, reason)
+            if count <= 3:
+                out = {"decision": "block", "reason": reason, "suppressOutput": True}
+                log_json_event(event, out)
+                log_event(f"Stop guard blocked plan idle session={session_id} count={count} transcript={transcript_path}")
+                emit(out)
+                return 0
+            log_event(f"Stop guard allowed repeated plan idle session={session_id} count={count} transcript={transcript_path}")
     log_event(f"Stop guard observed session={session_id}")
     return 0
 
@@ -405,6 +533,7 @@ def handle_pre_tool(event: dict[str, Any]) -> None:
     if tool.startswith("mcp__"):
         return
     log_json_event(event)
+    reset_stop_block_count(str(event.get("session_id") or ""))
     raw = event.get("tool_input")
     if not isinstance(raw, dict):
         pre_deny(

@@ -90,7 +90,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.62"
+VERSION = "0.1.63"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -106,6 +106,7 @@ _RATE_LIMIT_LOCK = threading.Lock()
 _CHAT_CONDITION = threading.Condition()
 _CHAT_NEXT_ID: int | None = None
 ADVISOR_FEEDBACK_MARKER = "CLAUDE_ANY_ADVISOR_FEEDBACK"
+PLAN_GUARD_MARKER = "[claude-any-plan-guard]"
 
 # Tools Claude Code injects into every model's tool list that misfire when called
 # by non-Anthropic models. See docs/notes from anthropics/claude-code issues
@@ -2112,6 +2113,15 @@ def plan_mode_tool_name_for_emit(body: dict[str, Any], name: str, tool_input: di
     return name, tool_input
 
 
+def is_guard_feedback_text(text: str) -> bool:
+    stripped = (text or "").strip()
+    return (
+        stripped.startswith("Stop hook feedback:")
+        or stripped.startswith("Claude Any plan guard:")
+        or PLAN_GUARD_MARKER in stripped
+    )
+
+
 def latest_user_text(body: dict[str, Any]) -> str:
     for message in reversed(body.get("messages") or []):
         if not isinstance(message, dict) or message.get("role") != "user":
@@ -2120,7 +2130,7 @@ def latest_user_text(body: dict[str, Any]) -> str:
             continue
         content = message.get("content")
         if isinstance(content, str):
-            if content.startswith("Stop hook feedback:"):
+            if is_guard_feedback_text(content):
                 continue
             return content
         if not isinstance(content, list):
@@ -2135,7 +2145,7 @@ def latest_user_text(body: dict[str, Any]) -> str:
             if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
         ]
         text = anthropic_content_to_text(text_blocks)
-        if not text or text.startswith("Stop hook feedback:"):
+        if not text or is_guard_feedback_text(text):
             continue
         return text
     return ""
@@ -3910,7 +3920,7 @@ def should_skip_upstream_message(message: dict[str, Any]) -> bool:
     if role == "user" and message.get("isMeta") is True:
         return True
     text = anthropic_content_to_text(content).strip()
-    if role == "user" and text.startswith("Stop hook feedback:"):
+    if is_guard_feedback_text(text):
         return True
     # Router diagnostics must never be fed back to the upstream model. In Claude
     # Code they can also appear in the prompt input after a malformed/empty turn.

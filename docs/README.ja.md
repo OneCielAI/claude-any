@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.62`
+現在のバージョン: `0.1.63`
 
 ## 作られた理由
 
@@ -350,6 +350,17 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.63
+
+- **Plan Mode stop guard**: non-Anthropic モデルが Plan Mode 中に短い確認文だけで
+  tool call なしに停止した場合、Stop hook が構造化 JSON フィードバックを返し、
+  Claude Code が plan-mode-safe tool で続行できるようにしました。
+- **Guard feedback filtering**: claude-any の plan-guard marker をすべての role
+  の router history から除外し、Stop hook の復旧メッセージが upstream モデルへ
+  戻らないようにしました。
+- **より安全な retry budget**: 実際の tool call が試行されたら Stop guard の
+  カウンターをリセットし、`SubagentStop` は観察専用のままにします。
 
 ### 0.1.62
 

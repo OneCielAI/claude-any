@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.62`
+현재 버전: `0.1.63`
 
 ## 왜 만들었나
 
@@ -350,6 +350,17 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.63
+
+- **Plan Mode stop guard**: non-Anthropic 모델이 Plan Mode 안에서 짧은 확인
+  문장만 내고 tool call 없이 멈추는 경우, Stop hook이 구조화된 JSON 피드백을
+  반환해 Claude Code가 plan-mode-safe tool로 계속 진행하도록 했습니다.
+- **Guard 피드백 필터링**: claude-any의 plan-guard marker를 모든 role의 router
+  history에서 제거하여, Stop hook 복구 메시지가 upstream 모델로 다시 전달되지
+  않게 했습니다.
+- **더 안전한 retry budget**: 실제 tool call이 시도되면 Stop guard 카운터를
+  리셋하고, `SubagentStop` 이벤트는 관찰 전용으로 유지합니다.
 
 ### 0.1.62
 

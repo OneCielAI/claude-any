@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.62`
+Current version: `0.1.63`
 
 ## Why This Exists
 
@@ -384,6 +384,18 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.63
+
+- **Plan Mode stop guard**: when a non-Anthropic model is already in Plan Mode
+  and stops after a short acknowledgement without a tool call, the Stop hook
+  now returns structured JSON feedback so Claude Code continues with a
+  plan-mode-safe tool instead of leaking text into the prompt box.
+- **Guard-feedback filtering**: claude-any filters its own plan-guard marker
+  from router history for all roles, preventing Stop hook recovery messages from
+  being sent back to upstream models.
+- **Safer retry budget**: the Stop guard retry counter now resets once a real
+  tool call is attempted, while `SubagentStop` events are kept observational.
 
 ### 0.1.62
 

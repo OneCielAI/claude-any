@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.62`
+当前版本: `0.1.63`
 
 ## 为什么存在
 
@@ -336,6 +336,16 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.63
+
+- **Plan Mode stop guard**：当 non-Anthropic 模型已经处于 Plan Mode，却只输出
+  简短确认文本且没有 tool call 就停止时，Stop hook 现在会返回结构化 JSON
+  反馈，让 Claude Code 继续调用 plan-mode-safe tool。
+- **Guard feedback filtering**：claude-any 会从所有 role 的 router history 中过滤
+  自己的 plan-guard marker，避免 Stop hook 恢复消息再次发送给 upstream 模型。
+- **更安全的 retry budget**：一旦真正的 tool call 被尝试，Stop guard 计数器会
+  重置；`SubagentStop` 事件保持仅观察模式。
 
 ### 0.1.62
 
