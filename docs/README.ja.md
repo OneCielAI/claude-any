@@ -47,7 +47,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.63`
+現在のバージョン: `0.1.64`
 
 ## 作られた理由
 
@@ -350,6 +350,14 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.64
+
+- **モデル context 対応の native auto-compact**: claude-any は起動時に、選択中の
+  provider/model の context window を使って `CLAUDE_CODE_AUTO_COMPACT_WINDOW`
+  を注入します。Ollama/Ollama Cloud ではディスクにキャッシュした model catalog
+  も利用するため、小さい custom model でも Claude Code の汎用 200K 仮定ではなく、
+  実際の context budget に合わせて native auto-compact が発火します。
 
 ### 0.1.63
 

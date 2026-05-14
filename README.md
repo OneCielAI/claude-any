@@ -48,7 +48,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.63`
+Current version: `0.1.64`
 
 ## Why This Exists
 
@@ -384,6 +384,15 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.64
+
+- **Model-aware native auto-compact**: claude-any now injects
+  `CLAUDE_CODE_AUTO_COMPACT_WINDOW` at launch using the selected provider/model
+  context window, including the cached Ollama/Ollama Cloud model catalog. Smaller
+  custom models now let Claude Code's native auto-compact trigger against their
+  real context budget instead of falling back to Claude Code's generic 200K
+  assumption.
 
 ### 0.1.63
 

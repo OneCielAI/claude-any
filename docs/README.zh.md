@@ -47,7 +47,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.63`
+当前版本: `0.1.64`
 
 ## 为什么存在
 
@@ -336,6 +336,14 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.64
+
+- **按模型上下文触发 native auto-compact**：claude-any 启动时会根据当前
+  provider/model 的 context window 注入 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`。
+  Ollama/Ollama Cloud 会同时使用磁盘缓存的 model catalog，因此较小的 custom
+  model 也会按真实 context budget 触发 Claude Code 原生 auto-compact，而不是
+  退回到 Claude Code 通用的 200K 假设。
 
 ### 0.1.63
 

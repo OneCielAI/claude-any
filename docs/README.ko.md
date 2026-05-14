@@ -47,7 +47,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.63`
+현재 버전: `0.1.64`
 
 ## 왜 만들었나
 
@@ -350,6 +350,14 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.64
+
+- **모델 컨텍스트 인식 native auto-compact**: claude-any가 실행 시 선택된
+  provider/model의 context window를 기준으로 `CLAUDE_CODE_AUTO_COMPACT_WINDOW`를
+  주입합니다. Ollama/Ollama Cloud는 디스크에 캐시된 model catalog도 활용하므로,
+  작은 커스텀 모델도 Claude Code의 기본 200K 가정이 아니라 실제 context budget에
+  맞춰 native auto-compact가 발동됩니다.
 
 ### 0.1.63
 

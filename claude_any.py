@@ -90,7 +90,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.63"
+VERSION = "0.1.64"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -8774,6 +8774,13 @@ def claude_code_output_token_limit(provider: str, pcfg: dict[str, Any]) -> int |
     return None
 
 
+def claude_code_auto_compact_window(provider: str, pcfg: dict[str, Any]) -> int | None:
+    limit = context_limit_for_status(provider, pcfg)
+    if limit:
+        return limit
+    return None
+
+
 def claude_code_context_model_alias(provider: str, pcfg: dict[str, Any], model: str) -> str:
     model = strip_claude_context_suffix(model)
     limit = context_limit_for_status(provider, pcfg)
@@ -8790,6 +8797,9 @@ def apply_common_claude_env(provider: str, pcfg: dict[str, Any], env: dict[str, 
     output_tokens = claude_code_output_token_limit(provider, pcfg)
     if output_tokens:
         env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"] = str(output_tokens)
+    compact_window = claude_code_auto_compact_window(provider, pcfg)
+    if compact_window:
+        env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(compact_window)
     advisor_model = str(pcfg.get("advisor_model") or "").strip()
     if advisor_model:
         env["CLAUDE_ANY_ADVISOR_MODEL"] = advisor_model
@@ -8880,6 +8890,7 @@ def cmd_env(_: argparse.Namespace) -> None:
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
         "CLAUDE_CODE_ATTRIBUTION_HEADER",
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+        "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
         "ANTHROPIC_MODEL",
         "ANTHROPIC_CUSTOM_MODEL_OPTION",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
