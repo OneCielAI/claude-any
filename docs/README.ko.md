@@ -25,6 +25,14 @@
 
 ## 오늘 추가된 최고의 3가지 베네핏
 
+### 2026-05-14
+
+1. **Plan Mode 루프 복구를 하드코딩이 아닌 의미 기반으로 처리** — 변경 없는 `Read` 결과를 이전의 권위 있는 관측값과 현재 Plan Mode 상태로 변환해, Claude Code가 같은 구간을 반복해서 읽지 않고 `ExitPlanMode` 또는 다음 실제 단계로 넘어갈 수 있습니다.
+2. **원격 테스트용 router 공개 바인딩 지원** — 다른 머신에서 router를 테스트해야 할 때 `CLAUDE_ANY_ROUTER_BIND_HOST=0.0.0.0`을 설정할 수 있고, Claude Code 내부 client base는 안전하게 로컬 주소를 유지합니다.
+3. **서드파티 모델용 transcript 정리 강화** — attachment-only 메타데이터, 과거 no-op tool 결과, orphan tool 결과를 Ollama, Ollama Cloud, NVIDIA hosted, vLLM, NIM으로 보내기 전에 정규화합니다.
+
+### 2026-05-13
+
 1. **non-Anthropic 모델에서도 Plan Mode 동작** — NVIDIA hosted, Ollama Cloud, 로컬 Ollama, vLLM, NIM 같은 provider 에서도 Claude Code Plan Mode 를 사용할 수 있습니다.
 2. **더 큰 모델로 Advisor 리뷰** — 실행 시 긴 컨텍스트 Advisor Model 을 선택하고, Claude Code 안에서 `/advisor`로 현재 작업, blocker, 다음 구체적 행동을 검토할 수 있습니다.
 3. **무료 모델 RPM 제한을 더 부드럽게 사용** — router-side RPM pacing 이 파일 읽기와 tool 실행에 걸리는 자연스러운 시간을 활용하므로, NVIDIA hosted 무료 모델을 분당 제한 안에서 덜 기다리며 사용할 수 있습니다.
@@ -47,7 +55,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.64`
+현재 버전: `0.1.65`
 
 ## 왜 만들었나
 
@@ -125,7 +133,7 @@ CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-forma
 모든 실행 옵션을 플래그로 전달:
 
 ```sh
-claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 300000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 120000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
 ```
 
 같은 값을 환경변수로 설정:
@@ -139,7 +147,7 @@ export CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
 export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
 export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
 export CLAUDE_ANY_CONTEXT_WINDOW=65536
-export CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+export CLAUDE_ANY_REQUEST_TIMEOUT_MS=120000
 export CLAUDE_ANY_RATE_LIMIT_RPM=40
 export CLAUDE_ANY_RATE_LIMIT_STATUS=on
 claude-any -p "Reply with OK only." --output-format text
@@ -351,6 +359,19 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 ## 변경 이력
 
+### 0.1.65
+
+- **Plan Mode unchanged-Read 루프 복구**: router 변환이 변경 없는/no-op
+  `Read`에 대해 이전 성공 `Read` 결과를 유지하고, 현재 Plan Mode 상태를
+  서드파티 모델에 전달하며, 임의 retry 횟수 제한 없이 다음 단계로 이동하도록
+  돕습니다.
+- **서드파티 transcript 정리 강화**: attachment-only 메타데이터, 과거 no-op
+  tool 결과, orphan tool 결과를 Ollama, Ollama Cloud, NVIDIA hosted, vLLM,
+  NIM으로 보내기 전에 정규화합니다.
+- **원격 router 테스트 바인딩**: 의도적인 원격 테스트에는
+  `CLAUDE_ANY_ROUTER_BIND_HOST=0.0.0.0`을 사용할 수 있고, Claude Code는
+  계속 로컬 client base URL을 사용합니다.
+
 ### 0.1.64
 
 - **모델 컨텍스트 인식 native auto-compact**: claude-any가 실행 시 선택된
@@ -391,7 +412,7 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 ### 0.1.50
 
 - **동적 timeout help**: LLM 옵션 패널의 `request_timeout_ms` 설명이 더 이상
-  고정 예시 `300000 ms = 5 minutes`를 보여주지 않고, 현재 선택된 값을 기준으로
+  하드코딩된 timeout 예시를 보여주지 않고, 현재 선택된 값을 기준으로
   표시됩니다.
 
 ### 0.1.49
@@ -517,8 +538,8 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 ### 0.1.31
 
-- **기본 upstream timeout 5분**: 기존 저장 설정의 10/30분 기본 timeout을
-  300000 ms로 마이그레이션하여 gateway stall을 더 빨리 감지합니다.
+- **기본 upstream timeout 2분**: 기존 저장 설정의 더 긴 번들 기본 timeout을
+  120000 ms로 마이그레이션하여 gateway stall을 더 빨리 감지합니다.
 - **언어별 gateway 재시도 표시**: 502/503/504 및 socket timeout 응답을 자동
   재시도하고, 선택된 UI 언어로 재시도 진행 상황을 채팅에 표시합니다.
 

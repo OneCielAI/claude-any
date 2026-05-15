@@ -10,7 +10,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.64`
+Current version: `0.1.65`
 
 ## Install
 
@@ -126,7 +126,7 @@ without editing every parameter manually. Claude Any currently includes:
 - Fast short tasks: shorter output and timeout for quick background jobs.
 - Long context 65K: 65K context target with a 4K output reserve.
 - Large output/report: 8K output for summaries and reports.
-- Reasoning model: longer timeout and reasoning-friendly sampling.
+- Reasoning model: reasoning-friendly sampling.
 
 The recommended preset is chosen from the current provider and model name. For
 example, `coder` models prefer the coding preset, `r1`/`thinking` models prefer
@@ -321,7 +321,7 @@ claude-any \
   --ca-provider nvidia-hosted \
   --ca-api-key-env NVIDIA_API_KEY \
   --ca-model moonshotai/kimi-k2.6 \
-  --ca-request-timeout-ms 300000
+  --ca-request-timeout-ms 120000
 
 # Self-hosted NIM Anthropic-compatible endpoint
 claude-any \
@@ -343,14 +343,13 @@ claude-any \
   --ca-api-key-env NVIDIA_API_KEY \
   --ca-max-output-tokens 4096 \
   --ca-context-window 65536 \
-  --ca-request-timeout-ms 300000 \
+  --ca-request-timeout-ms 120000 \
   --ca-rate-limit-rpm 40 \
   --ca-rate-limit-status on \
   --ca-stream on \
   --ca-stream-word-chunking off \
   --ca-web-search \
   --ca-web-fetch \
-  --ca-enable-skills \
   --ca-no-update-check \
   -p "Reply with OK only." \
   --output-format text
@@ -368,14 +367,13 @@ export CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
 export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
 export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
 export CLAUDE_ANY_CONTEXT_WINDOW=65536
-export CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+export CLAUDE_ANY_REQUEST_TIMEOUT_MS=120000
 export CLAUDE_ANY_RATE_LIMIT_RPM=40
 export CLAUDE_ANY_RATE_LIMIT_STATUS=on
 export CLAUDE_ANY_STREAM=on
 export CLAUDE_ANY_STREAM_WORD_CHUNKING=off
 export CLAUDE_ANY_WEB_SEARCH=on
 export CLAUDE_ANY_WEB_FETCH=on
-export CLAUDE_ANY_DISABLE_SKILLS=off
 export CLAUDE_ANY_SELF_UPDATE_CHECK=off
 export CLAUDE_ANY_UPDATE_CHECK=off
 claude-any -p "Reply with OK only." --output-format text
@@ -393,14 +391,13 @@ CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
 CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
 CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
 CLAUDE_ANY_CONTEXT_WINDOW=65536
-CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+CLAUDE_ANY_REQUEST_TIMEOUT_MS=120000
 CLAUDE_ANY_RATE_LIMIT_RPM=40
 CLAUDE_ANY_RATE_LIMIT_STATUS=on
 CLAUDE_ANY_STREAM=on
 CLAUDE_ANY_STREAM_WORD_CHUNKING=off
 CLAUDE_ANY_WEB_SEARCH=on
 CLAUDE_ANY_WEB_FETCH=on
-CLAUDE_ANY_DISABLE_SKILLS=off
 CLAUDE_ANY_SELF_UPDATE_CHECK=off
 CLAUDE_ANY_UPDATE_CHECK=off
 ```
@@ -464,6 +461,7 @@ Common Claude Any setup flags:
 | `--ca-max-output-tokens VALUE` | Set provider output-token cap. |
 | `--ca-context-window VALUE` | Set provider/router context-window cap where supported. |
 | `--ca-request-timeout-ms VALUE` | Set upstream request timeout in milliseconds. |
+| `--ca-stream-idle-timeout-ms VALUE` | Set stream idle timeout in milliseconds; if no bytes arrive for this long, the router can retry or fail instead of hanging forever. |
 | `--ca-rate-limit-rpm VALUE` | Set provider RPM limit; `0` disables throttling but keeps usage display. |
 | `--ca-rate-limit-status on|off` | Show or hide RPM/rate-limit status in the Claude Code statusline. |
 | `--ca-stream on|off` | Enable or disable streaming through the router. |
@@ -473,7 +471,6 @@ Common Claude Any setup flags:
 | `--ca-ollama-option KEY=VALUE` | Set an Ollama option such as `temperature=0.3`. |
 | `--ca-web-search` / `--ca-no-web-search` | Force-enable or disable web-search MCP for this launch. |
 | `--ca-web-fetch` / `--ca-no-web-fetch` | Enable or disable fetch MCP for web page content. |
-| `--ca-disable-skills` / `--ca-enable-skills` | Control Claude Code skills for this launch. |
 | `--ca-no-self-update-check` | Skip the Claude Any npm self-update check. |
 | `--ca-no-update-check` | Skip the Claude Code update check. |
 | `--ca-status` | Print status and exit. |

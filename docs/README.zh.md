@@ -25,6 +25,14 @@
 
 ## 今日新增的 3 个最大收益
 
+### 2026-05-14
+
+1. **Plan Mode 循环恢复基于语义，而不是硬编码次数** — 对 unchanged `Read` 结果，会结合上一次有效观察和当前 Plan Mode 状态进行转换，让 Claude Code 能进入 `ExitPlanMode` 或下一步实际操作，而不是反复读取同一片段。
+2. **更容易开放远程测试 router** — 当需要从另一台机器测试 router 时，可设置 `CLAUDE_ANY_ROUTER_BIND_HOST=0.0.0.0`；Claude Code 内部使用的 client base 仍保持安全的本地地址。
+3. **为第三方模型清理 transcript** — attachment-only 元数据、历史 no-op tool 结果和 orphan tool 结果会在发送给 Ollama、Ollama Cloud、NVIDIA hosted、vLLM 或 NIM 之前被规范化。
+
+### 2026-05-13
+
 1. **non-Anthropic 模型也能使用 Plan Mode** — NVIDIA hosted、Ollama Cloud、本地 Ollama、vLLM、NIM 等 provider 也可以保留 Claude Code Plan Mode。
 2. **用更大的模型做 Advisor 审查** — 启动时选择长上下文 Advisor Model，然后在 Claude Code 中使用 `/advisor` 检查当前任务、blocker 和下一步具体行动。
 3. **免费模型 RPM 限制更平滑** — router-side RPM pacing 会利用文件读取和 tool 执行的自然耗时，让 NVIDIA hosted 免费模型在每分钟限制内运行时更少感到等待。
@@ -47,7 +55,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.64`
+当前版本: `0.1.65`
 
 ## 为什么存在
 
@@ -122,7 +130,7 @@ CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-forma
 用 flags 传入全部启动选项:
 
 ```sh
-claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 300000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 120000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
 ```
 
 也可以用环境变量传入同样的值:
@@ -136,7 +144,7 @@ export CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
 export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
 export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
 export CLAUDE_ANY_CONTEXT_WINDOW=65536
-export CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+export CLAUDE_ANY_REQUEST_TIMEOUT_MS=120000
 export CLAUDE_ANY_RATE_LIMIT_RPM=40
 export CLAUDE_ANY_RATE_LIMIT_STATUS=on
 claude-any -p "Reply with OK only." --output-format text
@@ -337,6 +345,18 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 ## 更新日志
 
+### 0.1.65
+
+- **Plan Mode unchanged-Read 循环恢复**：router 转换现在会为 unchanged/no-op
+  `Read` 保留上一次成功的 `Read` 结果，把当前 Plan Mode 状态传递给第三方模型，
+  并且不依赖任意 retry 次数限制。
+- **更干净的第三方 transcript**：attachment-only 元数据、历史 no-op tool
+  结果和 orphan tool 结果会在发送给 Ollama、Ollama Cloud、NVIDIA hosted、
+  vLLM 或 NIM 之前被规范化。
+- **远程 router 测试绑定**：需要有意进行远程测试时，可以使用
+  `CLAUDE_ANY_ROUTER_BIND_HOST=0.0.0.0`，同时 Claude Code 仍使用本地 client
+  base URL。
+
 ### 0.1.64
 
 - **按模型上下文触发 native auto-compact**：claude-any 启动时会根据当前
@@ -375,7 +395,7 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 ### 0.1.50
 
 - **Dynamic timeout help**：LLM options panel 中 `request_timeout_ms` 的说明不再
-  固定显示 `300000 ms = 5 minutes` 示例，而是显示当前选择的值。
+  显示 hard-coded timeout 示例，而是显示当前选择的值。
 
 ### 0.1.49
 
@@ -494,8 +514,8 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 ### 0.1.31
 
-- **默认 upstream timeout 改为 5 分钟**：已保存配置中的 10/30 分钟默认
-  timeout 会迁移到 300000 ms，更快发现 gateway stall。
+- **默认 upstream timeout 改为 2 分钟**：已保存配置中更长的 bundled 默认
+  timeout 会迁移到 120000 ms，更快发现 gateway stall。
 - **按语言显示 gateway 重试**：502/503/504 和 socket timeout 会自动重试，并用
   当前 UI 语言在聊天中显示重试进度。
 

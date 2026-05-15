@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import hashlib
 import sys
 import time
 from pathlib import Path
@@ -13,6 +12,42 @@ from typing import Any
 
 NON_NATIVE_PROVIDERS = {"ollama", "ollama-cloud", "vllm", "nvidia-hosted", "self-hosted-nim"}
 TASK_STATUS = {"pending", "in_progress", "completed", "deleted"}
+TASK_STATUS_ALIASES = {
+    "active": "in_progress",
+    "assigned": "in_progress",
+    "current": "in_progress",
+    "doing": "in_progress",
+    "inprogress": "in_progress",
+    "in_progress": "in_progress",
+    "in-progress": "in_progress",
+    "in progress": "in_progress",
+    "ongoing": "in_progress",
+    "processing": "in_progress",
+    "running": "in_progress",
+    "started": "in_progress",
+    "working": "in_progress",
+    "complete": "completed",
+    "completed": "completed",
+    "done": "completed",
+    "finished": "completed",
+    "resolved": "completed",
+    "success": "completed",
+    "closed": "completed",
+    "open": "pending",
+    "pending": "pending",
+    "queued": "pending",
+    "todo": "pending",
+    "to_do": "pending",
+    "to-do": "pending",
+    "waiting": "pending",
+    "cancel": "deleted",
+    "cancelled": "deleted",
+    "canceled": "deleted",
+    "delete": "deleted",
+    "deleted": "deleted",
+    "remove": "deleted",
+    "removed": "deleted",
+}
 DESCRIPTION_OK = {"Bash", "TaskCreate", "TaskUpdate"}
 DROP_DESCRIPTION = {"Read", "Write", "Edit", "MultiEdit", "Glob", "Grep", "LS"}
 BASH_KEYS = {"command", "description", "timeout", "run_in_background"}
@@ -24,7 +59,17 @@ GLOB_KEYS = {"pattern", "path"}
 GREP_KEYS = {"pattern", "path", "glob", "type", "output_mode", "-A", "-B", "-C", "head_limit", "multiline"}
 LS_KEYS = {"path", "ignore"}
 TASKLIST_KEYS: set[str] = set()
-TASKUPDATE_KEYS = {"taskId", "status"}
+TASKUPDATE_KEYS = {
+    "taskId",
+    "subject",
+    "description",
+    "activeForm",
+    "status",
+    "addBlocks",
+    "addBlockedBy",
+    "owner",
+    "metadata",
+}
 STRICT_KEYS = {
     "Bash": BASH_KEYS,
     "Read": READ_KEYS,
@@ -45,7 +90,7 @@ REQUIRED_KEYS = {
     "MultiEdit": {"file_path", "edits"},
     "Glob": {"pattern"},
     "Grep": {"pattern"},
-    "TaskUpdate": {"taskId", "status"},
+    "TaskUpdate": {"taskId"},
 }
 TOOL_HINTS = {
     "Bash": "Use Bash with command, description, timeout, and run_in_background only.",
@@ -55,7 +100,7 @@ TOOL_HINTS = {
     "MultiEdit": "Use MultiEdit with file_path and edits only.",
     "Glob": "Use Glob with pattern and optional path only.",
     "Grep": "Use Grep with pattern, path, glob, type, output_mode, context, head_limit, or multiline only.",
-    "TaskUpdate": "Use TaskUpdate with taskId and status.",
+    "TaskUpdate": "Use TaskUpdate with taskId and optional status pending, in_progress, completed, or deleted.",
 }
 PLAN_GUARD_MARKER = "[claude-any-plan-guard]"
 
@@ -421,37 +466,6 @@ def should_block_plan_stop(transcript_path: str | None) -> tuple[bool, str]:
     return True, reason
 
 
-def stop_block_count_path(session_id: str) -> Path:
-    return cache_dir() / f"stop-block-{session_id or 'unknown'}.json"
-
-
-def increment_stop_block_count(session_id: str | None, text: str) -> int:
-    path = stop_block_count_path(session_id or "unknown")
-    key = hashlib.sha256(text.strip().encode("utf-8", errors="ignore")).hexdigest()[:16]
-    try:
-        data = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
-        if not isinstance(data, dict):
-            data = {}
-    except Exception:
-        data = {}
-    count = int(data.get(key) or 0) + 1
-    data[key] = count
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False) + "\n", encoding="utf-8")
-    tmp.replace(path)
-    return count
-
-
-def reset_stop_block_count(session_id: str | None) -> None:
-    if not session_id:
-        return
-    path = stop_block_count_path(session_id)
-    try:
-        path.unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
 def handle_stop(event: dict[str, Any]) -> int:
     log_json_event(event)
     if str(event.get("hook_event_name") or "") == "SubagentStop":
@@ -462,14 +476,11 @@ def handle_stop(event: dict[str, Any]) -> int:
     if active():
         should_block, reason = should_block_plan_stop(transcript_path)
         if should_block:
-            count = increment_stop_block_count(session_id, reason)
-            if count <= 3:
-                out = {"decision": "block", "reason": reason, "suppressOutput": True}
-                log_json_event(event, out)
-                log_event(f"Stop guard blocked plan idle session={session_id} count={count} transcript={transcript_path}")
-                emit(out)
-                return 0
-            log_event(f"Stop guard allowed repeated plan idle session={session_id} count={count} transcript={transcript_path}")
+            out = {"decision": "block", "reason": reason, "suppressOutput": True}
+            log_json_event(event, out)
+            log_event(f"Stop guard blocked plan idle session={session_id} transcript={transcript_path}")
+            emit(out)
+            return 0
     log_event(f"Stop guard observed session={session_id}")
     return 0
 
@@ -478,12 +489,19 @@ def normalize_aliases(tool: str, tool_input: dict[str, Any]) -> tuple[dict[str, 
     updated = dict(tool_input)
     changed: list[str] = []
 
+    def present(value: Any) -> bool:
+        if value is None:
+            return False
+        if isinstance(value, str):
+            return bool(value.strip())
+        return True
+
     def alias(target: str, *names: str) -> None:
-        if target in updated:
+        if present(updated.get(target)):
             return
         for name in names:
             value = updated.get(name)
-            if value not in (None, ""):
+            if present(value):
                 updated[target] = value
                 changed.append(f"{name}->{target}")
                 return
@@ -500,7 +518,34 @@ def normalize_aliases(tool: str, tool_input: dict[str, Any]) -> tuple[dict[str, 
         alias("path", "file_path", "directory")
     elif tool == "TaskUpdate":
         alias("taskId", "task_id", "id")
+        status = normalize_task_status(updated.get("status"))
+        if status and updated.get("status") != status:
+            before = updated.get("status")
+            updated["status"] = status
+            changed.append(f"status:{before}->{status}")
+        for key in ("addBlocks", "addBlockedBy"):
+            value = updated.get(key)
+            if isinstance(value, str) and value.strip():
+                updated[key] = [value.strip()]
+                changed.append(f"{key}:string->array")
+        metadata = updated.get("metadata")
+        if metadata is not None and not isinstance(metadata, dict):
+            updated.pop("metadata", None)
+            changed.append("metadata dropped")
     return updated, changed
+
+
+def normalize_task_status(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = re.sub(r"[\s\-]+", "_", text.lower())
+    normalized = re.sub(r"[^a-z0-9_]", "", normalized)
+    if normalized in TASK_STATUS:
+        return normalized
+    return TASK_STATUS_ALIASES.get(text.lower()) or TASK_STATUS_ALIASES.get(normalized)
 
 
 def missing_required_keys(tool: str, tool_input: dict[str, Any]) -> list[str]:
@@ -533,7 +578,6 @@ def handle_pre_tool(event: dict[str, Any]) -> None:
     if tool.startswith("mcp__"):
         return
     log_json_event(event)
-    reset_stop_block_count(str(event.get("session_id") or ""))
     raw = event.get("tool_input")
     if not isinstance(raw, dict):
         pre_deny(
@@ -561,9 +605,11 @@ def handle_pre_tool(event: dict[str, Any]) -> None:
                 )
                 return
 
+    updated, dropped, changed = strip_unknown_keys(tool, raw)
+
     if tool == "TaskUpdate":
-        task_id = raw.get("taskId")
-        status = raw.get("status")
+        task_id = updated.get("taskId")
+        status = updated.get("status")
         if not isinstance(task_id, str) or not task_id.strip():
             tasks = known_tasks(str(event.get("session_id") or ""))
             known = ", ".join(f"{tid} ({info.get('subject')})" for tid, info in sorted(tasks.items())[:8] if isinstance(info, dict))
@@ -572,14 +618,13 @@ def handle_pre_tool(event: dict[str, Any]) -> None:
                 context += f" Known task ids for this session: {known}."
             pre_deny("TaskUpdate requires parameter taskId.", context)
             return
-        if not isinstance(status, str) or status not in TASK_STATUS:
+        if status is not None and (not isinstance(status, str) or status not in TASK_STATUS):
             pre_deny(
                 "TaskUpdate status must be one of pending, in_progress, completed, or deleted.",
                 "Regenerate TaskUpdate with a valid status enum and preserve the taskId.",
             )
             return
 
-    updated, dropped, changed = strip_unknown_keys(tool, raw)
     missing = missing_required_keys(tool, updated)
     if missing:
         log_event(f"PreToolUse denied tool={tool} missing={missing} keys={list(raw.keys())}")
@@ -593,7 +638,7 @@ def handle_pre_tool(event: dict[str, Any]) -> None:
         if dropped:
             reason_parts.append(f"removed unsupported parameter(s): {', '.join(dropped)}")
         if changed:
-            reason_parts.append(f"normalized parameter name(s): {', '.join(changed)}")
+            reason_parts.append(f"normalized parameter/value(s): {', '.join(changed)}")
         reason = "; ".join(reason_parts)
         log_event(f"PreToolUse sanitized tool={tool} dropped={dropped} changed={changed} keys={list(raw.keys())}")
         pre_allow(

@@ -25,6 +25,14 @@
 
 ## Today's Top 3 Benefits
 
+### 2026-05-14
+
+1. **Plan Mode loop recovery is semantic, not hard-coded** — unchanged `Read` results are now converted with the previous authoritative observation and current Plan Mode state, so Claude Code can move to `ExitPlanMode` or the next real step instead of rereading the same slice.
+2. **Remote test router mode is easier to expose** — set `CLAUDE_ANY_ROUTER_BIND_HOST=0.0.0.0` when you intentionally want to test the router from another machine, while Claude Code still talks to the safe local client base.
+3. **Cleaner router transcripts for third-party models** — attachment-only metadata, historical no-op tool results, and orphan tool results are normalized before reaching Ollama, Ollama Cloud, NVIDIA hosted, vLLM, or NIM.
+
+### 2026-05-13
+
 1. **Plan Mode works on non-Anthropic models** — Claude Any keeps Claude Code's Plan Mode usable even when the upstream provider is NVIDIA hosted, Ollama Cloud, local Ollama, vLLM, or NIM.
 2. **Advisor review with a bigger model** — pick a long-context Advisor Model at launch, then use `/advisor` inside Claude Code to review the current task, blockers, and next concrete action.
 3. **Free-model RPM limits feel smoother** — router-side RPM pacing uses the natural time spent reading files and running tools, so NVIDIA hosted free models can stay within per-minute limits with less visible waiting.
@@ -48,7 +56,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.64`
+Current version: `0.1.65`
 
 ## Why This Exists
 
@@ -130,7 +138,7 @@ CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-forma
 Configure every launch option with flags:
 
 ```sh
-claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 300000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 120000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
 ```
 
 Or put the same values in environment variables:
@@ -144,7 +152,7 @@ export CLAUDE_ANY_ADVISOR_MODEL=deepseek-ai/deepseek-v4-pro
 export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
 export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
 export CLAUDE_ANY_CONTEXT_WINDOW=65536
-export CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+export CLAUDE_ANY_REQUEST_TIMEOUT_MS=120000
 export CLAUDE_ANY_RATE_LIMIT_RPM=40
 export CLAUDE_ANY_RATE_LIMIT_STATUS=on
 claude-any -p "Reply with OK only." --output-format text
@@ -385,6 +393,19 @@ steps under that larger model's supervision.
 
 ## Changelog
 
+### 0.1.65
+
+- **Plan Mode unchanged-Read loop recovery**: router conversion now preserves the
+  previous successful `Read` result for unchanged/no-op reads, exposes the
+  current Plan Mode state to third-party models, and avoids arbitrary retry
+  thresholds.
+- **Cleaner third-party transcripts**: attachment-only metadata, historical
+  no-op tool results, and orphan tool results are normalized before reaching
+  Ollama, Ollama Cloud, NVIDIA hosted, vLLM, or NIM.
+- **Remote router test binding**: `CLAUDE_ANY_ROUTER_BIND_HOST=0.0.0.0` can be
+  used for intentional remote testing while Claude Code keeps using the local
+  client base URL.
+
 ### 0.1.64
 
 - **Model-aware native auto-compact**: claude-any now injects
@@ -429,7 +450,7 @@ steps under that larger model's supervision.
 
 - **Dynamic timeout help**: the LLM options panel now describes
   `request_timeout_ms` using the currently selected value instead of always
-  showing the old `300000 ms = 5 minutes` example.
+  showing a hard-coded timeout example.
 
 ### 0.1.49
 
@@ -558,8 +579,7 @@ steps under that larger model's supervision.
 
 ### 0.1.31
 
-- **5-minute default upstream timeout**: existing saved 10/30-minute defaults
-  are migrated to 300000 ms so gateway stalls fail faster.
+- **2-minute default upstream timeout**: existing saved longer bundled defaults are migrated to 120000 ms so gateway stalls fail faster.
 - **Localized gateway retries**: 502/503/504 and socket timeout responses are
   retried automatically, with retry progress shown in the selected UI language.
 

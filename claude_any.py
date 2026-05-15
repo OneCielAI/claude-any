@@ -51,7 +51,12 @@ PID_PATH = CONFIG_DIR / "router.pid"
 MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
-ROUTER_HOST = "127.0.0.1"
+ROUTER_HOST = os.environ.get("CLAUDE_ANY_ROUTER_CLIENT_HOST", "127.0.0.1").strip() or "127.0.0.1"
+ROUTER_BIND_HOST = (
+    os.environ.get("CLAUDE_ANY_ROUTER_BIND_HOST")
+    or os.environ.get("CLAUDE_ANY_ROUTER_HOST")
+    or ROUTER_HOST
+).strip() or "127.0.0.1"
 ROUTER_PORT = 8799
 ROUTER_BASE = f"http://{ROUTER_HOST}:{ROUTER_PORT}"
 CLAUDE_GATEWAY_CACHE = HOME / ".claude" / "cache" / "gateway-models.json"
@@ -90,7 +95,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.64"
+VERSION = "0.1.65"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -107,6 +112,43 @@ _CHAT_CONDITION = threading.Condition()
 _CHAT_NEXT_ID: int | None = None
 ADVISOR_FEEDBACK_MARKER = "CLAUDE_ANY_ADVISOR_FEEDBACK"
 PLAN_GUARD_MARKER = "[claude-any-plan-guard]"
+TASK_UPDATE_STATUSES = {"pending", "in_progress", "completed", "deleted"}
+TASK_UPDATE_STATUS_ALIASES = {
+    "active": "in_progress",
+    "assigned": "in_progress",
+    "current": "in_progress",
+    "doing": "in_progress",
+    "inprogress": "in_progress",
+    "in_progress": "in_progress",
+    "in-progress": "in_progress",
+    "in progress": "in_progress",
+    "ongoing": "in_progress",
+    "processing": "in_progress",
+    "running": "in_progress",
+    "started": "in_progress",
+    "working": "in_progress",
+    "complete": "completed",
+    "completed": "completed",
+    "done": "completed",
+    "finished": "completed",
+    "resolved": "completed",
+    "success": "completed",
+    "closed": "completed",
+    "open": "pending",
+    "pending": "pending",
+    "queued": "pending",
+    "todo": "pending",
+    "to_do": "pending",
+    "to-do": "pending",
+    "waiting": "pending",
+    "cancel": "deleted",
+    "cancelled": "deleted",
+    "canceled": "deleted",
+    "delete": "deleted",
+    "deleted": "deleted",
+    "remove": "deleted",
+    "removed": "deleted",
+}
 
 # Tools Claude Code injects into every model's tool list that misfire when called
 # by non-Anthropic models. See docs/notes from anthropics/claude-code issues
@@ -141,7 +183,7 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "Read: file_path (string), offset (integer), limit (integer). "
     "Write: file_path (string), content (string). "
     "Edit: file_path (string), old_string (string), new_string (string), replace_all (boolean). "
-    "TaskList: no input. TaskUpdate: taskId (string), status (string). "
+    "TaskList: no input. TaskUpdate: taskId (string), optional status enum exactly one of pending, in_progress, completed, deleted. "
     "Never write pseudo tool calls, partial JSON, or markdown code fences when a real Claude Code tool call is required."
 )
 LANGUAGES = {
@@ -610,10 +652,17 @@ _BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
         "properties": {},
     },
     "TaskUpdate": {
-        "required": ["taskId", "status"],
+        "required": ["taskId"],
         "properties": {
             "taskId": {"type": "string"},
-            "status": {"type": "string"},
+            "subject": {"type": "string"},
+            "description": {"type": "string"},
+            "activeForm": {"type": "string"},
+            "status": {"type": "string", "enum": ["pending", "in_progress", "completed", "deleted"]},
+            "owner": {"type": "string"},
+            "addBlocks": {"type": "array"},
+            "addBlockedBy": {"type": "array"},
+            "metadata": {"type": "object"},
         },
     },
     "TaskCreate": {
@@ -691,6 +740,27 @@ def _coerce_value(value: Any, expected_type: str | None) -> Any:
         return float(value)
     if isinstance(value, str) and expected_type == "string":
         return value
+    if expected_type == "array":
+        if isinstance(value, list):
+            return value
+        if isinstance(value, tuple):
+            return list(value)
+        if isinstance(value, str) and value.strip():
+            return [value.strip()]
+        if value is None:
+            return []
+        return value
+    if expected_type == "object":
+        if isinstance(value, dict):
+            return value
+        if isinstance(value, str) and value.strip():
+            try:
+                parsed = json.loads(value)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                pass
+        return value
     # Coerce string -> integer
     if isinstance(value, str) and expected_type in ("integer", "number"):
         try:
@@ -713,6 +783,19 @@ def _coerce_value(value: Any, expected_type: str | None) -> Any:
     return value
 
 
+def normalize_task_update_status(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    normalized = re.sub(r"[\s\-]+", "_", text.lower())
+    normalized = re.sub(r"[^a-z0-9_]", "", normalized)
+    if normalized in TASK_UPDATE_STATUSES:
+        return normalized
+    return TASK_UPDATE_STATUS_ALIASES.get(text.lower()) or TASK_UPDATE_STATUS_ALIASES.get(normalized)
+
+
 def _default_for_missing_required(tool_name: str, field: str) -> Any:
     """Return a safe default for known required fields."""
     defaults: dict[str, dict[str, Any]] = {
@@ -721,7 +804,6 @@ def _default_for_missing_required(tool_name: str, field: str) -> Any:
         "Edit": {"replace_all": False},
         "Glob": {"path": "."},
         "Grep": {"output_mode": "content"},
-        "TaskUpdate": {"status": "completed"},
         "TaskCreate": {"description": ""},
         "TaskStop": {},
     }
@@ -771,6 +853,20 @@ def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> 
         expected_type = prop_schema.get("type") if isinstance(prop_schema, dict) else None
         fixed[key] = _coerce_value(raw_value, expected_type)
 
+    if matched_name == "TaskUpdate":
+        if "taskId" not in fixed or _is_empty_value(fixed.get("taskId")):
+            for alias in ("task_id", "id"):
+                value = fixed.get(alias)
+                if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value).strip():
+                    fixed["taskId"] = str(value)
+                    break
+        if "status" in fixed:
+            status = normalize_task_update_status(fixed.get("status"))
+            if status:
+                fixed["status"] = status
+        for alias in ("task_id", "id"):
+            fixed.pop(alias, None)
+
     # Fill in missing or empty required fields with defaults
     injected: list[str] = []
     for req in required:
@@ -778,6 +874,8 @@ def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> 
             default = _default_for_missing_required(matched_name, req)
             if default is not None:
                 fixed[req] = default
+            elif matched_name == "TaskUpdate" and req == "taskId":
+                continue
             elif req not in fixed:
                 # No known default: inject empty value matching expected type
                 prop_schema = properties.get(req)
@@ -816,6 +914,7 @@ UI_TEXT = {
         "options": "LLM options",
         "presets": "LLM presets",
         "context_setup": "Context setup",
+        "timeout_preset": "Timeout preset",
         "apply_preset": "Apply preset",
         "model_family": "Model family",
         "recommended_preset_is": "recommended preset is",
@@ -835,6 +934,7 @@ UI_TEXT = {
         "options": "LLM 옵션",
         "presets": "LLM 프리셋",
         "context_setup": "컨텍스트 설정",
+        "timeout_preset": "타임아웃 프리셋",
         "apply_preset": "프리셋 적용",
         "model_family": "모델 계열",
         "recommended_preset_is": "추천 프리셋",
@@ -854,6 +954,7 @@ UI_TEXT = {
         "options": "LLMオプション",
         "presets": "LLMプリセット",
         "context_setup": "コンテキスト設定",
+        "timeout_preset": "timeout プリセット",
         "apply_preset": "プリセットを適用",
         "model_family": "モデル系統",
         "recommended_preset_is": "推奨プリセット",
@@ -873,6 +974,7 @@ UI_TEXT = {
         "options": "LLM 选项",
         "presets": "LLM 预设",
         "context_setup": "上下文设置",
+        "timeout_preset": "Timeout 预设",
         "apply_preset": "应用预设",
         "model_family": "模型类型",
         "recommended_preset_is": "推荐预设",
@@ -1009,8 +1111,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "language": "en",
     "migrations": {},
     "claude_code": {
-        "disable_skills_for_non_anthropic": False,
-        "blocked_skills_for_non_anthropic": ["keybindings-help"],
         "compat_prompt_for_non_anthropic": True,
     },
     "cleanup": {
@@ -1047,7 +1147,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "num_ctx_max": 131072,
             "keep_alive": "5m",
             "think": False,
-            "request_timeout_ms": 300000,
+            "request_timeout_ms": 120000,
             "stream_enabled": True,
             "stream_word_chunking": False,
             "ollama_options": {
@@ -1070,7 +1170,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "num_ctx_max": 131072,
             "keep_alive": "5m",
             "think": False,
-            "request_timeout_ms": 300000,
+            "request_timeout_ms": 120000,
             "stream_enabled": True,
             "stream_word_chunking": False,
             "ollama_options": {
@@ -1092,7 +1192,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "temperature": 0.7,
             "top_p": 0.8,
             "context_reserve_tokens": 1024,
-            "request_timeout_ms": 300000,
+            "request_timeout_ms": 120000,
             "stream_enabled": True,
             "stream_word_chunking": False,
         },
@@ -1109,7 +1209,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "max_output_tokens": 4096,
             "temperature": 0.7,
             "top_p": 0.8,
-            "request_timeout_ms": 300000,
+            "request_timeout_ms": 120000,
             "stream_enabled": True,
             "stream_word_chunking": False,
         },
@@ -1127,7 +1227,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "temperature": 0.7,
             "top_p": 0.8,
             "context_reserve_tokens": 1024,
-            "request_timeout_ms": 300000,
+            "request_timeout_ms": 120000,
             "stream_enabled": True,
             "stream_word_chunking": False,
         },
@@ -1160,11 +1260,22 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
 
     marker = "default_timeout_5m_20260513"
     if not migrations.get(marker):
+        # Historical marker kept for configs that have already recorded it.
+        # Do not rewrite 10/30 minute values here anymore: those can now be
+        # deliberate long-running timeout profiles.
+        migrations[marker] = True
+
+    marker = "default_timeout_2m_20260514"
+    if not migrations.get(marker):
         for pcfg in (cfg.get("providers") or {}).values():
             if not isinstance(pcfg, dict):
                 continue
-            if positive_int(pcfg.get("request_timeout_ms")) in (600000, 1800000):
-                pcfg["request_timeout_ms"] = 300000
+            if (
+                positive_int(pcfg.get("request_timeout_ms")) == 300000
+                and not pcfg.get("llm_preset")
+                and "stream_idle_timeout_ms" not in pcfg
+            ):
+                pcfg["request_timeout_ms"] = 120000
         migrations[marker] = True
 
     marker = "nvidia_context_window_32k_20260513"
@@ -3840,8 +3951,16 @@ def advisor_model_enabled(pcfg: dict[str, Any]) -> str:
     return str(pcfg.get("advisor_model") or "").strip()
 
 
+def advisor_provider_kind(provider: str) -> str:
+    if provider in ("ollama", "ollama-cloud"):
+        return "ollama"
+    if provider == "nvidia-hosted":
+        return "openai-compatible"
+    return ""
+
+
 def advisor_provider_supported(provider: str) -> bool:
-    return provider in ("ollama", "ollama-cloud")
+    return bool(advisor_provider_kind(provider))
 
 
 def body_has_advisor_feedback(body: dict[str, Any]) -> bool:
@@ -3885,11 +4004,19 @@ def advisor_trigger_for_message(body: dict[str, Any], message: dict[str, Any]) -
 
 
 def advisor_gate_possible_for_body(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> bool:
+    return bool(advisor_gate_reason_for_body(provider, pcfg, body))
+
+
+def advisor_gate_reason_for_body(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> str:
     if not advisor_model_enabled(pcfg) or not advisor_provider_supported(provider):
-        return False
+        return ""
     if is_advisor_request(body) or body_has_advisor_feedback(body):
-        return False
-    return plan_mode_active(body) or latest_tool_result_indicates_completed_work(body)
+        return ""
+    if plan_mode_active(body):
+        return "plan_mode"
+    if latest_tool_result_indicates_completed_work(body):
+        return "completed_work"
+    return ""
 
 
 def anthropic_system_to_ollama_messages(system: Any) -> list[dict[str, Any]]:
@@ -3909,9 +4036,253 @@ def ollama_claude_code_reminder() -> dict[str, str]:
             "Claude Code execution reminder: when the user asks to create, edit, or run code, "
             "use the available tools such as Write, Edit, Read, and Bash. Do not stop after saying "
             "you will run something. Do not present a code block as a substitute for creating the file "
-            "unless the user explicitly asks for code only."
+            "unless the user explicitly asks for code only. Exception: while Claude Code is in Plan Mode, "
+            "do not implement normal project files; explore as needed, write or update the plan file, "
+            "then call ExitPlanMode when the plan is ready for approval."
         ),
     }
+
+
+READ_UNCHANGED_RESULT_RE = re.compile(
+    r"(wasted call|unchanged since (?:your )?last read|file unchanged since (?:your )?last read)",
+    re.IGNORECASE,
+)
+
+
+def message_attachment(message: dict[str, Any]) -> dict[str, Any] | None:
+    attachment = message.get("attachment")
+    return attachment if isinstance(attachment, dict) else None
+
+
+def is_attachment_only_message(message: dict[str, Any]) -> bool:
+    if not message_attachment(message):
+        return False
+    content = message.get("content")
+    if content is None:
+        return True
+    blocks = _message_content_blocks(message)
+    if any(isinstance(block, dict) and block.get("type") in {"tool_use", "tool_result"} for block in blocks):
+        return False
+    return not anthropic_content_to_text(content).strip()
+
+
+def latest_plan_attachment(body: dict[str, Any]) -> dict[str, Any] | None:
+    latest: dict[str, Any] | None = None
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        attachment = message_attachment(message)
+        if not attachment:
+            continue
+        if attachment.get("type") in {"plan_mode", "plan_mode_reentry", "plan_mode_exit"}:
+            latest = attachment
+    return latest
+
+
+def plan_file_written_in_body(body: dict[str, Any], plan_file_path: str) -> bool:
+    if not plan_file_path:
+        return False
+    tool_names_by_id: dict[str, str] = {}
+    tool_inputs_by_id: dict[str, Any] = {}
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        content = _message_content_blocks(message)
+        if message.get("role") == "assistant":
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tool_id = str(block.get("id") or "")
+                if not tool_id:
+                    continue
+                tool_names_by_id[tool_id] = str(block.get("name") or "")
+                tool_inputs_by_id[tool_id] = block.get("input") if isinstance(block.get("input"), dict) else {}
+        elif message.get("role") == "user":
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = str(block.get("tool_use_id") or "")
+                if tool_names_by_id.get(tool_use_id) not in {"Write", "Edit", "MultiEdit"}:
+                    continue
+                tool_input = tool_inputs_by_id.get(tool_use_id)
+                if not isinstance(tool_input, dict):
+                    continue
+                if str(tool_input.get("file_path") or "") == plan_file_path and not block.get("is_error"):
+                    return True
+    return False
+
+
+def claude_code_state_messages(body: dict[str, Any]) -> list[dict[str, str]]:
+    messages: list[dict[str, str]] = []
+    plan_attachment = latest_plan_attachment(body)
+    if plan_mode_active(body):
+        plan_file_path = ""
+        plan_exists = None
+        if plan_attachment:
+            plan_file_path = str(plan_attachment.get("planFilePath") or "")
+            plan_exists = plan_attachment.get("planExists")
+        plan_written = plan_file_written_in_body(body, plan_file_path)
+        parts = [
+            "Claude Code state: Plan Mode is active.",
+            "In Plan Mode, exploration tools are allowed, but implementation/editing of normal project files must wait until ExitPlanMode approval.",
+        ]
+        if plan_file_path:
+            parts.append(f"Plan file path: {plan_file_path}.")
+            parts.append(f"Plan file written or updated in this conversation: {'yes' if plan_written else 'no'}.")
+        if plan_exists is not None:
+            parts.append(f"Claude Code attachment planExists: {bool(plan_exists)}.")
+        parts.append(
+            "When the plan file is complete and no new information is needed, call ExitPlanMode with the plan instead of repeating unchanged Read calls."
+        )
+        messages.append({"role": "system", "content": "\n".join(parts)})
+    return messages
+
+
+def canonical_tool_signature(tool_name: str, tool_input: Any) -> str:
+    normalized = tool_input if isinstance(tool_input, dict) else {}
+    return f"{tool_name}:{json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(',', ':'))}"
+
+
+def is_read_unchanged_result(tool_name: str, result_text: str) -> bool:
+    return tool_name == "Read" and bool(READ_UNCHANGED_RESULT_RE.search(result_text or ""))
+
+
+def upstream_relevant_message(message: dict[str, Any]) -> bool:
+    if is_attachment_only_message(message) or should_skip_upstream_message(message):
+        return False
+    role = message.get("role")
+    if role not in {"assistant", "user", "system", "tool"}:
+        return False
+    blocks = _message_content_blocks(message)
+    if any(isinstance(block, dict) and block.get("type") in {"tool_use", "tool_result"} for block in blocks):
+        return True
+    return bool(anthropic_content_to_text(message.get("content", "")).strip())
+
+
+def collect_tool_result_context(body: dict[str, Any]) -> tuple[dict[str, str], set[str]]:
+    tool_names_by_id: dict[str, str] = {}
+    tool_inputs_by_id: dict[str, Any] = {}
+    successful_results: dict[str, str] = {}
+    tool_result_records: list[tuple[int, str, str, Any, str, bool]] = []
+    latest_relevant_message_index = -1
+    for message_index, message in enumerate(body.get("messages") or []):
+        if not isinstance(message, dict):
+            continue
+        if upstream_relevant_message(message):
+            latest_relevant_message_index = message_index
+        content = _message_content_blocks(message)
+        if message.get("role") == "assistant":
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_use":
+                    continue
+                tool_id = str(block.get("id") or "")
+                if not tool_id:
+                    continue
+                tool_names_by_id[tool_id] = str(block.get("name") or "")
+                tool_inputs_by_id[tool_id] = block.get("input") if isinstance(block.get("input"), dict) else {}
+        elif message.get("role") == "user":
+            for block in content:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = str(block.get("tool_use_id") or "")
+                tool_name = tool_names_by_id.get(tool_use_id, "tool")
+                tool_input = tool_inputs_by_id.get(tool_use_id) or {}
+                result_text = anthropic_content_to_text(block.get("content", ""))
+                signature = canonical_tool_signature(tool_name, tool_input)
+                is_error = bool(block.get("is_error"))
+                tool_result_records.append((message_index, tool_use_id, tool_name, tool_input, result_text, is_error))
+                if not is_read_unchanged_result(tool_name, result_text) and not is_error and result_text.strip():
+                    successful_results[signature] = result_text
+    current_read_noop_ids = {
+        tool_use_id
+        for message_index, tool_use_id, tool_name, _tool_input, result_text, _is_error in tool_result_records
+        if message_index == latest_relevant_message_index and is_read_unchanged_result(tool_name, result_text)
+    }
+    return successful_results, current_read_noop_ids
+
+
+def format_tool_result_for_upstream(
+    tool_name: str,
+    tool_input_text: str,
+    result_text: str,
+    is_error: bool,
+    prior_success_text: str = "",
+    include_prior_success: bool = False,
+    in_plan_mode: bool = False,
+) -> tuple[str, str]:
+    if is_error:
+        tool_text = (
+            f"Tool `{tool_name}` failed.\n"
+            f"Input:\n{tool_input_text}\n\n"
+            f"Error:\n{result_text}"
+        )
+        tool_summary = (
+            f"The `{tool_name}` tool call above failed. Its input was {tool_input_text}. "
+            f"Use the error output to choose a different next step; do not blindly repeat it."
+        )
+        return tool_text, tool_summary
+
+    if is_read_unchanged_result(tool_name, result_text):
+        if not include_prior_success:
+            tool_text = (
+                "Tool `Read` returned an unchanged/no-op cache result for content that was already "
+                "available earlier in this conversation. No new file content was produced by this "
+                "historical duplicate observation."
+            )
+            return tool_text, ""
+        previous = ""
+        if prior_success_text:
+            previous = (
+                "\n\nPrevious successful Read result for this exact input remains authoritative:\n"
+                f"{truncate_for_prompt(prior_success_text, PROMPT_TOOL_RESULT_LIMIT)}"
+            )
+        plan_hint = (
+            " If you are in Plan Mode and the plan file is already complete, call ExitPlanMode."
+            if in_plan_mode
+            else ""
+        )
+        if not prior_success_text:
+            tool_text = (
+                "Tool `Read` returned a no-op unchanged result.\n"
+                f"Input:\n{tool_input_text}\n\n"
+                f"Result:\n{result_text}\n\n"
+                "No previous successful Read result for this exact input is available in the converted context. "
+                "Do not repeat the same Read. If the content is still needed, read a different or broader range once; "
+                "otherwise proceed with the next distinct step."
+            )
+            tool_summary = (
+                "The latest `Read` result says the file/range is unchanged, but no prior exact Read content is available "
+                "in this converted context. Do not loop on the same Read; either read a different range once or continue "
+                f"with the next distinct step.{plan_hint}"
+            )
+            return tool_text, tool_summary
+        tool_text = (
+            "Tool `Read` returned a no-op unchanged result.\n"
+            f"Input:\n{tool_input_text}\n\n"
+            f"Result:\n{result_text}"
+            f"{previous}\n\n"
+            "This is not new file content. It means the previous successful Read result for the same input is still current."
+        )
+        tool_summary = (
+            "The latest `Read` result is a Claude Code no-op/cache result: no file content changed and no new observation was produced. "
+            "Use the previous successful Read result for this exact input as the current observation, then choose the next distinct step."
+            f"{plan_hint}"
+        )
+        return tool_text, tool_summary
+
+    tool_text = (
+        f"Tool `{tool_name}` completed successfully.\n"
+        f"Input:\n{tool_input_text}\n\n"
+        f"Result:\n{result_text}\n\n"
+        f"If this result satisfies the user's request, provide the final answer now. "
+        f"Do not call `{tool_name}` again with the same arguments."
+    )
+    tool_summary = (
+        f"The `{tool_name}` tool call above already completed successfully. "
+        f"Treat its tool output as authoritative. Do not repeat the same or equivalent "
+        f"`{tool_name}` call; continue with the next required concrete tool call or final answer."
+    )
+    return tool_text, tool_summary
 
 
 def should_skip_upstream_message(message: dict[str, Any]) -> bool:
@@ -3940,10 +4311,15 @@ def should_skip_upstream_message(message: dict[str, Any]) -> bool:
 def anthropic_messages_to_ollama(body: dict[str, Any]) -> list[dict[str, Any]]:
     messages = anthropic_system_to_ollama_messages(body.get("system"))
     messages.append(ollama_claude_code_reminder())
+    messages.extend(claude_code_state_messages(body))
+    prior_tool_results, latest_noop_result_ids = collect_tool_result_context(body)
+    in_plan_mode = plan_mode_active(body)
     tool_names_by_id: dict[str, str] = {}
     tool_inputs_by_id: dict[str, Any] = {}
     for message in body.get("messages", []) or []:
         if not isinstance(message, dict):
+            continue
+        if is_attachment_only_message(message):
             continue
         if should_skip_upstream_message(message):
             continue
@@ -3967,19 +4343,17 @@ def anthropic_messages_to_ollama(body: dict[str, Any]) -> list[dict[str, Any]]:
                 tool_input = tool_inputs_by_id.get(tool_use_id)
                 tool_input_text = tool_input_for_prompt(tool_input)
                 result_text = truncate_for_prompt(anthropic_content_to_text(block.get("content", "")), PROMPT_TOOL_RESULT_LIMIT)
+                signature = canonical_tool_signature(tool_name, tool_input)
+                tool_text, tool_summary = format_tool_result_for_upstream(
+                    tool_name=tool_name,
+                    tool_input_text=tool_input_text,
+                    result_text=result_text,
+                    is_error=bool(block.get("is_error")),
+                    prior_success_text=prior_tool_results.get(signature, ""),
+                    include_prior_success=tool_use_id in latest_noop_result_ids,
+                    in_plan_mode=in_plan_mode,
+                )
                 if not block.get("is_error"):
-                    tool_text = (
-                        f"Tool `{tool_name}` completed successfully.\n"
-                        f"Input:\n{tool_input_text}\n\n"
-                        f"Result:\n{result_text}\n\n"
-                        f"If this result satisfies the user's request, provide the final answer now. "
-                        f"Do not call `{tool_name}` again with the same arguments."
-                    )
-                    tool_summary = (
-                        f"The `{tool_name}` tool call above already completed successfully. "
-                        f"Treat its tool output as authoritative. Do not repeat the same or equivalent "
-                        f"`{tool_name}` call; continue with the next required concrete tool call or final answer."
-                    )
                     if tool_name == "TaskList":
                         tool_summary = (
                             f"The task list is current:\n{result_text}\n\n"
@@ -3988,18 +4362,9 @@ def anthropic_messages_to_ollama(body: dict[str, Any]) -> list[dict[str, Any]]:
                             "another progress announcement like 'I will write the files now'. If everything is "
                             "actually complete, provide the final answer."
                         )
-                else:
-                    tool_text = (
-                        f"Tool `{tool_name}` failed.\n"
-                        f"Input:\n{tool_input_text}\n\n"
-                        f"Error:\n{result_text}"
-                    )
-                    tool_summary = (
-                        f"The `{tool_name}` tool call above failed. Its input was {tool_input_text}. "
-                        f"Use the error output to choose a different next step; do not blindly repeat it."
-                    )
                 messages.append({"role": "tool", "tool_name": tool_name, "content": tool_text})
-                messages.append({"role": "user", "content": tool_summary})
+                if tool_summary:
+                    messages.append({"role": "user", "content": tool_summary})
             continue
 
         text = anthropic_content_to_text(content)
@@ -4043,8 +4408,15 @@ def anthropic_tools_to_ollama(tools: Any) -> list[dict[str, Any]]:
 def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
     messages = anthropic_system_to_ollama_messages(body.get("system"))
     messages.append(ollama_claude_code_reminder())
+    messages.extend(claude_code_state_messages(body))
+    prior_tool_results, latest_noop_result_ids = collect_tool_result_context(body)
+    in_plan_mode = plan_mode_active(body)
+    tool_names_by_id: dict[str, str] = {}
+    tool_inputs_by_id: dict[str, Any] = {}
     for message in body.get("messages", []) or []:
         if not isinstance(message, dict):
+            continue
+        if is_attachment_only_message(message):
             continue
         if should_skip_upstream_message(message):
             continue
@@ -4058,6 +4430,9 @@ def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
                     tool_id = str(block.get("id") or f"call_{len(tool_calls) + 1}")
                     name = str(block.get("name") or "tool")
                     tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    if tool_id:
+                        tool_names_by_id[tool_id] = name
+                        tool_inputs_by_id[tool_id] = tool_input
                     tool_calls.append({
                         "id": tool_id,
                         "type": "function",
@@ -4078,12 +4453,35 @@ def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
             for block in content:
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     tool_id = str(block.get("tool_use_id") or "call_tool")
+                    if tool_id not in tool_names_by_id:
+                        result_text = truncate_for_prompt(anthropic_content_to_text(block.get("content", "")), PROMPT_TOOL_RESULT_LIMIT)
+                        text_blocks.append({
+                            "type": "text",
+                            "text": (
+                                f"Historical tool result without a retained assistant tool call ({tool_id}):\n"
+                                f"{result_text}"
+                            ),
+                        })
+                        continue
+                    tool_name = tool_names_by_id.get(tool_id, "tool")
+                    tool_input = tool_inputs_by_id.get(tool_id)
+                    tool_input_text = tool_input_for_prompt(tool_input)
                     result_text = truncate_for_prompt(anthropic_content_to_text(block.get("content", "")), PROMPT_TOOL_RESULT_LIMIT)
+                    signature = canonical_tool_signature(tool_name, tool_input)
+                    tool_text, _ = format_tool_result_for_upstream(
+                        tool_name=tool_name,
+                        tool_input_text=tool_input_text,
+                        result_text=result_text,
+                        is_error=bool(block.get("is_error")),
+                        prior_success_text=prior_tool_results.get(signature, ""),
+                        include_prior_success=tool_id in latest_noop_result_ids,
+                        in_plan_mode=in_plan_mode,
+                    )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_id,
                         "id": tool_id,
-                        "content": result_text,
+                        "content": tool_text,
                     })
                 else:
                     text_blocks.append(block)
@@ -4212,13 +4610,13 @@ def ollama_options_status(pcfg: dict[str, Any]) -> str:
 
 
 def ollama_request_timeout_seconds(pcfg: dict[str, Any]) -> float:
-    raw = pcfg.get("request_timeout_ms", pcfg.get("request_timeout", pcfg.get("timeout_ms", 300000)))
+    raw = pcfg.get("request_timeout_ms", pcfg.get("request_timeout", pcfg.get("timeout_ms", 120000)))
     try:
         value = float(raw)
     except (TypeError, ValueError):
-        return 300.0
+        return 120.0
     if value <= 0:
-        return 300.0
+        return 120.0
     # Values above 10k are treated as milliseconds, matching common UI/API timeout notation.
     if value > 10000:
         return max(1.0, value / 1000.0)
@@ -4453,25 +4851,57 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
     return req
 
 
-def advisor_ollama_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], focus_override: str = "") -> dict[str, Any]:
-    messages = anthropic_messages_to_ollama(body)
+ADVISOR_REVIEW_PROMPT = (
+    "You are claude-any Advisor, a stronger reviewer model. Review the current task state and provide "
+    "concise, actionable guidance for the executor model. Do not write code unless a small exact patch is "
+    "the clearest advice. Include: Current blocker, Next concrete action, Validation step. "
+    "If the executor is stuck after progress announcements, tell it the exact next Claude Code tool to call."
+)
+
+
+def advisor_messages_for_provider(provider: str, body: dict[str, Any], focus_override: str = "") -> list[dict[str, Any]]:
+    kind = advisor_provider_kind(provider)
+    if kind == "openai-compatible":
+        messages = anthropic_messages_to_openai(body)
+    else:
+        messages = anthropic_messages_to_ollama(body)
     focus = focus_override or advisor_focus_from_body(body)
-    messages.append({
-        "role": "system",
-        "content": (
-            "You are claude-any Advisor, a stronger reviewer model. Review the current task state and provide "
-            "concise, actionable guidance for the executor model. Do not write code unless a small exact patch is "
-            "the clearest advice. Include: Current blocker, Next concrete action, Validation step. "
-            "If the executor is stuck after progress announcements, tell it the exact next Claude Code tool to call."
-        ),
-    })
+    messages.insert(0, {"role": "system", "content": ADVISOR_REVIEW_PROMPT})
     if focus:
         messages.append({"role": "user", "content": f"Advisor focus:\n{compact_message_text_for_prompt(focus)}"})
-    context_limit = ollama_context_limit_for_budget(pcfg)
-    input_budget = max(8192, context_limit - 4096 - (positive_int(pcfg.get("context_reserve_tokens")) or 1024))
-    messages = compact_ollama_messages_for_budget(messages, [], input_budget)
+    return messages
+
+
+def advisor_input_budget(provider: str, pcfg: dict[str, Any]) -> int:
+    context_limit = (
+        ollama_context_limit_for_budget(pcfg)
+        if advisor_provider_kind(provider) == "ollama"
+        else openai_context_limit_for_budget(provider, pcfg)
+    )
+    return max(8192, context_limit - 4096 - (positive_int(pcfg.get("context_reserve_tokens")) or 1024))
+
+
+def advisor_upstream_model(provider: str, model: str) -> str:
+    return ncp_model_id_for_nvidia_hosted(model) if provider == "nvidia-hosted" else model
+
+
+def advisor_request(provider: str, model: str, body: dict[str, Any], pcfg: dict[str, Any], focus_override: str = "") -> dict[str, Any]:
+    messages = advisor_messages_for_provider(provider, body, focus_override=focus_override)
+    messages = compact_ollama_messages_for_budget(messages, [], advisor_input_budget(provider, pcfg))
+    upstream_model = advisor_upstream_model(provider, model)
+    if advisor_provider_kind(provider) == "openai-compatible":
+        req: dict[str, Any] = {
+            "model": upstream_model,
+            "messages": messages,
+            "stream": False,
+            "max_tokens": min(4096, configured_output_tokens(pcfg, body) or 4096),
+        }
+        for key in ("temperature", "top_p"):
+            if pcfg.get(key) is not None:
+                req[key] = pcfg[key]
+        return req
     req: dict[str, Any] = {
-        "model": model,
+        "model": upstream_model,
         "messages": messages,
         "stream": False,
         "think": bool(pcfg.get("think", False)),
@@ -4486,24 +4916,65 @@ def advisor_ollama_request(model: str, body: dict[str, Any], pcfg: dict[str, Any
     return req
 
 
-def call_advisor_ollama_text(provider: str, pcfg: dict[str, Any], body: dict[str, Any], focus: str = "") -> str:
+def advisor_response_text(provider: str, data: Any) -> str:
+    if not isinstance(data, dict):
+        return ""
+    if advisor_provider_kind(provider) == "openai-compatible":
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+            if isinstance(message, dict):
+                return str(message.get("content") or "").strip()
+        return ""
+    message = data.get("message") if isinstance(data, dict) else {}
+    return str((message or {}).get("content") or "").strip()
+
+
+def advisor_endpoint(provider: str, pcfg: dict[str, Any]) -> str:
+    base = pcfg.get("base_url", "").rstrip("/")
+    if advisor_provider_kind(provider) == "openai-compatible":
+        return join_url(provider_upstream_request_base(provider, pcfg), "/chat/completions")
+    return join_url(base, "/api/chat")
+
+
+def call_advisor_text(provider: str, pcfg: dict[str, Any], body: dict[str, Any], focus: str = "") -> str:
     advisor_model = advisor_model_enabled(pcfg)
     if not advisor_model or not advisor_provider_supported(provider):
         return ""
-    base = pcfg.get("base_url", "").rstrip("/")
-    req_body = advisor_ollama_request(advisor_model, body, pcfg, focus_override=focus)
+    upstream_model = advisor_upstream_model(provider, advisor_model)
+    req_body = advisor_request(provider, advisor_model, body, pcfg, focus_override=focus)
     try:
-        apply_router_rate_limit(provider, pcfg, advisor_model)
-        write_router_activity("advisor", provider, advisor_model, tokens=estimate_tokens(req_body))
-        data = post_json(join_url(base, "/api/chat"), req_body, headers=provider_headers(provider, pcfg), timeout=ollama_request_timeout_seconds(pcfg))
-        message = data.get("message") if isinstance(data, dict) else {}
-        text = str((message or {}).get("content") or "").strip()
+        apply_router_rate_limit(provider, pcfg, upstream_model)
+        write_router_activity("advisor", provider, upstream_model, tokens=estimate_tokens(req_body))
+        if advisor_provider_kind(provider) == "openai-compatible":
+            data = post_json_with_rate_retry(
+                advisor_endpoint(provider, pcfg),
+                req_body,
+                provider_headers(provider, pcfg),
+                provider_request_timeout_seconds(pcfg),
+                provider,
+                pcfg,
+                upstream_model,
+                None,
+            )
+        else:
+            data = post_json_with_rate_retry(
+                advisor_endpoint(provider, pcfg),
+                req_body,
+                provider_headers(provider, pcfg),
+                ollama_request_timeout_seconds(pcfg),
+                provider,
+                pcfg,
+                upstream_model,
+                None,
+            )
+        text = advisor_response_text(provider, data)
         if text:
-            router_log("INFO", f"advisor_feedback provider={provider} advisor_model={advisor_model} chars={len(text)}")
+            router_log("INFO", f"advisor_feedback provider={provider} advisor_model={upstream_model} chars={len(text)}")
         return text
     except Exception as exc:
-        router_log("WARN", f"advisor_request_failed provider={provider} advisor_model={advisor_model} error={type(exc).__name__}: {exc}")
-        write_router_activity("advisor_error", provider, advisor_model, error=type(exc).__name__)
+        router_log("WARN", f"advisor_request_failed provider={provider} advisor_model={upstream_model} error={type(exc).__name__}: {exc}")
+        write_router_activity("advisor_error", provider, upstream_model, error=type(exc).__name__)
         return ""
 
 
@@ -4533,7 +5004,41 @@ def body_with_internal_advisor_feedback(body: dict[str, Any], assistant_message:
     return follow_body
 
 
-def refine_ollama_message_with_advisor(
+def call_provider_chat_once(provider: str, pcfg: dict[str, Any], body: dict[str, Any], model: str) -> dict[str, Any]:
+    if provider in ("ollama", "ollama-cloud"):
+        base = pcfg.get("base_url", "").rstrip("/")
+        req_body = ollama_chat_request(model, body, pcfg, stream=False)
+        apply_router_rate_limit(provider, pcfg, model)
+        data = post_json_with_rate_retry(
+            join_url(base, "/api/chat"),
+            req_body,
+            provider_headers(provider, pcfg),
+            ollama_request_timeout_seconds(pcfg),
+            provider,
+            pcfg,
+            model,
+            None,
+        )
+        return ollama_chat_to_anthropic(data, model, source_body=body)
+    if provider == "nvidia-hosted":
+        upstream_model = ncp_model_id_for_nvidia_hosted(model)
+        req_body = openai_compatible_chat_request(provider, upstream_model, body, pcfg, stream=False)
+        apply_router_rate_limit(provider, pcfg, upstream_model)
+        data = post_json_with_rate_retry(
+            join_url(provider_upstream_request_base(provider, pcfg), "/chat/completions"),
+            req_body,
+            provider_headers(provider, pcfg),
+            provider_request_timeout_seconds(pcfg),
+            provider,
+            pcfg,
+            upstream_model,
+            None,
+        )
+        return openai_chat_to_anthropic(data, upstream_model, source_body=body)
+    raise RuntimeError(f"Advisor refinement is not supported for provider {provider}")
+
+
+def refine_message_with_advisor(
     provider: str,
     pcfg: dict[str, Any],
     original_body: dict[str, Any],
@@ -4549,17 +5054,13 @@ def refine_ollama_message_with_advisor(
     trigger = advisor_trigger_for_message(original_body, message)
     if not trigger:
         return message
-    advisor_text = call_advisor_ollama_text(provider, pcfg, original_body, focus=trigger)
+    advisor_text = call_advisor_text(provider, pcfg, original_body, focus=trigger)
     if not advisor_text:
         return message
     follow_body = body_with_internal_advisor_feedback(original_body, message, advisor_text, trigger)
-    base = pcfg.get("base_url", "").rstrip("/")
-    req_body = ollama_chat_request(main_model, follow_body, pcfg, stream=False)
     try:
-        apply_router_rate_limit(provider, pcfg, main_model)
         router_log("INFO", f"advisor_refinement_call trigger={trigger} main_model={main_model}")
-        data = post_json(join_url(base, "/api/chat"), req_body, headers=provider_headers(provider, pcfg), timeout=ollama_request_timeout_seconds(pcfg))
-        refined = ollama_chat_to_anthropic(data, main_model, source_body=follow_body)
+        refined = call_provider_chat_once(provider, pcfg, follow_body, main_model)
         router_log("INFO", f"advisor_refinement_done trigger={trigger} stop_reason={refined.get('stop_reason')}")
         return refined
     except Exception as exc:
@@ -4725,21 +5226,16 @@ def maybe_handle_advisor_request(handler: BaseHTTPRequestHandler, provider: str,
             stream,
         )
         return True
-    if provider not in ("ollama", "ollama-cloud"):
+    if not advisor_provider_supported(provider):
         write_anthropic_text_response(
             handler,
             advisor_model,
-            f"Advisor Model is configured as `{advisor_model}`, but claude-any advisor calling is currently implemented for ollama/ollama-cloud providers. Current provider: `{provider}`.",
+            f"Advisor Model is configured as `{advisor_model}`, but claude-any advisor calling is not implemented for provider `{provider}`.",
             stream,
         )
         return True
-    base = pcfg.get("base_url", "").rstrip("/")
-    req_body = advisor_ollama_request(advisor_model, body, pcfg, )
-    headers = provider_headers(provider, pcfg)
     try:
-        data = post_json(join_url(base, "/api/chat"), req_body, headers=headers, timeout=ollama_request_timeout_seconds(pcfg))
-        message = data.get("message") if isinstance(data, dict) else {}
-        text = str((message or {}).get("content") or "").strip()
+        text = call_advisor_text(provider, pcfg, body)
         if not text:
             text = "Advisor returned no text."
     except Exception as exc:
@@ -4783,7 +5279,8 @@ def infer_tool_name_from_args(args: dict[str, Any]) -> str:
         return "Edit"
     if "file_path" in keys:
         return "Read"
-    if "taskId" in keys and "status" in keys:
+    task_update_keys = {"taskId", "task_id", "addBlocks", "addBlockedBy"}
+    if keys & task_update_keys:
         return "TaskUpdate"
     return "TaskList" if not args else "Write"
 
@@ -5468,8 +5965,9 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     if not bool(pcfg.get("stream_enabled", True)):
         stream_requested = False
     if stream_requested and advisor_gate_possible_for_body(provider, pcfg, body):
+        gate_reason = advisor_gate_reason_for_body(provider, pcfg, body)
         stream_requested = False
-        router_log("INFO", "advisor gate enabled; collecting this turn before returning it to Claude Code")
+        router_log("INFO", f"advisor gate enabled reason={gate_reason}; collecting this turn before returning it to Claude Code")
     word_chunking = bool(pcfg.get("stream_word_chunking", False))
     req_body = ollama_chat_request(model, body, pcfg, stream=stream_requested)
     headers = provider_headers(provider, pcfg)
@@ -5479,28 +5977,73 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     if stream_requested:
         # Stream Ollama response through as Anthropic SSE
         data_bytes = json.dumps(req_body).encode("utf-8")
-        req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
-        try:
-            resp = urllib.request.urlopen(req, timeout=ollama_request_timeout_seconds(pcfg))
-            set_upstream_stream_read_timeout(resp, provider_stream_idle_timeout_seconds(pcfg))
-        except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="ignore")
-            msg = raw.strip() or str(exc)
+        req_tokens = estimate_tokens(req_body)
+        req_bytes = len(data_bytes)
+        gateway_retries = configured_gateway_retries(pcfg)
+        max_attempts = max(1, gateway_retries + 1)
+        resp = None
+        for attempt in range(max_attempts):
+            req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
             try:
-                err = json.loads(raw)
-                if isinstance(err, dict):
-                    if isinstance(err.get("error"), dict):
-                        msg = str(err["error"].get("message") or err["error"])
-                    elif err.get("error"):
-                        msg = str(err["error"])
-                    elif err.get("message"):
-                        msg = str(err["message"])
-            except Exception:
-                pass
+                write_router_activity(
+                    "request",
+                    provider,
+                    model,
+                    attempt=attempt + 1,
+                    total=max_attempts,
+                    tokens=req_tokens,
+                    bytes=req_bytes,
+                    timeout=ollama_request_timeout_seconds(pcfg),
+                    stream=True,
+                )
+                router_log("INFO", f"ollama_stream_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={req_tokens} bytes={req_bytes}")
+                resp = urllib.request.urlopen(req, timeout=ollama_request_timeout_seconds(pcfg))
+                set_upstream_stream_read_timeout(resp, provider_stream_idle_timeout_seconds(pcfg))
+                learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
+                break
+            except urllib.error.HTTPError as exc:
+                raw = exc.read().decode("utf-8", errors="ignore")
+                learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
+                if exc.code == 429 and attempt + 1 < max_attempts:
+                    retry_no = attempt + 1
+                    wait = register_router_rate_limit_backoff(provider, pcfg, model, exc.headers.get("Retry-After"))
+                    write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, wait=wait, tokens=req_tokens, bytes=req_bytes, stream=True)
+                    router_log("WARN", f"ollama_stream_rate_limit_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} wait={wait:.2f}s tokens={req_tokens} bytes={req_bytes}")
+                    time.sleep(wait)
+                    continue
+                if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
+                    retry_no = attempt + 1
+                    write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, tokens=req_tokens, bytes=req_bytes, stream=True)
+                    router_log("WARN", f"ollama_stream_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} code={exc.code} tokens={req_tokens} bytes={req_bytes}")
+                    time.sleep(upstream_retry_wait_seconds(retry_no))
+                    continue
+                write_router_activity("error", provider, model, code=exc.code, tokens=req_tokens, bytes=req_bytes, stream=True)
+                write_json(
+                    handler,
+                    {"type": "error", "error": {"type": "upstream_error", "message": upstream_http_error_message(exc, raw)}},
+                    exc.code,
+                )
+                return
+            except (TimeoutError, urllib.error.URLError, OSError) as exc:
+                if retryable_upstream_exception(exc) and attempt + 1 < max_attempts:
+                    retry_no = attempt + 1
+                    write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes, stream=True)
+                    router_log("WARN", f"ollama_stream_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} error={type(exc).__name__} tokens={req_tokens} bytes={req_bytes}")
+                    time.sleep(upstream_retry_wait_seconds(retry_no))
+                    continue
+                write_router_activity("error", provider, model, error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes, stream=True)
+                write_json(
+                    handler,
+                    {"type": "error", "error": {"type": "upstream_error", "message": f"{type(exc).__name__}: {exc}"}},
+                    504 if retryable_upstream_exception(exc) else 502,
+                )
+                return
+        if resp is None:
+            write_router_activity("error", provider, model, tokens=req_tokens, bytes=req_bytes, stream=True)
             write_json(
                 handler,
-                {"type": "error", "error": {"type": "upstream_error", "message": msg}},
-                exc.code,
+                {"type": "error", "error": {"type": "upstream_error", "message": "upstream stream request failed"}},
+                504,
             )
             return
         # Check if Claude Code requested SSE streaming
@@ -5528,35 +6071,82 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
             if data is None:
                 data = {"message": {"content": ""}, "done": True, "done_reason": "end_turn"}
             message = ollama_chat_to_anthropic(data, model, source_body=body)
-            message = refine_ollama_message_with_advisor(provider, pcfg, body, message, model)
+            message = refine_message_with_advisor(provider, pcfg, body, message, model)
             message = prepend_anthropic_text(message, rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
             write_json(handler, message)
         return
     # Non-streaming fallback
-    try:
-        data = post_json(url, req_body, headers=headers, timeout=ollama_request_timeout_seconds(pcfg))
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", errors="ignore")
-        msg = raw.strip() or str(exc)
+    data_bytes = json.dumps(req_body).encode("utf-8")
+    req_tokens = estimate_tokens(req_body)
+    req_bytes = len(data_bytes)
+    gateway_retries = configured_gateway_retries(pcfg)
+    max_attempts = max(1, gateway_retries + 1)
+    data = None
+    for attempt in range(max_attempts):
+        req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
         try:
-            err = json.loads(raw)
-            if isinstance(err, dict):
-                if isinstance(err.get("error"), dict):
-                    msg = str(err["error"].get("message") or err["error"])
-                elif err.get("error"):
-                    msg = str(err["error"])
-                elif err.get("message"):
-                    msg = str(err["message"])
-        except Exception:
-            pass
+            write_router_activity(
+                "request",
+                provider,
+                model,
+                attempt=attempt + 1,
+                total=max_attempts,
+                tokens=req_tokens,
+                bytes=req_bytes,
+                timeout=ollama_request_timeout_seconds(pcfg),
+            )
+            router_log("INFO", f"ollama_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={req_tokens} bytes={req_bytes}")
+            with urllib.request.urlopen(req, timeout=ollama_request_timeout_seconds(pcfg)) as resp:
+                learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
+                data = json.loads(resp.read().decode("utf-8"))
+                break
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="ignore")
+            learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
+            if exc.code == 429 and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
+                wait = register_router_rate_limit_backoff(provider, pcfg, model, exc.headers.get("Retry-After"))
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, wait=wait, tokens=req_tokens, bytes=req_bytes)
+                router_log("WARN", f"ollama_rate_limit_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} wait={wait:.2f}s tokens={req_tokens} bytes={req_bytes}")
+                time.sleep(wait)
+                continue
+            if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, tokens=req_tokens, bytes=req_bytes)
+                router_log("WARN", f"ollama_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} code={exc.code} tokens={req_tokens} bytes={req_bytes}")
+                time.sleep(upstream_retry_wait_seconds(retry_no))
+                continue
+            write_router_activity("error", provider, model, code=exc.code, tokens=req_tokens, bytes=req_bytes)
+            write_json(
+                handler,
+                {"type": "error", "error": {"type": "upstream_error", "message": upstream_http_error_message(exc, raw)}},
+                exc.code,
+            )
+            return
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            if retryable_upstream_exception(exc) and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes)
+                router_log("WARN", f"ollama_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} error={type(exc).__name__} tokens={req_tokens} bytes={req_bytes}")
+                time.sleep(upstream_retry_wait_seconds(retry_no))
+                continue
+            write_router_activity("error", provider, model, error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes)
+            write_json(
+                handler,
+                {"type": "error", "error": {"type": "upstream_error", "message": f"{type(exc).__name__}: {exc}"}},
+                504 if retryable_upstream_exception(exc) else 502,
+            )
+            return
+    if data is None:
+        write_router_activity("error", provider, model, tokens=req_tokens, bytes=req_bytes)
         write_json(
             handler,
-            {"type": "error", "error": {"type": "upstream_error", "message": msg}},
-            exc.code,
+            {"type": "error", "error": {"type": "upstream_error", "message": "upstream request failed"}},
+            504,
         )
         return
     message = ollama_chat_to_anthropic(data, model, source_body=body)
-    message = refine_ollama_message_with_advisor(provider, pcfg, body, message, model)
+    message = refine_message_with_advisor(provider, pcfg, body, message, model)
     message = prepend_anthropic_text(message, rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
     write_json(handler, message)
 
@@ -5906,9 +6496,33 @@ def upstream_retry_wait_seconds(attempt: int) -> float:
     return min(20.0, 2.0 * max(1, attempt))
 
 
-def retryable_timeout_exception(exc: BaseException) -> bool:
+def retryable_upstream_exception(exc: BaseException) -> bool:
     text = f"{type(exc).__name__}: {exc}".lower()
-    return "timed out" in text or "timeout" in text
+    markers = (
+        "timed out",
+        "timeout",
+        "connection aborted",
+        "connection was aborted",
+        "connection reset",
+        "connection refused",
+        "remote end closed connection",
+        "remote disconnected",
+        "eof occurred in violation of protocol",
+        "temporarily unavailable",
+        "broken pipe",
+    )
+    return any(marker in text for marker in markers)
+
+
+def configured_gateway_retries(pcfg: dict[str, Any]) -> int:
+    value = pcfg.get("gateway_retries")
+    if value is None:
+        return 2
+    try:
+        retries = int(value)
+    except Exception:
+        return 2
+    return max(0, retries)
 
 
 def post_json_with_rate_retry(
@@ -5921,7 +6535,7 @@ def post_json_with_rate_retry(
     model: str,
     retry_notice: Callable[[str], None] | None = None,
 ) -> Any:
-    gateway_retries = positive_int(pcfg.get("gateway_retries")) or 2
+    gateway_retries = configured_gateway_retries(pcfg)
     max_attempts = max(1, gateway_retries + 1)
     token_estimate = estimate_tokens(req_body)
     byte_estimate = len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))
@@ -5968,7 +6582,7 @@ def post_json_with_rate_retry(
             write_router_activity("error", provider, model, code=exc.code, tokens=token_estimate, bytes=byte_estimate)
             raise RuntimeError(upstream_http_error_message(exc, raw)) from exc
         except (TimeoutError, urllib.error.URLError) as exc:
-            if retryable_timeout_exception(exc) and attempt + 1 < max_attempts:
+            if retryable_upstream_exception(exc) and attempt + 1 < max_attempts:
                 retry_no = attempt + 1
                 write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, error=type(exc).__name__, tokens=token_estimate, bytes=byte_estimate)
                 router_log("WARN", f"upstream_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} error={type(exc).__name__} tokens={token_estimate} bytes={byte_estimate}")
@@ -5991,7 +6605,7 @@ def open_openai_stream_with_rate_retry(
     model: str,
     retry_notice: Callable[[str], None] | None = None,
 ) -> Any:
-    gateway_retries = positive_int(pcfg.get("gateway_retries")) or 2
+    gateway_retries = configured_gateway_retries(pcfg)
     max_attempts = max(1, gateway_retries + 1)
     token_estimate = estimate_tokens(req_body)
     byte_estimate = len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))
@@ -6038,7 +6652,7 @@ def open_openai_stream_with_rate_retry(
             write_router_activity("error", provider, model, code=exc.code, tokens=token_estimate, bytes=byte_estimate, stream=True)
             raise RuntimeError(upstream_http_error_message(exc, raw)) from exc
         except (TimeoutError, urllib.error.URLError) as exc:
-            if retryable_timeout_exception(exc) and attempt + 1 < max_attempts:
+            if retryable_upstream_exception(exc) and attempt + 1 < max_attempts:
                 retry_no = attempt + 1
                 write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, error=type(exc).__name__, tokens=token_estimate, bytes=byte_estimate, stream=True)
                 router_log("WARN", f"upstream_stream_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} error={type(exc).__name__} tokens={token_estimate} bytes={byte_estimate}")
@@ -6060,6 +6674,10 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
     waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
     stream_enabled = bool(pcfg.get("stream_enabled", True))
     stream = True if provider == "nvidia-hosted" else bool(body.get("stream", stream_enabled)) and stream_enabled
+    if stream and advisor_gate_possible_for_body(provider, pcfg, body):
+        gate_reason = advisor_gate_reason_for_body(provider, pcfg, body)
+        stream = False
+        router_log("INFO", f"advisor gate enabled for {provider} reason={gate_reason}; collecting this turn before returning it to Claude Code")
     notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", True)))
     if stream:
         req_body = openai_compatible_chat_request(provider, model, body, pcfg, stream=True)
@@ -6124,10 +6742,9 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
     except RuntimeError as exc:
         write_json(handler, {"type": "error", "error": {"type": "upstream_error", "message": str(exc)}}, 500)
         return
-    message = prepend_anthropic_text(
-        openai_chat_to_anthropic(data, model, source_body=body),
-        notice,
-    )
+    message = openai_chat_to_anthropic(data, model, source_body=body)
+    message = refine_message_with_advisor(provider, pcfg, body, message, model)
+    message = prepend_anthropic_text(message, notice)
     write_anthropic_message_response(handler, message, stream)
 
 
@@ -6152,7 +6769,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
         cfg = load_config()
         provider, pcfg = get_current_provider(cfg)
-        if path in ("/health", "/healthz"):
+        if path in ("/", "/health", "/healthz"):
             write_json(self, {"ok": True, "provider": provider, "model": current_alias(cfg), "chat": "/ca/chat/health", "plan": "/ca/plan/artifacts"})
             return
         if path == "/v1/models":
@@ -6261,9 +6878,12 @@ def serve(_: argparse.Namespace) -> None:
     os.chmod(PID_PATH, 0o600)
     lvl = current_log_level()
     src = "file" if LOG_LEVEL_PATH.exists() else ("env" if os.environ.get("CLAUDE_ANY_LOG_LEVEL") else "default")
-    sys.stderr.write(f"claude-any router starting on {ROUTER_HOST}:{ROUTER_PORT} (log level {LOG_LEVEL_NAMES.get(lvl, lvl)}, source={src})\n")
+    sys.stderr.write(
+        f"claude-any router starting on {ROUTER_BIND_HOST}:{ROUTER_PORT} "
+        f"(client base {ROUTER_BASE}, log level {LOG_LEVEL_NAMES.get(lvl, lvl)}, source={src})\n"
+    )
     sys.stderr.flush()
-    server = ThreadingHTTPServer((ROUTER_HOST, ROUTER_PORT), RouterHandler)
+    server = ThreadingHTTPServer((ROUTER_BIND_HOST, ROUTER_PORT), RouterHandler)
     try:
         server.serve_forever()
     finally:
@@ -6354,6 +6974,7 @@ def set_model_config(value: str) -> list[str]:
         pcfg["num_ctx_max"] = preset["num_ctx_max"]
     context_msgs = sync_ollama_library_context_limit(provider, pcfg, model_id)
     context_msgs.extend(cap_context_settings_to_model_capacity(provider, pcfg))
+    preset_msgs = auto_apply_recommended_llm_preset_for_model(provider, pcfg, cfg.get("language", "en"))
     known = read_model_list_cache(provider, pcfg) or []
     custom = pcfg.setdefault("custom_models", [])
     if model_id not in custom and model_id not in known:
@@ -6362,6 +6983,7 @@ def set_model_config(value: str) -> list[str]:
     clear_model_cache()
     msgs = [f"Model for {provider} set to {model_id}.", f"Claude Code alias: {alias_for(provider, model_id)}"]
     msgs.extend(context_msgs)
+    msgs.extend(preset_msgs)
     if preset.get("thinking"):
         msgs.append("Note: this is a thinking model; compatibility test uses extended token budget.")
     return msgs
@@ -6588,10 +7210,12 @@ def status_lines() -> list[str]:
         *([f"keep_alive: {pcfg.get('keep_alive', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"think: {bool(pcfg.get('think', False))}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
+        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
         *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "self-hosted-nim") else []),
         *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
+        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
         f"router: {'bypassed for native provider compatibility' if direct_native else (('up' if router_up() else 'down') + ' ' + ROUTER_BASE)}",
         f"config: {CONFIG_PATH}",
@@ -6723,6 +7347,8 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
             pcfg["stream_enabled"] = True
         elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
             pcfg["stream_word_chunking"] = False
+        elif key in ("stream_idle_timeout", "stream_idle_timeout_ms", "idle_timeout", "idle_timeout_ms"):
+            pcfg.pop("stream_idle_timeout_ms", None)
         elif key in ("rate_limit", "rate_limit_rpm", "rpm"):
             pcfg.pop("rate_limit_rpm", None)
         elif key in ("rate_limit_status", "rpm_status"):
@@ -6767,6 +7393,12 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
         if not fixed:
             raise SystemExit("timeout must be a positive integer; values above 10000 are treated as milliseconds")
         pcfg["request_timeout_ms"] = fixed if key.endswith("_ms") or fixed > 10000 else fixed * 1000
+        return
+    if key in ("stream_idle_timeout", "stream_idle_timeout_ms", "idle_timeout", "idle_timeout_ms"):
+        fixed = positive_int(value)
+        if not fixed:
+            raise SystemExit("stream_idle_timeout_ms must be a positive integer; values above 10000 are treated as milliseconds")
+        pcfg["stream_idle_timeout_ms"] = fixed if key.endswith("_ms") or fixed > 10000 else fixed * 1000
         return
     if key in ("max_tokens", "maxtoken", "max_token", "num_predict"):
         fixed = positive_int(value)
@@ -6837,7 +7469,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print(f"ollama_options: {ollama_options_status(pcfg)}")
     print("Examples:")
     print("  claude-anyctl ollama-options num_ctx=auto min=32768 max=131072")
-    print("  claude-anyctl ollama-options num_ctx=65536 temperature=0.7 top_p=0.8 max_tokens=32768 timeout=1800000")
+    print("  claude-anyctl ollama-options num_ctx=65536 temperature=0.7 top_p=0.8 max_tokens=32768 timeout=120000")
     print("  claude-any --ca-ollama-option temperature=0.7 --ca-ollama-num-ctx 65536")
 
 
@@ -6890,6 +7522,8 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
         f"max_output_tokens={pcfg.get('max_output_tokens', 'default')}",
         f"timeout={timeout_text}",
     ]
+    if pcfg.get("stream_idle_timeout_ms") is not None:
+        parts.append(f"stream_idle_timeout={pcfg.get('stream_idle_timeout_ms')}ms")
     if provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
         parts.append(f"rate_limit_rpm={pcfg.get('rate_limit_rpm', 40)}")
         if bool(pcfg.get("rate_limit_status", True)):
@@ -6921,6 +7555,8 @@ def llm_options_status(provider: str, pcfg: dict[str, Any]) -> str:
             f"think {bool(pcfg.get('think', False))}",
             f"timeout {pcfg.get('request_timeout_ms', 'default')}ms",
         ]
+        if pcfg.get("stream_idle_timeout_ms") is not None:
+            pieces.append(f"stream_idle_timeout={pcfg.get('stream_idle_timeout_ms')}ms")
         for key in ("num_predict", "temperature", "top_p", "top_k"):
             if key in opts:
                 pieces.append(f"{key}={opts[key]}")
@@ -6983,7 +7619,7 @@ LLM_PRESETS: dict[str, tuple[str, str]] = {
     "long-context-65k": ("Long context 65K", "65K context target, 4K output reserve"),
     "million-context-1m": ("Ultra context 1M", "1M context target for high-capacity models"),
     "large-output": ("Large output/report", "larger 8K output for summaries/reports"),
-    "reasoning": ("Reasoning model", "higher timeout and reasoning-friendly sampling"),
+    "reasoning": ("Reasoning model", "reasoning-friendly sampling"),
     "novelist": ("Novelist", "creative prose, voice, scenes, and narrative continuity"),
     "humanities-researcher": ("Humanities researcher", "interpretive research, close reading, and long evidence chains"),
     "mathematician": ("Mathematician", "careful derivations, proofs, and low-randomness reasoning"),
@@ -7000,7 +7636,7 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "long-context-65k": ("긴 컨텍스트 65K", "65K 컨텍스트 목표, 4K 출력 여유"),
         "million-context-1m": ("초장문 컨텍스트 1M", "고용량 모델용 1M 컨텍스트 목표"),
         "large-output": ("긴 출력/리포트", "요약과 리포트용 8K 출력"),
-        "reasoning": ("추론 모델", "긴 타임아웃과 추론 친화 샘플링"),
+        "reasoning": ("추론 모델", "추론 친화 샘플링"),
         "novelist": ("소설가", "문체, 서사, 장면 전개를 위한 창작 설정"),
         "humanities-researcher": ("인문연구자", "해석, 근거 정리, 긴 문헌 맥락"),
         "mathematician": ("수학자", "낮은 무작위성과 단계적 증명/유도"),
@@ -7014,7 +7650,7 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "long-context-65k": ("長いコンテキスト 65K", "65K コンテキスト目標、4K 出力予約"),
         "million-context-1m": ("超長文コンテキスト 1M", "大容量モデル向けの 1M コンテキスト目標"),
         "large-output": ("長い出力/レポート", "要約とレポート向けの 8K 出力"),
-        "reasoning": ("推論モデル", "長いタイムアウトと推論向けサンプリング"),
+        "reasoning": ("推論モデル", "推論向けサンプリング"),
         "novelist": ("小説家", "文体、物語、場面展開向けの創作設定"),
         "humanities-researcher": ("人文学研究者", "解釈、根拠整理、長い文献文脈"),
         "mathematician": ("数学者", "低いランダム性と段階的な証明/導出"),
@@ -7028,7 +7664,7 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "long-context-65k": ("长上下文 65K", "65K 上下文目标，4K 输出预留"),
         "million-context-1m": ("超长上下文 1M", "面向高容量模型的 1M 上下文目标"),
         "large-output": ("长输出/报告", "用于摘要和报告的 8K 输出"),
-        "reasoning": ("推理模型", "更长超时和适合推理的采样"),
+        "reasoning": ("推理模型", "适合推理的采样"),
         "novelist": ("小说家", "面向文风、叙事、场景推进的创作设置"),
         "humanities-researcher": ("人文学研究者", "解释性研究、证据整理和长文献上下文"),
         "mathematician": ("数学家", "低随机性、逐步证明和推导"),
@@ -7036,6 +7672,137 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "teacher": ("教师/导师", "清晰解释、示例和分步学习"),
     },
 }
+
+
+TIMEOUT_PRESETS: dict[str, tuple[int, str, str]] = {
+    "timeout-fast": (120000, "Fast retry 2m", "short wait, quick retry on stalled providers"),
+    "timeout-standard": (300000, "Standard 5m", "balanced wait for normal cloud coding"),
+    "timeout-long": (600000, "Long stream 10m", "large edits or slow streamed responses"),
+    "timeout-deep": (1200000, "Deep work 20m", "long reasoning, reports, and big context"),
+    "timeout-marathon": (3600000, "Marathon 60m", "very long hosted/model-server jobs"),
+}
+
+
+TIMEOUT_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
+    "ko": {
+        "timeout-fast": ("빠른 재시도 2분", "멈춘 provider를 빨리 감지"),
+        "timeout-standard": ("표준 5분", "일반 클라우드 코딩용 균형값"),
+        "timeout-long": ("긴 스트림 10분", "큰 편집 또는 느린 스트리밍 응답"),
+        "timeout-deep": ("깊은 작업 20분", "긴 추론, 리포트, 큰 컨텍스트"),
+        "timeout-marathon": ("장시간 60분", "매우 긴 hosted/model-server 작업"),
+    },
+    "ja": {
+        "timeout-fast": ("高速 retry 2分", "停止した provider を早く検出"),
+        "timeout-standard": ("標準 5分", "通常のクラウド coding 向け"),
+        "timeout-long": ("長い stream 10分", "大きな編集や遅い streamed 応答"),
+        "timeout-deep": ("深い作業 20分", "長い推論、report、大きな context"),
+        "timeout-marathon": ("長時間 60分", "非常に長い hosted/model-server 作業"),
+    },
+    "zh": {
+        "timeout-fast": ("快速重试 2分钟", "快速发现卡住的 provider"),
+        "timeout-standard": ("标准 5分钟", "普通云端编码的均衡值"),
+        "timeout-long": ("长流式 10分钟", "大型编辑或较慢流式响应"),
+        "timeout-deep": ("深度工作 20分钟", "长推理、报告和大上下文"),
+        "timeout-marathon": ("超长 60分钟", "很长的 hosted/model-server 任务"),
+    },
+}
+
+
+LLM_PRESET_TIMEOUT_MS: dict[str, int] = {
+    "balanced": 120000,
+    "coding": 120000,
+    "fast": 120000,
+    "long-context-65k": 300000,
+    "million-context-1m": 600000,
+    "large-output": 600000,
+    "reasoning": 1200000,
+    "novelist": 600000,
+    "humanities-researcher": 1200000,
+    "mathematician": 1200000,
+    "product-architect": 600000,
+    "teacher": 300000,
+}
+
+
+def llm_preset_timeout_ms(preset_id: str) -> int:
+    return LLM_PRESET_TIMEOUT_MS.get(preset_id, 120000)
+
+
+def timeout_profile_id_for_ms(ms: int | None) -> str | None:
+    if not ms:
+        return None
+    for preset_id, (preset_ms, _, _) in TIMEOUT_PRESETS.items():
+        if ms == preset_ms:
+            return preset_id
+    return None
+
+
+def timeout_profile_text(profile_id: str, lang: str | None = None) -> tuple[str, str]:
+    lang = lang or load_config().get("language", "en")
+    if profile_id == "__custom__":
+        return {
+            "ko": ("사용자 지정", "직접 입력한 timeout 값"),
+            "ja": ("カスタム", "直接入力した timeout 値"),
+            "zh": ("自定义", "手动输入的 timeout 值"),
+        }.get(lang, ("Custom", "manually entered timeout value"))
+    fallback = TIMEOUT_PRESETS[profile_id]
+    return TIMEOUT_PRESET_I18N.get(lang, {}).get(profile_id, (fallback[1], fallback[2]))
+
+
+def timeout_profile_status(pcfg: dict[str, Any], lang: str | None = None) -> str:
+    ms = positive_int(pcfg.get("request_timeout_ms")) or 120000
+    profile_id = timeout_profile_id_for_ms(ms)
+    if profile_id:
+        label = timeout_profile_text(profile_id, lang)[0]
+    else:
+        label = timeout_profile_text("__custom__", lang)[0]
+    idle = positive_int(pcfg.get("stream_idle_timeout_ms"))
+    idle_text = f"; idle {idle}ms" if idle and idle != ms else ""
+    return f"{label}; {ms}ms{idle_text}"
+
+
+def timeout_profile_idle_ms(request_timeout_ms: int) -> int:
+    return min(request_timeout_ms, 300000)
+
+
+def timeout_profile_panel_rows(pcfg: dict[str, Any], lang: str | None = None) -> tuple[list[str], list[str]]:
+    lang = lang or load_config().get("language", "en")
+    current_ms = positive_int(pcfg.get("request_timeout_ms")) or 120000
+    rows = [f"Current timeout: {current_ms} ms = {format_timeout_minutes(current_ms, lang)}"]
+    values = ["__info__"]
+    current_profile = timeout_profile_id_for_ms(current_ms)
+    for profile_id, (ms, _, _) in TIMEOUT_PRESETS.items():
+        label, description = timeout_profile_text(profile_id, lang)
+        mark = "*" if profile_id == current_profile else " "
+        rows.append(f"{mark} {pad_cells(label, 22)} {ms:>7} ms  {description}")
+        values.append(profile_id)
+    rows.append(ui_text("back", lang))
+    values.append("back")
+    return rows, values
+
+
+def apply_timeout_profile_to_provider(pcfg: dict[str, Any], profile_id: str, lang: str | None = None) -> list[str]:
+    if profile_id not in TIMEOUT_PRESETS:
+        raise SystemExit(f"Unknown timeout preset: {profile_id}")
+    ms, _, _ = TIMEOUT_PRESETS[profile_id]
+    idle_ms = timeout_profile_idle_ms(ms)
+    pcfg["request_timeout_ms"] = ms
+    pcfg["stream_idle_timeout_ms"] = idle_ms
+    label = timeout_profile_text(profile_id, lang)[0]
+    return [f"Timeout preset: {label}", f"request_timeout_ms: {ms}", f"stream_idle_timeout_ms: {idle_ms}"]
+
+
+def with_preset_timeout_tokens(tokens: list[str], preset_id: str) -> list[str]:
+    filtered = [
+        token
+        for token in tokens
+        if not token.startswith(("timeout=", "timeout_ms=", "request_timeout=", "request_timeout_ms=", "stream_idle_timeout=", "stream_idle_timeout_ms="))
+    ]
+    timeout_ms = llm_preset_timeout_ms(preset_id)
+    idle_ms = timeout_profile_idle_ms(timeout_ms)
+    filtered.append(f"timeout={timeout_ms}")
+    filtered.append(f"stream_idle_timeout_ms={idle_ms}")
+    return filtered
 
 
 CONTEXT_HEAVY_PRESETS = {
@@ -7343,32 +8110,30 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         num_predict = positive_int(opts.get("num_predict")) or 0
-        timeout = positive_int(pcfg.get("request_timeout_ms")) or 0
         num_ctx = positive_int(pcfg.get("num_ctx")) or 0
         num_ctx_min = positive_int(pcfg.get("num_ctx_min")) or 0
         num_ctx_max = positive_int(pcfg.get("num_ctx_max")) or 0
-        if bool(pcfg.get("think", False)) and timeout >= 1800000:
+        if bool(pcfg.get("think", False)):
             return "reasoning"
         if num_ctx_max >= 524288:
             return "million-context-1m"
-        if num_predict >= 8192 or timeout >= 1200000:
+        if num_predict >= 8192:
             return "large-output"
-        if timeout >= 900000 or num_ctx_min >= 65536 or num_ctx_max >= 131072:
+        if num_ctx_min >= 65536 or num_ctx_max >= 131072:
             return "long-context-65k"
         if num_ctx and num_ctx <= 32768 and num_predict and num_predict <= 2048:
             return "fast"
         return None
     if provider in ("vllm", "nvidia-hosted", "self-hosted-nim", "anthropic"):
         max_output = positive_int(pcfg.get("max_output_tokens")) or 0
-        timeout = positive_int(pcfg.get("request_timeout_ms")) or 0
         context_window = positive_int(pcfg.get("context_window")) or 0
-        if bool(pcfg.get("think", False)) and timeout >= 1800000:
+        if bool(pcfg.get("think", False)):
             return "reasoning"
         if context_window >= 524288:
             return "million-context-1m"
-        if max_output >= 8192 or timeout >= 1200000:
+        if max_output >= 8192:
             return "large-output"
-        if timeout >= 900000 or context_window >= 65536:
+        if context_window >= 65536:
             return "long-context-65k"
         if max_output and max_output <= 2048:
             return "fast"
@@ -7408,7 +8173,13 @@ def llm_preset_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
     return rows, values
 
 
-def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id: str, lang: str | None = None) -> list[str]:
+def apply_llm_preset_to_provider(
+    provider: str,
+    pcfg: dict[str, Any],
+    preset_id: str,
+    lang: str | None = None,
+    sync_ollama_context: bool = True,
+) -> list[str]:
     if preset_id not in LLM_PRESETS:
         raise SystemExit(f"Unknown preset: {preset_id}")
     lang = lang or load_config().get("language", "en")
@@ -7426,7 +8197,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=false",
                 "keep_alive=5m",
-                "timeout=300000",
+                "timeout=120000",
             ],
             "coding": [
                 "num_ctx=auto",
@@ -7438,7 +8209,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=false",
                 "keep_alive=5m",
-                "timeout=300000",
+                "timeout=120000",
             ],
             "fast": [
                 "num_ctx=32768",
@@ -7448,7 +8219,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=false",
                 "keep_alive=5m",
-                "timeout=300000",
+                "timeout=120000",
             ],
             "long-context-65k": [
                 "num_ctx=auto",
@@ -7460,7 +8231,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=false",
                 "keep_alive=10m",
-                "timeout=900000",
+                "timeout=120000",
             ],
             "million-context-1m": [
                 "num_ctx=auto",
@@ -7472,7 +8243,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=false",
                 "keep_alive=15m",
-                "timeout=3600000",
+                "timeout=120000",
             ],
             "large-output": [
                 "num_ctx=auto",
@@ -7484,7 +8255,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=false",
                 "keep_alive=10m",
-                "timeout=1200000",
+                "timeout=120000",
             ],
             "reasoning": [
                 "num_ctx=auto",
@@ -7496,7 +8267,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=true",
                 "keep_alive=10m",
-                "timeout=1800000",
+                "timeout=120000",
             ],
             "novelist": [
                 "num_ctx=auto",
@@ -7508,7 +8279,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=80",
                 "think=false",
                 "keep_alive=10m",
-                "timeout=1800000",
+                "timeout=120000",
             ],
             "humanities-researcher": [
                 "num_ctx=auto",
@@ -7520,7 +8291,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=50",
                 "think=false",
                 "keep_alive=15m",
-                "timeout=2400000",
+                "timeout=120000",
             ],
             "mathematician": [
                 "num_ctx=auto",
@@ -7532,7 +8303,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=true",
                 "keep_alive=15m",
-                "timeout=2400000",
+                "timeout=120000",
             ],
             "product-architect": [
                 "num_ctx=auto",
@@ -7544,7 +8315,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=40",
                 "think=false",
                 "keep_alive=10m",
-                "timeout=1800000",
+                "timeout=120000",
             ],
             "teacher": [
                 "num_ctx=auto",
@@ -7556,30 +8327,30 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "top_k=60",
                 "think=false",
                 "keep_alive=10m",
-                "timeout=1200000",
+                "timeout=120000",
             ],
         }
-        for token in tokens_by_preset[preset_id]:
+        for token in with_preset_timeout_tokens(tokens_by_preset[preset_id], preset_id):
             apply_ollama_option(pcfg, token)
         model_id = str(pcfg.get("current_model") or "").strip()
-        if model_id:
+        if model_id and sync_ollama_context:
             context_msgs = sync_ollama_library_context_limit(provider, pcfg, model_id)
     elif provider == "anthropic":
         tokens_by_preset = {
-            "balanced": ["max_output_tokens=4096", "timeout=300000"],
-            "coding": ["max_output_tokens=4096", "timeout=300000"],
-            "fast": ["max_output_tokens=2048", "timeout=300000"],
-            "long-context-65k": ["max_output_tokens=4096", "timeout=900000"],
-            "million-context-1m": ["max_output_tokens=8192", "timeout=3600000"],
-            "large-output": ["max_output_tokens=8192", "timeout=1200000"],
-            "reasoning": ["max_output_tokens=4096", "timeout=1800000"],
-            "novelist": ["max_output_tokens=8192", "timeout=1800000"],
-            "humanities-researcher": ["max_output_tokens=8192", "timeout=2400000"],
-            "mathematician": ["max_output_tokens=8192", "timeout=2400000"],
-            "product-architect": ["max_output_tokens=8192", "timeout=1800000"],
-            "teacher": ["max_output_tokens=6144", "timeout=1200000"],
+            "balanced": ["max_output_tokens=4096", "timeout=120000"],
+            "coding": ["max_output_tokens=4096", "timeout=120000"],
+            "fast": ["max_output_tokens=2048", "timeout=120000"],
+            "long-context-65k": ["max_output_tokens=4096", "timeout=120000"],
+            "million-context-1m": ["max_output_tokens=8192", "timeout=120000"],
+            "large-output": ["max_output_tokens=8192", "timeout=120000"],
+            "reasoning": ["max_output_tokens=4096", "timeout=120000"],
+            "novelist": ["max_output_tokens=8192", "timeout=120000"],
+            "humanities-researcher": ["max_output_tokens=8192", "timeout=120000"],
+            "mathematician": ["max_output_tokens=8192", "timeout=120000"],
+            "product-architect": ["max_output_tokens=8192", "timeout=120000"],
+            "teacher": ["max_output_tokens=6144", "timeout=120000"],
         }
-        for token in tokens_by_preset[preset_id]:
+        for token in with_preset_timeout_tokens(tokens_by_preset[preset_id], preset_id):
             apply_provider_option(provider, pcfg, token)
     else:
         native_default = "false" if provider == "nvidia-hosted" else "true"
@@ -7590,7 +8361,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=65536",
                     "reserve=4096",
                     "max_output_tokens=4096",
-                    "timeout=300000",
+                    "timeout=120000",
                     "temperature=0.3",
                     "unset:top_p",
                     "unset:top_k",
@@ -7599,7 +8370,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=65536",
                     "reserve=4096",
                     "max_output_tokens=4096",
-                    "timeout=300000",
+                    "timeout=120000",
                     "temperature=0.2",
                     "unset:top_p",
                     "unset:top_k",
@@ -7608,7 +8379,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=65536",
                     "reserve=2048",
                     "max_output_tokens=2048",
-                    "timeout=300000",
+                    "timeout=120000",
                     "temperature=0.2",
                     "unset:top_p",
                     "unset:top_k",
@@ -7617,7 +8388,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=131072",
                     "reserve=8192",
                     "max_output_tokens=4096",
-                    "timeout=900000",
+                    "timeout=120000",
                     "temperature=0.3",
                     "unset:top_p",
                     "unset:top_k",
@@ -7626,7 +8397,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=1048576",
                     "reserve=16384",
                     "max_output_tokens=8192",
-                    "timeout=3600000",
+                    "timeout=120000",
                     "temperature=0.3",
                     "unset:top_p",
                     "unset:top_k",
@@ -7635,7 +8406,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=262144",
                     "reserve=8192",
                     "max_output_tokens=8192",
-                    "timeout=1200000",
+                    "timeout=120000",
                     "temperature=0.3",
                     "unset:top_p",
                     "unset:top_k",
@@ -7644,7 +8415,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=262144",
                     "reserve=8192",
                     "max_output_tokens=4096",
-                    "timeout=1800000",
+                    "timeout=120000",
                     "temperature=0.6",
                     "unset:top_p",
                     "unset:top_k",
@@ -7653,7 +8424,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=262144",
                     "reserve=8192",
                     "max_output_tokens=8192",
-                    "timeout=1800000",
+                    "timeout=120000",
                     "temperature=0.85",
                     "top_p=0.95",
                     "top_k=80",
@@ -7662,7 +8433,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=262144",
                     "reserve=8192",
                     "max_output_tokens=8192",
-                    "timeout=2400000",
+                    "timeout=120000",
                     "temperature=0.45",
                     "top_p=0.9",
                     "top_k=50",
@@ -7671,7 +8442,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=262144",
                     "reserve=8192",
                     "max_output_tokens=8192",
-                    "timeout=2400000",
+                    "timeout=120000",
                     "temperature=0.15",
                     "top_p=0.85",
                     "top_k=40",
@@ -7680,7 +8451,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=262144",
                     "reserve=8192",
                     "max_output_tokens=8192",
-                    "timeout=1800000",
+                    "timeout=120000",
                     "temperature=0.25",
                     "top_p=0.85",
                     "top_k=40",
@@ -7689,7 +8460,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                     "context_window=131072",
                     "reserve=4096",
                     "max_output_tokens=6144",
-                    "timeout=1200000",
+                    "timeout=120000",
                     "temperature=0.55",
                     "top_p=0.9",
                     "top_k=60",
@@ -7701,7 +8472,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=32768",
                 "reserve=2048",
                 "max_output_tokens=4096",
-                "timeout=300000",
+                "timeout=120000",
                 "temperature=0.3",
                 "unset:top_p",
                 "unset:top_k",
@@ -7711,7 +8482,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=32768",
                 "reserve=2048",
                 "max_output_tokens=4096",
-                "timeout=300000",
+                "timeout=120000",
                 "temperature=0.2",
                 "unset:top_p",
                 "unset:top_k",
@@ -7721,7 +8492,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=32768",
                 "reserve=1024",
                 "max_output_tokens=2048",
-                "timeout=300000",
+                "timeout=120000",
                 "temperature=0.2",
                 "unset:top_p",
                 "unset:top_k",
@@ -7731,7 +8502,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=65536",
                 "reserve=4096",
                 "max_output_tokens=4096",
-                "timeout=900000",
+                "timeout=120000",
                 "temperature=0.3",
                 "unset:top_p",
                 "unset:top_k",
@@ -7741,7 +8512,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=1048576",
                 "reserve=16384",
                 "max_output_tokens=8192",
-                "timeout=3600000",
+                "timeout=120000",
                 "temperature=0.3",
                 "unset:top_p",
                 "unset:top_k",
@@ -7751,7 +8522,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=65536",
                 "reserve=4096",
                 "max_output_tokens=8192",
-                "timeout=1200000",
+                "timeout=120000",
                 "temperature=0.3",
                 "unset:top_p",
                 "unset:top_k",
@@ -7761,7 +8532,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=65536",
                 "reserve=4096",
                 "max_output_tokens=4096",
-                "timeout=1800000",
+                "timeout=120000",
                 "temperature=0.6",
                 "unset:top_p",
                 "unset:top_k",
@@ -7771,7 +8542,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=262144",
                 "reserve=8192",
                 "max_output_tokens=8192",
-                "timeout=1800000",
+                "timeout=120000",
                 "temperature=0.85",
                 "top_p=0.95",
                 "top_k=80",
@@ -7781,7 +8552,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=262144",
                 "reserve=8192",
                 "max_output_tokens=8192",
-                "timeout=2400000",
+                "timeout=120000",
                 "temperature=0.45",
                 "top_p=0.9",
                 "top_k=50",
@@ -7791,7 +8562,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=262144",
                 "reserve=8192",
                 "max_output_tokens=8192",
-                "timeout=2400000",
+                "timeout=120000",
                 "temperature=0.15",
                 "top_p=0.85",
                 "top_k=40",
@@ -7801,7 +8572,7 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=262144",
                 "reserve=8192",
                 "max_output_tokens=8192",
-                "timeout=1800000",
+                "timeout=120000",
                 "temperature=0.25",
                 "top_p=0.85",
                 "top_k=40",
@@ -7811,14 +8582,14 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
                 "context_window=131072",
                 "reserve=4096",
                 "max_output_tokens=6144",
-                "timeout=1200000",
+                "timeout=120000",
                 "temperature=0.55",
                 "top_p=0.9",
                 "top_k=60",
                 f"native={native_default}",
             ],
             }
-        for token in tokens_by_preset[preset_id]:
+        for token in with_preset_timeout_tokens(tokens_by_preset[preset_id], preset_id):
             if provider == "nvidia-hosted" and token.startswith("native="):
                 continue
             apply_provider_option(provider, pcfg, token)
@@ -7870,6 +8641,16 @@ def apply_llm_preset_to_provider(provider: str, pcfg: dict[str, Any], preset_id:
             f"max_output_tokens={pcfg.get('max_output_tokens', 'default')}, "
             f"timeout={pcfg.get('request_timeout_ms', 'default')}ms"
         )
+    return lines
+
+
+def auto_apply_recommended_llm_preset_for_model(provider: str, pcfg: dict[str, Any], lang: str | None = None) -> list[str]:
+    preset_id = recommended_preset_id(provider, pcfg)
+    if not preset_available_for_model(provider, pcfg, preset_id):
+        return []
+    label = llm_preset_text(preset_id, lang)[0]
+    lines = [f"Auto-applied recommended LLM preset for selected model: {label}."]
+    lines.extend(apply_llm_preset_to_provider(provider, pcfg, preset_id, lang, sync_ollama_context=False))
     return lines
 
 
@@ -7942,6 +8723,18 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ko": "업스트림 응답 대기 시간(ms).",
         "ja": "上流応答待ちタイムアウト(ms)。",
         "zh": "上游响应等待超时（毫秒）。",
+    },
+    "timeout_profile": {
+        "en": "Choose a timeout preset. It sets both upstream wait timeout and stream idle timeout.",
+        "ko": "타임아웃 프리셋을 선택합니다. 업스트림 대기 시간과 스트림 idle timeout을 함께 설정합니다.",
+        "ja": "timeout preset を選びます。上流待機 timeout と stream idle timeout を同時に設定します。",
+        "zh": "选择 timeout 预设，同时设置上游等待超时和 stream idle timeout。",
+    },
+    "stream_idle_timeout_ms": {
+        "en": "Maximum silence allowed while a stream is open. If no bytes arrive for this long, claude-any retries or reports a timeout.",
+        "ko": "스트림 연결이 열린 뒤 아무 byte도 오지 않아도 기다리는 최대 시간입니다. 이 시간을 넘으면 재시도하거나 timeout으로 처리합니다.",
+        "ja": "stream 接続中に byte が来ないまま待つ最大時間です。超えると retry または timeout として扱います。",
+        "zh": "流式连接打开后允许无字节到达的最长时间；超过后重试或作为 timeout 处理。",
     },
     "rate_limit_rpm": {
         "en": "Router-side upstream request limit per minute. NIM hosted defaults to 40 RPM; unset/0 disables waiting.",
@@ -8036,9 +8829,9 @@ def format_timeout_minutes(ms: int, lang: str = "en") -> str:
 
 def llm_option_description_for_value(provider: str, pcfg: dict[str, Any], key: str, lang: str | None = None) -> str:
     text = llm_option_description(provider, key, lang)
-    if key != "request_timeout_ms":
+    if key not in ("request_timeout_ms", "stream_idle_timeout_ms"):
         return text
-    value = positive_int(pcfg.get("request_timeout_ms"))
+    value = positive_int(pcfg.get(key))
     if not value:
         return text
     lang = lang or load_config().get("language", "en")
@@ -8088,6 +8881,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
 
     add(ui_text("context_setup", lang), "context_setup", context_setting_status(provider, pcfg))
     add(ui_text("apply_preset", lang), "preset", llm_preset_text(applied_preset_id(provider, pcfg), lang)[0])
+    add(ui_text("timeout_preset", lang), "timeout_profile", timeout_profile_status(pcfg, lang))
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         add("Context window", "num_ctx", ollama_num_ctx_status(pcfg))
@@ -8102,6 +8896,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
         add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
         if bool(pcfg.get("stream_enabled", True)):
+            add("Stream idle timeout ms", "stream_idle_timeout_ms", pcfg.get("stream_idle_timeout_ms", "auto"))
             add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
         add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 40))
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
@@ -8121,6 +8916,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
                 add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", True)))
             add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
             if bool(pcfg.get("stream_enabled", True)):
+                add("Stream idle timeout ms", "stream_idle_timeout_ms", pcfg.get("stream_idle_timeout_ms", "auto"))
                 add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
         elif provider == "anthropic":
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
@@ -8141,7 +8937,7 @@ def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> 
         opts = ollama_extra_options(pcfg)
         if key == "num_ctx":
             return str(pcfg.get("num_ctx", "auto"))
-        if key in ("num_ctx_min", "num_ctx_max", "keep_alive", "think", "request_timeout_ms"):
+        if key in ("num_ctx_min", "num_ctx_max", "keep_alive", "think", "request_timeout_ms", "stream_idle_timeout_ms"):
             return str(pcfg.get(key, ""))
         if key in opts:
             return str(opts[key])
@@ -8173,6 +8969,10 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
         "timeout_ms",
         "request_timeout",
         "request_timeout_ms",
+        "stream_idle_timeout",
+        "stream_idle_timeout_ms",
+        "idle_timeout",
+        "idle_timeout_ms",
         "rate_limit",
         "rate_limit_rpm",
         "rpm",
@@ -8210,6 +9010,8 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg.pop("max_output_tokens", None)
         elif key in ("timeout", "timeout_ms", "request_timeout", "request_timeout_ms"):
             pcfg.pop("request_timeout_ms", None)
+        elif key in ("stream_idle_timeout", "stream_idle_timeout_ms", "idle_timeout", "idle_timeout_ms"):
+            pcfg.pop("stream_idle_timeout_ms", None)
         elif key in ("rate_limit", "rate_limit_rpm", "rpm"):
             pcfg.pop("rate_limit_rpm", None)
         elif key in ("rate_limit_status", "rpm_status"):
@@ -8258,6 +9060,12 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         if not fixed:
             raise SystemExit("timeout must be a positive integer; values above 10000 are treated as milliseconds")
         pcfg["request_timeout_ms"] = fixed if key.endswith("_ms") or fixed > 10000 else fixed * 1000
+        return
+    if key in ("stream_idle_timeout", "stream_idle_timeout_ms", "idle_timeout", "idle_timeout_ms"):
+        fixed = positive_int(value)
+        if not fixed:
+            raise SystemExit("stream_idle_timeout_ms must be a positive integer; values above 10000 are treated as milliseconds")
+        pcfg["stream_idle_timeout_ms"] = fixed if key.endswith("_ms") or fixed > 10000 else fixed * 1000
         return
     if key in ("rate_limit", "rate_limit_rpm", "rpm"):
         fixed = positive_int(value)
@@ -8324,7 +9132,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
     print("  temperature/top_p/top_k are injected by claude-any router mode when the provider supports them.")
     print("Examples:")
     print("  claude-anyctl provider-options nvidia-hosted max_output_tokens=4096 temperature=0.7 top_p=0.8 timeout=120000 rate_limit_rpm=40")
-    print("  claude-anyctl provider-options vllm max_output_tokens=4096 context_window=65536 timeout=1800000")
+    print("  claude-anyctl provider-options vllm max_output_tokens=4096 context_window=65536 timeout=120000")
     print("  claude-anyctl provider-options self-hosted-nim native=true max_output_tokens=4096")
 
 
@@ -9726,6 +10534,7 @@ def render_prelaunch_screen(
             "options": ui_text("options", lang),
             "context": ui_text("context_setup", lang),
             "preset": ui_text("presets", lang),
+            "timeout": ui_text("timeout_preset", lang),
         }
         add("")
         add("-" * render_width, "38;5;208")
@@ -9880,6 +10689,8 @@ def portable_prelaunch_menu() -> int:
             panel_rows, panel_values = context_setup_panel_rows(provider, pcfg, cfg.get("language", "en"))
         elif name == "preset":
             panel_rows, panel_values = llm_preset_panel_rows(provider, pcfg, cfg.get("language", "en"))
+        elif name == "timeout":
+            panel_rows, panel_values = timeout_profile_panel_rows(pcfg, cfg.get("language", "en"))
         if panel_rows:
             panel_idx = max(0, min(panel_idx, len(panel_rows) - 1))
 
@@ -10058,6 +10869,8 @@ def portable_prelaunch_menu() -> int:
                         open_panel("context")
                     elif value == "preset":
                         open_panel("preset")
+                    elif value == "timeout_profile":
+                        open_panel("timeout")
                     elif value in LLM_OPTION_TOGGLE_KEYS:
                         # Boolean toggles flip on Enter — no input prompt.
                         current = llm_option_current_bool(provider, pcfg, value)
@@ -10114,6 +10927,28 @@ def portable_prelaunch_menu() -> int:
                             messages = apply_llm_preset_config(provider, value)
                         except Exception as exc:
                             messages = [f"Preset failed: {type(exc).__name__}: {exc}"]
+                        refresh_checks()
+                        cfg = load_config()
+                        provider, pcfg = get_current_provider(cfg)
+                        panel = "options"
+                        panel_idx = panel_last_idx.get("options", 0)
+                        panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
+                        panel_idx = max(0, min(panel_idx, len(panel_rows) - 1))
+                        panel_last_idx["options"] = panel_idx
+                elif panel == "timeout":
+                    if value == "back":
+                        open_panel("options")
+                    elif value == "__info__":
+                        continue
+                    else:
+                        try:
+                            cfg = load_config()
+                            provider, pcfg = get_current_provider(cfg)
+                            messages = apply_timeout_profile_to_provider(pcfg, value, cfg.get("language", "en"))
+                            save_config(cfg)
+                            clear_model_cache()
+                        except Exception as exc:
+                            messages = [f"Timeout preset failed: {type(exc).__name__}: {exc}"]
                         refresh_checks()
                         cfg = load_config()
                         provider, pcfg = get_current_provider(cfg)
@@ -10212,21 +11047,6 @@ def should_attach_web_search(provider: str, cfg: dict[str, Any], override: bool 
     return provider != "anthropic" and bool(cfg.get("web_search", {}).get("auto_for_non_native", True))
 
 
-def should_disable_claude_skills(provider: str, cfg: dict[str, Any], override: bool | None) -> bool:
-    if override is not None:
-        return override
-    return provider != "anthropic" and bool(cfg.get("claude_code", {}).get("disable_skills_for_non_anthropic", False))
-
-
-def blocked_claude_skills(provider: str, cfg: dict[str, Any], override: bool | None) -> list[str]:
-    if provider == "anthropic" or override is False or should_disable_claude_skills(provider, cfg, override):
-        return []
-    blocked = cfg.get("claude_code", {}).get("blocked_skills_for_non_anthropic", ["keybindings-help"])
-    if not isinstance(blocked, list):
-        return []
-    return [str(name).strip() for name in blocked if str(name).strip()]
-
-
 def should_append_compat_prompt(provider: str, cfg: dict[str, Any]) -> bool:
     return provider != "anthropic" and bool(cfg.get("claude_code", {}).get("compat_prompt_for_non_anthropic", True))
 
@@ -10281,6 +11101,29 @@ def run_claude_update_check(claude: str, enabled: bool = True) -> None:
     if os.environ.get("CLAUDE_ANY_SKIP_CLAUDE_UPDATE") == "1":
         return
     print("Checking Claude Code update before launch...", flush=True)
+    current = claude_code_current_version(claude)
+    if current:
+        print(f"Current Claude Code version: {current}", flush=True)
+    npm = find_executable("npm")
+    if not npm:
+        print("Claude Code update check skipped: npm was not found.", flush=True)
+        return
+    package_spec = os.environ.get("CLAUDE_ANY_CLAUDE_CODE_PACKAGE", "@anthropic-ai/claude-code@latest")
+    latest = npm_latest_package_version(npm, package_spec)
+    if not latest:
+        print("Claude Code update check could not read the latest npm version; continuing.", flush=True)
+        return
+    if current and not version_newer(latest, current):
+        print(f"Claude Code is up to date ({current}).", flush=True)
+        return
+    current_label = current or "unknown"
+    print(f"Claude Code update available: {current_label} -> {latest}", flush=True)
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        print("Claude Code update requires confirmation; skipping in non-interactive mode.", flush=True)
+        return
+    answer = input("Update Claude Code now with `claude update`? [y/N] ").strip().lower()
+    if answer not in ("y", "yes"):
+        return
     update_env = os.environ.copy()
     local_bin = str(HOME / ".local" / "bin")
     update_env["PATH"] = local_bin + os.pathsep + update_env.get("PATH", "")
@@ -10294,16 +11137,20 @@ def run_claude_update_check(claude: str, enabled: bool = True) -> None:
             timeout=180,
         )
     except subprocess.TimeoutExpired:
-        print("Claude Code update check timed out; continuing with current version.", flush=True)
+        print("Claude Code update timed out; continuing with current version.", flush=True)
         return
     except Exception as exc:
-        print(f"Claude Code update check failed ({type(exc).__name__}); continuing.", flush=True)
+        print(f"Claude Code update failed ({type(exc).__name__}); continuing.", flush=True)
         return
     out = (p.stdout or "").strip()
     if out:
         print(out, flush=True)
     if p.returncode != 0:
-        print(f"Claude Code update check exited with {p.returncode}; continuing.", flush=True)
+        print(f"Claude Code update exited with {p.returncode}; continuing with current version.", flush=True)
+        return
+    new_version = claude_code_current_version(find_executable("claude") or claude)
+    if new_version:
+        print(f"Claude Code version after update: {new_version}", flush=True)
 
 
 def parse_version_tuple(value: str) -> tuple[int, ...]:
@@ -10321,6 +11168,40 @@ def version_newer(latest: str, current: str) -> bool:
     left.extend([0] * (size - len(left)))
     right.extend([0] * (size - len(right)))
     return tuple(left) > tuple(right)
+
+
+def npm_latest_package_version(npm: str, package_spec: str, timeout: float = 8.0) -> str:
+    try:
+        p = subprocess.run(
+            [npm, "view", package_spec, "version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except Exception:
+        return ""
+    if p.returncode != 0:
+        return ""
+    out = (p.stdout or "").strip()
+    return out.splitlines()[-1].strip() if out else ""
+
+
+def claude_code_current_version(claude: str) -> str:
+    try:
+        p = subprocess.run(
+            [claude, "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=8,
+        )
+    except Exception:
+        return ""
+    if p.returncode != 0:
+        return ""
+    match = re.search(r"\d+(?:\.\d+)+", p.stdout or "")
+    return match.group(0) if match else ""
 
 
 def running_from_npm_package() -> bool:
@@ -10344,19 +11225,7 @@ def run_claude_any_update_check(enabled: bool = True) -> bool:
     npm = find_executable("npm")
     if not npm:
         return False
-    try:
-        p = subprocess.run(
-            [npm, "view", "@oneciel-ai/claude-any@latest", "version"],
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            timeout=8,
-        )
-    except Exception:
-        return False
-    if p.returncode != 0:
-        return False
-    latest = (p.stdout or "").strip().splitlines()[-1].strip() if (p.stdout or "").strip() else ""
+    latest = npm_latest_package_version(npm, "@oneciel-ai/claude-any@latest")
     if not latest or not version_newer(latest, VERSION):
         return False
     print(f"Claude Any update available: {VERSION} -> {latest}", flush=True)
@@ -10397,7 +11266,6 @@ def launch_claude(
     skip_menu: bool = False,
     force_menu: bool = False,
     web_search_override: bool | None = None,
-    disable_skills_override: bool | None = None,
     update_check: bool = True,
     self_update_check: bool = True,
 ) -> int:
@@ -10455,16 +11323,6 @@ def launch_claude(
     extra_args: list[str] = []
     if should_attach_web_search(provider, cfg, web_search_override):
         extra_args.extend(["--mcp-config", str(write_duckduckgo_mcp_config(cfg))])
-    if (
-        should_disable_claude_skills(provider, cfg, disable_skills_override)
-        and "--disable-slash-commands" not in passthrough
-    ):
-        extra_args.append("--disable-slash-commands")
-    if should_disable_claude_skills(provider, cfg, disable_skills_override):
-        extra_args.extend(["--disallowedTools", "Skill"])
-    else:
-        for skill_name in blocked_claude_skills(provider, cfg, disable_skills_override):
-            extra_args.extend(["--disallowedTools", f"Skill({skill_name})"])
     if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(passthrough, "--system-prompt"):
         extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
     cmd = [
@@ -10524,6 +11382,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-max-output-tokens VALUE
   claude-any --ca-context-window VALUE
   claude-any --ca-request-timeout-ms VALUE
+  claude-any --ca-stream-idle-timeout-ms VALUE
   claude-any --ca-rate-limit-rpm VALUE
   claude-any --ca-rate-limit-status on|off
   claude-any --ca-stream on|off
@@ -10532,8 +11391,6 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-no-web-search      Disable DuckDuckGo MCP for this launch
   claude-any --ca-web-fetch          Enable fetch MCP
   claude-any --ca-no-web-fetch       Disable fetch MCP
-  claude-any --ca-disable-skills     Disable Claude Code skills for this launch
-  claude-any --ca-enable-skills      Keep Claude Code skills enabled for this launch
   claude-any --ca-no-self-update-check
                                       Skip Claude Any npm self-update check
   claude-any --ca-no-update-check    Skip Claude Code update check for this launch
@@ -10569,11 +11426,10 @@ def pop_headless_env_file_args(argv: list[str]) -> list[str]:
     return cleaned
 
 
-def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | None, bool | None, bool]:
+def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | None, bool]:
     skip_menu = os.environ.get("CLAUDE_ANY_SKIP_MENU") == "1"
     force_menu = bool(env_bool(os.environ.get("CLAUDE_ANY_FORCE_MENU"), False))
     web_search_override = env_bool(os.environ.get("CLAUDE_ANY_WEB_SEARCH"))
-    disable_skills_override = env_bool(os.environ.get("CLAUDE_ANY_DISABLE_SKILLS"))
     update_check_override = env_bool(os.environ.get("CLAUDE_ANY_UPDATE_CHECK"))
     self_update_check_override = env_bool(os.environ.get("CLAUDE_ANY_SELF_UPDATE_CHECK"))
     language = os.environ.get("CLAUDE_ANY_LANGUAGE", "").strip()
@@ -10617,6 +11473,7 @@ def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | 
         "CLAUDE_ANY_MAX_OUTPUT_TOKENS": "max_output_tokens",
         "CLAUDE_ANY_CONTEXT_WINDOW": "context_window",
         "CLAUDE_ANY_REQUEST_TIMEOUT_MS": "request_timeout_ms",
+        "CLAUDE_ANY_STREAM_IDLE_TIMEOUT_MS": "stream_idle_timeout_ms",
         "CLAUDE_ANY_RATE_LIMIT_RPM": "rate_limit_rpm",
         "CLAUDE_ANY_RATE_LIMIT_STATUS": "rate_limit_status",
         "CLAUDE_ANY_STREAM": "stream_enabled",
@@ -10639,7 +11496,7 @@ def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | 
     if ollama_values:
         cmd_ollama_options(argparse.Namespace(values=ollama_values))
         skip_menu = True
-    return skip_menu, web_search_override, disable_skills_override, update_check_override, self_update_check_override, force_menu
+    return skip_menu, web_search_override, update_check_override, self_update_check_override, force_menu
 
 
 def run_cli(argv: list[str]) -> int:
@@ -10744,7 +11601,7 @@ def run_cli(argv: list[str]) -> int:
             return 0
 
     passthrough: list[str] = []
-    skip_menu, web_search_override, disable_skills_override, update_check_override, self_update_check_override, force_menu = apply_headless_env_config()
+    skip_menu, web_search_override, update_check_override, self_update_check_override, force_menu = apply_headless_env_config()
     update_check = True
     if update_check_override is not None:
         update_check = update_check_override
@@ -10939,6 +11796,17 @@ def run_cli(argv: list[str]) -> int:
                 i += 1
             cmd_provider_options(argparse.Namespace(values=[f"request_timeout_ms={value}"]))
             skip_menu = True
+        elif arg == "--ca-stream-idle-timeout-ms" or arg.startswith("--ca-stream-idle-timeout-ms="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing value for --ca-stream-idle-timeout-ms")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            cmd_provider_options(argparse.Namespace(values=[f"stream_idle_timeout_ms={value}"]))
+            skip_menu = True
         elif arg == "--ca-rate-limit-rpm" or arg.startswith("--ca-rate-limit-rpm="):
             value = arg.split("=", 1)[1] if "=" in arg else None
             if value is None:
@@ -10999,14 +11867,6 @@ def run_cli(argv: list[str]) -> int:
             cmd_web_fetch(argparse.Namespace(value="off"))
             skip_menu = True
             i += 1
-        elif arg == "--ca-disable-skills":
-            disable_skills_override = True
-            skip_menu = True
-            i += 1
-        elif arg == "--ca-enable-skills":
-            disable_skills_override = False
-            skip_menu = True
-            i += 1
         elif arg == "--ca-no-update-check":
             update_check = False
             skip_menu = True
@@ -11032,7 +11892,6 @@ def run_cli(argv: list[str]) -> int:
         skip_menu=skip_menu,
         force_menu=force_menu,
         web_search_override=web_search_override,
-        disable_skills_override=disable_skills_override,
         update_check=update_check,
         self_update_check=self_update_check,
     )
