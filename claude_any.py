@@ -28,7 +28,6 @@ from typing import Any, Callable
 
 from claude_any_support.observability import EventBus, render_events_html
 from claude_any_support.transcript_filter import (
-    CLAUDE_CODE_TRANSCRIPT_EVENT_TYPES,
     is_claude_code_transcript_event,
 )
 

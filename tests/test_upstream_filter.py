@@ -1,6 +1,8 @@
 import claude_any
 import unittest
 
+from claude_any_support.transcript_filter import CLAUDE_CODE_TRANSCRIPT_EVENT_TYPES
+
 
 def converted_texts(messages):
     body = {"messages": messages}
@@ -16,7 +18,7 @@ def converted_openai_texts(messages):
 
 class UpstreamFilterTests(unittest.TestCase):
     def test_all_known_transcript_event_types_are_filtered(self):
-        for event_type in claude_any.CLAUDE_CODE_TRANSCRIPT_EVENT_TYPES:
+        for event_type in CLAUDE_CODE_TRANSCRIPT_EVENT_TYPES:
             with self.subTest(event_type=event_type):
                 messages = [
                     {"role": "user", "content": "real user prompt"},
