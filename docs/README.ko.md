@@ -55,7 +55,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.65`
+현재 버전: `0.1.66`
 
 ## 왜 만들었나
 
@@ -358,6 +358,14 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.66
+
+- **tmux/zsh TUI 입력 수정**: portable menu 입력 프롬프트가 이제 fragile한
+  terminal echo 복구에 의존하지 않고 raw terminal mode에서 직접 글자 표시,
+  붙여넣기, Backspace/Delete, Ctrl-U 전체 삭제를 처리합니다.
+- **Issue-linked release flow**: GitHub release/manual dispatch 외에도 `v*`
+  태그 push로 npm publish workflow를 자동 트리거할 수 있습니다.
 
 ### 0.1.65
 

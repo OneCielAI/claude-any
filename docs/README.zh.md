@@ -55,7 +55,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.65`
+当前版本: `0.1.66`
 
 ## 为什么存在
 
@@ -344,6 +344,14 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.66
+
+- **修复 tmux/zsh 下的 TUI 输入**：portable menu 的输入提示现在不再依赖脆弱的
+  terminal echo 恢复，而是在 raw terminal mode 中直接处理文字显示、粘贴、
+  Backspace/Delete 和 Ctrl-U 清空。
+- **Issue-linked release flow**：除了 GitHub release/manual dispatch，现在推送
+  `v*` 标签也会自动触发 npm publish workflow。
 
 ### 0.1.65
 

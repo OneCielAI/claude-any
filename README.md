@@ -56,7 +56,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.65`
+Current version: `0.1.66`
 
 ## Why This Exists
 
@@ -392,6 +392,15 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.66
+
+- **TUI input fix for tmux/zsh**: portable menu prompts now handle visible text,
+  paste, Backspace/Delete, and Ctrl-U directly in raw terminal mode instead of
+  depending on fragile terminal echo restoration.
+- **Issue-linked release flow**: npm publishing can now be triggered
+  automatically by pushing a `v*` tag, in addition to GitHub releases and manual
+  workflow dispatch.
 
 ### 0.1.65
 

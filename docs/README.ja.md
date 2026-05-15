@@ -55,7 +55,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.65`
+現在のバージョン: `0.1.66`
 
 ## 作られた理由
 
@@ -358,6 +358,14 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.66
+
+- **tmux/zsh の TUI 入力修正**: portable menu の入力プロンプトは、壊れやすい
+  terminal echo 復旧に依存せず、raw terminal mode で文字表示、貼り付け、
+  Backspace/Delete、Ctrl-U の全消去を直接処理します。
+- **Issue-linked release flow**: GitHub release/manual dispatch に加えて、
+  `v*` タグ push でも npm publish workflow を自動トリガーできます。
 
 ### 0.1.65
 
