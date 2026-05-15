@@ -25,6 +25,12 @@
 
 ## 今日新增的 3 个最大收益
 
+### 2026-05-15
+
+1. **Router 管理页改为菜单式** — 内置 router 首页拆分为 Overview、LLM Settings、Events、Endpoints 顶部菜单，不再把所有内容堆在一个长页面里。
+2. **更安全的远程调试暴露** — router 外部访问默认 off，只有显式确认的 toggle 才会启用。可在 Claude Code 中用 `/router-debug` 切换，并自动重启 router 以立即应用 bind 地址。
+3. **面向运维的可观测性与实时设置** — 结构化 event 页面和 live LLM 设置 UI 让长时间 Claude Code 会话无需手动编辑 config 文件也能监控和调整。
+
 ### 2026-05-14
 
 1. **Plan Mode 循环恢复基于语义，而不是硬编码次数** — 对 unchanged `Read` 结果，会结合上一次有效观察和当前 Plan Mode 状态进行转换，让 Claude Code 能进入 `ExitPlanMode` 或下一步实际操作，而不是反复读取同一片段。
@@ -55,7 +61,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.67`
+当前版本: `0.1.68`
 
 ## 为什么存在
 
@@ -344,6 +350,12 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.68
+
+- **标签式 router 管理页**：router 根页面拆分为 Overview、LLM Settings、Events、Endpoints 顶部菜单，让远程管理界面随着功能增加仍然易于使用。
+- **安全的 `/router-debug` toggle**：外部 router 暴露默认 off，并且必须有显式确认值才会启用。可在 Claude Code 中用 `/router-debug` 切换，router 会自动重启以立即改变 bind 地址。
+- **main 分支 npm 自动化**：push/merge 到 `main` 会触发 npm publish workflow；如果相同 package version 已经存在于 npm，则跳过重复 publish。
 
 ### 0.1.67
 

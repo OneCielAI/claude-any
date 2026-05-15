@@ -7,6 +7,11 @@ $binDir = Join-Path $prefix "bin"
 New-Item -ItemType Directory -Force -Path $shareDir, $binDir | Out-Null
 
 Copy-Item -Force "claude_any.py" (Join-Path $shareDir "claude_any.py")
+$supportDir = Join-Path $shareDir "claude_any_support"
+if (Test-Path $supportDir) {
+    Remove-Item -Recurse -Force $supportDir
+}
+Copy-Item -Recurse -Force "claude_any_support" $supportDir
 Copy-Item -Force "claude-any-menu.py" (Join-Path $binDir "claude-any-menu.py")
 Copy-Item -Force "claude-any-tool-guard.py" (Join-Path $binDir "claude-any-tool-guard.py")
 Copy-Item -Force "claude-any" (Join-Path $binDir "claude-any")

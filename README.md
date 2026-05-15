@@ -25,6 +25,12 @@
 
 ## Today's Top 3 Benefits
 
+### 2026-05-15
+
+1. **Router management is now navigable** — the built-in router home page is split into top-menu sections for Overview, LLM Settings, Events, and Endpoints instead of crowding everything into one long screen.
+2. **Safer remote debug exposure** — router external access is off by default, requires an explicit confirmed toggle, can be switched with `/router-debug`, restarts the router to apply the bind address, and shows `debug external` in the Claude Code status line when enabled.
+3. **Operator-grade observability and live settings** — the router now exposes structured event views plus live LLM setting controls, making long Claude Code sessions easier to monitor, tune, and debug without editing config files by hand.
+
 ### 2026-05-14
 
 1. **Plan Mode loop recovery is semantic, not hard-coded** — unchanged `Read` results are now converted with the previous authoritative observation and current Plan Mode state, so Claude Code can move to `ExitPlanMode` or the next real step instead of rereading the same slice.
@@ -56,7 +62,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.67`
+Current version: `0.1.68`
 
 ## Why This Exists
 
@@ -392,6 +398,19 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.68
+
+- **Tabbed router management page**: the router root page now has top-menu
+  sections for Overview, LLM Settings, Events, and Endpoints, keeping remote
+  management usable as more controls are added.
+- **Safe `/router-debug` toggle**: external router exposure is off by default,
+  requires an explicit confirmed setting, can be toggled inside Claude Code
+  with `/router-debug`, and automatically restarts the router so the bind
+  address changes immediately.
+- **Main-branch npm automation**: pushing or merging to `main` now triggers the
+  npm publish workflow, but the workflow first checks whether the package
+  version already exists on npm and skips duplicate publishes.
 
 ### 0.1.67
 

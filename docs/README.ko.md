@@ -25,6 +25,12 @@
 
 ## 오늘 추가된 최고의 3가지 베네핏
 
+### 2026-05-15
+
+1. **Router 관리 페이지가 메뉴형으로 정리** — 내장 router 홈 화면을 Overview, LLM Settings, Events, Endpoints 상단 메뉴로 나눠 모든 정보가 한 화면에 길게 쌓이지 않도록 했습니다.
+2. **더 안전한 원격 디버그 노출** — router 외부 접속은 기본 off이며, 명시적으로 확인된 토글이 있어야 켜집니다. Claude Code 안에서 `/router-debug`로 켜고 끌 수 있고, bind 주소가 즉시 반영되도록 router를 자동 재시작합니다.
+3. **운영자용 관측성과 실시간 설정** — 구조화된 event 화면과 live LLM 설정 UI를 제공해 긴 Claude Code 세션을 config 파일 편집 없이 모니터링하고 조정할 수 있습니다.
+
 ### 2026-05-14
 
 1. **Plan Mode 루프 복구를 하드코딩이 아닌 의미 기반으로 처리** — 변경 없는 `Read` 결과를 이전의 권위 있는 관측값과 현재 Plan Mode 상태로 변환해, Claude Code가 같은 구간을 반복해서 읽지 않고 `ExitPlanMode` 또는 다음 실제 단계로 넘어갈 수 있습니다.
@@ -55,7 +61,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.67`
+현재 버전: `0.1.68`
 
 ## 왜 만들었나
 
@@ -358,6 +364,12 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.68
+
+- **탭형 router 관리 페이지**: router 루트 페이지를 Overview, LLM Settings, Events, Endpoints 상단 메뉴로 분리해 원격 관리 화면이 커져도 다루기 쉽게 했습니다.
+- **안전한 `/router-debug` 토글**: 외부 router 노출은 기본 off이며, 명시 확인값이 같이 있어야 켜집니다. Claude Code 안에서 `/router-debug`로 토글할 수 있고, bind 주소가 바로 바뀌도록 router가 자동 재시작됩니다.
+- **main 브랜치 npm 자동화**: `main`으로 push/merge되면 npm publish workflow가 트리거됩니다. 단, 같은 package version이 이미 npm에 있으면 중복 publish를 건너뜁니다.
 
 ### 0.1.67
 

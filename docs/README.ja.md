@@ -25,6 +25,12 @@
 
 ## 今日追加されたトップ 3 ベネフィット
 
+### 2026-05-15
+
+1. **Router 管理ページをメニュー化** — 組み込み router ホームを Overview、LLM Settings、Events、Endpoints の上部メニューに分割し、すべてが長い 1 画面に並ばないようにしました。
+2. **より安全なリモートデバッグ公開** — router 外部アクセスは既定で off です。明示的に確認された toggle がある場合だけ有効になり、Claude Code 内の `/router-debug` で切り替えでき、bind アドレスを即時反映するため router を自動再起動します。
+3. **運用向け observability とリアルタイム設定** — 構造化 event 画面と live LLM 設定 UI により、長い Claude Code セッションを config ファイル編集なしで監視・調整できます。
+
 ### 2026-05-14
 
 1. **Plan Mode ループ復旧をハードコードではなく意味ベースで処理** — 変更なしの `Read` 結果を、直前の有効な観測結果と現在の Plan Mode 状態に変換するため、Claude Code は同じ範囲を読み続けずに `ExitPlanMode` または次の実作業へ進めます。
@@ -55,7 +61,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.67`
+現在のバージョン: `0.1.68`
 
 ## 作られた理由
 
@@ -358,6 +364,12 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.68
+
+- **タブ式 router 管理ページ**: router ルートページを Overview、LLM Settings、Events、Endpoints の上部メニューに分割し、リモート管理画面が大きくなっても扱いやすくしました。
+- **安全な `/router-debug` toggle**: 外部 router 公開は既定で off で、明示確認値が一緒にある場合のみ有効です。Claude Code 内で `/router-debug` により toggle でき、bind アドレスがすぐ変わるよう router が自動再起動します。
+- **main ブランチ npm 自動化**: `main` への push/merge で npm publish workflow がトリガーされます。同じ package version が既に npm にある場合は重複 publish をスキップします。
 
 ### 0.1.67
 
