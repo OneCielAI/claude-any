@@ -95,7 +95,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.65"
+VERSION = "0.1.66"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -10589,6 +10589,77 @@ def render_prelaunch_screen(
     return False
 
 
+def _prompt_menu_value_raw(label: str, default: str = "", secret: bool = False) -> str | None:
+    if os.name == "nt" or not sys.stdin.isatty():
+        return None
+    try:
+        import codecs
+        import termios
+    except Exception:
+        return None
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+        new_settings = termios.tcgetattr(fd)
+        new_settings[3] = new_settings[3] & ~(termios.ECHO | termios.ICANON)
+        new_settings[6][termios.VMIN] = 1
+        new_settings[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, new_settings)
+    except Exception:
+        return None
+
+    chars: list[str] = []
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    try:
+        sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
+        sys.stdout.flush()
+        while True:
+            b = os.read(fd, 1)
+            if not b:
+                continue
+            if b in (b"\r", b"\n"):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                break
+            if b in (b"\x03",):
+                raise KeyboardInterrupt
+            if b in (b"\x04", b"\x1b"):
+                sys.stdout.write("\n")
+                sys.stdout.flush()
+                return default
+            if b in (b"\x7f", b"\x08"):
+                if chars:
+                    chars.pop()
+                    if not secret:
+                        sys.stdout.write("\b \b")
+                        sys.stdout.flush()
+                continue
+            if b == b"\x15":
+                if chars and not secret:
+                    sys.stdout.write("\b \b" * len(chars))
+                    sys.stdout.flush()
+                chars.clear()
+                continue
+            if b < b" ":
+                continue
+            text = decoder.decode(b)
+            if not text:
+                continue
+            for ch in text:
+                if ch in ("\ufffd", "\r", "\n"):
+                    continue
+                chars.append(ch)
+                if not secret:
+                    sys.stdout.write(ch)
+                    sys.stdout.flush()
+        return "".join(chars).strip() or default
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+        except Exception:
+            pass
+
+
 def prompt_menu_value(prompt: str, default: str = "", secret: bool = False, restore_tty: Callable[[], None] | None = None, raw_tty: Callable[[], None] | None = None) -> str:
     label = f"{prompt}"
     if default:
@@ -10599,13 +10670,17 @@ def prompt_menu_value(prompt: str, default: str = "", secret: bool = False, rest
     if sys.stdout.isatty():
         sys.stdout.write("\033[?25h")
         sys.stdout.flush()
-    sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
-    sys.stdout.flush()
     try:
-        if secret:
-            value = getpass.getpass("")
+        raw_value = _prompt_menu_value_raw(label, default, secret)
+        if raw_value is not None:
+            value = raw_value
         else:
-            value = input()
+            sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
+            sys.stdout.flush()
+            if secret:
+                value = getpass.getpass("")
+            else:
+                value = input()
     finally:
         if sys.stdout.isatty():
             sys.stdout.write("\033[?25l")
