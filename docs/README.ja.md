@@ -55,7 +55,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.66`
+現在のバージョン: `0.1.67`
 
 ## 作られた理由
 
@@ -358,6 +358,14 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.67
+
+- **高速な prelaunch ナビゲーション**: arrow-key redraw は `mode:` ラベルを
+  描画するためだけに router `/health` endpoint を呼ばなくなり、router が停止中
+  または遅い場合でもキー入力ごとの遅延を避けます。
+- **貼り付け遅延を低減**: portable raw 入力プロンプトは貼り付け burst をまとめて
+  drain し、文字ごとではなく batch ごとに flush します。
 
 ### 0.1.66
 

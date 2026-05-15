@@ -95,7 +95,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.66"
+VERSION = "0.1.67"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -7183,21 +7183,24 @@ def cmd_ollama_catalog(args: argparse.Namespace) -> None:
     print(f"Context windows: {context_count}/{len(models)}")
 
 
+def provider_mode_label(provider: str, pcfg: dict[str, Any]) -> str:
+    if native_anthropic_enabled(provider):
+        return "anthropic-native"
+    if ollama_native_compat_enabled(provider, pcfg):
+        return "ollama-native"
+    if vllm_native_compat_enabled(provider, pcfg):
+        return "vllm-native"
+    if nim_native_compat_enabled(provider, pcfg):
+        return "nim-native"
+    if nvidia_hosted_native_compat_enabled(provider, pcfg):
+        return "nvidia-native"
+    return "claude-any-router"
+
+
 def status_lines() -> list[str]:
     cfg = load_config()
     provider, pcfg = get_current_provider(cfg)
-    if native_anthropic_enabled(provider):
-        mode = "anthropic-native"
-    elif ollama_native_compat_enabled(provider, pcfg):
-        mode = "ollama-native"
-    elif vllm_native_compat_enabled(provider, pcfg):
-        mode = "vllm-native"
-    elif nim_native_compat_enabled(provider, pcfg):
-        mode = "nim-native"
-    elif nvidia_hosted_native_compat_enabled(provider, pcfg):
-        mode = "nvidia-native"
-    else:
-        mode = "claude-any-router"
+    mode = provider_mode_label(provider, pcfg)
     direct_native = mode != "claude-any-router"
     return [
         f"provider: {provider}",
@@ -10501,7 +10504,7 @@ def render_prelaunch_screen(
         padding = " " * max(0, render_width - cell_width(visible))
         screen.append(rendered_text + padding)
 
-    mode_line = next((line for line in status_lines() if line.startswith("mode:")), "mode: claude-any-router")
+    mode_line = f"mode: {provider_mode_label(provider, pcfg)}"
     title_text = f"Claude Any v{VERSION}"
     add_rendered(title_text, animated_ansi_text(title_text))
     add(CREDITS, "2")
@@ -10594,6 +10597,7 @@ def _prompt_menu_value_raw(label: str, default: str = "", secret: bool = False) 
         return None
     try:
         import codecs
+        import select
         import termios
     except Exception:
         return None
@@ -10614,44 +10618,61 @@ def _prompt_menu_value_raw(label: str, default: str = "", secret: bool = False) 
         sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
         sys.stdout.flush()
         while True:
-            b = os.read(fd, 1)
-            if not b:
+            first = os.read(fd, 1)
+            if not first:
                 continue
-            if b in (b"\r", b"\n"):
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                break
-            if b in (b"\x03",):
-                raise KeyboardInterrupt
-            if b in (b"\x04", b"\x1b"):
-                sys.stdout.write("\n")
-                sys.stdout.flush()
-                return default
-            if b in (b"\x7f", b"\x08"):
-                if chars:
-                    chars.pop()
-                    if not secret:
-                        sys.stdout.write("\b \b")
-                        sys.stdout.flush()
-                continue
-            if b == b"\x15":
-                if chars and not secret:
-                    sys.stdout.write("\b \b" * len(chars))
+            data = bytearray(first)
+            try:
+                while select.select([fd], [], [], 0)[0]:
+                    more = os.read(fd, 4096)
+                    if not more:
+                        break
+                    data.extend(more)
+            except Exception:
+                pass
+
+            display: list[str] = []
+            done = False
+            for byte in data:
+                b = bytes((byte,))
+                if b in (b"\r", b"\n"):
+                    display.append("\n")
+                    done = True
+                    break
+                if b in (b"\x03",):
+                    raise KeyboardInterrupt
+                if b in (b"\x04", b"\x1b"):
+                    display.append("\n")
+                    sys.stdout.write("".join(display))
                     sys.stdout.flush()
-                chars.clear()
-                continue
-            if b < b" ":
-                continue
-            text = decoder.decode(b)
-            if not text:
-                continue
-            for ch in text:
-                if ch in ("\ufffd", "\r", "\n"):
+                    return default
+                if b in (b"\x7f", b"\x08"):
+                    if chars:
+                        chars.pop()
+                        if not secret:
+                            display.append("\b \b")
                     continue
-                chars.append(ch)
-                if not secret:
-                    sys.stdout.write(ch)
-                    sys.stdout.flush()
+                if b == b"\x15":
+                    if chars and not secret:
+                        display.append("\b \b" * len(chars))
+                    chars.clear()
+                    continue
+                if byte < 0x20:
+                    continue
+                text = decoder.decode(b)
+                if not text:
+                    continue
+                for ch in text:
+                    if ch in ("\ufffd", "\r", "\n"):
+                        continue
+                    chars.append(ch)
+                    if not secret:
+                        display.append(ch)
+            if display:
+                sys.stdout.write("".join(display))
+                sys.stdout.flush()
+            if done:
+                break
         return "".join(chars).strip() or default
     finally:
         try:

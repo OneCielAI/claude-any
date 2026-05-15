@@ -55,7 +55,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.66`
+当前版本: `0.1.67`
 
 ## 为什么存在
 
@@ -344,6 +344,13 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.67
+
+- **更快的 prelaunch 导航**：方向键 redraw 不再为了渲染 `mode:` 标签而调用
+  router `/health` endpoint，因此 router 停止或响应较慢时也不会每次按键都卡顿。
+- **降低粘贴延迟**：portable raw 输入提示会一次性 drain 粘贴 burst，并按 batch
+  flush，而不是每个字符 flush 一次。
 
 ### 0.1.66
 

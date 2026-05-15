@@ -56,7 +56,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.66`
+Current version: `0.1.67`
 
 ## Why This Exists
 
@@ -392,6 +392,14 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.67
+
+- **Fast prelaunch navigation**: arrow-key redraws no longer call the router
+  `/health` endpoint just to render the `mode:` label, avoiding per-keystroke
+  delays when the router is stopped or slow.
+- **Lower-latency paste handling**: portable raw input prompts drain pasted
+  bursts and flush once per batch instead of once per character.
 
 ### 0.1.66
 
