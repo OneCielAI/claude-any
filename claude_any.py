@@ -9445,6 +9445,29 @@ def auto_apply_recommended_llm_preset_for_model(provider: str, pcfg: dict[str, A
     return lines
 
 
+def apply_auto_llm_options_config(model_id: str | None = None) -> list[str]:
+    if model_id and model_id.strip():
+        return set_model_config(model_id.strip())
+    cfg = load_config()
+    provider, pcfg = get_current_provider(cfg)
+    model = str(pcfg.get("current_model") or "").strip()
+    if model:
+        context_msgs = sync_ollama_library_context_limit(provider, pcfg, model)
+        context_msgs.extend(cap_context_settings_to_model_capacity(provider, pcfg))
+    else:
+        context_msgs = []
+    preset_id = recommended_preset_id(provider, pcfg)
+    if not preset_available_for_model(provider, pcfg, preset_id):
+        preset_id = applied_preset_id(provider, pcfg)
+    label = llm_preset_text(preset_id, cfg.get("language", "en"))[0]
+    lines = [f"Auto LLM options applied for {provider}{f' model {model}' if model else ''}: {label}."]
+    lines.extend(context_msgs)
+    lines.extend(apply_llm_preset_to_provider(provider, pcfg, preset_id, cfg.get("language", "en")))
+    save_config(cfg)
+    clear_model_cache()
+    return lines
+
+
 def apply_llm_preset_config(provider: str, preset_id: str) -> list[str]:
     cfg = load_config()
     pcfg = cfg["providers"][provider]
@@ -12173,6 +12196,72 @@ def run_claude_any_update_check(enabled: bool = True) -> bool:
     return True
 
 
+def run_command_for_upgrade(cmd: list[str], timeout: float = 300.0) -> tuple[int, str]:
+    try:
+        proc = subprocess.run(
+            cmd,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return 124, "timed out"
+    except Exception as exc:
+        return 1, f"{type(exc).__name__}: {exc}"
+    return proc.returncode, (proc.stdout or "").strip()
+
+
+def quiet_upgrade_claude_any() -> int:
+    npm = find_executable("npm")
+    if not npm:
+        print("Claude Any update skipped: npm was not found.", flush=True)
+        return 1
+    latest = npm_latest_package_version(npm, "@oneciel-ai/claude-any@latest")
+    if latest and not version_newer(latest, VERSION):
+        print(f"Claude Any is up to date ({VERSION}).", flush=True)
+        return 0
+    target = latest or "latest"
+    print(f"Updating Claude Any to {target}...", flush=True)
+    rc, out = run_command_for_upgrade([npm, "install", "-g", "@oneciel-ai/claude-any@latest"], timeout=300)
+    if out:
+        print(out, flush=True)
+    if rc != 0:
+        print(f"Claude Any update failed ({rc}).", flush=True)
+    return rc
+
+
+def quiet_upgrade_claude_code() -> int:
+    claude = find_executable("claude")
+    if not claude:
+        print("Claude Code update skipped: claude executable was not found.", flush=True)
+        return 1
+    current = claude_code_current_version(claude)
+    npm = find_executable("npm")
+    latest = ""
+    if npm:
+        package_spec = os.environ.get("CLAUDE_ANY_CLAUDE_CODE_PACKAGE", "@anthropic-ai/claude-code@latest")
+        latest = npm_latest_package_version(npm, package_spec)
+    if current and latest and not version_newer(latest, current):
+        print(f"Claude Code is up to date ({current}).", flush=True)
+        return 0
+    target = latest or "latest"
+    current_label = current or "unknown"
+    print(f"Updating Claude Code ({current_label} -> {target})...", flush=True)
+    rc, out = run_command_for_upgrade([claude, "update"], timeout=180)
+    if out:
+        print(out, flush=True)
+    if rc != 0:
+        print(f"Claude Code update failed ({rc}).", flush=True)
+    return rc
+
+
+def run_quiet_upgrade_and_exit() -> int:
+    any_rc = quiet_upgrade_claude_any()
+    claude_rc = quiet_upgrade_claude_code()
+    return 0 if any_rc == 0 and claude_rc == 0 else 1
+
+
 def launch_claude(
     passthrough: list[str],
     skip_menu: bool = False,
@@ -12181,6 +12270,9 @@ def launch_claude(
     update_check: bool = True,
     self_update_check: bool = True,
 ) -> int:
+    if has_noninteractive_claude_args(passthrough):
+        update_check = False
+        self_update_check = False
     run_claude_any_update_check(enabled=self_update_check)
     rc = run_prelaunch_menu(passthrough, skip_menu=skip_menu, force_menu=force_menu)
     if rc == 10:
@@ -12284,6 +12376,8 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-base-url URL       Set current provider base URL, then launch
   claude-any --ca-model MODEL_ID     Set provider model, then launch
   claude-any --ca-advisor-model MODEL_ID
+  claude-any --ca-auto-llm-options [MODEL_ID]
+                                      Apply recommended LLM options for MODEL_ID or the saved model
   claude-any --ca-api-key KEY        Set current provider API key, then launch
   claude-any --ca-api-key-env ENVVAR Set current provider API key from env, then launch
   claude-any --ca-set-api-key PROVIDER KEY
@@ -12306,6 +12400,8 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-no-self-update-check
                                       Skip Claude Any npm self-update check
   claude-any --ca-no-update-check    Skip Claude Code update check for this launch
+  claude-any --ca-upgrade-and-exit   Update Claude Any and Claude Code without prompts, then exit
+  claude-any --ca-no-launch          Apply setup flags/env values, then exit without launching Claude
   claude-any --ca-stop               Stop router/proxy
   claude-any --                      Pass all following args directly to Claude Code
 
@@ -12416,6 +12512,8 @@ def run_cli(argv: list[str]) -> int:
         print(cli_usage())
         return 0
     argv = pop_headless_env_file_args(argv)
+    if any(arg in ("--ca-upgrade-and-exit", "--ca-quiet-upgrade", "--ca-upgrade-exit") for arg in argv):
+        return run_quiet_upgrade_and_exit()
     if argv:
         head, rest = argv[0], argv[1:]
         if head in ("version", "--version", "-v"):
@@ -12513,6 +12611,9 @@ def run_cli(argv: list[str]) -> int:
             return 0
 
     passthrough: list[str] = []
+    configure_only = False
+    auto_llm_options = False
+    auto_llm_model: str | None = None
     skip_menu, web_search_override, update_check_override, self_update_check_override, force_menu = apply_headless_env_config()
     update_check = True
     if update_check_override is not None:
@@ -12525,6 +12626,10 @@ def run_cli(argv: list[str]) -> int:
         arg = argv[i]
         if arg in ("--ca-menu", "--ca-interactive"):
             force_menu = True
+            i += 1
+        elif arg in ("--ca-no-launch", "--ca-configure-only", "--ca-setup-only"):
+            configure_only = True
+            skip_menu = True
             i += 1
         elif arg == "--ca-language" or arg.startswith("--ca-language="):
             value = arg.split("=", 1)[1] if "=" in arg else None
@@ -12589,6 +12694,19 @@ def run_cli(argv: list[str]) -> int:
                 i += 1
             for line in set_advisor_model_config(value):
                 print(line)
+            skip_menu = True
+        elif arg in ("--ca-auto-llm-options", "--ca-auto-llm", "--ca-recommended-llm") or arg.startswith(
+            ("--ca-auto-llm-options=", "--ca-auto-llm=", "--ca-recommended-llm=")
+        ):
+            auto_llm_options = True
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None and i + 1 < len(argv) and not argv[i + 1].startswith("--"):
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            if value:
+                auto_llm_model = value
             skip_menu = True
         elif arg == "--ca-models":
             cmd_models(argparse.Namespace(provider=None))
@@ -12799,6 +12917,11 @@ def run_cli(argv: list[str]) -> int:
         else:
             passthrough.append(arg)
             i += 1
+    if auto_llm_options:
+        for line in apply_auto_llm_options_config(auto_llm_model):
+            print(line)
+    if configure_only:
+        return 0
     return launch_claude(
         passthrough,
         skip_menu=skip_menu,

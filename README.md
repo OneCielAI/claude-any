@@ -129,6 +129,33 @@ claude-any --ca-provider ollama-cloud --ca-model glm-5.1
 claude-any --ca-provider ollama --ca-base-url http://127.0.0.1:11434 --ca-model qwen3-coder
 ```
 
+Apply settings only, without launching Claude Code:
+
+```sh
+claude-any --ca-provider ollama-cloud --ca-model deepseek-v4-flash --ca-context-window 1048576 --ca-request-timeout-ms 300000 --ca-no-launch
+```
+
+Apply the recommended LLM options for the saved provider/model, then exit:
+
+```sh
+claude-any --ca-auto-llm-options --ca-no-launch
+```
+
+Apply the recommended LLM options for a specific model name, then exit:
+
+```sh
+claude-any --ca-provider ollama-cloud --ca-auto-llm-options deepseek-v4-flash --ca-no-launch
+```
+
+```sh
+claude-any --ca-env-file .env.claude-any --ca-no-launch
+```
+
+This is useful for remote provisioning, CI setup, base image preparation, or a
+parent agent that wants to configure Claude Any once and launch Claude Code in a
+separate step. Without `--ca-no-launch`, Claude Any applies the settings and
+then launches Claude Code as usual.
+
 Run one non-interactive Claude Code prompt:
 
 ```sh
@@ -145,6 +172,30 @@ Configure every launch option with flags:
 
 ```sh
 claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 120000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+```
+
+Full Ollama Cloud 1M-context setup with flags:
+
+```sh
+claude-any --ca-provider ollama-cloud --ca-base-url https://ollama.com --ca-model deepseek-v4-flash --ca-advisor-model deepseek-v4-pro --ca-api-key-env OLLAMA_API_KEY --ca-context-window 1048576 --ca-max-output-tokens 8192 --ca-request-timeout-ms 300000 --ca-stream on --ca-stream-word-chunking off --ca-rate-limit-rpm 0 --ca-rate-limit-status on -p "Create an implementation plan." --output-format text
+```
+
+The same setup can let Claude Any choose the model's recommended LLM options:
+
+```sh
+claude-any --ca-provider ollama-cloud --ca-base-url https://ollama.com --ca-auto-llm-options deepseek-v4-flash --ca-advisor-model deepseek-v4-pro --ca-api-key-env OLLAMA_API_KEY --ca-stream on --ca-rate-limit-status on -p "Create an implementation plan." --output-format text
+```
+
+Full local Ollama setup with flags:
+
+```sh
+claude-any --ca-provider ollama --ca-base-url http://127.0.0.1:11434 --ca-model qwen3-coder --ca-ollama-num-ctx auto --ca-ollama-ctx-range 65536 262144 --ca-request-timeout-ms 180000 --ca-stream on --ca-no-update-check -p "Inspect the current project and summarize risks." --output-format text
+```
+
+Full NVIDIA hosted setup with rate-limit management:
+
+```sh
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-context-window 65536 --ca-max-output-tokens 4096 --ca-request-timeout-ms 180000 --ca-stream on --ca-rate-limit-rpm 40 --ca-rate-limit-status on -p "Review this repository and list next actions." --output-format text
 ```
 
 Or put the same values in environment variables:
@@ -164,17 +215,56 @@ export CLAUDE_ANY_RATE_LIMIT_STATUS=on
 claude-any -p "Reply with OK only." --output-format text
 ```
 
-For `.env` driven runs, save the same `CLAUDE_ANY_*` values in a file and pass
-it explicitly:
+For `.env` driven runs, save the same `CLAUDE_ANY_*` values in a file:
+
+```dotenv
+CLAUDE_ANY_SKIP_MENU=1
+CLAUDE_ANY_PROVIDER=ollama-cloud
+CLAUDE_ANY_BASE_URL=https://ollama.com
+CLAUDE_ANY_MODEL=deepseek-v4-flash
+CLAUDE_ANY_ADVISOR_MODEL=deepseek-v4-pro
+CLAUDE_ANY_API_KEY_ENV=OLLAMA_API_KEY
+CLAUDE_ANY_CONTEXT_WINDOW=1048576
+CLAUDE_ANY_MAX_OUTPUT_TOKENS=8192
+CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
+CLAUDE_ANY_STREAM=on
+CLAUDE_ANY_STREAM_WORD_CHUNKING=off
+CLAUDE_ANY_RATE_LIMIT_RPM=0
+CLAUDE_ANY_RATE_LIMIT_STATUS=on
+CLAUDE_ANY_WEB_SEARCH=on
+CLAUDE_ANY_WEB_FETCH=on
+CLAUDE_ANY_SELF_UPDATE_CHECK=off
+CLAUDE_ANY_UPDATE_CHECK=off
+```
+
+Then apply and launch:
 
 ```sh
 claude-any --ca-env-file .env.claude-any -p "Reply with OK only." --output-format text
+```
+
+Or apply only and exit:
+
+```sh
+claude-any --ca-env-file .env.claude-any --ca-no-launch
+```
+
+You can also use a CLI flag to override one `.env` value for a single run:
+
+```sh
+claude-any --ca-env-file .env.claude-any --ca-model glm-5.1 -p "Use the overridden model for this run." --output-format text
 ```
 
 Override order is deterministic: saved user choices from the menu are the
 baseline, OS environment variables override them, `--ca-env-file` values
 override the OS environment, CLI `--ca-*` parameters override the env file, and
 `--ca-menu` lets the final interactive menu choice override everything.
+
+Quietly upgrade Claude Any and Claude Code, then exit without launching Claude:
+
+```sh
+claude-any --ca-upgrade-and-exit
+```
 
 Headless coverage checklist: provider, base URL, model, Advisor model, API key
 or API-key environment variable, max output, context window, request timeout,
