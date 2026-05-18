@@ -95,6 +95,12 @@ PROVIDER_LABELS = {
     "nvidia-hosted": "Nvidia Hosted",
     "self-hosted-nim": "Self Hosted NIM",
 }
+OFFICIAL_CHANNEL_PLUGINS = {
+    "telegram": "plugin:telegram@claude-plugins-official",
+    "discord": "plugin:discord@claude-plugins-official",
+    "imessage": "plugin:imessage@claude-plugins-official",
+    "fakechat": "plugin:fakechat@claude-plugins-official",
+}
 APP_NAME = "Claude Any"
 VERSION = "0.1.71"
 CREDITS = "Credits: One Ciel LLC"
@@ -116,7 +122,6 @@ _CHANNEL_SSE_LOCK = threading.Lock()
 _CHANNEL_SSE_CONNECTIONS: dict[str, dict[str, Any]] = {}
 EVENT_BUS = EventBus()
 ADVISOR_FEEDBACK_MARKER = "CLAUDE_ANY_ADVISOR_FEEDBACK"
-CHANNEL_BRIDGE_MARKER = "CLAUDE_ANY_CHANNEL_BRIDGE"
 PLAN_GUARD_MARKER = "[claude-any-plan-guard]"
 TASK_UPDATE_STATUSES = {"pending", "in_progress", "completed", "deleted"}
 TASK_UPDATE_STATUS_ALIASES = {
@@ -189,8 +194,6 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "TaskList: no input. TaskUpdate: taskId (string), optional status enum exactly one of pending, in_progress, completed, deleted. "
     "CronCreate: cron (standard 5-field local-time cron string), prompt (string), optional recurring (boolean), optional durable (boolean). "
     "CronDelete: id (string returned by CronCreate). CronList: no input. "
-    "Claude Any channel bridge: external systems can post messages to /ca/channel/messages or /ca/channel/notify. "
-    "Use /channel status, /channel poll, or /channel wait to inspect bridge messages when the user asks about external channels. "
     "Never write pseudo tool calls, partial JSON, or markdown code fences when a real Claude Code tool call is required."
 )
 LANGUAGES = {
@@ -1248,6 +1251,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "router_debug_message_preview_chars": 0,
     "claude_code": {
         "compat_prompt_for_non_anthropic": True,
+        "channels": [],
+        "development_channels": False,
     },
     "cleanup": {
         "managed_services_on_launch": True,
@@ -2173,32 +2178,21 @@ Value: $ARGUMENTS
 Toggle claude-any router debug external access. With no argument, this toggles the current state. Use `on`, `off`, or `status` for explicit control.
 """
 
-CHANNEL_SLASH_COMMAND = """---
-description: Inspect or send messages through the claude-any channel bridge
-argument-hint: [status|poll|wait|send|sse key=value ...]
----
-
-CLAUDE_ANY_CHANNEL_BRIDGE
-
-Args: $ARGUMENTS
-
-Use the claude-any channel bridge for external agent/channel messages. Examples:
-- `/channel status`
-- `/channel poll channel=default after=0 recipient=claude`
-- `/channel wait channel=default after=12 timeout=60`
-- `/channel send channel=default to=all message="hello"`
-- `/channel sse`
-"""
-
-
 def install_claude_any_slash_commands() -> None:
     try:
         CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
         commands = {
             "advisor.md": ADVISOR_SLASH_COMMAND,
             "router-debug.md": ROUTER_DEBUG_SLASH_COMMAND,
-            "channel.md": CHANNEL_SLASH_COMMAND,
         }
+        stale_channel = CLAUDE_COMMANDS_DIR / "channel.md"
+        if stale_channel.exists():
+            try:
+                stale_text = stale_channel.read_text(encoding="utf-8", errors="replace")
+                if "CLAUDE_ANY_CHANNEL_BRIDGE" in stale_text or "claude-any channel bridge" in stale_text:
+                    stale_channel.unlink()
+            except Exception:
+                pass
         for name, content in commands.items():
             path = CLAUDE_COMMANDS_DIR / name
             if path.exists() and path.read_text(encoding="utf-8") == content:
@@ -2468,7 +2462,7 @@ def router_event_message_preview(body: dict[str, Any], cfg: dict[str, Any] | Non
     text = latest_user_text(body).strip()
     if not text:
         return {"message_preview_chars": limit, "message_preview": "", "message_preview_truncated": False}
-    normalized = re.sub(r"\s+", " ", text)
+    normalized = re.sub(r"\s+", " ", redact_sensitive_text(text))
     truncated = len(normalized) > limit
     return {
         "message_preview_chars": limit,
@@ -4286,8 +4280,16 @@ def read_chat_messages(after_id: int = 0, channel: str | None = None, recipient:
                         continue
                 except Exception:
                     continue
-                if channel and item.get("channel") != channel:
-                    continue
+                if channel:
+                    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
+                    aliases = {
+                        str(item.get("channel") or ""),
+                        str(meta.get("room_id") or ""),
+                        str(meta.get("room") or ""),
+                        str(meta.get("channel") or ""),
+                    }
+                    if channel not in aliases:
+                        continue
                 if not _message_visible_to(item, recipient):
                     continue
                 messages.append(item)
@@ -4350,6 +4352,74 @@ def channel_sse_status() -> dict[str, Any]:
         return {name: _channel_sse_status_public(name, state) for name, state in _CHANNEL_SSE_CONNECTIONS.items()}
 
 
+def _first_present_dict_value(*sources: Any, keys: tuple[str, ...]) -> Any:
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        for key in keys:
+            value = source.get(key)
+            if value is not None:
+                return value
+    return None
+
+
+def _event_payload_text(value: Any, depth: int = 0) -> str | None:
+    if value is None or depth > 5:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    if not isinstance(value, dict):
+        return str(value)
+    direct = _first_present_dict_value(value, keys=("content", "message", "text", "body", "summary"))
+    if isinstance(direct, str) and direct.strip():
+        return direct.strip()
+    if isinstance(direct, dict):
+        nested = _event_payload_text(direct, depth + 1)
+        if nested:
+            return nested
+    for key in ("data", "event", "payload", "message", "notification", "item"):
+        nested = _event_payload_text(value.get(key), depth + 1)
+        if nested:
+            return nested
+    event_type = value.get("type") or value.get("event_type") or value.get("kind")
+    if event_type:
+        payload = value.get("payload") if isinstance(value.get("payload"), dict) else value.get("data")
+        if payload is not None:
+            return f"{event_type}: {json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
+        return str(event_type)
+    return None
+
+
+def _event_meta_from_sources(*sources: Any) -> dict[str, Any]:
+    meta: dict[str, Any] = {}
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        source_meta = source.get("meta")
+        if isinstance(source_meta, dict):
+            meta.update(source_meta)
+        for key in (
+            "room_id",
+            "room",
+            "channel",
+            "thread_id",
+            "parent_id",
+            "message_id",
+            "task_id",
+            "round_id",
+            "agent_id",
+            "sender_id",
+            "recipient_id",
+            "type",
+            "event_type",
+            "kind",
+        ):
+            value = source.get(key)
+            if value is not None and key not in meta:
+                meta[key] = value
+    return meta
+
+
 def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict[str, Any]) -> dict[str, Any] | None:
     text = (data_text or "").strip()
     if not text or text == "[DONE]":
@@ -4375,28 +4445,24 @@ def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict
         method = str(parsed.get("method") or event_name or "message")
         params = parsed.get("params") if isinstance(parsed.get("params"), dict) else {}
         payload = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else {}
-        meta.update({k: v for k, v in (params.get("meta") if isinstance(params.get("meta"), dict) else {}).items()})
-        if isinstance(parsed.get("meta"), dict):
-            meta.update(parsed["meta"])
-        for source in (params, payload, parsed):
-            for key in ("content", "message", "text", "body"):
-                value = source.get(key)
-                if value is not None:
-                    content = str(value)
-                    break
-            if content != text:
-                break
+        data = params.get("data") if isinstance(params.get("data"), dict) else {}
+        event = params.get("event") if isinstance(params.get("event"), dict) else {}
+        nested_payload = (
+            data.get("payload") if isinstance(data.get("payload"), dict) else
+            event.get("payload") if isinstance(event.get("payload"), dict) else {}
+        )
+        meta.update(_event_meta_from_sources(parsed, params, payload, data, event, nested_payload))
+        content = _event_payload_text(params) or _event_payload_text(payload) or _event_payload_text(data) or _event_payload_text(event) or content
         kind = method.replace("notifications/claude/", "").replace("/", ".") if method else "sse"
-        for key in ("room_id", "room", "thread_id", "parent_id", "message_id", "task_id", "round_id"):
-            value = params.get(key, payload.get(key, parsed.get(key)))
-            if value is not None:
-                meta[key] = value
     if allowed_events and method not in allowed_events and (event_name or "message") not in allowed_events:
         return None
+    channel = defaults.get("channel") or "default"
+    if str(channel) == "default" and meta.get("channel"):
+        channel = meta.get("channel")
     return {
-        "channel": defaults.get("channel") or "default",
-        "sender_id": defaults.get("sender_id") or "sse",
-        "recipients": defaults.get("recipient") or defaults.get("recipients") or "all",
+        "channel": channel,
+        "sender_id": meta.get("sender_id") or meta.get("agent_id") or defaults.get("sender_id") or "sse",
+        "recipients": meta.get("recipient_id") or defaults.get("recipient") or defaults.get("recipients") or "all",
         "thread_id": meta.get("thread_id"),
         "parent_id": meta.get("parent_id"),
         "kind": kind,
@@ -4899,24 +4965,6 @@ def is_advisor_request(body: dict[str, Any]) -> bool:
 
 def is_router_debug_request(body: dict[str, Any]) -> bool:
     return "CLAUDE_ANY_ROUTER_DEBUG_ACCESS" in latest_user_text(body)
-
-
-def is_channel_bridge_request(body: dict[str, Any]) -> bool:
-    return CHANNEL_BRIDGE_MARKER in latest_user_text(body)
-
-
-def channel_bridge_args_from_body(body: dict[str, Any]) -> str:
-    text = latest_user_text(body)
-    if CHANNEL_BRIDGE_MARKER not in text:
-        return "status"
-    tail = text.split(CHANNEL_BRIDGE_MARKER, 1)[1]
-    for line in tail.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.lower().startswith("args:"):
-            return stripped.split(":", 1)[1].strip() or "status"
-    return tail.strip() or "status"
 
 
 def parse_channel_bridge_args(raw: str) -> tuple[str, dict[str, str]]:
@@ -6509,96 +6557,6 @@ def maybe_handle_router_debug_request(handler: BaseHTTPRequestHandler, body: dic
     write_anthropic_text_response(handler, str(body.get("model") or current_alias(load_config())), "\n".join(lines), stream)
     if should_restart:
         schedule_router_process_restart()
-    return True
-
-
-def maybe_handle_channel_bridge_request(handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> bool:
-    if not is_channel_bridge_request(body):
-        return False
-    stream = bool(body.get("stream", True))
-    raw_args = channel_bridge_args_from_body(body)
-    command, options = parse_channel_bridge_args(raw_args)
-    try:
-        after = max(0, int(options.get("after") or "0"))
-    except Exception:
-        after = 0
-    channel = options.get("channel") or None
-    recipient = options.get("recipient") or options.get("recipient_id") or options.get("to") or None
-    try:
-        limit = max(1, min(100, int(options.get("limit") or "20")))
-    except Exception:
-        limit = 20
-    model = str(body.get("model") or current_alias(load_config()))
-
-    if command == "status":
-        latest = read_chat_messages(0, None, None, 1_000_000)
-        last_id = int(latest[-1]["id"]) if latest else 0
-        lines = [
-            "Claude Any channel bridge is available.",
-            "This is the router bridge API, separate from Claude Code's gated native --channels feature.",
-            f"Last message id: {last_id}.",
-            f"Poll: {ROUTER_BASE}/ca/channel/messages?after={last_id}&channel=default",
-            f"Wait: {ROUTER_BASE}/ca/channel/wait?after={last_id}&timeout=60",
-            f"SSE: {ROUTER_BASE}/ca/channel/stream?after={last_id}",
-            f"Notify: POST {ROUTER_BASE}/ca/channel/notify with {{\"params\":{{\"content\":\"...\",\"meta\":{{}}}}}}",
-            f"SSE connector status: {ROUTER_BASE}/ca/channel/sse/status",
-            "SSE connector control: POST /ca/channel/sse/connect or /ca/channel/sse/disconnect.",
-            "Slash usage: `/channel poll after=0`, `/channel wait after=0 timeout=60`, `/channel send channel=default to=all message=\"hello\"`, or `/channel sse`.",
-        ]
-        write_anthropic_text_response(handler, model, "\n".join(lines), stream)
-        return True
-
-    if command == "sse":
-        statuses = channel_sse_status()
-        if not statuses:
-            text = "No channel SSE connectors are configured."
-        else:
-            lines = ["Channel SSE connectors:"]
-            for name, state in statuses.items():
-                running = "running" if state.get("running") else "stopped"
-                received = int(state.get("messages_received") or 0)
-                error = state.get("last_error") or ""
-                suffix = f", last_error={error}" if error else ""
-                lines.append(f"- {name}: {running}, received={received}, url={state.get('url')}{suffix}")
-            text = "\n".join(lines)
-        write_anthropic_text_response(handler, model, text, stream)
-        return True
-
-    if command in {"poll", "wait"}:
-        timeout = 0.0
-        if command == "wait":
-            try:
-                timeout = max(0.0, min(300.0, float(options.get("timeout") or "60")))
-            except Exception:
-                timeout = 60.0
-        deadline = time.time() + timeout
-        messages = read_chat_messages(after, channel, recipient, limit)
-        while not messages and timeout > 0 and time.time() < deadline:
-            with _CHAT_CONDITION:
-                _CHAT_CONDITION.wait(timeout=min(5.0, max(0.0, deadline - time.time())))
-            messages = read_chat_messages(after, channel, recipient, limit)
-        write_anthropic_text_response(handler, model, format_channel_messages(messages, after), stream)
-        return True
-
-    if command in {"send", "post"}:
-        message_text = options.get("message") or options.get("text") or ""
-        if not message_text:
-            write_anthropic_text_response(handler, model, "Channel send failed: provide message=\"...\".", stream)
-            return True
-        message = append_chat_message({
-            "channel": channel or "default",
-            "sender_id": options.get("sender") or options.get("sender_id") or "claude",
-            "recipients": recipient or options.get("recipients") or "all",
-            "thread_id": options.get("thread_id"),
-            "parent_id": options.get("parent_id"),
-            "kind": "message",
-            "message": message_text,
-            "meta": {"source": "slash_command"},
-        })
-        write_anthropic_text_response(handler, model, f"Channel message posted as id {message['id']}.", stream)
-        return True
-
-    write_anthropic_text_response(handler, model, "Usage: `/channel status`, `/channel poll`, `/channel wait`, or `/channel send message=\"...\"`.", stream)
     return True
 
 
@@ -8230,9 +8188,6 @@ class RouterHandler(BaseHTTPRequestHandler):
         if maybe_handle_router_debug_request(self, body):
             EVENT_BUS.publish(level="info", category="router_debug.short_circuit", message="router debug request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
-        if maybe_handle_channel_bridge_request(self, body):
-            EVENT_BUS.publish(level="info", category="channel.short_circuit", message="channel bridge request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
-            return
         if maybe_handle_advisor_request(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
@@ -8469,6 +8424,38 @@ def mask_secret(value: str | None) -> str:
     return f"{text[:4]}...{text[-4:]}"
 
 
+SECRET_TEXT_PATTERNS = (
+    re.compile(r"ak_key_[A-Za-z0-9_-]+_secret_[A-Za-z0-9_-]+"),
+    re.compile(r"(AINET_API_KEY\s*=\s*)(\S+)", re.IGNORECASE),
+    re.compile(r"(Authorization\s*:\s*Bearer\s+)(\S+)", re.IGNORECASE),
+    re.compile(r"(token=)(ak_key_[A-Za-z0-9_-]+_secret_[A-Za-z0-9_-]+)", re.IGNORECASE),
+)
+
+
+def redact_sensitive_text(text: str) -> str:
+    redacted = text
+    redacted = SECRET_TEXT_PATTERNS[0].sub(lambda m: mask_secret(m.group(0)), redacted)
+    for pattern in SECRET_TEXT_PATTERNS[1:]:
+        redacted = pattern.sub(lambda m: f"{m.group(1)}{mask_secret(m.group(2))}", redacted)
+    return redacted
+
+
+def redact_sensitive_obj(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_sensitive_text(value)
+    if isinstance(value, list):
+        return [redact_sensitive_obj(item) for item in value]
+    if isinstance(value, dict):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            if str(key).lower() in {"api_key", "apikey", "token", "authorization", "bearer_token"}:
+                redacted[key] = mask_secret(str(item))
+            else:
+                redacted[key] = redact_sensitive_obj(item)
+        return redacted
+    return value
+
+
 def stored_api_key_mask(provider: str, pcfg: dict[str, Any]) -> str:
     if provider == "nvidia-hosted":
         return mask_secret(nvidia_api_key())
@@ -8658,6 +8645,7 @@ def status_lines() -> list[str]:
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
         *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
+        f"channels: {channel_status_text(cfg)}",
         f"router: {'bypassed for native provider compatibility' if direct_native else (('up' if router_up() else 'down') + ' ' + ROUTER_BASE)}",
         f"config: {CONFIG_PATH}",
     ]
@@ -8749,6 +8737,137 @@ def cmd_web_fetch(args: argparse.Namespace) -> None:
     print(f"ignore_robots_txt: {bool(web.get('fetch_ignore_robots_txt', False))}")
     print(f"user_agent: {web.get('fetch_user_agent') or 'default'}")
     print(f"mcp_config: {WEB_TOOLS_MCP_CONFIG}")
+
+
+def channel_specs(cfg: dict[str, Any] | None = None) -> list[str]:
+    cfg = cfg or load_config()
+    raw = cfg.setdefault("claude_code", {}).get("channels", [])
+    if isinstance(raw, str):
+        items = [raw]
+    elif isinstance(raw, list):
+        items = raw
+    else:
+        items = []
+    channels: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        spec = str(item).strip()
+        if not spec or spec in seen:
+            continue
+        seen.add(spec)
+        channels.append(spec)
+    return channels
+
+
+def channel_development_enabled(cfg: dict[str, Any] | None = None) -> bool:
+    cfg = cfg or load_config()
+    return bool(cfg.setdefault("claude_code", {}).get("development_channels", False))
+
+
+def channel_status_text(cfg: dict[str, Any] | None = None) -> str:
+    cfg = cfg or load_config()
+    channels = channel_specs(cfg)
+    if not channels:
+        return "off"
+    suffix = "; dev" if channel_development_enabled(cfg) else ""
+    return f"{len(channels)} channel{'s' if len(channels) != 1 else ''}{suffix}"
+
+
+def set_channel_development_enabled(enabled: bool) -> list[str]:
+    cfg = load_config()
+    cfg.setdefault("claude_code", {})["development_channels"] = bool(enabled)
+    save_config(cfg)
+    return [f"Development channels: {'on' if enabled else 'off'}."]
+
+
+def add_channel_spec(spec: str, *, development: bool = False) -> list[str]:
+    spec = spec.strip()
+    if not spec:
+        return ["Channel spec was empty."]
+    cfg = load_config()
+    cc = cfg.setdefault("claude_code", {})
+    channels = channel_specs(cfg)
+    if spec not in channels:
+        channels.append(spec)
+    cc["channels"] = channels
+    if development:
+        cc["development_channels"] = True
+    save_config(cfg)
+    lines = [f"Channel added: {spec}."]
+    if development:
+        lines.append("Development channels: on.")
+    return lines
+
+
+def remove_channel_spec(spec: str) -> list[str]:
+    cfg = load_config()
+    cc = cfg.setdefault("claude_code", {})
+    before = channel_specs(cfg)
+    after = [item for item in before if item != spec]
+    cc["channels"] = after
+    save_config(cfg)
+    return [f"Channel removed: {spec}." if len(after) != len(before) else f"Channel was not configured: {spec}."]
+
+
+def clear_channel_specs() -> list[str]:
+    cfg = load_config()
+    cfg.setdefault("claude_code", {})["channels"] = []
+    save_config(cfg)
+    return ["Claude Code channels cleared."]
+
+
+def cmd_channels(args: argparse.Namespace) -> None:
+    cfg = load_config()
+    values = list(getattr(args, "values", []) or [])
+    if not values:
+        print(f"channels: {channel_status_text(cfg)}")
+        for name, spec in OFFICIAL_CHANNEL_PLUGINS.items():
+            mark = "*" if spec in channel_specs(cfg) else " "
+            print(f" {mark} {name:<10} {spec}")
+        for spec in channel_specs(cfg):
+            if spec not in OFFICIAL_CHANNEL_PLUGINS.values():
+                print(f" * custom    {spec}")
+        print(f"development_channels: {'on' if channel_development_enabled(cfg) else 'off'}")
+        return
+    head = values[0].strip().lower()
+    if head in ("on", "enable", "add"):
+        if len(values) < 2:
+            raise SystemExit("Usage: claude-any channels add CHANNEL_SPEC")
+        for line in add_channel_spec(values[1]):
+            print(line)
+        return
+    if head in ("dev", "development"):
+        if len(values) >= 2 and values[1].lower() in ("on", "off", "true", "false", "1", "0"):
+            enabled = values[1].lower() in ("on", "true", "1")
+            for line in set_channel_development_enabled(enabled):
+                print(line)
+            return
+        if len(values) < 2:
+            raise SystemExit("Usage: claude-any channels dev CHANNEL_SPEC | claude-any channels dev on|off")
+        for line in add_channel_spec(values[1], development=True):
+            print(line)
+        return
+    if head in ("off", "disable", "remove", "rm"):
+        if len(values) < 2:
+            raise SystemExit("Usage: claude-any channels remove CHANNEL_SPEC")
+        for line in remove_channel_spec(values[1]):
+            print(line)
+        return
+    if head in ("clear", "reset"):
+        for line in clear_channel_specs():
+            print(line)
+        return
+    if head in OFFICIAL_CHANNEL_PLUGINS:
+        spec = OFFICIAL_CHANNEL_PLUGINS[head]
+        if spec in channel_specs(cfg):
+            for line in remove_channel_spec(spec):
+                print(line)
+        else:
+            for line in add_channel_spec(spec):
+                print(line)
+        return
+    for line in add_channel_spec(values[0]):
+        print(line)
 
 
 def cmd_ollama_native(args: argparse.Namespace) -> None:
@@ -11937,8 +12056,9 @@ def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lan
         f"4. {ui_text('model', lang)}  [{compact_text(pcfg.get('current_model', 'unset'), 62)}]",
         f"5. {ui_text('advisor_model', lang)}  [{compact_text(pcfg.get('advisor_model') or 'off', 62)}]",
         f"6. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
-        f"7. {ui_text('test', lang)}",
-        f"8. {ui_text('launch', lang)}",
+        f"7. Channels  [{channel_status_text(cfg)}]",
+        f"8. {ui_text('test', lang)}",
+        f"9. {ui_text('launch', lang)}",
         ui_text("quit", lang),
     ]
 
@@ -12008,6 +12128,29 @@ def advisor_model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[
     rows.append("Back")
     deduped_values.append("back")
     return rows, deduped_values
+
+
+def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    channels = channel_specs(cfg)
+    dev_enabled = channel_development_enabled(cfg)
+    rows: list[str] = []
+    values: list[str] = []
+    rows.append(f"Development channel loading  [{'on' if dev_enabled else 'off'}]")
+    values.append("__toggle_dev__")
+    for name, spec in OFFICIAL_CHANNEL_PLUGINS.items():
+        mark = "*" if spec in channels else " "
+        rows.append(f"{mark} {name:<10} {spec}")
+        values.append(spec)
+    rows.append("+ Add development/custom channel...")
+    values.append("__add_custom__")
+    if channels:
+        rows.append("- Remove channel...")
+        values.append("__remove__")
+        rows.append("Clear all channels")
+        values.append("__clear__")
+    rows.append("Back")
+    values.append("back")
+    return rows, values
 
 
 def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
@@ -12310,7 +12453,7 @@ def portable_language_menu() -> int:
 
 def portable_prelaunch_menu() -> int:
     enable_ansi()
-    main_idx = 7 if settings_ready_except_api_key() else 0
+    main_idx = 9 if settings_ready_except_api_key() else 0
     panel: str | None = None
     panel_idx = 0
     panel_rows: list[str] = []
@@ -12352,6 +12495,8 @@ def portable_prelaunch_menu() -> int:
             panel_rows, panel_values = ["Run compatibility test", "Back"], ["run", "back"]
         elif name == "options":
             panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
+        elif name == "channels":
+            panel_rows, panel_values = channel_panel_rows(cfg)
         elif name == "context":
             panel_rows, panel_values = context_setup_panel_rows(provider, pcfg, cfg.get("language", "en"))
         elif name == "preset":
@@ -12528,7 +12673,40 @@ def portable_prelaunch_menu() -> int:
                         messages = lines[-8:] if lines else ["Test produced no output."]
                         panel_rows, panel_values = ["Run compatibility test again", "Back"], ["run", "back"]
                         refresh_checks()
-                        main_idx = 8 if "Compatibility: OK" in out else 4
+                        main_idx = 9 if "Compatibility: OK" in out else 4
+                elif panel == "channels":
+                    if value == "back":
+                        close_panel()
+                    elif value == "__toggle_dev__":
+                        messages = set_channel_development_enabled(not channel_development_enabled(cfg))
+                        cfg = load_config()
+                        panel_rows, panel_values = channel_panel_rows(cfg)
+                        panel_idx = 0
+                    elif value == "__add_custom__":
+                        spec = prompt_menu_value("Channel spec (for example plugin:ainet@local or server:ainet)", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
+                        if spec:
+                            messages = add_channel_spec(spec, development=True)
+                            cfg = load_config()
+                            panel_rows, panel_values = channel_panel_rows(cfg)
+                    elif value == "__remove__":
+                        spec = prompt_menu_value("Channel spec to remove", "", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
+                        if spec:
+                            messages = remove_channel_spec(spec)
+                            cfg = load_config()
+                            panel_rows, panel_values = channel_panel_rows(cfg)
+                    elif value == "__clear__":
+                        messages = clear_channel_specs()
+                        cfg = load_config()
+                        panel_rows, panel_values = channel_panel_rows(cfg)
+                        panel_idx = 0
+                    elif value:
+                        if value in channel_specs(cfg):
+                            messages = remove_channel_spec(value)
+                        else:
+                            messages = add_channel_spec(value)
+                        cfg = load_config()
+                        panel_rows, panel_values = channel_panel_rows(cfg)
+                    refresh_checks()
                 elif panel == "options":
                     if value == "back":
                         close_panel()
@@ -12627,13 +12805,13 @@ def portable_prelaunch_menu() -> int:
                 continue
 
             if key in ("up", "k"):
-                main_idx = (main_idx - 1) % 10
+                main_idx = (main_idx - 1) % 11
             elif key in ("down", "j"):
-                main_idx = (main_idx + 1) % 10
+                main_idx = (main_idx + 1) % 11
             elif key in ("esc", "q"):
                 return 10
             elif key == "enter":
-                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "test", "launch", "quit"]
+                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "channels", "test", "launch", "quit"]
                 action = actions[main_idx]
                 if action == "launch":
                     blockers = launch_readiness_errors()
@@ -12720,6 +12898,18 @@ def should_append_compat_prompt(provider: str, cfg: dict[str, Any]) -> bool:
 
 def has_passthrough_option(passthrough: list[str], *names: str) -> bool:
     return any(arg in names or any(arg.startswith(name + "=") for name in names) for arg in passthrough)
+
+
+def claude_channel_args(cfg: dict[str, Any], passthrough: list[str]) -> list[str]:
+    channels = channel_specs(cfg)
+    if not channels or has_passthrough_option(passthrough, "--channels"):
+        return []
+    args: list[str] = []
+    if channel_development_enabled(cfg) and not has_passthrough_option(passthrough, "--dangerously-load-development-channels"):
+        args.append("--dangerously-load-development-channels")
+    args.append("--channels")
+    args.extend(channels)
+    return args
 
 
 def write_web_tools_mcp_config(cfg: dict[str, Any]) -> Path:
@@ -13061,6 +13251,7 @@ def launch_claude(
         extra_args.extend(["--mcp-config", str(write_duckduckgo_mcp_config(cfg))])
     if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(passthrough, "--system-prompt"):
         extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
+    extra_args.extend(claude_channel_args(cfg, passthrough))
     cmd = [
         claude,
         "--dangerously-skip-permissions",
@@ -13091,6 +13282,7 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
   claude-any set-api-key PROVIDER KEY
   claude-any web-search [on|off]     Auto-attach DuckDuckGo MCP for non-native providers
   claude-any web-fetch [on|off]      Auto-attach fetch MCP for web page content
+  claude-any channels [cmd]          Configure Claude Code --channels auto-injection
   claude-any ollama-native [on|off]  Use Ollama's official Claude Code env path
   claude-any ollama-options [provider] [key=value ...]
                                       Set Ollama num_ctx/options/keep_alive/think
@@ -13129,6 +13321,11 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-no-web-search      Disable DuckDuckGo MCP for this launch
   claude-any --ca-web-fetch          Enable fetch MCP
   claude-any --ca-no-web-fetch       Disable fetch MCP
+  claude-any --ca-channel SPEC       Add an official/approved Claude Code channel
+  claude-any --ca-dev-channel SPEC   Add a development channel and enable dev loading
+  claude-any --ca-development-channels on|off
+                                      Auto-add --dangerously-load-development-channels
+  claude-any --ca-clear-channels     Clear saved channel auto-injection specs
   claude-any --ca-no-self-update-check
                                       Skip Claude Any npm self-update check
   claude-any --ca-no-update-check    Skip Claude Code update check for this launch
@@ -13236,6 +13433,28 @@ def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | 
     if ollama_values:
         cmd_ollama_options(argparse.Namespace(values=ollama_values))
         skip_menu = True
+    channel_values = [
+        item.strip()
+        for item in re.split(r"[\s,]+", os.environ.get("CLAUDE_ANY_CHANNELS", "").strip())
+        if item.strip()
+    ]
+    for channel_value in channel_values:
+        add_channel_spec(channel_value)
+        skip_menu = True
+    dev_channel_values = [
+        item.strip()
+        for item in re.split(r"[\s,]+", os.environ.get("CLAUDE_ANY_DEV_CHANNELS", "").strip())
+        if item.strip()
+    ]
+    for channel_value in dev_channel_values:
+        add_channel_spec(channel_value, development=True)
+        skip_menu = True
+    dev_channels = os.environ.get("CLAUDE_ANY_DEVELOPMENT_CHANNELS", "").strip().lower()
+    if dev_channels:
+        if dev_channels not in ("on", "off", "true", "false", "1", "0"):
+            raise SystemExit("CLAUDE_ANY_DEVELOPMENT_CHANNELS must be on or off")
+        set_channel_development_enabled(dev_channels in ("on", "true", "1"))
+        skip_menu = True
     return skip_menu, web_search_override, update_check_override, self_update_check_override, force_menu
 
 
@@ -13294,6 +13513,9 @@ def run_cli(argv: list[str]) -> int:
             return 0
         if head in ("web-fetch", "webfetch"):
             cmd_web_fetch(argparse.Namespace(value=rest[0] if rest else None))
+            return 0
+        if head in ("channels", "channel"):
+            cmd_channels(argparse.Namespace(values=rest))
             return 0
         if head in ("ollama-native", "ollama-compat"):
             cmd_ollama_native(argparse.Namespace(value=rest[0] if rest else None))
@@ -13629,6 +13851,48 @@ def run_cli(argv: list[str]) -> int:
             cmd_web_fetch(argparse.Namespace(value="off"))
             skip_menu = True
             i += 1
+        elif arg == "--ca-channel" or arg.startswith("--ca-channel="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing channel spec for --ca-channel")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            for line in add_channel_spec(value):
+                print(line)
+            skip_menu = True
+        elif arg == "--ca-dev-channel" or arg.startswith("--ca-dev-channel="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing channel spec for --ca-dev-channel")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            for line in add_channel_spec(value, development=True):
+                print(line)
+            skip_menu = True
+        elif arg == "--ca-development-channels" or arg.startswith("--ca-development-channels="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing on/off for --ca-development-channels")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            enabled = value.strip().lower() in ("on", "enable", "enabled", "true", "1")
+            for line in set_channel_development_enabled(enabled):
+                print(line)
+            skip_menu = True
+        elif arg == "--ca-clear-channels":
+            for line in clear_channel_specs():
+                print(line)
+            skip_menu = True
+            i += 1
         elif arg == "--ca-no-update-check":
             update_check = False
             skip_menu = True
@@ -13699,6 +13963,9 @@ def build_parser() -> argparse.ArgumentParser:
     wf = sub.add_parser("web-fetch")
     wf.add_argument("value", nargs="?")
     wf.set_defaults(func=cmd_web_fetch)
+    ch = sub.add_parser("channels")
+    ch.add_argument("values", nargs="*")
+    ch.set_defaults(func=cmd_channels)
     on = sub.add_parser("ollama-native")
     on.add_argument("value", nargs="?")
     on.set_defaults(func=cmd_ollama_native)

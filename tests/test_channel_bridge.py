@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from unittest import mock
 
 import claude_any
@@ -52,6 +54,30 @@ class ChannelBridgeTests(unittest.TestCase):
             {"name": "ai-net", "event_filter": ["notifications/message"]},
         )
         self.assertIsNone(hidden)
+
+    def test_sse_payload_maps_nested_ai_net_event(self):
+        payload = claude_any._sse_payload_to_chat_payload(
+            '{"method":"notifications/message","params":{"data":{"type":"message.created","room_id":"room_phase1sim","payload":{"message":{"content":"hello from ai-net"},"sender_id":"agent_a"}}}}',
+            "message",
+            {"name": "ai-net", "channel": "default", "sender_id": "ai-net", "recipient": "claude", "event_filter": ["notifications/message"]},
+        )
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual(payload["message"], "hello from ai-net")
+        self.assertEqual(payload["sender_id"], "agent_a")
+        self.assertEqual(payload["meta"]["room_id"], "room_phase1sim")
+
+    def test_read_channel_matches_room_id_alias(self):
+        messages = [
+            {"id": 1, "channel": "default", "recipients": ["all"], "sender_id": "agent", "message": "hello", "meta": {"room_id": "room_phase1sim"}},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "chat-messages.jsonl"
+            path.write_text("\n".join(__import__("json").dumps(item) for item in messages), encoding="utf-8")
+            with mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path):
+                found = claude_any.read_chat_messages(0, "room_phase1sim", None, 10)
+        self.assertEqual(1, len(found))
+        self.assertEqual("hello", found[0]["message"])
 
     def test_mcp_endpoint_event_initializes_sse_session(self):
         name = "unit-mcp"
