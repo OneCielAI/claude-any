@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import claude_any
 
@@ -51,6 +52,33 @@ class ChannelBridgeTests(unittest.TestCase):
             {"name": "ai-net", "event_filter": ["notifications/message"]},
         )
         self.assertIsNone(hidden)
+
+    def test_mcp_endpoint_event_initializes_sse_session(self):
+        name = "unit-mcp"
+        original = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
+        try:
+            claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+            claude_any._CHANNEL_SSE_CONNECTIONS[name] = {
+                "name": name,
+                "url": "http://example.test/sse",
+                "headers": {"Authorization": "Bearer test"},
+                "running": True,
+                "mcp_enabled": True,
+                "mcp_initialized": False,
+                "mcp_protocol_version": "2024-11-05",
+                "mcp_timeout_seconds": 20.0,
+            }
+            with mock.patch.object(claude_any, "_mcp_sse_post_json", return_value={"ok": True}) as post:
+                claude_any._channel_sse_dispatch(name, "endpoint", ["/messages?session=abc"])
+            state = claude_any._CHANNEL_SSE_CONNECTIONS[name]
+            self.assertEqual("http://example.test/messages?session=abc", state["mcp_endpoint"])
+            self.assertTrue(state["mcp_initialized"])
+            self.assertEqual(2, post.call_count)
+            self.assertEqual("initialize", post.call_args_list[0].args[2]["method"])
+            self.assertEqual("notifications/initialized", post.call_args_list[1].args[2]["method"])
+        finally:
+            claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+            claude_any._CHANNEL_SSE_CONNECTIONS.update(original)
 
 
 if __name__ == "__main__":

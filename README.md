@@ -68,7 +68,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.70`
+Current version: `0.1.71`
 
 ## Why This Exists
 
@@ -494,6 +494,14 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.71
+
+- **MCP SSE channel initialization**: the channel bridge now handles MCP
+  `endpoint` events by sending `initialize` and `notifications/initialized`,
+  so AI-Net style push notifications can start flowing into Claude Any.
+- **Channel SSE diagnostics**: connector status now reports the MCP endpoint,
+  initialization state, and last MCP initialization error.
 
 ### 0.1.70
 

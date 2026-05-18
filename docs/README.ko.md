@@ -67,7 +67,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.70`
+현재 버전: `0.1.71`
 
 ## 왜 만들었나
 
@@ -370,6 +370,14 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.71
+
+- **MCP SSE channel 초기화**: channel bridge가 MCP `endpoint` 이벤트를 받으면
+  `initialize`와 `notifications/initialized`를 자동 전송하므로, AI-Net 스타일
+  push notification이 Claude Any로 흐를 수 있습니다.
+- **Channel SSE 진단 정보**: connector 상태에 MCP endpoint, 초기화 여부, 마지막
+  MCP 초기화 오류를 표시합니다.
 
 ### 0.1.70
 

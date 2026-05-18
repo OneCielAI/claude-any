@@ -61,7 +61,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.70`
+現在のバージョン: `0.1.71`
 
 ## 作られた理由
 
@@ -364,6 +364,14 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.71
+
+- **MCP SSE channel 初期化**: channel bridge は MCP `endpoint` event を受けると
+  `initialize` と `notifications/initialized` を自動送信し、AI-Net 型 push
+  notification が Claude Any に流れ始めるようになりました。
+- **Channel SSE 診断情報**: connector status に MCP endpoint、初期化状態、
+  最後の MCP 初期化エラーを表示します。
 
 ### 0.1.70
 

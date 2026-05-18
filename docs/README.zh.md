@@ -61,7 +61,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.70`
+当前版本: `0.1.71`
 
 ## 为什么存在
 
@@ -350,6 +350,14 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.71
+
+- **MCP SSE channel 初始化**：channel bridge 收到 MCP `endpoint` 事件后会自动发送
+  `initialize` 与 `notifications/initialized`，让 AI-Net 风格的 push
+  notification 可以流入 Claude Any。
+- **Channel SSE 诊断信息**：connector status 现在会显示 MCP endpoint、初始化状态
+  以及最后一次 MCP 初始化错误。
 
 ### 0.1.70
 

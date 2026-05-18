@@ -96,7 +96,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.70"
+VERSION = "0.1.71"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -4338,6 +4338,9 @@ def _channel_sse_status_public(name: str, state: dict[str, Any]) -> dict[str, An
         "messages_received": int(state.get("messages_received") or 0),
         "event_filter": state.get("event_filter") or [],
         "read_timeout_seconds": state.get("read_timeout_seconds"),
+        "mcp_endpoint": state.get("mcp_endpoint"),
+        "mcp_initialized": bool(state.get("mcp_initialized")),
+        "mcp_last_error": state.get("mcp_last_error"),
         "last_error": state.get("last_error"),
     }
 
@@ -4402,8 +4405,78 @@ def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict
     }
 
 
+def _channel_sse_set_state(name: str, **updates: Any) -> None:
+    with _CHANNEL_SSE_LOCK:
+        state = _CHANNEL_SSE_CONNECTIONS.get(name)
+        if state:
+            state.update(updates)
+
+
+def _channel_sse_absolute_endpoint(stream_url: str, endpoint: str) -> str:
+    endpoint = (endpoint or "").strip()
+    if endpoint.startswith(("http://", "https://")):
+        return endpoint
+    return urllib.parse.urljoin(stream_url, endpoint)
+
+
+def _mcp_sse_post_json(endpoint: str, headers: dict[str, str], payload: dict[str, Any], timeout: float) -> Any:
+    request_headers = {**headers, "Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
+    req = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers=request_headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as response:
+        data = response.read()
+        if not data:
+            return None
+        try:
+            return json.loads(data.decode("utf-8"))
+        except Exception:
+            return data.decode("utf-8", errors="replace")
+
+
+def _channel_sse_maybe_initialize_mcp(name: str, endpoint_text: str) -> None:
+    with _CHANNEL_SSE_LOCK:
+        state = _CHANNEL_SSE_CONNECTIONS.get(name)
+        if not state:
+            return
+        if not bool(state.get("mcp_enabled", True)):
+            return
+        if state.get("mcp_initialized"):
+            return
+        stream_url = str(state.get("url") or "")
+        headers = dict(state.get("headers") or {})
+        timeout = max(5.0, min(120.0, float(state.get("mcp_timeout_seconds") or 20.0)))
+        protocol_version = str(state.get("mcp_protocol_version") or "2024-11-05")
+    endpoint = _channel_sse_absolute_endpoint(stream_url, endpoint_text)
+    try:
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "claude-any-channel-bridge", "version": VERSION},
+            },
+        }
+        _mcp_sse_post_json(endpoint, headers, initialize, timeout)
+        initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+        _mcp_sse_post_json(endpoint, headers, initialized, timeout)
+        _channel_sse_set_state(name, mcp_endpoint=endpoint, mcp_initialized=True, mcp_last_error=None)
+        router_log("INFO", f"channel_sse_mcp_initialized name={name} endpoint={endpoint}")
+    except Exception as exc:
+        _channel_sse_set_state(name, mcp_endpoint=endpoint, mcp_initialized=False, mcp_last_error=f"{type(exc).__name__}: {exc}")
+        router_log("WARN", f"channel_sse_mcp_initialize_failed name={name} endpoint={endpoint} error={type(exc).__name__}: {exc}")
+
+
 def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str]) -> None:
     data_text = "\n".join(data_lines)
+    if (event_name or "").strip().lower() == "endpoint":
+        _channel_sse_maybe_initialize_mcp(name, data_text)
+        return
     with _CHANNEL_SSE_LOCK:
         state = _CHANNEL_SSE_CONNECTIONS.get(name)
         if not state:
@@ -4511,6 +4584,12 @@ def start_channel_sse_connection(config: dict[str, Any]) -> dict[str, Any]:
             "event_filter": event_filter,
             "read_timeout_seconds": float(config.get("read_timeout_seconds") or config.get("timeout") or 300.0),
             "retry_seconds": float(config.get("retry_seconds") or 5.0),
+            "mcp_enabled": bool(config.get("mcp", config.get("mcp_enabled", True))),
+            "mcp_endpoint": None,
+            "mcp_initialized": False,
+            "mcp_last_error": None,
+            "mcp_protocol_version": str(config.get("mcp_protocol_version") or "2024-11-05"),
+            "mcp_timeout_seconds": float(config.get("mcp_timeout_seconds") or 20.0),
         }
         _CHANNEL_SSE_CONNECTIONS[name] = state
     thread = threading.Thread(target=_channel_sse_worker, args=(name,), daemon=True, name=f"claude-any-channel-sse-{name}")
