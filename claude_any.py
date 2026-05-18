@@ -51,6 +51,7 @@ CONTEXT_USAGE_PATH = CONFIG_DIR / "context-usage.json"
 OLLAMA_MODEL_CATALOG_PATH = CONFIG_DIR / "ollama-model-catalog.json"
 CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
 CHAT_FILES_DIR = CONFIG_DIR / "chat-files"
+MENU_KEY_DEBUG_PATH = CONFIG_DIR / "ca-key-debug.log"
 PLAN_ARTIFACTS_DIR = CONFIG_DIR / "plan-artifacts"
 PID_PATH = CONFIG_DIR / "router.pid"
 MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
@@ -95,7 +96,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.69"
+VERSION = "0.1.70"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -11693,6 +11694,15 @@ def print_intro_panel(width: int) -> None:
     print("\n".join(intro_panel_lines(width)))
 
 
+def append_menu_key_debug_log(line: str) -> None:
+    try:
+        MENU_KEY_DEBUG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with MENU_KEY_DEBUG_PATH.open("a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
 def read_menu_key(fd: int | None = None) -> str:
     if os.name == "nt":
         import msvcrt
@@ -11707,7 +11717,6 @@ def read_menu_key(fd: int | None = None) -> str:
         return ch.lower()
 
     import time
-    debug_path = "/tmp/ca-key-debug.log"
     if fd is None or fd < 0:
         fd = sys.stdin.fileno()
     ch = os.read(fd, 1)
@@ -11717,8 +11726,7 @@ def read_menu_key(fd: int | None = None) -> str:
         b = os.read(fd, 1)
         log += f" next={b!r}"
         if not b:
-            with open(debug_path, "a", encoding="utf-8") as f:
-                f.write(log + " result='esc'\n")
+            append_menu_key_debug_log(log + " result='esc'\n")
             return "esc"
         seq += b.decode("latin-1")
         if b == b"[":
@@ -11741,15 +11749,13 @@ def read_menu_key(fd: int | None = None) -> str:
             "\x1b[H": "home", "\x1b[F": "end",
         }.get(seq, "esc")
         log += f" seq={seq!r} result={result!r}"
-        with open(debug_path, "a", encoding="utf-8") as f:
-            f.write(log + "\n")
+        append_menu_key_debug_log(log + "\n")
         return result
     if ch in (b"\r", b"\n"):
         result = "enter"
     else:
         result = ch.decode("latin-1").lower()
-    with open(debug_path, "a", encoding="utf-8") as f:
-        f.write(log + f" result={result!r}\n")
+    append_menu_key_debug_log(log + f" result={result!r}\n")
     return result
 
 

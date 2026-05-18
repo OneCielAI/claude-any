@@ -61,7 +61,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.69`
+当前版本: `0.1.70`
 
 ## 为什么存在
 
@@ -350,6 +350,12 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.70
+
+- **Linux 菜单调试日志修复**：key-debug 日志现在写入用户的 Claude Any config
+  目录，而不是全局 `/tmp`，避免受限 Linux 环境中的 permission crash。
+- **best-effort key logging**：即使可选 key-debug 日志无法写入，菜单输入也不会失败。
 
 ### 0.1.69
 

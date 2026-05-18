@@ -68,7 +68,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.69`
+Current version: `0.1.70`
 
 ## Why This Exists
 
@@ -494,6 +494,14 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.70
+
+- **Linux menu debug log fix**: key-debug logging now writes under the user's
+  Claude Any config directory instead of global `/tmp`, avoiding permission
+  crashes on locked-down Linux systems.
+- **Best-effort key logging**: menu input no longer fails if the optional
+  key-debug log cannot be written.
 
 ### 0.1.69
 

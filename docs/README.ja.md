@@ -61,7 +61,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.69`
+現在のバージョン: `0.1.70`
 
 ## 作られた理由
 
@@ -364,6 +364,14 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.70
+
+- **Linux menu debug log 修正**: key-debug log は global `/tmp` ではなく
+  user の Claude Any config directory に書き込むようになり、制限された Linux
+  環境での permission crash を避けます。
+- **best-effort key logging**: 任意の key-debug log を書けない場合でも menu
+  input は失敗しません。
 
 ### 0.1.69
 

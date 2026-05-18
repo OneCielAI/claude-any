@@ -67,7 +67,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.69`
+현재 버전: `0.1.70`
 
 ## 왜 만들었나
 
@@ -370,6 +370,14 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.70
+
+- **Linux 메뉴 디버그 로그 수정**: key-debug 로그를 전역 `/tmp`가 아니라 사용자
+  Claude Any config 디렉터리 아래에 기록해, 제한된 Linux 환경에서 permission
+  crash가 발생하지 않도록 했습니다.
+- **best-effort key logging**: 선택적 key-debug 로그를 쓸 수 없어도 메뉴 입력이
+  실패하지 않습니다.
 
 ### 0.1.69
 
