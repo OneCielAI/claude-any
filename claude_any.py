@@ -95,7 +95,7 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.68"
+VERSION = "0.1.69"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -111,8 +111,11 @@ _LOG_LEVEL_CACHE: dict[str, Any] = {"value": None, "checked_at": 0.0, "file_mtim
 _RATE_LIMIT_LOCK = threading.Lock()
 _CHAT_CONDITION = threading.Condition()
 _CHAT_NEXT_ID: int | None = None
+_CHANNEL_SSE_LOCK = threading.Lock()
+_CHANNEL_SSE_CONNECTIONS: dict[str, dict[str, Any]] = {}
 EVENT_BUS = EventBus()
 ADVISOR_FEEDBACK_MARKER = "CLAUDE_ANY_ADVISOR_FEEDBACK"
+CHANNEL_BRIDGE_MARKER = "CLAUDE_ANY_CHANNEL_BRIDGE"
 PLAN_GUARD_MARKER = "[claude-any-plan-guard]"
 TASK_UPDATE_STATUSES = {"pending", "in_progress", "completed", "deleted"}
 TASK_UPDATE_STATUS_ALIASES = {
@@ -164,9 +167,6 @@ DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC: tuple[str, ...] = (
     "TeammateTool",
     "SendMessage",
     "SendMessageTool",
-    "CronCreate",
-    "CronDelete",
-    "CronList",
     "ScheduleWakeup",
     "RemoteTrigger",
     "PushNotification",
@@ -186,6 +186,10 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "Write: file_path (string), content (string). "
     "Edit: file_path (string), old_string (string), new_string (string), replace_all (boolean). "
     "TaskList: no input. TaskUpdate: taskId (string), optional status enum exactly one of pending, in_progress, completed, deleted. "
+    "CronCreate: cron (standard 5-field local-time cron string), prompt (string), optional recurring (boolean), optional durable (boolean). "
+    "CronDelete: id (string returned by CronCreate). CronList: no input. "
+    "Claude Any channel bridge: external systems can post messages to /ca/channel/messages or /ca/channel/notify. "
+    "Use /channel status, /channel poll, or /channel wait to inspect bridge messages when the user asks about external channels. "
     "Never write pseudo tool calls, partial JSON, or markdown code fences when a real Claude Code tool call is required."
 )
 LANGUAGES = {
@@ -734,6 +738,25 @@ _BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
             "task_id": {"type": "string"},
         },
     },
+    "CronCreate": {
+        "required": ["cron", "prompt"],
+        "properties": {
+            "cron": {"type": "string"},
+            "prompt": {"type": "string"},
+            "recurring": {"type": "boolean"},
+            "durable": {"type": "boolean"},
+        },
+    },
+    "CronDelete": {
+        "required": ["id"],
+        "properties": {
+            "id": {"type": "string"},
+        },
+    },
+    "CronList": {
+        "required": [],
+        "properties": {},
+    },
     "advisor": {
         "required": ["question"],
         "properties": {
@@ -875,6 +898,17 @@ def _is_empty_value(value: Any) -> bool:
     return False
 
 
+def _move_first_present(fixed: dict[str, Any], target: str, aliases: tuple[str, ...]) -> None:
+    """Move the first non-empty alias value to the target field."""
+    if target in fixed and not _is_empty_value(fixed.get(target)):
+        return
+    for alias in aliases:
+        value = fixed.get(alias)
+        if not _is_empty_value(value):
+            fixed[target] = value
+            break
+
+
 def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> dict[str, Any]:
     """
     Validate tool_use input against schema and fix common errors:
@@ -922,6 +956,48 @@ def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> 
                 fixed["status"] = status
         for alias in ("task_id", "id"):
             fixed.pop(alias, None)
+
+    if matched_name == "CronCreate":
+        _move_first_present(
+            fixed,
+            "cron",
+            ("schedule", "cronExpression", "cron_expression", "expression", "interval", "time"),
+        )
+        _move_first_present(
+            fixed,
+            "prompt",
+            ("message", "task", "instruction", "instructions", "command", "query"),
+        )
+        for key in ("cron", "prompt", "recurring", "durable"):
+            prop_schema = properties.get(key)
+            expected_type = prop_schema.get("type") if isinstance(prop_schema, dict) else None
+            if key in fixed:
+                fixed[key] = _coerce_value(fixed[key], expected_type)
+        for alias in (
+            "schedule",
+            "cronExpression",
+            "cron_expression",
+            "expression",
+            "interval",
+            "time",
+            "message",
+            "task",
+            "instruction",
+            "instructions",
+            "command",
+            "query",
+        ):
+            fixed.pop(alias, None)
+
+    if matched_name == "CronDelete":
+        _move_first_present(fixed, "id", ("taskId", "task_id", "jobId", "job_id", "cronId", "cron_id"))
+        if "id" in fixed:
+            fixed["id"] = _coerce_value(fixed["id"], "string")
+        for alias in ("taskId", "task_id", "jobId", "job_id", "cronId", "cron_id"):
+            fixed.pop(alias, None)
+
+    if matched_name == "CronList":
+        fixed = {}
 
     # Fill in missing or empty required fields with defaults
     injected: list[str] = []
@@ -1168,6 +1244,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "migrations": {},
     "router_debug_external_access": False,
     "router_debug_external_access_confirmed": False,
+    "router_debug_message_preview_chars": 0,
     "claude_code": {
         "compat_prompt_for_non_anthropic": True,
     },
@@ -1867,6 +1944,15 @@ def session_context_status_text(session):
     return f"ctx {tokens:,} tok"
 
 
+def is_claude_any_session(session):
+    if os.environ.get("CLAUDE_ANY_PROVIDER") or os.environ.get("CLAUDE_ANY_MODEL_ALIAS"):
+        return True
+    if os.environ.get("CLAUDE_ANY_STATUSLINE_FORCE", "").lower() in ("1", "true", "yes", "on"):
+        return True
+    model_name = ((session.get("model") or {}).get("display_name") if isinstance(session.get("model"), dict) else None) or ""
+    return str(model_name).startswith("claude-any-")
+
+
 def display_capacity(rpm):
     if rpm <= 1:
         return rpm
@@ -1881,6 +1967,8 @@ def main():
             session = {}
     except Exception:
         session = {}
+    if not is_claude_any_session(session):
+        return
     cfg = load_json(CONFIG_PATH, {})
     providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
     provider = str(cfg.get("current_provider") or "")
@@ -2084,6 +2172,23 @@ Value: $ARGUMENTS
 Toggle claude-any router debug external access. With no argument, this toggles the current state. Use `on`, `off`, or `status` for explicit control.
 """
 
+CHANNEL_SLASH_COMMAND = """---
+description: Inspect or send messages through the claude-any channel bridge
+argument-hint: [status|poll|wait|send|sse key=value ...]
+---
+
+CLAUDE_ANY_CHANNEL_BRIDGE
+
+Args: $ARGUMENTS
+
+Use the claude-any channel bridge for external agent/channel messages. Examples:
+- `/channel status`
+- `/channel poll channel=default after=0 recipient=claude`
+- `/channel wait channel=default after=12 timeout=60`
+- `/channel send channel=default to=all message="hello"`
+- `/channel sse`
+"""
+
 
 def install_claude_any_slash_commands() -> None:
     try:
@@ -2091,6 +2196,7 @@ def install_claude_any_slash_commands() -> None:
         commands = {
             "advisor.md": ADVISOR_SLASH_COMMAND,
             "router-debug.md": ROUTER_DEBUG_SLASH_COMMAND,
+            "channel.md": CHANNEL_SLASH_COMMAND,
         }
         for name, content in commands.items():
             path = CLAUDE_COMMANDS_DIR / name
@@ -2342,6 +2448,32 @@ def latest_user_text(body: dict[str, Any]) -> str:
             continue
         return text
     return ""
+
+
+def router_debug_message_preview_chars(cfg: dict[str, Any] | None = None) -> int:
+    cfg = cfg or load_config()
+    env = os.environ.get("CLAUDE_ANY_ROUTER_MESSAGE_PREVIEW_CHARS", "").strip()
+    if env:
+        value = positive_int(env)
+        return min(value or 0, 4000)
+    value = positive_int(cfg.get("router_debug_message_preview_chars"))
+    return min(value or 0, 4000)
+
+
+def router_event_message_preview(body: dict[str, Any], cfg: dict[str, Any] | None = None) -> dict[str, Any]:
+    limit = router_debug_message_preview_chars(cfg)
+    if limit <= 0:
+        return {}
+    text = latest_user_text(body).strip()
+    if not text:
+        return {"message_preview_chars": limit, "message_preview": "", "message_preview_truncated": False}
+    normalized = re.sub(r"\s+", " ", text)
+    truncated = len(normalized) > limit
+    return {
+        "message_preview_chars": limit,
+        "message_preview": normalized[:limit].rstrip(),
+        "message_preview_truncated": truncated,
+    }
 
 
 def likely_implementation_planning_request(text: str) -> bool:
@@ -3852,6 +3984,8 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
         ("Events SSE", "/ca/events/stream", "Server-sent events stream"),
         ("Chat health", "/ca/chat/health", "Agent chat component status"),
         ("Chat messages", "/ca/chat/messages", "Stored agent chat messages"),
+        ("Channel bridge", "/ca/channel/health", "External channel bridge API"),
+        ("Channel messages", "/ca/channel/messages", "Messages posted through channel bridge"),
         ("Plan artifacts", "/ca/plan/artifacts", "Plan mode artifacts served by router"),
         ("Models", "/v1/models", "Claude-compatible model list"),
         ("Health", "/health", "Machine-readable health JSON"),
@@ -3903,6 +4037,7 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
     .event {{ padding: 8px 0; border-top: 1px solid #1f2937; }}
     .event:first-child {{ border-top: 0; }}
     .meta {{ color: #93a4ba; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }}
+    .preview {{ margin-top: 4px; color: #cbd5e1; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }}
     code {{ color: #bfdbfe; }}
   </style>
 </head>
@@ -4011,7 +4146,10 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
     loadSettings();
     fetch('/ca/events/recent?limit=20').then(r => r.json()).then(j => {{
       const events = j.events || [];
-      el.innerHTML = events.length ? events.reverse().map(e => `<div class="event"><div class="meta">#${{e.id}} ${{esc(e.time)}} · ${{esc(e.level)}} · ${{esc(e.category)}} · ${{esc(e.provider)}} ${{esc(e.model)}}</div><div>${{esc(e.message)}}</div></div>`).join('') : '<div class="meta">No events yet.</div>';
+      el.innerHTML = events.length ? events.reverse().map(e => {{
+        const preview = e.data && e.data.message_preview ? `<div class="preview">${{esc(e.data.message_preview)}}${{e.data.message_preview_truncated ? '…' : ''}}</div>` : '';
+        return `<div class="event"><div class="meta">#${{e.id}} ${{esc(e.time)}} · ${{esc(e.level)}} · ${{esc(e.category)}} · ${{esc(e.provider)}} ${{esc(e.model)}}</div><div>${{esc(e.message)}}</div>${{preview}}</div>`;
+      }}).join('') : '<div class="meta">No events yet.</div>';
     }}).catch(err => {{ el.innerHTML = '<div class="meta">Could not load events: ' + esc(err) + '</div>'; }});
   </script>
 </body>
@@ -4186,6 +4324,213 @@ def append_chat_message(payload: dict[str, Any]) -> dict[str, Any]:
         return message
 
 
+def _channel_sse_status_public(name: str, state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "name": name,
+        "url": state.get("url"),
+        "channel": state.get("channel"),
+        "sender_id": state.get("sender_id"),
+        "recipient": state.get("recipient"),
+        "running": bool(state.get("running")),
+        "started_at": state.get("started_at"),
+        "last_event_at": state.get("last_event_at"),
+        "messages_received": int(state.get("messages_received") or 0),
+        "event_filter": state.get("event_filter") or [],
+        "read_timeout_seconds": state.get("read_timeout_seconds"),
+        "last_error": state.get("last_error"),
+    }
+
+
+def channel_sse_status() -> dict[str, Any]:
+    with _CHANNEL_SSE_LOCK:
+        return {name: _channel_sse_status_public(name, state) for name, state in _CHANNEL_SSE_CONNECTIONS.items()}
+
+
+def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict[str, Any]) -> dict[str, Any] | None:
+    text = (data_text or "").strip()
+    if not text or text == "[DONE]":
+        return None
+    if (event_name or "").strip().lower() == "endpoint":
+        return None
+    parsed: Any = None
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        parsed = None
+
+    meta: dict[str, Any] = {
+        "sse_event": event_name or "message",
+        "sse_source": defaults.get("name") or "",
+    }
+    content = text
+    kind = "sse"
+    method = str(event_name or "message")
+    event_filter = defaults.get("event_filter")
+    allowed_events = {str(item).strip() for item in event_filter if str(item).strip()} if isinstance(event_filter, list) else set()
+    if isinstance(parsed, dict):
+        method = str(parsed.get("method") or event_name or "message")
+        params = parsed.get("params") if isinstance(parsed.get("params"), dict) else {}
+        payload = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else {}
+        meta.update({k: v for k, v in (params.get("meta") if isinstance(params.get("meta"), dict) else {}).items()})
+        if isinstance(parsed.get("meta"), dict):
+            meta.update(parsed["meta"])
+        for source in (params, payload, parsed):
+            for key in ("content", "message", "text", "body"):
+                value = source.get(key)
+                if value is not None:
+                    content = str(value)
+                    break
+            if content != text:
+                break
+        kind = method.replace("notifications/claude/", "").replace("/", ".") if method else "sse"
+        for key in ("room_id", "room", "thread_id", "parent_id", "message_id", "task_id", "round_id"):
+            value = params.get(key, payload.get(key, parsed.get(key)))
+            if value is not None:
+                meta[key] = value
+    if allowed_events and method not in allowed_events and (event_name or "message") not in allowed_events:
+        return None
+    return {
+        "channel": defaults.get("channel") or "default",
+        "sender_id": defaults.get("sender_id") or "sse",
+        "recipients": defaults.get("recipient") or defaults.get("recipients") or "all",
+        "thread_id": meta.get("thread_id"),
+        "parent_id": meta.get("parent_id"),
+        "kind": kind,
+        "message": content,
+        "meta": meta,
+    }
+
+
+def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str]) -> None:
+    data_text = "\n".join(data_lines)
+    with _CHANNEL_SSE_LOCK:
+        state = _CHANNEL_SSE_CONNECTIONS.get(name)
+        if not state:
+            return
+        defaults = dict(state)
+    payload = _sse_payload_to_chat_payload(data_text, event_name, defaults)
+    if not payload:
+        return
+    append_chat_message(payload)
+    now = time.strftime("%Y-%m-%dT%H:%M:%S")
+    with _CHANNEL_SSE_LOCK:
+        state = _CHANNEL_SSE_CONNECTIONS.get(name)
+        if state:
+            state["last_event_at"] = now
+            state["messages_received"] = int(state.get("messages_received") or 0) + 1
+            state["last_error"] = None
+
+
+def _channel_sse_worker(name: str) -> None:
+    while True:
+        with _CHANNEL_SSE_LOCK:
+            state = _CHANNEL_SSE_CONNECTIONS.get(name)
+            if not state or not state.get("running"):
+                return
+            url = str(state.get("url") or "")
+            headers = dict(state.get("headers") or {})
+            read_timeout = max(5.0, min(3600.0, float(state.get("read_timeout_seconds") or 300.0)))
+            retry_seconds = max(1.0, min(60.0, float(state.get("retry_seconds") or 5.0)))
+        event_name = "message"
+        data_lines: list[str] = []
+        try:
+            req = urllib.request.Request(url, headers={**headers, "Accept": "text/event-stream"})
+            with urllib.request.urlopen(req, timeout=read_timeout) as response:
+                while True:
+                    with _CHANNEL_SSE_LOCK:
+                        current = _CHANNEL_SSE_CONNECTIONS.get(name)
+                        if not current or not current.get("running"):
+                            return
+                    raw = response.readline()
+                    if raw == b"":
+                        raise ConnectionError("SSE stream ended")
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line:
+                        if data_lines:
+                            _channel_sse_dispatch(name, event_name, data_lines)
+                        event_name = "message"
+                        data_lines = []
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    field, _, value = line.partition(":")
+                    if value.startswith(" "):
+                        value = value[1:]
+                    if field == "event":
+                        event_name = value or "message"
+                    elif field == "data":
+                        data_lines.append(value)
+                    elif field == "retry":
+                        try:
+                            retry_seconds = max(1.0, min(60.0, int(value) / 1000.0))
+                        except Exception:
+                            pass
+        except Exception as exc:
+            with _CHANNEL_SSE_LOCK:
+                state = _CHANNEL_SSE_CONNECTIONS.get(name)
+                if not state or not state.get("running"):
+                    return
+                state["last_error"] = f"{type(exc).__name__}: {exc}"
+            time.sleep(retry_seconds)
+
+
+def start_channel_sse_connection(config: dict[str, Any]) -> dict[str, Any]:
+    url = str(config.get("url") or "").strip()
+    if not url.startswith(("http://", "https://")):
+        raise ValueError("SSE url must start with http:// or https://")
+    name = _safe_segment(str(config.get("name") or urllib.parse.urlparse(url).netloc or "sse"), "sse")
+    headers = config.get("headers") if isinstance(config.get("headers"), dict) else {}
+    headers = {str(k): str(v) for k, v in headers.items() if str(k).strip()}
+    token = str(config.get("bearer_token") or config.get("token") or "").strip()
+    if token and "Authorization" not in headers:
+        headers["Authorization"] = f"Bearer {token}"
+    event_filter = config.get("event_filter")
+    if isinstance(event_filter, str):
+        event_filter = [item.strip() for item in event_filter.split(",") if item.strip()]
+    elif isinstance(event_filter, list):
+        event_filter = [str(item).strip() for item in event_filter if str(item).strip()]
+    else:
+        event_filter = []
+    with _CHANNEL_SSE_LOCK:
+        prior = _CHANNEL_SSE_CONNECTIONS.get(name)
+        if prior:
+            prior["running"] = False
+        state = {
+            "name": name,
+            "url": url,
+            "headers": headers,
+            "channel": str(config.get("channel") or "default"),
+            "sender_id": str(config.get("sender_id") or config.get("sender") or name),
+            "recipient": str(config.get("recipient") or config.get("recipient_id") or config.get("to") or "all"),
+            "running": True,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "last_event_at": None,
+            "messages_received": 0,
+            "last_error": None,
+            "event_filter": event_filter,
+            "read_timeout_seconds": float(config.get("read_timeout_seconds") or config.get("timeout") or 300.0),
+            "retry_seconds": float(config.get("retry_seconds") or 5.0),
+        }
+        _CHANNEL_SSE_CONNECTIONS[name] = state
+    thread = threading.Thread(target=_channel_sse_worker, args=(name,), daemon=True, name=f"claude-any-channel-sse-{name}")
+    thread.start()
+    return _channel_sse_status_public(name, state)
+
+
+def stop_channel_sse_connection(name: str | None = None) -> dict[str, Any]:
+    stopped: list[str] = []
+    with _CHANNEL_SSE_LOCK:
+        targets = [name] if name else list(_CHANNEL_SSE_CONNECTIONS)
+        for target in targets:
+            if not target:
+                continue
+            state = _CHANNEL_SSE_CONNECTIONS.get(target)
+            if state:
+                state["running"] = False
+                stopped.append(target)
+    return {"stopped": stopped, "connections": channel_sse_status()}
+
+
 def _query_params(handler: BaseHTTPRequestHandler) -> dict[str, list[str]]:
     return urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query, keep_blank_values=True)
 
@@ -4196,8 +4541,28 @@ def _first_param(params: dict[str, list[str]], name: str, default: str = "") -> 
 
 
 def handle_chat_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    channel_alias = path.startswith("/ca/channel/")
+    if channel_alias:
+        path = "/ca/chat/" + path[len("/ca/channel/"):]
     if path == "/ca/chat/health":
-        write_json(handler, {"ok": True, "base": ROUTER_BASE, "messages": "/ca/chat/messages", "stream": "/ca/chat/stream"})
+        write_json(
+            handler,
+            {
+                "ok": True,
+                "base": ROUTER_BASE,
+                "messages": "/ca/channel/messages" if channel_alias else "/ca/chat/messages",
+                "wait": "/ca/channel/wait" if channel_alias else "/ca/chat/wait",
+                "stream": "/ca/channel/stream" if channel_alias else "/ca/chat/stream",
+                "notify": "/ca/channel/notify",
+                "sse_status": "/ca/channel/sse/status",
+                "sse_connect": "POST /ca/channel/sse/connect",
+                "sse_disconnect": "POST /ca/channel/sse/disconnect",
+                "native_note": "This is the Claude Any bridge API, not Claude Code's gated native --channels path.",
+            },
+        )
+        return True
+    if path == "/ca/chat/sse/status":
+        write_json(handler, {"ok": True, "connections": channel_sse_status()})
         return True
     if path in ("/ca/chat/messages", "/ca/chat/wait"):
         params = _query_params(handler)
@@ -4262,6 +4627,39 @@ def handle_chat_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
 
 
 def handle_chat_post(handler: BaseHTTPRequestHandler, path: str, body: dict[str, Any]) -> bool:
+    channel_alias = path.startswith("/ca/channel/")
+    if channel_alias:
+        path = "/ca/chat/" + path[len("/ca/channel/"):]
+    if path == "/ca/chat/sse/connect":
+        try:
+            status = start_channel_sse_connection(body)
+            write_json(handler, {"ok": True, "connection": status})
+        except Exception as exc:
+            write_json(handler, {"ok": False, "error": str(exc)}, 400)
+        return True
+    if path == "/ca/chat/sse/disconnect":
+        name = body.get("name")
+        result = stop_channel_sse_connection(str(name) if name else None)
+        write_json(handler, {"ok": True, **result})
+        return True
+    if path == "/ca/chat/notify":
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        meta = params.get("meta") if isinstance(params.get("meta"), dict) else body.get("meta")
+        if not isinstance(meta, dict):
+            meta = {}
+        content = str(params.get("content") or body.get("content") or body.get("message") or body.get("text") or "")
+        message = append_chat_message({
+            "channel": body.get("channel") or meta.get("channel") or "default",
+            "sender_id": body.get("sender_id") or body.get("sender") or body.get("server") or meta.get("source") or "channel",
+            "recipients": body.get("recipients", body.get("recipient_id", meta.get("recipients", "all"))),
+            "thread_id": body.get("thread_id") or meta.get("thread_id"),
+            "parent_id": body.get("parent_id") or meta.get("parent_id"),
+            "kind": body.get("kind") or "channel",
+            "message": content,
+            "meta": meta,
+        })
+        write_json(handler, {"ok": True, "message": message})
+        return True
     if path == "/ca/chat/messages":
         message = append_chat_message(body)
         write_json(handler, {"ok": True, "message": message})
@@ -4423,6 +4821,71 @@ def is_router_debug_request(body: dict[str, Any]) -> bool:
     return "CLAUDE_ANY_ROUTER_DEBUG_ACCESS" in latest_user_text(body)
 
 
+def is_channel_bridge_request(body: dict[str, Any]) -> bool:
+    return CHANNEL_BRIDGE_MARKER in latest_user_text(body)
+
+
+def channel_bridge_args_from_body(body: dict[str, Any]) -> str:
+    text = latest_user_text(body)
+    if CHANNEL_BRIDGE_MARKER not in text:
+        return "status"
+    tail = text.split(CHANNEL_BRIDGE_MARKER, 1)[1]
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("args:"):
+            return stripped.split(":", 1)[1].strip() or "status"
+    return tail.strip() or "status"
+
+
+def parse_channel_bridge_args(raw: str) -> tuple[str, dict[str, str]]:
+    text = (raw or "").strip()
+    if not text:
+        return "status", {}
+    try:
+        parts = shlex.split(text)
+    except Exception:
+        parts = text.split()
+    if not parts:
+        return "status", {}
+    command = parts[0].strip().lower()
+    if command not in {"status", "poll", "wait", "send", "post", "sse"}:
+        parts = ["status", *parts]
+        command = "status"
+    options: dict[str, str] = {}
+    loose: list[str] = []
+    for part in parts[1:]:
+        if "=" in part:
+            key, value = part.split("=", 1)
+            options[key.strip().lower().replace("-", "_")] = value.strip()
+        elif part:
+            loose.append(part)
+    if loose and "message" not in options and command in {"send", "post"}:
+        options["message"] = " ".join(loose)
+    return command, options
+
+
+def format_channel_messages(messages: list[dict[str, Any]], after: int) -> str:
+    if not messages:
+        return f"No channel messages after id {after}."
+    lines = [f"Channel bridge messages ({len(messages)}):"]
+    for item in messages:
+        recipients = item.get("recipients") or []
+        if isinstance(recipients, list):
+            recipient_text = ",".join(str(r) for r in recipients) or "all"
+        else:
+            recipient_text = str(recipients or "all")
+        text = re.sub(r"\s+", " ", str(item.get("message") or "")).strip()
+        if len(text) > 500:
+            text = text[:500].rstrip() + "..."
+        lines.append(
+            f"- #{item.get('id')} [{item.get('channel')}] {item.get('sender_id')} -> {recipient_text}: {text}"
+        )
+    lines.append(f"Last id: {messages[-1].get('id')}")
+    return "\n".join(lines)
+
+
 def router_debug_value_from_body(body: dict[str, Any]) -> str:
     text = latest_user_text(body)
     marker = "CLAUDE_ANY_ROUTER_DEBUG_ACCESS"
@@ -4514,6 +4977,59 @@ def advisor_tool_focus_from_message(message: dict[str, Any]) -> str | None:
                     return value.strip()
         return "advisor tool call"
     return None
+
+
+def tool_review_context_from_message(message: dict[str, Any], trigger: str) -> str:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return ""
+    sections: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        name = str(block.get("name") or "").strip()
+        if not name:
+            continue
+        if name == "advisor":
+            continue
+        tool_input = block.get("input")
+        input_text = tool_input_for_prompt(tool_input)
+        if name == "ExitPlanMode":
+            sections.append(
+                "Review target: ExitPlanMode plan before user approval.\n"
+                "The executor is about to submit this plan. Review the actual plan/tool input below.\n"
+                f"Tool input:\n{input_text}"
+            )
+        elif trigger:
+            sections.append(f"Review target tool: {name} ({trigger}).\nTool input:\n{input_text}")
+    return "\n\n".join(sections)
+
+
+def advisor_focus_for_message(message: dict[str, Any], trigger: str | None) -> tuple[str | None, str | None]:
+    explicit_focus = advisor_tool_focus_from_message(message)
+    if explicit_focus:
+        return "advisor tool call", explicit_focus
+    if not trigger:
+        return None, None
+    review_context = tool_review_context_from_message(message, trigger)
+    if review_context:
+        return trigger, review_context
+    return trigger, trigger
+
+
+def assistant_tool_call_summary_for_prompt(message: dict[str, Any]) -> str:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return ""
+    sections: list[str] = []
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        name = str(block.get("name") or "tool").strip() or "tool"
+        if name == "advisor":
+            continue
+        sections.append(f"Pending Claude Code tool call: {name}\nTool input:\n{tool_input_for_prompt(block.get('input'))}")
+    return "\n\n".join(sections)
 
 
 def body_has_advisor_feedback(body: dict[str, Any]) -> bool:
@@ -5476,8 +5992,10 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
 
 ADVISOR_REVIEW_PROMPT = (
     "You are claude-any Advisor, a stronger reviewer model. Review the current task state and provide "
-    "concise, actionable guidance for the executor model. Do not write code unless a small exact patch is "
-    "the clearest advice. Include: Current blocker, Next concrete action, Validation step. "
+    "concise, actionable guidance for the executor model. Review now; do not say that you will review later. "
+    "Do not write code unless a small exact patch is the clearest advice. Use this exact structure: "
+    "Verdict: approve, revise, or continue. Key findings: concrete gaps or risks. Required next action: "
+    "the next action or Claude Code tool call. Validation: the check that proves the work. "
     "If the executor is stuck after progress announcements, tell it the exact next Claude Code tool to call."
 )
 
@@ -5605,8 +6123,11 @@ def body_with_internal_advisor_feedback(body: dict[str, Any], assistant_message:
     messages = [m for m in body.get("messages", []) if isinstance(m, dict)]
     assistant_text = anthropic_content_to_text(assistant_message.get("content")).strip()
     tool_names = anthropic_message_tool_names(assistant_message)
+    tool_summary = assistant_tool_call_summary_for_prompt(assistant_message)
     if assistant_text:
         messages.append({"role": "assistant", "content": [{"type": "text", "text": compact_message_text_for_prompt(assistant_text)}]})
+    elif tool_summary:
+        messages.append({"role": "assistant", "content": [{"type": "text", "text": compact_message_text_for_prompt(tool_summary)}]})
     elif tool_names:
         messages.append({
             "role": "assistant",
@@ -5625,6 +6146,15 @@ def body_with_internal_advisor_feedback(body: dict[str, Any], assistant_message:
     follow_body["messages"] = messages
     follow_body.pop("tool_choice", None)
     return follow_body
+
+
+def advisor_visible_summary(advisor_text: str, trigger: str, limit: int = 700) -> str:
+    text = re.sub(r"\s+", " ", str(advisor_text or "")).strip()
+    if not text:
+        return ""
+    if len(text) > limit:
+        text = text[: max(0, limit - 1)].rstrip() + "…"
+    return f"Advisor review ({trigger}): {text}\n\n"
 
 
 def call_provider_chat_once(provider: str, pcfg: dict[str, Any], body: dict[str, Any], model: str) -> dict[str, Any]:
@@ -5674,23 +6204,24 @@ def refine_message_with_advisor(
         return message
     if is_advisor_request(original_body) or body_has_advisor_feedback(original_body):
         return message
-    advisor_focus = advisor_tool_focus_from_message(message)
-    trigger = "advisor tool call" if advisor_focus else advisor_trigger_for_message(original_body, message)
+    trigger = advisor_trigger_for_message(original_body, message)
+    trigger, advisor_focus = advisor_focus_for_message(message, trigger)
     if not trigger:
         return message
     advisor_text = call_advisor_text(provider, pcfg, original_body, focus=advisor_focus or trigger)
     if not advisor_text:
         return message
     follow_body = body_with_internal_advisor_feedback(original_body, message, advisor_text, trigger)
+    visible_summary = advisor_visible_summary(advisor_text, trigger)
     try:
         router_log("INFO", f"advisor_refinement_call trigger={trigger} main_model={main_model}")
         refined = call_provider_chat_once(provider, pcfg, follow_body, main_model)
         router_log("INFO", f"advisor_refinement_done trigger={trigger} stop_reason={refined.get('stop_reason')}")
-        return refined
+        return prepend_anthropic_text(refined, visible_summary)
     except Exception as exc:
         router_log("WARN", f"advisor_refinement_failed trigger={trigger} model={main_model} error={type(exc).__name__}: {exc}")
         write_router_activity("advisor_refinement_error", provider, main_model, error=type(exc).__name__)
-        return message
+        return prepend_anthropic_text(message, visible_summary)
 
 
 def anthropic_text_response(model: str, text: str, stop_reason: str = "end_turn") -> dict[str, Any]:
@@ -5898,6 +6429,96 @@ def maybe_handle_router_debug_request(handler: BaseHTTPRequestHandler, body: dic
     write_anthropic_text_response(handler, str(body.get("model") or current_alias(load_config())), "\n".join(lines), stream)
     if should_restart:
         schedule_router_process_restart()
+    return True
+
+
+def maybe_handle_channel_bridge_request(handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> bool:
+    if not is_channel_bridge_request(body):
+        return False
+    stream = bool(body.get("stream", True))
+    raw_args = channel_bridge_args_from_body(body)
+    command, options = parse_channel_bridge_args(raw_args)
+    try:
+        after = max(0, int(options.get("after") or "0"))
+    except Exception:
+        after = 0
+    channel = options.get("channel") or None
+    recipient = options.get("recipient") or options.get("recipient_id") or options.get("to") or None
+    try:
+        limit = max(1, min(100, int(options.get("limit") or "20")))
+    except Exception:
+        limit = 20
+    model = str(body.get("model") or current_alias(load_config()))
+
+    if command == "status":
+        latest = read_chat_messages(0, None, None, 1_000_000)
+        last_id = int(latest[-1]["id"]) if latest else 0
+        lines = [
+            "Claude Any channel bridge is available.",
+            "This is the router bridge API, separate from Claude Code's gated native --channels feature.",
+            f"Last message id: {last_id}.",
+            f"Poll: {ROUTER_BASE}/ca/channel/messages?after={last_id}&channel=default",
+            f"Wait: {ROUTER_BASE}/ca/channel/wait?after={last_id}&timeout=60",
+            f"SSE: {ROUTER_BASE}/ca/channel/stream?after={last_id}",
+            f"Notify: POST {ROUTER_BASE}/ca/channel/notify with {{\"params\":{{\"content\":\"...\",\"meta\":{{}}}}}}",
+            f"SSE connector status: {ROUTER_BASE}/ca/channel/sse/status",
+            "SSE connector control: POST /ca/channel/sse/connect or /ca/channel/sse/disconnect.",
+            "Slash usage: `/channel poll after=0`, `/channel wait after=0 timeout=60`, `/channel send channel=default to=all message=\"hello\"`, or `/channel sse`.",
+        ]
+        write_anthropic_text_response(handler, model, "\n".join(lines), stream)
+        return True
+
+    if command == "sse":
+        statuses = channel_sse_status()
+        if not statuses:
+            text = "No channel SSE connectors are configured."
+        else:
+            lines = ["Channel SSE connectors:"]
+            for name, state in statuses.items():
+                running = "running" if state.get("running") else "stopped"
+                received = int(state.get("messages_received") or 0)
+                error = state.get("last_error") or ""
+                suffix = f", last_error={error}" if error else ""
+                lines.append(f"- {name}: {running}, received={received}, url={state.get('url')}{suffix}")
+            text = "\n".join(lines)
+        write_anthropic_text_response(handler, model, text, stream)
+        return True
+
+    if command in {"poll", "wait"}:
+        timeout = 0.0
+        if command == "wait":
+            try:
+                timeout = max(0.0, min(300.0, float(options.get("timeout") or "60")))
+            except Exception:
+                timeout = 60.0
+        deadline = time.time() + timeout
+        messages = read_chat_messages(after, channel, recipient, limit)
+        while not messages and timeout > 0 and time.time() < deadline:
+            with _CHAT_CONDITION:
+                _CHAT_CONDITION.wait(timeout=min(5.0, max(0.0, deadline - time.time())))
+            messages = read_chat_messages(after, channel, recipient, limit)
+        write_anthropic_text_response(handler, model, format_channel_messages(messages, after), stream)
+        return True
+
+    if command in {"send", "post"}:
+        message_text = options.get("message") or options.get("text") or ""
+        if not message_text:
+            write_anthropic_text_response(handler, model, "Channel send failed: provide message=\"...\".", stream)
+            return True
+        message = append_chat_message({
+            "channel": channel or "default",
+            "sender_id": options.get("sender") or options.get("sender_id") or "claude",
+            "recipients": recipient or options.get("recipients") or "all",
+            "thread_id": options.get("thread_id"),
+            "parent_id": options.get("parent_id"),
+            "kind": "message",
+            "message": message_text,
+            "meta": {"source": "slash_command"},
+        })
+        write_anthropic_text_response(handler, model, f"Channel message posted as id {message['id']}.", stream)
+        return True
+
+    write_anthropic_text_response(handler, model, "Usage: `/channel status`, `/channel poll`, `/channel wait`, or `/channel send message=\"...\"`.", stream)
     return True
 
 
@@ -7513,7 +8134,12 @@ class RouterHandler(BaseHTTPRequestHandler):
             request_id=request_id,
             provider=provider,
             model=str(body.get("model") or ""),
-            data={"path": path, "messages": len(body.get("messages") or []), "tools": len(body.get("tools") or [])},
+            data={
+                "path": path,
+                "messages": len(body.get("messages") or []),
+                "tools": len(body.get("tools") or []),
+                **router_event_message_preview(body, cfg),
+            },
         )
         dump_request_for_trace(provider, path, body)
         if maybe_handle_plan_mode_tool_choice(self, provider, body):
@@ -7523,6 +8149,9 @@ class RouterHandler(BaseHTTPRequestHandler):
         write_context_usage(provider, pcfg, body, "messages")
         if maybe_handle_router_debug_request(self, body):
             EVENT_BUS.publish(level="info", category="router_debug.short_circuit", message="router debug request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
+            return
+        if maybe_handle_channel_bridge_request(self, body):
+            EVENT_BUS.publish(level="info", category="channel.short_circuit", message="channel bridge request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
         if maybe_handle_advisor_request(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
@@ -9616,6 +10245,12 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ja": "デバッグ用にルーター UI/API を外部クライアントへ公開します。off では外部リクエストを拒否し、次回起動時は環境変数がなければローカルのみで bind します。",
         "zh": "为了调试向外部客户端暴露路由器 UI/API。关闭时会拒绝外部请求；下次启动在没有环境变量覆盖时仅绑定本地。",
     },
+    "router_debug_message_preview_chars": {
+        "en": "When greater than 0, include the first N characters of the latest user message in router event data for debugging. Keep 0 for privacy.",
+        "ko": "0보다 크면 디버깅용 이벤트 data에 최근 사용자 메시지 앞 N자를 포함합니다. 개인정보 보호를 위해 기본값은 0입니다.",
+        "ja": "0より大きい場合、デバッグ用イベントdataに直近ユーザーメッセージの先頭N文字を含めます。プライバシー保護のため既定値は0です。",
+        "zh": "大于0时，在调试事件data中包含最近用户消息的前N个字符。为保护隐私默认值为0。",
+    },
     "back": {
         "en": "Return to the main menu.",
         "ko": "메인 메뉴로 돌아갑니다.",
@@ -9706,6 +10341,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
     add(ui_text("apply_preset", lang), "preset", llm_preset_text(applied_preset_id(provider, pcfg), lang)[0])
     add(ui_text("timeout_preset", lang), "timeout_profile", timeout_profile_status(pcfg, lang))
     add("Router debug external", "router_debug_external_access", "on" if router_debug_external_access_enabled() else "off")
+    add("Event message preview", "router_debug_message_preview_chars", router_debug_message_preview_chars())
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         add("Context window", "num_ctx", ollama_num_ctx_status(pcfg))
@@ -9753,6 +10389,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
 def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> str:
     if key == "router_debug_external_access":
         return "true" if router_debug_external_access_enabled() else "false"
+    if key == "router_debug_message_preview_chars":
+        return str(router_debug_message_preview_chars())
     if key == "stream_enabled":
         return "true" if bool(pcfg.get("stream_enabled", True)) else "false"
     if key == "stream_word_chunking":
@@ -9780,6 +10418,15 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
         return ["Option unchanged."]
     if key == "router_debug_external_access":
         return set_router_debug_external_access_config(value)
+    if key == "router_debug_message_preview_chars":
+        fixed = positive_int(value)
+        if str(value).lower() in ("0", "false", "off", "disable", "disabled", "none", "unset"):
+            fixed = 0
+        if fixed is None:
+            return ["router_debug_message_preview_chars: enter digits only, or 0/off to disable."]
+        cfg["router_debug_message_preview_chars"] = min(fixed, 4000)
+        save_config(cfg)
+        return ["Router event message preview updated.", f"preview chars: {cfg['router_debug_message_preview_chars']}"]
     numeric_keys = {
         "context_window",
         "context",

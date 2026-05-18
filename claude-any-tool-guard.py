@@ -740,9 +740,16 @@ def main() -> int:
     except Exception:
         return 0
     name = str(event.get("hook_event_name") or "")
+    provider = os.environ.get("CLAUDE_ANY_PROVIDER", "").strip()
+    is_active = active()
+    if not is_active:
+        if provider:
+            log_event(f"inactive provider={provider}")
+        return 0
 
-    # Worktree handlers always run, regardless of provider, so the non-git
-    # worktree fallback works whenever the hook is installed at all.
+    # Claude Any hooks are installed in Claude Code's global settings, so they
+    # must be silent for native Claude sessions. Only alter worktree, stop, and
+    # tool behavior when Claude Any launched the process with an active provider.
     if name == "WorktreeCreate":
         return handle_worktree_create(event)
     if name == "WorktreeRemove":
@@ -753,19 +760,13 @@ def main() -> int:
     # Lightweight observation for events we do not act on. Skip when inactive
     # to avoid touching disk on every event.
     if name in OBSERVE_ONLY_EVENTS:
-        if active():
-            try:
-                log_json_event(event)
-            except Exception:
-                pass
+        try:
+            log_json_event(event)
+        except Exception:
+            pass
         return 0
 
     # Tool/task events: keep existing provider gating.
-    provider = os.environ.get("CLAUDE_ANY_PROVIDER", "").strip()
-    if not active():
-        if provider:
-            log_event(f"inactive provider={provider}")
-        return 0
     if name == "PreToolUse":
         tool = str(event.get("tool_name") or "")
         raw = event.get("tool_input")

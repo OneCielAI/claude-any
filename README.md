@@ -25,6 +25,12 @@
 
 ## Today's Top 3 Benefits
 
+### 2026-05-18
+
+1. **Realtime channel bridge for external agents** — Claude Any now exposes `/ca/channel/*` endpoints and an SSE connector so systems like AI-Net can push live agent messages into Claude Code sessions.
+2. **Advisor feedback is visible and actionable** — Advisor reviews can be surfaced in the Claude Code transcript and fed back into the executor model before plan approval or risky continuation points.
+3. **Better non-Anthropic workflow parity** — Cron-style task scheduling, channel polling, and router-native coordination commands are modeled more closely to Claude Code's native behavior for Ollama, Ollama Cloud, NVIDIA hosted, vLLM, and NIM.
+
 ### 2026-05-15
 
 1. **Router management is now navigable** — the built-in router home page is split into top-menu sections for Overview, LLM Settings, Events, and Endpoints instead of crowding everything into one long screen.
@@ -62,7 +68,7 @@ arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.68`
+Current version: `0.1.69`
 
 ## Why This Exists
 
@@ -488,6 +494,17 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.69
+
+- **Realtime channel bridge**: added `/ca/channel/messages`, `/ca/channel/wait`,
+  `/ca/channel/stream`, `/ca/channel/notify`, and runtime SSE connector controls
+  so external systems can deliver live messages into Claude Any.
+- **`/channel` slash command**: Claude Code can inspect bridge status, poll,
+  wait, send messages, and check SSE connector state without leaving the session.
+- **Advisor and coordination parity**: Advisor feedback is summarized back into
+  the visible transcript/executor flow, while channel and Cron-compatible tool
+  schemas make third-party model sessions behave closer to native Claude Code.
 
 ### 0.1.68
 

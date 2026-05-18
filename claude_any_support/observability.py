@@ -158,6 +158,7 @@ def render_events_html(events_path: str = "/ca/events/stream", recent_path: str 
     .event.trace {{ border-color: #a78bfa; }}
     .meta {{ color: #94a3b8; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }}
     .message {{ margin-top: 4px; }}
+    .preview {{ margin-top: 4px; color: #cbd5e1; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }}
     aside {{ border-left: 1px solid #263244; padding: 12px; background: #0b1018; overflow: auto; }}
     pre {{ white-space: pre-wrap; word-break: break-word; background: #05070a; border: 1px solid #1f2937; border-radius: 6px; padding: 10px; }}
   </style>
@@ -190,7 +191,10 @@ def render_events_html(events_path: str = "/ca/events/stream", recent_path: str 
     function render() {{
       const rows = allEvents.filter(visible).slice(-500);
       countEl.textContent = rows.length + ' events';
-      eventsEl.innerHTML = rows.map(e => `<div class=\"event ${{esc(e.level)}}\" data-id=\"${{e.id}}\"><div class=\"meta\">#${{e.id}} ${{esc(e.time)}} · ${{esc(e.level)}} · ${{esc(e.category)}} · ${{esc(e.provider)}} ${{esc(e.model)}}</div><div class=\"message\">${{esc(e.message)}}</div></div>`).join('');
+      eventsEl.innerHTML = rows.map(e => {{
+        const preview = e.data && e.data.message_preview ? `<div class=\"preview\">${{esc(e.data.message_preview)}}${{e.data.message_preview_truncated ? '…' : ''}}</div>` : '';
+        return `<div class=\"event ${{esc(e.level)}}\" data-id=\"${{e.id}}\"><div class=\"meta\">#${{e.id}} ${{esc(e.time)}} · ${{esc(e.level)}} · ${{esc(e.category)}} · ${{esc(e.provider)}} ${{esc(e.model)}}</div><div class=\"message\">${{esc(e.message)}}</div>${{preview}}</div>`;
+      }}).join('');
     }}
     eventsEl.addEventListener('click', ev => {{
       const row = ev.target.closest('.event');

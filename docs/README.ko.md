@@ -25,6 +25,12 @@
 
 ## 오늘 추가된 최고의 3가지 베네핏
 
+### 2026-05-18
+
+1. **외부 에이전트용 실시간 채널 브리지** — Claude Any가 `/ca/channel/*` 엔드포인트와 SSE connector를 제공해 AI-Net 같은 시스템의 실시간 에이전트 메시지를 Claude Code 세션으로 밀어 넣을 수 있습니다.
+2. **Advisor 피드백을 보고 실행 흐름에 반영** — Advisor 리뷰를 Claude Code transcript에 요약해서 보여주고, 계획 승인이나 위험한 진행 지점 전에 executor 모델에게 다시 전달할 수 있습니다.
+3. **non-Anthropic 워크플로우 호환성 강화** — Cron 스타일 작업 예약, 채널 polling, router-native coordination command를 Claude Code native 동작에 더 가깝게 모델링했습니다.
+
 ### 2026-05-15
 
 1. **Router 관리 페이지가 메뉴형으로 정리** — 내장 router 홈 화면을 Overview, LLM Settings, Events, Endpoints 상단 메뉴로 나눠 모든 정보가 한 화면에 길게 쌓이지 않도록 했습니다.
@@ -61,7 +67,7 @@ NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.68`
+현재 버전: `0.1.69`
 
 ## 왜 만들었나
 
@@ -364,6 +370,17 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   파일 수정 시에만 다시 읽습니다.
 
 ## 변경 이력
+
+### 0.1.69
+
+- **실시간 채널 브리지**: `/ca/channel/messages`, `/ca/channel/wait`,
+  `/ca/channel/stream`, `/ca/channel/notify`, runtime SSE connector control을
+  추가해 외부 시스템이 Claude Any로 live message를 전달할 수 있습니다.
+- **`/channel` slash command**: Claude Code 안에서 bridge 상태 확인, polling,
+  wait, message send, SSE connector 상태 확인을 수행할 수 있습니다.
+- **Advisor 및 coordination 호환성 강화**: Advisor 피드백을 visible transcript와
+  executor flow에 요약 반영하고, channel/Cron 호환 tool schema로 서드파티 모델
+  세션이 Claude Code native 동작에 더 가까워졌습니다.
 
 ### 0.1.68
 

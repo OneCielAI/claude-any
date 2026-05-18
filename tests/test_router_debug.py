@@ -53,6 +53,20 @@ class RouterDebugTests(unittest.TestCase):
 
         self.assertEqual("toggle", claude_any.router_debug_value_from_body(body))
 
+    def test_router_event_message_preview_defaults_to_off(self):
+        body = {"messages": [{"role": "user", "content": "secret prompt"}]}
+
+        self.assertEqual({}, claude_any.router_event_message_preview(body, {"router_debug_message_preview_chars": 0}))
+
+    def test_router_event_message_preview_truncates_latest_user_text(self):
+        body = {"messages": [{"role": "user", "content": "hello\nworld side question"}]}
+
+        preview = claude_any.router_event_message_preview(body, {"router_debug_message_preview_chars": 11})
+
+        self.assertEqual(11, preview["message_preview_chars"])
+        self.assertEqual("hello world", preview["message_preview"])
+        self.assertTrue(preview["message_preview_truncated"])
+
 
 if __name__ == "__main__":
     unittest.main()

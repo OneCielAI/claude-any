@@ -61,7 +61,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.68`
+現在のバージョン: `0.1.69`
 
 ## 作られた理由
 
@@ -364,6 +364,17 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   設定をメモリにキャッシュし、ファイル変更時のみ再読み込みします。
 
 ## 変更履歴
+
+### 0.1.69
+
+- **リアルタイム channel bridge**: `/ca/channel/messages`, `/ca/channel/wait`,
+  `/ca/channel/stream`, `/ca/channel/notify`, runtime SSE connector control を
+  追加し、外部システムが Claude Any に live message を配信できるようにしました。
+- **`/channel` slash command**: Claude Code 内で bridge 状態確認、polling、
+  wait、message send、SSE connector 状態確認を行えます。
+- **Advisor と coordination の互換性向上**: Advisor feedback を visible
+  transcript と executor flow に要約して戻し、channel/Cron 互換 tool schema により
+  third-party model session が Claude Code native の動作に近づきました。
 
 ### 0.1.68
 

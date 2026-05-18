@@ -61,7 +61,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.68`
+当前版本: `0.1.69`
 
 ## 为什么存在
 
@@ -350,6 +350,17 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
   减少了每次请求的磁盘 I/O 开销。
 
 ## 更新日志
+
+### 0.1.69
+
+- **实时 channel bridge**：新增 `/ca/channel/messages`、`/ca/channel/wait`、
+  `/ca/channel/stream`、`/ca/channel/notify` 以及运行时 SSE connector 控制，
+  外部系统可以把 live message 推送到 Claude Any。
+- **`/channel` slash command**：可在 Claude Code 内查看 bridge 状态、poll、
+  wait、发送消息，并检查 SSE connector 状态。
+- **Advisor 与 coordination 兼容性增强**：Advisor feedback 会摘要回显到可见
+  transcript/executor flow，channel/Cron 兼容 tool schema 让 third-party model
+  session 更接近 Claude Code native 行为。
 
 ### 0.1.68
 
