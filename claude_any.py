@@ -24,7 +24,7 @@ import urllib.request
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from claude_any_support.observability import EventBus, render_events_html
 from claude_any_support.transcript_filter import (
@@ -57,6 +57,7 @@ PID_PATH = CONFIG_DIR / "router.pid"
 MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
+CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
 ROUTER_HOST = os.environ.get("CLAUDE_ANY_ROUTER_CLIENT_HOST", "127.0.0.1").strip() or "127.0.0.1"
 ROUTER_PORT = 8799
 ROUTER_BASE = f"http://{ROUTER_HOST}:{ROUTER_PORT}"
@@ -120,6 +121,8 @@ _CHAT_CONDITION = threading.Condition()
 _CHAT_NEXT_ID: int | None = None
 _CHANNEL_SSE_LOCK = threading.Lock()
 _CHANNEL_SSE_CONNECTIONS: dict[str, dict[str, Any]] = {}
+_CHANNEL_MCP_LOCK = threading.Lock()
+_CHANNEL_MCP_SESSIONS: dict[str, dict[str, Any]] = {}
 EVENT_BUS = EventBus()
 ADVISOR_FEEDBACK_MARKER = "CLAUDE_ANY_ADVISOR_FEEDBACK"
 PLAN_GUARD_MARKER = "[claude-any-plan-guard]"
@@ -4677,6 +4680,134 @@ def stop_channel_sse_connection(name: str | None = None) -> dict[str, Any]:
     return {"stopped": stopped, "connections": channel_sse_status()}
 
 
+def _channel_mcp_session_id() -> str:
+    return f"s{os.getpid()}-{time.time_ns()}"
+
+
+def _channel_mcp_notification(message: dict[str, Any]) -> dict[str, Any]:
+    text = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
+    channel = str(message.get("channel") or "default")
+    sender = str(message.get("sender_id") or "channel")
+    prefix = f"[{channel}] {sender}"
+    content = f"{prefix}: {text}" if text else prefix
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    merged_meta = {
+        **meta,
+        "claude_any_message_id": message.get("id"),
+        "channel": channel,
+        "sender_id": sender,
+        "thread_id": message.get("thread_id"),
+        "parent_id": message.get("parent_id"),
+    }
+    return {
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": {
+            "content": content,
+            "meta": merged_meta,
+        },
+    }
+
+
+def _write_sse_event(handler: BaseHTTPRequestHandler, event: str, data: Any, event_id: int | None = None) -> None:
+    if event_id is not None:
+        handler.wfile.write(f"id: {event_id}\n".encode("utf-8"))
+    handler.wfile.write(f"event: {event}\n".encode("utf-8"))
+    payload = data if isinstance(data, str) else json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+    for line in payload.splitlines() or [""]:
+        handler.wfile.write(f"data: {line}\n".encode("utf-8"))
+    handler.wfile.write(b"\n")
+    handler.wfile.flush()
+
+
+def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    if path == "/ca/mcp/health":
+        write_json(handler, {"ok": True, "name": "claude-any-router", "sse": "/ca/mcp/sse"})
+        return True
+    if path != "/ca/mcp/sse":
+        return False
+    session = _channel_mcp_session_id()
+    last_id = _chat_init_next_id() - 1
+    with _CHANNEL_MCP_LOCK:
+        _CHANNEL_MCP_SESSIONS[session] = {"created_at": time.time(), "last_id": last_id, "initialized": False}
+    handler.send_response(200)
+    handler.send_header("content-type", "text/event-stream")
+    handler.send_header("cache-control", "no-cache")
+    handler.send_header("connection", "close")
+    handler.end_headers()
+    _write_sse_event(handler, "endpoint", f"/ca/mcp/messages?session={urllib.parse.quote(session)}")
+    try:
+        while True:
+            with _CHANNEL_MCP_LOCK:
+                state = _CHANNEL_MCP_SESSIONS.get(session)
+                if not state:
+                    return True
+                last_id = int(state.get("last_id") or 0)
+            messages = read_chat_messages(last_id, None, None, 100)
+            if messages:
+                for message in messages:
+                    last_id = max(last_id, int(message.get("id") or 0))
+                    _write_sse_event(handler, "message", _channel_mcp_notification(message), last_id)
+                with _CHANNEL_MCP_LOCK:
+                    state = _CHANNEL_MCP_SESSIONS.get(session)
+                    if state:
+                        state["last_id"] = last_id
+                continue
+            handler.wfile.write(b": keepalive\n\n")
+            handler.wfile.flush()
+            with _CHAT_CONDITION:
+                _CHAT_CONDITION.wait(timeout=15.0)
+    except (BrokenPipeError, ConnectionError, ConnectionResetError):
+        return True
+    finally:
+        with _CHANNEL_MCP_LOCK:
+            _CHANNEL_MCP_SESSIONS.pop(session, None)
+
+
+def handle_channel_mcp_post(handler: BaseHTTPRequestHandler, path: str, body: dict[str, Any]) -> bool:
+    if path != "/ca/mcp/messages":
+        return False
+    params = _query_params(handler)
+    session = _first_param(params, "session")
+    with _CHANNEL_MCP_LOCK:
+        if session and session in _CHANNEL_MCP_SESSIONS:
+            _CHANNEL_MCP_SESSIONS[session]["last_seen_at"] = time.time()
+    method = str(body.get("method") or "")
+    request_id = body.get("id")
+    if method == "initialize":
+        protocol = "2024-11-05"
+        req_params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        if req_params.get("protocolVersion"):
+            protocol = str(req_params["protocolVersion"])
+        with _CHANNEL_MCP_LOCK:
+            if session and session in _CHANNEL_MCP_SESSIONS:
+                _CHANNEL_MCP_SESSIONS[session]["initialized"] = True
+        write_json(
+            handler,
+            {
+                "jsonrpc": "2.0",
+                "id": request_id,
+                "result": {
+                    "protocolVersion": protocol,
+                    "capabilities": {"tools": {"listChanged": False}},
+                    "serverInfo": {"name": "claude-any-router", "version": VERSION},
+                },
+            },
+        )
+        return True
+    if method == "tools/list":
+        write_json(handler, {"jsonrpc": "2.0", "id": request_id, "result": {"tools": []}})
+        return True
+    if method == "ping":
+        write_json(handler, {"jsonrpc": "2.0", "id": request_id, "result": {}})
+        return True
+    if request_id is None:
+        write_json(handler, {"ok": True})
+        return True
+    write_json(handler, {"jsonrpc": "2.0", "id": request_id, "result": {}})
+    return True
+
+
 def _query_params(handler: BaseHTTPRequestHandler) -> dict[str, list[str]]:
     return urllib.parse.parse_qs(urllib.parse.urlparse(handler.path).query, keep_blank_values=True)
 
@@ -8123,6 +8254,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
         if handle_llm_config_get(self, path):
             return
+        if handle_channel_mcp_get(self, path):
+            return
         if handle_chat_get(self, path) or handle_plan_get(self, path):
             return
         provider, pcfg = get_current_provider(cfg)
@@ -8152,6 +8285,8 @@ class RouterHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length) if length else b"{}"
         body = parse_json_body(raw)
         if handle_llm_config_post(self, path, body):
+            return
+        if handle_channel_mcp_post(self, path, body):
             return
         if handle_chat_post(self, path, body) or handle_plan_post(self, path, body):
             return
@@ -8757,6 +8892,221 @@ def channel_specs(cfg: dict[str, Any] | None = None) -> list[str]:
         seen.add(spec)
         channels.append(spec)
     return channels
+
+
+def _dedupe_strings(values: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        text = str(value or "").strip()
+        if not text or text in seen:
+            continue
+        seen.add(text)
+        out.append(text)
+    return out
+
+
+def _path_for_compare(path: Path | str) -> str:
+    try:
+        return str(Path(path).expanduser().resolve()).replace("\\", "/").rstrip("/").casefold()
+    except Exception:
+        return str(path).replace("\\", "/").rstrip("/").casefold()
+
+
+def _project_key_matches_cwd(project_key: str, cwd: Path) -> bool:
+    key = str(project_key or "").strip()
+    if not key:
+        return False
+    try:
+        project_path = Path(key).expanduser()
+    except Exception:
+        return False
+    if not project_path.is_absolute():
+        return False
+    project = _path_for_compare(project_path)
+    current = _path_for_compare(cwd)
+    return current == project or current.startswith(project + "/")
+
+
+def _mcp_server_names_from_mapping(mapping: Any) -> list[str]:
+    if not isinstance(mapping, dict):
+        return []
+    names: list[str] = []
+    for key in ("mcpServers", "servers"):
+        servers = mapping.get(key)
+        if isinstance(servers, dict):
+            names.extend(str(name).strip() for name in servers if str(name).strip())
+    return _dedupe_strings(names)
+
+
+def _read_mcp_server_names_from_json(path: Path, cwd: Path) -> list[str]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    names = _mcp_server_names_from_mapping(data)
+    if path.name == ".claude.json" and isinstance(data, dict):
+        projects = data.get("projects")
+        if isinstance(projects, dict):
+            for project_key, project_data in projects.items():
+                if _project_key_matches_cwd(str(project_key), cwd):
+                    names.extend(_mcp_server_names_from_mapping(project_data))
+    return _dedupe_strings(names)
+
+
+def _mcp_config_paths_from_passthrough(passthrough: list[str]) -> list[Path]:
+    paths: list[Path] = []
+    i = 0
+    while i < len(passthrough):
+        arg = passthrough[i]
+        value: str | None = None
+        if arg == "--mcp-config":
+            if i + 1 < len(passthrough):
+                value = passthrough[i + 1]
+                i += 2
+            else:
+                i += 1
+        elif arg.startswith("--mcp-config="):
+            value = arg.split("=", 1)[1]
+            i += 1
+        else:
+            i += 1
+        if value:
+            paths.append(Path(value).expanduser())
+    return paths
+
+
+def claude_mcp_config_paths(passthrough: list[str] | None = None, cwd: Path | None = None, home: Path | None = None) -> list[Path]:
+    cwd = cwd or Path.cwd()
+    home = home or HOME
+    paths: list[Path] = []
+    paths.extend(_mcp_config_paths_from_passthrough(passthrough or []))
+    current = cwd
+    visited: set[str] = set()
+    while True:
+        key = _path_for_compare(current)
+        if key in visited:
+            break
+        visited.add(key)
+        paths.append(current / ".mcp.json")
+        if current == current.parent:
+            break
+        current = current.parent
+    paths.extend([
+        home / ".mcp.json",
+        home / ".claude" / "settings.json",
+        home / ".claude.json",
+    ])
+    out: list[Path] = []
+    seen: set[str] = set()
+    for path in paths:
+        key = _path_for_compare(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def auto_discovered_mcp_channel_specs(
+    passthrough: list[str] | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+) -> list[str]:
+    cwd = cwd or Path.cwd()
+    specs: list[str] = []
+    for path in claude_mcp_config_paths(passthrough, cwd, home):
+        if not path.exists() or not path.is_file():
+            continue
+        for name in _read_mcp_server_names_from_json(path, cwd):
+            if re.search(r"\s", name):
+                continue
+            specs.append(f"server:{name}" if not is_channel_spec_tagged(name) else name)
+    return _dedupe_strings(specs)
+
+
+def _mcp_sse_servers_from_mapping(mapping: Any) -> list[dict[str, Any]]:
+    if not isinstance(mapping, dict):
+        return []
+    found: list[dict[str, Any]] = []
+    for key in ("mcpServers", "servers"):
+        servers = mapping.get(key)
+        if not isinstance(servers, dict):
+            continue
+        for raw_name, raw_server in servers.items():
+            name = str(raw_name or "").strip()
+            if not name or not isinstance(raw_server, dict):
+                continue
+            url = str(raw_server.get("url") or raw_server.get("endpoint") or "").strip()
+            if not url.startswith(("http://", "https://")):
+                continue
+            server_type = str(raw_server.get("type") or "").strip().lower()
+            if server_type and server_type not in ("sse", "http", "streamable-http"):
+                continue
+            headers = raw_server.get("headers") if isinstance(raw_server.get("headers"), dict) else {}
+            found.append(
+                {
+                    "name": f"mcp-{name}",
+                    "url": url,
+                    "headers": {str(k): str(v) for k, v in headers.items() if str(k).strip()},
+                    "channel": name,
+                    "sender_id": name,
+                    "recipient": "all",
+                    "mcp": True,
+                }
+            )
+    return found
+
+
+def _read_mcp_sse_servers_from_json(path: Path, cwd: Path) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    servers = _mcp_sse_servers_from_mapping(data)
+    if path.name == ".claude.json" and isinstance(data, dict):
+        projects = data.get("projects")
+        if isinstance(projects, dict):
+            for project_key, project_data in projects.items():
+                if _project_key_matches_cwd(str(project_key), cwd):
+                    servers.extend(_mcp_sse_servers_from_mapping(project_data))
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for server in servers:
+        key = f"{server.get('name')}|{server.get('url')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(server)
+    return out
+
+
+def auto_start_sse_channels_from_mcp_configs(
+    passthrough: list[str] | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+) -> list[dict[str, Any]]:
+    cwd = cwd or Path.cwd()
+    started: list[dict[str, Any]] = []
+    for path in claude_mcp_config_paths(passthrough, cwd, home):
+        if not path.exists() or not path.is_file():
+            continue
+        for server in _read_mcp_sse_servers_from_json(path, cwd):
+            try:
+                status = start_channel_sse_connection(server)
+                started.append(status)
+                router_log("INFO", f"channel_sse_auto_started name={status.get('name')} url={status.get('url')}")
+            except Exception as exc:
+                router_log("WARN", f"channel_sse_auto_start_failed path={path} error={type(exc).__name__}: {exc}")
+    return started
+
+
+def channel_specs_for_launch(cfg: dict[str, Any], passthrough: list[str], extra_specs: list[str] | None = None) -> list[str]:
+    configured = [spec for spec in channel_specs(cfg) if is_channel_spec_tagged(spec)]
+    specs = configured
+    if extra_specs:
+        specs = [*specs, *extra_specs]
+    return _dedupe_strings(spec for spec in specs if is_channel_spec_tagged(spec))
 
 
 def is_channel_spec_tagged(spec: str) -> bool:
@@ -12907,17 +13257,16 @@ def normalize_channel_passthrough(passthrough: list[str]) -> list[str]:
     return normalized
 
 
-def claude_channel_args(cfg: dict[str, Any], passthrough: list[str]) -> list[str]:
-    channels = [spec for spec in channel_specs(cfg) if is_channel_spec_tagged(spec)]
-    if not channels or has_passthrough_option(passthrough, "--channels", "--dangerously-load-development-channels"):
-        return []
-    return ["--dangerously-load-development-channels", *channels]
+def native_channel_passthrough_requested(passthrough: list[str]) -> bool:
+    return has_passthrough_option(passthrough, "--channels", "--dangerously-load-development-channels")
 
 
-def claude_channels_requested(cfg: dict[str, Any], passthrough: list[str]) -> bool:
-    if has_passthrough_option(passthrough, "--channels", "--dangerously-load-development-channels"):
-        return True
-    return any(is_channel_spec_tagged(spec) for spec in channel_specs(cfg))
+def claude_channel_args(cfg: dict[str, Any], passthrough: list[str], extra_specs: list[str] | None = None) -> list[str]:
+    return []
+
+
+def claude_channels_requested(cfg: dict[str, Any], passthrough: list[str], extra_specs: list[str] | None = None) -> bool:
+    return native_channel_passthrough_requested(passthrough)
 
 
 def write_web_tools_mcp_config(cfg: dict[str, Any]) -> Path:
@@ -12958,6 +13307,155 @@ def write_duckduckgo_mcp_config(cfg: dict[str, Any]) -> Path:
     except Exception:
         pass
     return path
+
+
+def write_channel_mcp_config() -> Path:
+    data = {
+        "mcpServers": {
+            "claude-any-router": {
+                "type": "sse",
+                "url": f"{ROUTER_BASE}/ca/mcp/sse",
+            }
+        }
+    }
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    CHANNEL_MCP_CONFIG.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(CHANNEL_MCP_CONFIG, 0o600)
+    except Exception:
+        pass
+    return CHANNEL_MCP_CONFIG
+
+
+def should_use_channel_stdin_proxy(use_router_mode: bool, passthrough: list[str]) -> bool:
+    return bool(use_router_mode and not native_channel_passthrough_requested(passthrough))
+
+
+def format_channel_wake_prompt(message: dict[str, Any]) -> str:
+    channel = str(message.get("channel") or "default")
+    sender = str(message.get("sender_id") or "channel")
+    mid = str(message.get("id") or "")
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    room = str(meta.get("room_id") or meta.get("room") or channel)
+    thread = str(message.get("thread_id") or meta.get("thread_id") or "")
+    body = str(message.get("message") or "").strip()
+    lines = [
+        "[claude-any external channel message]",
+        f"channel: {channel}",
+        f"room: {room}",
+        f"from: {sender}",
+    ]
+    if mid:
+        lines.append(f"message_id: {mid}")
+    if thread:
+        lines.append(f"thread_id: {thread}")
+    lines.extend(
+        [
+            "",
+            body,
+            "",
+            "If this message is relevant to the current work, respond or act on it now. If it is only informational, keep working.",
+        ]
+    )
+    return "\n".join(lines).strip() + "\n"
+
+
+def _write_fd_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        written = os.write(fd, view)
+        view = view[written:]
+
+
+def _inject_pending_channel_messages(master_fd: int, last_id: int) -> int:
+    for message in read_chat_messages(last_id, None, None, 100):
+        try:
+            last_id = max(last_id, int(message.get("id") or 0))
+        except Exception:
+            continue
+        prompt = format_channel_wake_prompt(message)
+        _write_fd_all(master_fd, prompt.encode("utf-8", errors="replace") + b"\r")
+        router_log("INFO", f"channel_stdin_proxy_injected message_id={message.get('id')} channel={message.get('channel')}")
+    return last_id
+
+
+def _chat_messages_file_marker() -> tuple[float, int]:
+    try:
+        stat = CHAT_MESSAGES_PATH.stat()
+        return (stat.st_mtime, stat.st_size)
+    except Exception:
+        return (0.0, 0)
+
+
+def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str]) -> int:
+    if os.name != "posix" or not sys.stdin.isatty() or not sys.stdout.isatty():
+        router_log("INFO", "channel_stdin_proxy_unavailable; using direct subprocess call")
+        return subprocess.call(cmd, env=env)
+    import pty
+    import select
+    import termios
+    import tty
+
+    master_fd, slave_fd = pty.openpty()
+    proc = subprocess.Popen(cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, env=env, close_fds=True)
+    os.close(slave_fd)
+    stdin_fd = sys.stdin.fileno()
+    stdout_fd = sys.stdout.fileno()
+    old_attrs = termios.tcgetattr(stdin_fd)
+    last_id = _chat_init_next_id() - 1
+    last_channel_poll = 0.0
+    last_channel_marker = _chat_messages_file_marker()
+    try:
+        tty.setraw(stdin_fd)
+        while proc.poll() is None:
+            try:
+                readable, _, _ = select.select([stdin_fd, master_fd], [], [], 0.2)
+            except OSError:
+                break
+            if stdin_fd in readable:
+                data = os.read(stdin_fd, 4096)
+                if data:
+                    _write_fd_all(master_fd, data)
+            if master_fd in readable:
+                try:
+                    data = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if data:
+                    _write_fd_all(stdout_fd, data)
+            now = time.time()
+            if now - last_channel_poll >= 0.5:
+                last_channel_poll = now
+                marker = _chat_messages_file_marker()
+                if marker != last_channel_marker:
+                    last_channel_marker = marker
+                    last_id = _inject_pending_channel_messages(master_fd, last_id)
+        while True:
+            try:
+                readable, _, _ = select.select([master_fd], [], [], 0)
+                if master_fd not in readable:
+                    break
+                data = os.read(master_fd, 4096)
+                if not data:
+                    break
+                _write_fd_all(stdout_fd, data)
+            except OSError:
+                break
+        return proc.returncode if proc.returncode is not None else 0
+    finally:
+        try:
+            termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
+        except Exception:
+            pass
+        try:
+            os.close(master_fd)
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
 
 
 def run_claude_update_check(claude: str, enabled: bool = True) -> None:
@@ -13264,14 +13762,16 @@ def launch_claude(
     use_native_anthropic = native_anthropic_enabled(provider)
     use_ollama_native = ollama_native_compat_enabled(provider, pcfg)
     use_provider_native = provider_native_compat_enabled(provider, pcfg)
+    use_router_mode = not (use_native_anthropic or use_ollama_native or use_provider_native)
     cleanup_managed_services_for_provider(provider, pcfg, cfg, quiet=True)
-    if not (use_native_anthropic or use_ollama_native or use_provider_native):
+    if use_router_mode:
         start_router_if_needed()
     env = os.environ.copy()
     env["PATH"] = str(HOME / ".local" / "bin") + os.pathsep + env.get("PATH", "")
     launch_env = env_vars(cfg)
     launch_passthrough = normalize_channel_passthrough(passthrough)
     if claude_channels_requested(cfg, launch_passthrough):
+        env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
     if use_native_anthropic:
         for key in (
@@ -13302,8 +13802,13 @@ def launch_claude(
     run_claude_update_check(claude, enabled=update_check)
     claude = find_executable("claude") or claude
     extra_args: list[str] = []
+    mcp_config_paths: list[str] = []
     if should_attach_web_search(provider, cfg, web_search_override):
-        extra_args.extend(["--mcp-config", str(write_duckduckgo_mcp_config(cfg))])
+        mcp_config_paths.append(str(write_duckduckgo_mcp_config(cfg)))
+    if mcp_config_paths:
+        extra_args.extend(["--mcp-config", *mcp_config_paths])
+    if should_use_channel_stdin_proxy(use_router_mode, launch_passthrough):
+        auto_start_sse_channels_from_mcp_configs(launch_passthrough)
     if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
         extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
     extra_args.extend(claude_channel_args(cfg, launch_passthrough))
@@ -13316,6 +13821,8 @@ def launch_claude(
         cmd.extend(["--model", model])
     cmd.extend(extra_args)
     cmd.extend(launch_passthrough)
+    if should_use_channel_stdin_proxy(use_router_mode, launch_passthrough):
+        return subprocess_call_with_channel_wake_proxy(cmd, env)
     return subprocess.call(cmd, env=env)
 
 
@@ -13337,7 +13844,7 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
   claude-any set-api-key PROVIDER KEY
   claude-any web-search [on|off]     Auto-attach DuckDuckGo MCP for non-native providers
   claude-any web-fetch [on|off]      Auto-attach fetch MCP for web page content
-  claude-any channels [cmd]          Configure Claude Code --channels auto-injection
+  claude-any channels [cmd]          Configure external channel specs
   claude-any ollama-native [on|off]  Use Ollama's official Claude Code env path
   claude-any ollama-options [provider] [key=value ...]
                                       Set Ollama num_ctx/options/keep_alive/think
@@ -13377,7 +13884,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-web-fetch          Enable fetch MCP
   claude-any --ca-no-web-fetch       Disable fetch MCP
   claude-any --ca-channel SPEC       Add an official/approved Claude Code channel
-  claude-any --ca-clear-channels     Clear saved channel auto-injection specs
+  claude-any --ca-clear-channels     Clear saved channel specs
   claude-any --ca-no-self-update-check
                                       Skip Claude Any npm self-update check
   claude-any --ca-no-update-check    Skip Claude Code update check for this launch

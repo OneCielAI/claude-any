@@ -106,6 +106,66 @@ class ChannelBridgeTests(unittest.TestCase):
             claude_any._CHANNEL_SSE_CONNECTIONS.clear()
             claude_any._CHANNEL_SSE_CONNECTIONS.update(original)
 
+    def test_channel_wake_prompt_contains_routing_context(self):
+        prompt = claude_any.format_channel_wake_prompt(
+            {
+                "id": 9,
+                "channel": "room_phase1sim",
+                "sender_id": "robert",
+                "thread_id": "root",
+                "message": "please review the latest update",
+                "meta": {"room_id": "room_phase1sim"},
+            }
+        )
+        self.assertIn("claude-any external channel message", prompt)
+        self.assertIn("from: robert", prompt)
+        self.assertIn("message_id: 9", prompt)
+        self.assertIn("please review the latest update", prompt)
+
+    def test_inject_pending_channel_messages_writes_prompt_to_child_stdin(self):
+        messages = [
+            {
+                "id": 2,
+                "channel": "room",
+                "sender_id": "agent",
+                "message": "wake up",
+                "meta": {},
+            }
+        ]
+        with (
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_write_fd_all") as write_all,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            last_id = claude_any._inject_pending_channel_messages(99, 1)
+        self.assertEqual(2, last_id)
+        self.assertIn(b"wake up", write_all.call_args.args[1])
+        self.assertTrue(write_all.call_args.args[1].endswith(b"\r"))
+
+    def test_router_channel_mcp_notification_wraps_chat_message(self):
+        notification = claude_any._channel_mcp_notification(
+            {
+                "id": 7,
+                "channel": "room_phase1sim",
+                "sender_id": "robert",
+                "thread_id": "root",
+                "message": "hello Sarah",
+                "meta": {"room_id": "room_phase1sim"},
+            }
+        )
+        self.assertEqual("notifications/claude/channel", notification["method"])
+        self.assertIn("hello Sarah", notification["params"]["content"])
+        self.assertEqual(7, notification["params"]["meta"]["claude_any_message_id"])
+
+    def test_channel_mcp_config_points_to_router_sse(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "channel-mcp.json"
+            with mock.patch.object(claude_any, "CHANNEL_MCP_CONFIG", path):
+                written = claude_any.write_channel_mcp_config()
+            data = __import__("json").loads(written.read_text(encoding="utf-8"))
+        self.assertEqual("sse", data["mcpServers"]["claude-any-router"]["type"])
+        self.assertTrue(data["mcpServers"]["claude-any-router"]["url"].endswith("/ca/mcp/sse"))
+
 
 if __name__ == "__main__":
     unittest.main()
