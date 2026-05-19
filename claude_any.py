@@ -102,7 +102,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.74"
+VERSION = "0.1.75"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -12906,13 +12906,42 @@ def has_passthrough_option(passthrough: list[str], *names: str) -> bool:
     return any(arg in names or any(arg.startswith(name + "=") for name in names) for arg in passthrough)
 
 
+def normalize_channel_passthrough(passthrough: list[str]) -> list[str]:
+    normalized: list[str] = []
+    i = 0
+    while i < len(passthrough):
+        arg = passthrough[i]
+        if arg == "--channels":
+            normalized.append("--dangerously-load-development-channels")
+            i += 1
+            while i < len(passthrough) and is_channel_spec_tagged(passthrough[i]):
+                normalized.append(passthrough[i])
+                i += 1
+            continue
+        if arg.startswith("--channels="):
+            value = arg.split("=", 1)[1].strip()
+            if value:
+                normalized.extend(["--dangerously-load-development-channels", value])
+            else:
+                normalized.append("--dangerously-load-development-channels")
+            i += 1
+            continue
+        normalized.append(arg)
+        i += 1
+    return normalized
+
+
 def claude_channel_args(cfg: dict[str, Any], passthrough: list[str]) -> list[str]:
     channels = [spec for spec in channel_specs(cfg) if is_channel_spec_tagged(spec)]
     if not channels or has_passthrough_option(passthrough, "--channels", "--dangerously-load-development-channels"):
         return []
-    if channel_development_enabled(cfg):
-        return ["--dangerously-load-development-channels", *channels]
-    return ["--channels", *channels]
+    return ["--dangerously-load-development-channels", *channels]
+
+
+def claude_channels_requested(cfg: dict[str, Any], passthrough: list[str]) -> bool:
+    if has_passthrough_option(passthrough, "--channels", "--dangerously-load-development-channels"):
+        return True
+    return any(is_channel_spec_tagged(spec) for spec in channel_specs(cfg))
 
 
 def write_web_tools_mcp_config(cfg: dict[str, Any]) -> Path:
@@ -13221,6 +13250,9 @@ def launch_claude(
     env = os.environ.copy()
     env["PATH"] = str(HOME / ".local" / "bin") + os.pathsep + env.get("PATH", "")
     launch_env = env_vars(cfg)
+    launch_passthrough = normalize_channel_passthrough(passthrough)
+    if claude_channels_requested(cfg, launch_passthrough):
+        launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
     if use_native_anthropic:
         for key in (
             "ANTHROPIC_BASE_URL",
@@ -13252,9 +13284,9 @@ def launch_claude(
     extra_args: list[str] = []
     if should_attach_web_search(provider, cfg, web_search_override):
         extra_args.extend(["--mcp-config", str(write_duckduckgo_mcp_config(cfg))])
-    if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(passthrough, "--system-prompt"):
+    if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
         extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
-    extra_args.extend(claude_channel_args(cfg, passthrough))
+    extra_args.extend(claude_channel_args(cfg, launch_passthrough))
     cmd = [
         claude,
         "--dangerously-skip-permissions",
@@ -13263,7 +13295,7 @@ def launch_claude(
     if model:
         cmd.extend(["--model", model])
     cmd.extend(extra_args)
-    cmd.extend(passthrough)
+    cmd.extend(launch_passthrough)
     return subprocess.call(cmd, env=env)
 
 
