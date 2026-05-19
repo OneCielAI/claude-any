@@ -77,6 +77,27 @@ class HeadlessUpdateCheckTests(unittest.TestCase):
         ):
             self.assertEqual(1, claude_any.run_quiet_upgrade_and_exit())
 
+    def test_self_update_uses_install_latest_not_update(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": ""})()
+        with (
+            patch("claude_any.running_from_npm_package", return_value=True),
+            patch("claude_any.sys.stdin.isatty", return_value=True),
+            patch("claude_any.sys.stdout.isatty", return_value=True),
+            patch("claude_any.find_executable", return_value="npm"),
+            patch("claude_any.npm_latest_package_version", return_value="999.0.0"),
+            patch("claude_any.version_newer", return_value=True),
+            patch("builtins.input", return_value="y"),
+            patch("claude_any.subprocess.run", return_value=completed) as run,
+            patch("claude_any.os.execv", side_effect=RuntimeError("stop")),
+            patch("builtins.print"),
+        ):
+            claude_any.run_claude_any_update_check()
+
+        self.assertEqual(
+            ["npm", "install", "-g", "@oneciel-ai/claude-any@latest"],
+            run.call_args.args[0],
+        )
+
     def test_configure_only_applies_setup_without_launching(self):
         with (
             patch("claude_any.apply_headless_env_config", return_value=(False, None, None, None, False)),

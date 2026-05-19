@@ -102,7 +102,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.71"
+VERSION = "0.1.74"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -13094,7 +13094,7 @@ def run_claude_any_update_check(enabled: bool = True) -> bool:
         return False
     try:
         update = subprocess.run(
-            [npm, "update", "-g", "@oneciel-ai/claude-any"],
+            [npm, "install", "-g", "@oneciel-ai/claude-any@latest"],
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
