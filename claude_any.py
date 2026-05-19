@@ -102,7 +102,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.75"
+VERSION = "0.1.76"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -8763,25 +8763,16 @@ def is_channel_spec_tagged(spec: str) -> bool:
     return spec.startswith("plugin:") or spec.startswith("server:")
 
 
-def channel_development_enabled(cfg: dict[str, Any] | None = None) -> bool:
-    cfg = cfg or load_config()
-    return bool(cfg.setdefault("claude_code", {}).get("development_channels", False))
-
-
 def channel_status_text(cfg: dict[str, Any] | None = None) -> str:
     cfg = cfg or load_config()
     channels = channel_specs(cfg)
     if not channels:
         return "off"
-    suffix = "; dev" if channel_development_enabled(cfg) else ""
-    return f"{len(channels)} channel{'s' if len(channels) != 1 else ''}{suffix}"
+    return f"{len(channels)} channel{'s' if len(channels) != 1 else ''}"
 
 
 def set_channel_development_enabled(enabled: bool) -> list[str]:
-    cfg = load_config()
-    cfg.setdefault("claude_code", {})["development_channels"] = bool(enabled)
-    save_config(cfg)
-    return [f"Development channels: {'on' if enabled else 'off'}."]
+    return ["Channel wake delivery is always enabled by Claude Any."]
 
 
 def add_channel_spec(spec: str, *, development: bool = False) -> list[str]:
@@ -8796,13 +8787,8 @@ def add_channel_spec(spec: str, *, development: bool = False) -> list[str]:
     if spec not in channels:
         channels.append(spec)
     cc["channels"] = channels
-    if development:
-        cc["development_channels"] = True
     save_config(cfg)
-    lines = [f"Channel added: {spec}."]
-    if development:
-        lines.append("Development channels: on.")
-    return lines
+    return [f"Channel added: {spec}."]
 
 
 def remove_channel_spec(spec: str) -> list[str]:
@@ -8833,7 +8819,6 @@ def cmd_channels(args: argparse.Namespace) -> None:
         for spec in channel_specs(cfg):
             if spec not in OFFICIAL_CHANNEL_PLUGINS.values():
                 print(f" * custom    {spec}")
-        print(f"development_channels: {'on' if channel_development_enabled(cfg) else 'off'}")
         return
     head = values[0].strip().lower()
     if head in ("on", "enable", "add"):
@@ -8844,13 +8829,12 @@ def cmd_channels(args: argparse.Namespace) -> None:
         return
     if head in ("dev", "development"):
         if len(values) >= 2 and values[1].lower() in ("on", "off", "true", "false", "1", "0"):
-            enabled = values[1].lower() in ("on", "true", "1")
-            for line in set_channel_development_enabled(enabled):
+            for line in set_channel_development_enabled(True):
                 print(line)
             return
         if len(values) < 2:
-            raise SystemExit("Usage: claude-any channels dev CHANNEL_SPEC | claude-any channels dev on|off")
-        for line in add_channel_spec(values[1], development=True):
+            raise SystemExit("Usage: claude-any channels add CHANNEL_SPEC")
+        for line in add_channel_spec(values[1]):
             print(line)
         return
     if head in ("off", "disable", "remove", "rm"):
@@ -12138,16 +12122,13 @@ def advisor_model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[
 
 def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     channels = channel_specs(cfg)
-    dev_enabled = channel_development_enabled(cfg)
     rows: list[str] = []
     values: list[str] = []
-    rows.append(f"Development channel loading  [{'on' if dev_enabled else 'off'}]")
-    values.append("__toggle_dev__")
     for name, spec in OFFICIAL_CHANNEL_PLUGINS.items():
         mark = "*" if spec in channels else " "
         rows.append(f"{mark} {name:<10} {spec}")
         values.append(spec)
-    rows.append("+ Add development/custom channel...")
+    rows.append("+ Add custom channel...")
     values.append("__add_custom__")
     if channels:
         rows.append("- Remove channel...")
@@ -12683,15 +12664,10 @@ def portable_prelaunch_menu() -> int:
                 elif panel == "channels":
                     if value == "back":
                         close_panel()
-                    elif value == "__toggle_dev__":
-                        messages = set_channel_development_enabled(not channel_development_enabled(cfg))
-                        cfg = load_config()
-                        panel_rows, panel_values = channel_panel_rows(cfg)
-                        panel_idx = 0
                     elif value == "__add_custom__":
                         spec = prompt_menu_value("Channel spec (for example plugin:ainet@local or server:ainet)", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                         if spec:
-                            messages = add_channel_spec(spec, development=True)
+                            messages = add_channel_spec(spec)
                             cfg = load_config()
                             panel_rows, panel_values = channel_panel_rows(cfg)
                     elif value == "__remove__":
@@ -13076,6 +13052,29 @@ def npm_latest_package_version(npm: str, package_spec: str, timeout: float = 8.0
     return out.splitlines()[-1].strip() if out else ""
 
 
+def npm_global_package_root(npm: str, package_name: str = "@oneciel-ai/claude-any", timeout: float = 8.0) -> Path | None:
+    try:
+        p = subprocess.run(
+            [npm, "root", "-g"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=timeout,
+        )
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    root = (p.stdout or "").strip()
+    if not root:
+        return None
+    package_path = Path(root)
+    for part in package_name.split("/"):
+        if part:
+            package_path /= part
+    return package_path
+
+
 def claude_code_current_version(claude: str) -> str:
     try:
         p = subprocess.run(
@@ -13098,6 +13097,26 @@ def running_from_npm_package() -> bool:
         return True
     path = str(Path(__file__).resolve()).replace("\\", "/")
     return "/node_modules/@oneciel-ai/claude-any/" in path
+
+
+def claude_any_restart_user_args() -> list[str]:
+    args = list(sys.argv[1:])
+    if args and args[0] == "cli":
+        return args[1:]
+    return args
+
+
+def restart_claude_any_after_update(npm: str) -> None:
+    os.environ["CLAUDE_ANY_SKIP_SELF_UPDATE"] = "1"
+    user_args = claude_any_restart_user_args()
+    package_root = npm_global_package_root(npm)
+    package_script = package_root / "claude_any.py" if package_root else None
+    if package_script and package_script.exists():
+        os.execv(sys.executable, [sys.executable, str(package_script), "cli", *user_args])
+    launcher = find_executable("claude-any")
+    if launcher:
+        raise SystemExit(subprocess.call([launcher, *user_args], env=os.environ.copy()))
+    os.execv(sys.executable, [sys.executable, *sys.argv])
 
 
 def run_claude_any_update_check(enabled: bool = True) -> bool:
@@ -13142,9 +13161,10 @@ def run_claude_any_update_check(enabled: bool = True) -> bool:
         print(f"Claude Any update exited with {update.returncode}; continuing with current version.", flush=True)
         return False
     print("Claude Any updated. Restarting with the new version...", flush=True)
-    os.environ["CLAUDE_ANY_SKIP_SELF_UPDATE"] = "1"
     try:
-        os.execv(sys.executable, [sys.executable, *sys.argv])
+        restart_claude_any_after_update(npm)
+    except SystemExit:
+        raise
     except Exception as exc:
         print(f"Restart failed ({type(exc).__name__}); continuing with the current process.", flush=True)
     return True
@@ -13357,9 +13377,6 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-web-fetch          Enable fetch MCP
   claude-any --ca-no-web-fetch       Disable fetch MCP
   claude-any --ca-channel SPEC       Add an official/approved Claude Code channel
-  claude-any --ca-dev-channel SPEC   Add a development channel and enable dev loading
-  claude-any --ca-development-channels on|off
-                                      Use tagged specs with --dangerously-load-development-channels
   claude-any --ca-clear-channels     Clear saved channel auto-injection specs
   claude-any --ca-no-self-update-check
                                       Skip Claude Any npm self-update check
@@ -13482,13 +13499,7 @@ def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | 
         if item.strip()
     ]
     for channel_value in dev_channel_values:
-        add_channel_spec(channel_value, development=True)
-        skip_menu = True
-    dev_channels = os.environ.get("CLAUDE_ANY_DEVELOPMENT_CHANNELS", "").strip().lower()
-    if dev_channels:
-        if dev_channels not in ("on", "off", "true", "false", "1", "0"):
-            raise SystemExit("CLAUDE_ANY_DEVELOPMENT_CHANNELS must be on or off")
-        set_channel_development_enabled(dev_channels in ("on", "true", "1"))
+        add_channel_spec(channel_value)
         skip_menu = True
     return skip_menu, web_search_override, update_check_override, self_update_check_override, force_menu
 
@@ -13907,7 +13918,7 @@ def run_cli(argv: list[str]) -> int:
                 i += 2
             else:
                 i += 1
-            for line in add_channel_spec(value, development=True):
+            for line in add_channel_spec(value):
                 print(line)
             skip_menu = True
         elif arg == "--ca-development-channels" or arg.startswith("--ca-development-channels="):
@@ -13919,8 +13930,7 @@ def run_cli(argv: list[str]) -> int:
                 i += 2
             else:
                 i += 1
-            enabled = value.strip().lower() in ("on", "enable", "enabled", "true", "1")
-            for line in set_channel_development_enabled(enabled):
+            for line in set_channel_development_enabled(True):
                 print(line)
             skip_menu = True
         elif arg == "--ca-clear-channels":

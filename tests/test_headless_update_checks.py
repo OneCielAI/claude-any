@@ -1,4 +1,6 @@
 import unittest
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import claude_any
@@ -77,9 +79,10 @@ class HeadlessUpdateCheckTests(unittest.TestCase):
         ):
             self.assertEqual(1, claude_any.run_quiet_upgrade_and_exit())
 
-    def test_self_update_uses_install_latest_not_update(self):
+    def test_self_update_uses_install_latest_not_update_and_restarts_from_fresh_package(self):
         completed = type("Completed", (), {"returncode": 0, "stdout": ""})()
         with (
+            patch.dict("os.environ", {"CLAUDE_ANY_SKIP_SELF_UPDATE": "0"}, clear=False),
             patch("claude_any.running_from_npm_package", return_value=True),
             patch("claude_any.sys.stdin.isatty", return_value=True),
             patch("claude_any.sys.stdout.isatty", return_value=True),
@@ -88,7 +91,7 @@ class HeadlessUpdateCheckTests(unittest.TestCase):
             patch("claude_any.version_newer", return_value=True),
             patch("builtins.input", return_value="y"),
             patch("claude_any.subprocess.run", return_value=completed) as run,
-            patch("claude_any.os.execv", side_effect=RuntimeError("stop")),
+            patch("claude_any.restart_claude_any_after_update") as restart,
             patch("builtins.print"),
         ):
             claude_any.run_claude_any_update_check()
@@ -96,6 +99,26 @@ class HeadlessUpdateCheckTests(unittest.TestCase):
         self.assertEqual(
             ["npm", "install", "-g", "@oneciel-ai/claude-any@latest"],
             run.call_args.args[0],
+        )
+        restart.assert_called_once_with("npm")
+
+    def test_restart_after_update_prefers_npm_global_package_script(self):
+        with tempfile.TemporaryDirectory() as td:
+            package_root = Path(td)
+            script = package_root / "claude_any.py"
+            script.write_text("print('new')\n", encoding="utf-8")
+            with (
+                patch.dict("os.environ", {}, clear=False),
+                patch("claude_any.sys.argv", ["claude_any.py", "cli", "--ca-no-update-check"]),
+                patch("claude_any.npm_global_package_root", return_value=package_root),
+                patch("claude_any.os.execv", side_effect=RuntimeError("stop")) as execv,
+            ):
+                with self.assertRaises(RuntimeError):
+                    claude_any.restart_claude_any_after_update("npm")
+
+        self.assertEqual(
+            [claude_any.sys.executable, str(script), "cli", "--ca-no-update-check"],
+            execv.call_args.args[1],
         )
 
     def test_configure_only_applies_setup_without_launching(self):

@@ -132,7 +132,7 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertEqual([], cfg["claude_code"]["channels"])
         save.assert_not_called()
 
-    def test_development_channel_enables_development_flag(self):
+    def test_development_channel_alias_adds_channel_without_persisting_obsolete_toggle(self):
         cfg = {
             "claude_code": {
                 "channels": [],
@@ -143,7 +143,7 @@ class ChannelConfigTests(unittest.TestCase):
         with mock.patch.object(claude_any, "load_config", return_value=cfg), mock.patch.object(claude_any, "save_config"):
             claude_any.add_channel_spec("plugin:ainet@local", development=True)
         self.assertEqual(["plugin:ainet@local"], cfg["claude_code"]["channels"])
-        self.assertTrue(cfg["claude_code"]["development_channels"])
+        self.assertFalse(cfg["claude_code"]["development_channels"])
 
 
 if __name__ == "__main__":
