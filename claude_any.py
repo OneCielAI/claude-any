@@ -8759,6 +8759,10 @@ def channel_specs(cfg: dict[str, Any] | None = None) -> list[str]:
     return channels
 
 
+def is_channel_spec_tagged(spec: str) -> bool:
+    return spec.startswith("plugin:") or spec.startswith("server:")
+
+
 def channel_development_enabled(cfg: dict[str, Any] | None = None) -> bool:
     cfg = cfg or load_config()
     return bool(cfg.setdefault("claude_code", {}).get("development_channels", False))
@@ -8784,6 +8788,8 @@ def add_channel_spec(spec: str, *, development: bool = False) -> list[str]:
     spec = spec.strip()
     if not spec:
         return ["Channel spec was empty."]
+    if not is_channel_spec_tagged(spec):
+        return ["Channel spec must start with plugin: or server:."]
     cfg = load_config()
     cc = cfg.setdefault("claude_code", {})
     channels = channel_specs(cfg)
@@ -12901,15 +12907,12 @@ def has_passthrough_option(passthrough: list[str], *names: str) -> bool:
 
 
 def claude_channel_args(cfg: dict[str, Any], passthrough: list[str]) -> list[str]:
-    channels = channel_specs(cfg)
-    if not channels or has_passthrough_option(passthrough, "--channels"):
+    channels = [spec for spec in channel_specs(cfg) if is_channel_spec_tagged(spec)]
+    if not channels or has_passthrough_option(passthrough, "--channels", "--dangerously-load-development-channels"):
         return []
-    args: list[str] = []
-    if channel_development_enabled(cfg) and not has_passthrough_option(passthrough, "--dangerously-load-development-channels"):
-        args.append("--dangerously-load-development-channels")
-    args.append("--channels")
-    args.extend(channels)
-    return args
+    if channel_development_enabled(cfg):
+        return ["--dangerously-load-development-channels", *channels]
+    return ["--channels", *channels]
 
 
 def write_web_tools_mcp_config(cfg: dict[str, Any]) -> Path:
@@ -13324,7 +13327,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-channel SPEC       Add an official/approved Claude Code channel
   claude-any --ca-dev-channel SPEC   Add a development channel and enable dev loading
   claude-any --ca-development-channels on|off
-                                      Auto-add --dangerously-load-development-channels
+                                      Use tagged specs with --dangerously-load-development-channels
   claude-any --ca-clear-channels     Clear saved channel auto-injection specs
   claude-any --ca-no-self-update-check
                                       Skip Claude Any npm self-update check
