@@ -105,7 +105,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.93"
+VERSION = "0.1.94"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -14178,6 +14178,15 @@ def _channel_enter_bytes_from_user_input(data: bytes) -> bytes | None:
     return b"\r\n" if last_cr + 1 < len(data) and data[last_cr + 1 : last_cr + 2] == b"\n" else b"\r"
 
 
+def _channel_synthetic_enter_bytes_from_user_input(data: bytes) -> bytes | None:
+    observed = _channel_enter_bytes_from_user_input(data)
+    if observed == b"\r":
+        # Bare CR is common from raw POSIX terminals, but synthetic CR-only
+        # writes can sit in Claude Code's line editor on some PTY stacks.
+        return b"\r\n"
+    return observed
+
+
 def _channel_enter_label(enter_bytes: bytes) -> str:
     if enter_bytes == b"\r":
         return "cr"
@@ -14258,8 +14267,8 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
             if stdin_fd in readable:
                 data = os.read(stdin_fd, 4096)
                 if data:
-                    observed_enter = _channel_enter_bytes_from_user_input(data)
-                    if observed_enter:
+                    observed_enter = _channel_synthetic_enter_bytes_from_user_input(data)
+                    if observed_enter and not os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_ENTER"):
                         channel_enter_bytes = observed_enter
                     _write_fd_all(master_fd, data)
             if master_fd in readable:

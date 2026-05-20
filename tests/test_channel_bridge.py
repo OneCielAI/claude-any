@@ -222,6 +222,11 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(b"\r\n", claude_any._channel_enter_bytes_from_user_input(b"hello\r\n"))
         self.assertIsNone(claude_any._channel_enter_bytes_from_user_input(b"abc"))
 
+    def test_channel_synthetic_enter_normalizes_bare_cr_to_crlf(self):
+        self.assertEqual(b"\r\n", claude_any._channel_synthetic_enter_bytes_from_user_input(b"\r"))
+        self.assertEqual(b"\n", claude_any._channel_synthetic_enter_bytes_from_user_input(b"\n"))
+        self.assertEqual(b"\r\n", claude_any._channel_synthetic_enter_bytes_from_user_input(b"hello\r\n"))
+
     def test_inject_pending_channel_messages_writes_prompt_to_child_stdin(self):
         messages = [
             {
