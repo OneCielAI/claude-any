@@ -3,8 +3,11 @@ import os
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 import unittest
 import tempfile
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
 
@@ -39,6 +42,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(payload["recipients"], "claude")
         self.assertEqual(payload["thread_id"], "root")
         self.assertEqual(payload["meta"]["room_id"], "room_phase1sim")
+        self.assertEqual(payload["meta"]["mcp_method"], "notifications/claude/channel")
+        self.assertEqual(payload["meta"]["sse_json"]["params"]["meta"]["room_id"], "room_phase1sim")
 
     def test_sse_payload_ignores_done_marker(self):
         self.assertIsNone(claude_any._sse_payload_to_chat_payload("[DONE]", "message", {"name": "x"}))
@@ -71,6 +76,22 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(payload["message"], "hello from ai-net")
         self.assertEqual(payload["sender_id"], "agent_a")
         self.assertEqual(payload["meta"]["room_id"], "room_phase1sim")
+        self.assertEqual(payload["meta"]["mcp_method"], "notifications/message")
+        self.assertEqual(payload["meta"]["sse_json"]["params"]["data"]["type"], "message.created")
+
+    def test_sse_payload_preserves_event_id_and_redacts_sensitive_metadata(self):
+        payload = claude_any._sse_payload_to_chat_payload(
+            '{"method":"notifications/message","params":{"data":{"room_id":"room_phase1sim","cursor":"123-0","api_key":"secret-value","payload":{"message":{"content":"hello with metadata"}}}}}',
+            "message",
+            {"name": "ai-net", "channel": "default"},
+            event_id="evt-42",
+        )
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        meta = payload["meta"]
+        self.assertEqual("evt-42", meta["sse_id"])
+        self.assertEqual("123-0", meta["cursor"])
+        self.assertEqual("[redacted]", meta["sse_json"]["params"]["data"]["api_key"])
 
     def test_read_channel_matches_room_id_alias(self):
         messages = [
@@ -111,6 +132,64 @@ class ChannelBridgeTests(unittest.TestCase):
             claude_any._CHANNEL_SSE_CONNECTIONS.clear()
             claude_any._CHANNEL_SSE_CONNECTIONS.update(original)
 
+    def test_start_channel_sse_connection_receives_stream_message(self):
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(
+                    b'id: evt-1\n'
+                    b'event: message\n'
+                    b'data: {"method":"notifications/message","params":{"content":"hello over sse","room_id":"room_phase1sim"}}\n\n'
+                )
+                self.wfile.flush()
+                time.sleep(0.05)
+
+        original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
+        old_next = claude_any._CHAT_NEXT_ID
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chat_log = root / "chat-messages.jsonl"
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_address[1]}/events"
+                with (
+                    mock.patch.object(claude_any, "CONFIG_DIR", root),
+                    mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", chat_log),
+                    mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+                ):
+                    claude_any.start_channel_sse_connection(
+                        {
+                            "name": "unit-sse",
+                            "url": url,
+                            "channel": "unit",
+                            "retry_seconds": 60,
+                            "read_timeout_seconds": 5,
+                        }
+                    )
+                    deadline = time.time() + 2
+                    while time.time() < deadline:
+                        if chat_log.exists() and "hello over sse" in chat_log.read_text(encoding="utf-8"):
+                            break
+                        time.sleep(0.02)
+                    self.assertTrue(chat_log.exists())
+                    text = chat_log.read_text(encoding="utf-8")
+                    self.assertIn("hello over sse", text)
+                    self.assertIn("evt-1", text)
+                    claude_any.stop_channel_sse_connection("unit-sse")
+            finally:
+                server.shutdown()
+                server.server_close()
+                claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+                claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
+                claude_any._CHAT_NEXT_ID = old_next
+
     def test_channel_wake_prompt_contains_routing_context(self):
         prompt = claude_any.format_channel_wake_prompt(
             {
@@ -126,6 +205,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("from=robert", prompt)
         self.assertIn("id=9", prompt)
         self.assertIn("please review the latest update", prompt)
+        self.assertIn("metadata=", prompt)
+        self.assertIn("room_phase1sim", prompt)
         self.assertNotIn("\n", prompt)
 
     def test_inject_pending_channel_messages_writes_prompt_to_child_stdin(self):
@@ -158,7 +239,7 @@ class ChannelBridgeTests(unittest.TestCase):
         with (
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
-            mock.patch.object(claude_any, "router_log"),
+            mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0)
         self.assertEqual(3, last_id)
@@ -167,6 +248,9 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn(b"hello Sarah", payload)
         self.assertIn(b"status please", payload)
         self.assertNotIn(b"ai-net.ws.connected", payload)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_stdin_proxy_skipped_noise" in item for item in log_messages))
+        self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2,3" in item for item in log_messages))
 
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(
@@ -204,6 +288,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual("robert", payload["sender_id"])
         self.assertEqual("room_phase1sim", payload["channel"])
         self.assertEqual("notifications/message", payload["meta"]["mcp_method"])
+        self.assertEqual("wake from server", payload["meta"]["mcp_json"]["params"]["data"]["payload"]["message"]["content"])
 
     def test_mcp_proxy_observer_reads_content_length_framed_notification(self):
         body = __import__("json").dumps(

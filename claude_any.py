@@ -104,7 +104,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.80"
+VERSION = "0.1.81"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -4481,14 +4481,35 @@ def _event_meta_from_sources(*sources: Any) -> dict[str, Any]:
             "thread_id",
             "parent_id",
             "message_id",
+            "event_id",
+            "cursor",
+            "sequence",
+            "seq",
             "task_id",
             "round_id",
+            "conversation_id",
+            "session_id",
             "agent_id",
+            "agent_name",
             "sender_id",
+            "sender",
             "recipient_id",
+            "recipient",
+            "recipients",
+            "target_id",
+            "target",
             "type",
             "event_type",
             "kind",
+            "timestamp",
+            "created_at",
+            "updated_at",
+            "status",
+            "priority",
+            "title",
+            "name",
+            "model",
+            "runtime",
         ):
             value = source.get(key)
             if value is not None and key not in meta:
@@ -4496,7 +4517,45 @@ def _event_meta_from_sources(*sources: Any) -> dict[str, Any]:
     return meta
 
 
-def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict[str, Any]) -> dict[str, Any] | None:
+def _metadata_key_is_sensitive(key: str) -> bool:
+    return bool(re.search(r"(authorization|api[_-]?key|token|secret|password|credential|cookie)", key, re.I))
+
+
+def _json_safe_metadata(value: Any, depth: int = 0) -> Any:
+    if depth > 8:
+        return "<max-depth>"
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        return value if len(value) <= 8000 else value[:8000] + "...<truncated>"
+    if isinstance(value, list):
+        out = [_json_safe_metadata(item, depth + 1) for item in value[:200]]
+        if len(value) > 200:
+            out.append(f"...<{len(value) - 200} more>")
+        return out
+    if isinstance(value, dict):
+        out: dict[str, Any] = {}
+        items = list(value.items())
+        for key, item in items[:200]:
+            skey = str(key)
+            out[skey] = "[redacted]" if _metadata_key_is_sensitive(skey) else _json_safe_metadata(item, depth + 1)
+        if len(items) > 200:
+            out["..."] = f"<{len(items) - 200} more>"
+        return out
+    return str(value)
+
+
+def _compact_json_for_prompt(value: Any, max_chars: int = 2400) -> str:
+    try:
+        text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+    except Exception:
+        text = str(value)
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 16] + "...<truncated>"
+
+
+def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict[str, Any], event_id: str | None = None) -> dict[str, Any] | None:
     text = (data_text or "").strip()
     if not text or text == "[DONE]":
         return None
@@ -4512,6 +4571,8 @@ def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict
         "sse_event": event_name or "message",
         "sse_source": defaults.get("name") or "",
     }
+    if event_id:
+        meta["sse_id"] = event_id
     content = text
     kind = "sse"
     method = str(event_name or "message")
@@ -4519,6 +4580,13 @@ def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict
     allowed_events = {str(item).strip() for item in event_filter if str(item).strip()} if isinstance(event_filter, list) else set()
     if isinstance(parsed, dict):
         method = str(parsed.get("method") or event_name or "message")
+        meta["sse_json"] = _json_safe_metadata(parsed)
+        if parsed.get("jsonrpc") is not None:
+            meta["jsonrpc"] = parsed.get("jsonrpc")
+        if parsed.get("id") is not None:
+            meta["rpc_id"] = parsed.get("id")
+        if parsed.get("method") is not None:
+            meta["mcp_method"] = parsed.get("method")
         params = parsed.get("params") if isinstance(parsed.get("params"), dict) else {}
         payload = parsed.get("payload") if isinstance(parsed.get("payload"), dict) else {}
         data = params.get("data") if isinstance(params.get("data"), dict) else {}
@@ -4614,7 +4682,7 @@ def _channel_sse_maybe_initialize_mcp(name: str, endpoint_text: str) -> None:
         router_log("WARN", f"channel_sse_mcp_initialize_failed name={name} endpoint={endpoint} error={type(exc).__name__}: {exc}")
 
 
-def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str]) -> None:
+def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], event_id: str | None = None) -> None:
     data_text = "\n".join(data_lines)
     if (event_name or "").strip().lower() == "endpoint":
         _channel_sse_maybe_initialize_mcp(name, data_text)
@@ -4624,10 +4692,10 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str]) -> 
         if not state:
             return
         defaults = dict(state)
-    payload = _sse_payload_to_chat_payload(data_text, event_name, defaults)
+    payload = _sse_payload_to_chat_payload(data_text, event_name, defaults, event_id=event_id)
     if not payload:
         return
-    append_chat_message(payload)
+    saved = append_chat_message(payload)
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _CHANNEL_SSE_LOCK:
         state = _CHANNEL_SSE_CONNECTIONS.get(name)
@@ -4635,6 +4703,10 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str]) -> 
             state["last_event_at"] = now
             state["messages_received"] = int(state.get("messages_received") or 0) + 1
             state["last_error"] = None
+    router_log(
+        "INFO",
+        f"channel_sse_message_received name={name} event={event_name or 'message'} message_id={saved.get('id')} channel={saved.get('channel')}",
+    )
 
 
 def _channel_sse_worker(name: str) -> None:
@@ -4648,10 +4720,13 @@ def _channel_sse_worker(name: str) -> None:
             read_timeout = max(5.0, min(3600.0, float(state.get("read_timeout_seconds") or 300.0)))
             retry_seconds = max(1.0, min(60.0, float(state.get("retry_seconds") or 5.0)))
         event_name = "message"
+        event_id: str | None = None
         data_lines: list[str] = []
         try:
             req = urllib.request.Request(url, headers={**headers, "Accept": "text/event-stream"})
             with urllib.request.urlopen(req, timeout=read_timeout) as response:
+                _channel_sse_set_state(name, last_error=None)
+                router_log("INFO", f"channel_sse_connected name={name} url={url}")
                 while True:
                     with _CHANNEL_SSE_LOCK:
                         current = _CHANNEL_SSE_CONNECTIONS.get(name)
@@ -4663,8 +4738,9 @@ def _channel_sse_worker(name: str) -> None:
                     line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
                     if not line:
                         if data_lines:
-                            _channel_sse_dispatch(name, event_name, data_lines)
+                            _channel_sse_dispatch(name, event_name, data_lines, event_id=event_id)
                         event_name = "message"
+                        event_id = None
                         data_lines = []
                         continue
                     if line.startswith(":"):
@@ -4676,6 +4752,8 @@ def _channel_sse_worker(name: str) -> None:
                         event_name = value or "message"
                     elif field == "data":
                         data_lines.append(value)
+                    elif field == "id":
+                        event_id = value
                     elif field == "retry":
                         try:
                             retry_seconds = max(1.0, min(60.0, int(value) / 1000.0))
@@ -4687,6 +4765,7 @@ def _channel_sse_worker(name: str) -> None:
                 if not state or not state.get("running"):
                     return
                 state["last_error"] = f"{type(exc).__name__}: {exc}"
+            router_log("WARN", f"channel_sse_reconnect name={name} error={type(exc).__name__}: {exc}")
             time.sleep(retry_seconds)
 
 
@@ -13612,22 +13691,31 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
         fields.append(f"id={mid}")
     if thread:
         fields.append(f"thread={thread}")
+    meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
     return (
         "[claude-any external channel message] "
         + " ".join(fields)
-        + f" text={json.dumps(body, ensure_ascii=False)}. "
+        + f" text={json.dumps(body, ensure_ascii=False)}"
+        + meta_text
+        + ". "
         + "If relevant to current work, respond or act now; otherwise keep working."
     )
 
 
-def _channel_wake_message_is_noise(message: dict[str, Any]) -> bool:
+def _channel_wake_message_noise_reason(message: dict[str, Any]) -> str | None:
     body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip().lower()
     kind = str(message.get("kind") or "").strip().lower()
     if not body:
-        return True
+        return "empty"
     if kind in {"connection", "connected", "heartbeat", "keepalive"}:
-        return True
-    return bool(re.fullmatch(r"[a-z0-9_.:-]{1,80}\.(ws|sse)\.connected", body))
+        return kind
+    if re.fullmatch(r"[a-z0-9_.:-]{1,80}\.(ws|sse)\.connected", body):
+        return "transport_connected"
+    return None
+
+
+def _channel_wake_message_is_noise(message: dict[str, Any]) -> bool:
+    return _channel_wake_message_noise_reason(message) is not None
 
 
 def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
@@ -13645,7 +13733,8 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
         fields = [f"id={mid}", f"room={room}", f"from={sender}"]
         if thread:
             fields.append(f"thread={thread}")
-        parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False))
+        meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
+        parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False) + meta_text)
     return (
         f"[claude-any external channel messages] {len(messages)} new messages: "
         + " ; ".join(parts)
@@ -13674,7 +13763,12 @@ def _inject_pending_channel_messages(master_fd: int, last_id: int) -> int:
             last_id = max(last_id, int(message.get("id") or 0))
         except Exception:
             continue
-        if _channel_wake_message_is_noise(message):
+        noise_reason = _channel_wake_message_noise_reason(message)
+        if noise_reason:
+            router_log(
+                "INFO",
+                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
+            )
             continue
         pending.append(message)
     if pending:
@@ -13703,15 +13797,15 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
     import termios
     import tty
 
+    last_id = _chat_init_next_id() - 1
+    last_channel_marker = _chat_messages_file_marker()
     master_fd, slave_fd = pty.openpty()
     proc = subprocess.Popen(cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, env=env, close_fds=True)
     os.close(slave_fd)
     stdin_fd = sys.stdin.fileno()
     stdout_fd = sys.stdout.fileno()
     old_attrs = termios.tcgetattr(stdin_fd)
-    last_id = _chat_init_next_id() - 1
     last_channel_poll = 0.0
-    last_channel_marker = _chat_messages_file_marker()
     try:
         tty.setraw(stdin_fd)
         while proc.poll() is None:
@@ -13776,7 +13870,12 @@ def _mcp_proxy_notification_payload(server_name: str, message: dict[str, Any]) -
     meta: dict[str, Any] = {
         "mcp_server": server_name,
         "mcp_method": method,
+        "mcp_json": _json_safe_metadata(message),
     }
+    if message.get("jsonrpc") is not None:
+        meta["jsonrpc"] = message.get("jsonrpc")
+    if message.get("id") is not None:
+        meta["rpc_id"] = message.get("id")
     meta.update(_event_meta_from_sources(message, params, payload, data, event))
     content = (
         _event_payload_text(params)
