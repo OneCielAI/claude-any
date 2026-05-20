@@ -118,9 +118,10 @@ class ChannelBridgeTests(unittest.TestCase):
             }
         )
         self.assertIn("claude-any external channel message", prompt)
-        self.assertIn("from: robert", prompt)
-        self.assertIn("message_id: 9", prompt)
+        self.assertIn("from=robert", prompt)
+        self.assertIn("id=9", prompt)
         self.assertIn("please review the latest update", prompt)
+        self.assertNotIn("\n", prompt)
 
     def test_inject_pending_channel_messages_writes_prompt_to_child_stdin(self):
         messages = [
@@ -140,7 +141,8 @@ class ChannelBridgeTests(unittest.TestCase):
             last_id = claude_any._inject_pending_channel_messages(99, 1)
         self.assertEqual(2, last_id)
         self.assertIn(b"wake up", write_all.call_args.args[1])
-        self.assertTrue(write_all.call_args.args[1].endswith(b"\r"))
+        self.assertTrue(write_all.call_args.args[1].startswith(b"\x15"))
+        self.assertTrue(write_all.call_args.args[1].endswith(b"\n"))
 
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(
@@ -156,6 +158,28 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual("notifications/claude/channel", notification["method"])
         self.assertIn("hello Sarah", notification["params"]["content"])
         self.assertEqual(7, notification["params"]["meta"]["claude_any_message_id"])
+
+    def test_mcp_proxy_notification_maps_to_chat_payload(self):
+        payload = claude_any._mcp_proxy_notification_payload(
+            "ai-net",
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {
+                    "data": {
+                        "room_id": "room_phase1sim",
+                        "payload": {"message": {"content": "wake from server"}},
+                        "sender_id": "robert",
+                    }
+                },
+            },
+        )
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual("wake from server", payload["message"])
+        self.assertEqual("robert", payload["sender_id"])
+        self.assertEqual("room_phase1sim", payload["channel"])
+        self.assertEqual("notifications/message", payload["meta"]["mcp_method"])
 
     def test_channel_mcp_config_points_to_router_sse(self):
         with tempfile.TemporaryDirectory() as td:

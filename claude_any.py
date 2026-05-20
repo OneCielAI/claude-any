@@ -58,6 +58,7 @@ MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
+MCP_PROXY_CONFIG = CONFIG_DIR / "mcp-proxy.json"
 ROUTER_HOST = os.environ.get("CLAUDE_ANY_ROUTER_CLIENT_HOST", "127.0.0.1").strip() or "127.0.0.1"
 ROUTER_PORT = 8799
 ROUTER_BASE = f"http://{ROUTER_HOST}:{ROUTER_PORT}"
@@ -103,7 +104,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.76"
+VERSION = "0.1.77"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -1051,6 +1052,7 @@ UI_TEXT = {
         "advisor_model": "Advisor Model",
         "test": "Test compatibility",
         "options": "LLM options",
+        "log_level": "Log level",
         "presets": "LLM presets",
         "context_setup": "Context setup",
         "timeout_preset": "Timeout preset",
@@ -1071,6 +1073,7 @@ UI_TEXT = {
         "advisor_model": "Advisor Model",
         "test": "호환성 테스트",
         "options": "LLM 옵션",
+        "log_level": "로그 레벨",
         "presets": "LLM 프리셋",
         "context_setup": "컨텍스트 설정",
         "timeout_preset": "타임아웃 프리셋",
@@ -1091,6 +1094,7 @@ UI_TEXT = {
         "advisor_model": "Advisor Model",
         "test": "互換性テスト",
         "options": "LLMオプション",
+        "log_level": "ログレベル",
         "presets": "LLMプリセット",
         "context_setup": "コンテキスト設定",
         "timeout_preset": "timeout プリセット",
@@ -1111,6 +1115,7 @@ UI_TEXT = {
         "advisor_model": "Advisor Model",
         "test": "兼容性测试",
         "options": "LLM 选项",
+        "log_level": "日志级别",
         "presets": "LLM 预设",
         "context_setup": "上下文设置",
         "timeout_preset": "Timeout 预设",
@@ -2248,6 +2253,74 @@ def current_log_level() -> int:
     cache["value"] = level
     cache["checked_at"] = now
     return level
+
+
+def reset_log_level_cache() -> None:
+    _LOG_LEVEL_CACHE.update({"value": None, "checked_at": 0.0, "file_mtime": 0.0})
+
+
+def log_level_name(value: int | None = None) -> str:
+    if value is None:
+        value = current_log_level()
+    return str(LOG_LEVEL_NAMES.get(int(value), value))
+
+
+def log_level_source() -> str:
+    if LOG_LEVEL_PATH.exists():
+        return "file"
+    if os.environ.get("CLAUDE_ANY_LOG_LEVEL", "").strip():
+        return "env"
+    return "default"
+
+
+def log_level_status() -> str:
+    return f"{log_level_name()} ({log_level_source()})"
+
+
+def normalize_log_level(value: str) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        raise ValueError("log level is empty")
+    upper = raw.upper()
+    aliases = {
+        "OFF": "SILENT",
+        "NONE": "SILENT",
+        "QUIET": "SILENT",
+        "WARNING": "WARN",
+        "WARNINGS": "WARN",
+    }
+    upper = aliases.get(upper, upper)
+    if upper in ("DEFAULT", "RESET", "UNSET", "AUTO"):
+        return None
+    if upper in LOG_LEVELS:
+        return upper
+    if upper.isdigit():
+        numeric = max(0, min(5, int(upper)))
+        return LOG_LEVEL_NAMES[numeric]
+    raise ValueError(f"unknown log level: {value}")
+
+
+def set_log_level_config(value: str) -> list[str]:
+    try:
+        level = normalize_log_level(value)
+    except ValueError as exc:
+        known = ", ".join(LOG_LEVELS)
+        return [f"{exc}. Known levels: {known}, DEFAULT."]
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if level is None:
+        try:
+            LOG_LEVEL_PATH.unlink()
+        except FileNotFoundError:
+            pass
+        reset_log_level_cache()
+        return [f"Log level reset to {log_level_status()}."]
+    LOG_LEVEL_PATH.write_text(level + "\n", encoding="utf-8")
+    try:
+        os.chmod(LOG_LEVEL_PATH, 0o600)
+    except Exception:
+        pass
+    reset_log_level_cache()
+    return [f"Log level set to {level}."]
 
 
 def router_log(level: str, message: str) -> None:
@@ -8780,6 +8853,7 @@ def status_lines() -> list[str]:
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
         *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
+        f"log_level: {log_level_status()}",
         f"channels: {channel_status_text(cfg)}",
         f"router: {'bypassed for native provider compatibility' if direct_native else (('up' if router_up() else 'down') + ' ' + ROUTER_BASE)}",
         f"config: {CONFIG_PATH}",
@@ -8788,6 +8862,20 @@ def status_lines() -> list[str]:
 
 def cmd_status(_: argparse.Namespace) -> None:
     print("\n".join(status_lines()))
+
+
+def cmd_log_level(args: argparse.Namespace) -> None:
+    value = getattr(args, "value", None)
+    if not value:
+        print(f"log_level: {log_level_status()}")
+        for numeric in sorted(LOG_LEVEL_NAMES):
+            name = LOG_LEVEL_NAMES[numeric]
+            mark = "*" if name == log_level_name() else " "
+            print(f" {mark} {name:<6} {numeric}")
+        print("   DEFAULT reset to environment/default")
+        return
+    for line in set_log_level_config(str(value)):
+        print(line)
 
 
 def cmd_language(args: argparse.Namespace) -> None:
@@ -8939,6 +9027,24 @@ def _mcp_server_names_from_mapping(mapping: Any) -> list[str]:
     return _dedupe_strings(names)
 
 
+def _mcp_servers_from_mapping(mapping: Any) -> list[tuple[str, dict[str, Any]]]:
+    if not isinstance(mapping, dict):
+        return []
+    found: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for key in ("mcpServers", "servers"):
+        servers = mapping.get(key)
+        if not isinstance(servers, dict):
+            continue
+        for raw_name, raw_server in servers.items():
+            name = str(raw_name or "").strip()
+            if not name or name in seen or not isinstance(raw_server, dict):
+                continue
+            seen.add(name)
+            found.append((name, dict(raw_server)))
+    return found
+
+
 def _read_mcp_server_names_from_json(path: Path, cwd: Path) -> list[str]:
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
@@ -8954,26 +9060,85 @@ def _read_mcp_server_names_from_json(path: Path, cwd: Path) -> list[str]:
     return _dedupe_strings(names)
 
 
-def _mcp_config_paths_from_passthrough(passthrough: list[str]) -> list[Path]:
-    paths: list[Path] = []
+def _read_mcp_servers_from_json(path: Path, cwd: Path) -> list[tuple[str, dict[str, Any]]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+    servers = _mcp_servers_from_mapping(data)
+    if path.name == ".claude.json" and isinstance(data, dict):
+        projects = data.get("projects")
+        if isinstance(projects, dict):
+            for project_key, project_data in projects.items():
+                if _project_key_matches_cwd(str(project_key), cwd):
+                    servers.extend(_mcp_servers_from_mapping(project_data))
+    out: list[tuple[str, dict[str, Any]]] = []
+    seen: set[str] = set()
+    for name, server in servers:
+        if name in seen:
+            continue
+        seen.add(name)
+        out.append((name, server))
+    return out
+
+
+def _mcp_server_is_stdio(server: dict[str, Any]) -> bool:
+    if not isinstance(server, dict):
+        return False
+    server_type = str(server.get("type") or "").strip().lower()
+    if server_type and server_type not in ("stdio", "command"):
+        return False
+    command = str(server.get("command") or "").strip()
+    if not command:
+        return False
+    joined = " ".join([command, *[str(item) for item in server.get("args", []) if item is not None]])
+    return "mcp-proxy" not in joined
+
+
+def _mcp_config_passthrough_values(passthrough: list[str]) -> list[str]:
+    values: list[str] = []
     i = 0
     while i < len(passthrough):
         arg = passthrough[i]
-        value: str | None = None
         if arg == "--mcp-config":
-            if i + 1 < len(passthrough):
-                value = passthrough[i + 1]
-                i += 2
-            else:
+            i += 1
+            while i < len(passthrough) and not passthrough[i].startswith("-"):
+                values.append(passthrough[i])
                 i += 1
-        elif arg.startswith("--mcp-config="):
-            value = arg.split("=", 1)[1]
+            continue
+        if arg.startswith("--mcp-config="):
+            value = arg.split("=", 1)[1].strip()
+            if value:
+                values.append(value)
+        i += 1
+    return values
+
+
+def strip_mcp_config_passthrough(passthrough: list[str]) -> list[str]:
+    stripped: list[str] = []
+    i = 0
+    while i < len(passthrough):
+        arg = passthrough[i]
+        if arg == "--mcp-config":
             i += 1
-        else:
+            while i < len(passthrough) and not passthrough[i].startswith("-"):
+                i += 1
+            continue
+        if arg.startswith("--mcp-config="):
             i += 1
-        if value:
-            paths.append(Path(value).expanduser())
-    return paths
+            continue
+        stripped.append(arg)
+        i += 1
+    return stripped
+
+
+def _safe_mcp_proxy_name(name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", name.strip())
+    return safe[:80] or "server"
+
+
+def _mcp_config_paths_from_passthrough(passthrough: list[str]) -> list[Path]:
+    return [Path(value).expanduser() for value in _mcp_config_passthrough_values(passthrough)]
 
 
 def claude_mcp_config_paths(passthrough: list[str] | None = None, cwd: Path | None = None, home: Path | None = None) -> list[Path]:
@@ -12396,7 +12561,7 @@ def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lan
         f"4. {ui_text('model', lang)}  [{compact_text(pcfg.get('current_model', 'unset'), 62)}]",
         f"5. {ui_text('advisor_model', lang)}  [{compact_text(pcfg.get('advisor_model') or 'off', 62)}]",
         f"6. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
-        f"7. Channels  [{channel_status_text(cfg)}]",
+        f"7. {ui_text('log_level', lang)}  [{log_level_status()}]",
         f"8. {ui_text('test', lang)}",
         f"9. {ui_text('launch', lang)}",
         ui_text("quit", lang),
@@ -12423,6 +12588,30 @@ def language_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
         mark = "*" if code == current else " "
         rows.append(f"{mark} {code:<2} {label}")
         values.append(code)
+    return rows, values
+
+
+def log_level_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    rows: list[str] = []
+    values: list[str] = []
+    current = log_level_name()
+    descriptions = {
+        "SILENT": "no router log writes",
+        "ERROR": "errors only",
+        "WARN": "warnings and errors",
+        "INFO": "normal diagnostics",
+        "DEBUG": "verbose diagnostics",
+        "TRACE": "request/response trace detail",
+    }
+    for numeric in sorted(LOG_LEVEL_NAMES):
+        name = LOG_LEVEL_NAMES[numeric]
+        mark = "*" if name == current else " "
+        rows.append(f"{mark} {name:<6} {numeric}  {descriptions.get(name, '')}")
+        values.append(name)
+    rows.append(f"Reset to default/env  [{log_level_status()}]")
+    values.append("DEFAULT")
+    rows.append(ui_text("back", cfg.get("language", "en")))
+    values.append("back")
     return rows, values
 
 
@@ -12832,6 +13021,8 @@ def portable_prelaunch_menu() -> int:
             panel_rows, panel_values = ["Run compatibility test", "Back"], ["run", "back"]
         elif name == "options":
             panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
+        elif name == "log-level":
+            panel_rows, panel_values = log_level_panel_rows(cfg)
         elif name == "channels":
             panel_rows, panel_values = channel_panel_rows(cfg)
         elif name == "context":
@@ -13011,6 +13202,15 @@ def portable_prelaunch_menu() -> int:
                         panel_rows, panel_values = ["Run compatibility test again", "Back"], ["run", "back"]
                         refresh_checks()
                         main_idx = 9 if "Compatibility: OK" in out else 4
+                elif panel == "log-level":
+                    if value == "back":
+                        close_panel()
+                    elif value:
+                        messages = set_log_level_config(value)
+                        refresh_checks()
+                        cfg = load_config()
+                        panel_rows, panel_values = log_level_panel_rows(cfg)
+                        panel_idx = max(0, min(panel_idx, len(panel_rows) - 1))
                 elif panel == "channels":
                     if value == "back":
                         close_panel()
@@ -13143,7 +13343,7 @@ def portable_prelaunch_menu() -> int:
             elif key in ("esc", "q"):
                 return 10
             elif key == "enter":
-                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "channels", "test", "launch", "quit"]
+                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "log-level", "test", "launch", "quit"]
                 action = actions[main_idx]
                 if action == "launch":
                     blockers = launch_readiness_errors()
@@ -13327,6 +13527,59 @@ def write_channel_mcp_config() -> Path:
     return CHANNEL_MCP_CONFIG
 
 
+def write_mcp_proxy_config(
+    passthrough: list[str],
+    *,
+    extra_config_paths: list[Path | str] | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+) -> Path | None:
+    cwd = cwd or Path.cwd()
+    extra = [Path(item).expanduser() for item in (extra_config_paths or [])]
+    paths = [*extra, *claude_mcp_config_paths(passthrough, cwd, home)]
+    servers: dict[str, Any] = {}
+    seen: set[str] = set()
+    server_dir = CONFIG_DIR / "mcp-proxy-servers"
+    for path in paths:
+        if not path.exists() or not path.is_file():
+            continue
+        for name, server in _read_mcp_servers_from_json(path, cwd):
+            if name in seen:
+                continue
+            seen.add(name)
+            if _mcp_server_is_stdio(server):
+                server_dir.mkdir(parents=True, exist_ok=True)
+                server_path = server_dir / f"{_safe_mcp_proxy_name(name)}.json"
+                server_path.write_text(json.dumps(server, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                try:
+                    os.chmod(server_path, 0o600)
+                except Exception:
+                    pass
+                servers[name] = {
+                    "command": sys.executable,
+                    "args": [
+                        str(Path(__file__).resolve()),
+                        "mcp-proxy",
+                        "--server-name",
+                        name,
+                        "--server-config",
+                        str(server_path),
+                    ],
+                }
+            else:
+                servers[name] = server
+    if not servers:
+        return None
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    MCP_PROXY_CONFIG.write_text(json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(MCP_PROXY_CONFIG, 0o600)
+    except Exception:
+        pass
+    router_log("INFO", f"mcp_proxy_config_written servers={','.join(sorted(servers))}")
+    return MCP_PROXY_CONFIG
+
+
 def should_use_channel_stdin_proxy(use_router_mode: bool, passthrough: list[str]) -> bool:
     return bool(use_router_mode and not native_channel_passthrough_requested(passthrough))
 
@@ -13338,26 +13591,18 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
     room = str(meta.get("room_id") or meta.get("room") or channel)
     thread = str(message.get("thread_id") or meta.get("thread_id") or "")
-    body = str(message.get("message") or "").strip()
-    lines = [
-        "[claude-any external channel message]",
-        f"channel: {channel}",
-        f"room: {room}",
-        f"from: {sender}",
-    ]
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
+    fields = [f"channel={channel}", f"room={room}", f"from={sender}"]
     if mid:
-        lines.append(f"message_id: {mid}")
+        fields.append(f"id={mid}")
     if thread:
-        lines.append(f"thread_id: {thread}")
-    lines.extend(
-        [
-            "",
-            body,
-            "",
-            "If this message is relevant to the current work, respond or act on it now. If it is only informational, keep working.",
-        ]
+        fields.append(f"thread={thread}")
+    return (
+        "[claude-any external channel message] "
+        + " ".join(fields)
+        + f" text={json.dumps(body, ensure_ascii=False)}. "
+        + "If relevant to current work, respond or act now; otherwise keep working."
     )
-    return "\n".join(lines).strip() + "\n"
 
 
 def _write_fd_all(fd: int, data: bytes) -> None:
@@ -13367,6 +13612,11 @@ def _write_fd_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _channel_wake_input_bytes(prompt: str) -> bytes:
+    # Ctrl-U clears any stale line editor text before submitting the synthetic prompt.
+    return b"\x15" + prompt.encode("utf-8", errors="replace") + b"\n"
+
+
 def _inject_pending_channel_messages(master_fd: int, last_id: int) -> int:
     for message in read_chat_messages(last_id, None, None, 100):
         try:
@@ -13374,7 +13624,7 @@ def _inject_pending_channel_messages(master_fd: int, last_id: int) -> int:
         except Exception:
             continue
         prompt = format_channel_wake_prompt(message)
-        _write_fd_all(master_fd, prompt.encode("utf-8", errors="replace") + b"\r")
+        _write_fd_all(master_fd, _channel_wake_input_bytes(prompt))
         router_log("INFO", f"channel_stdin_proxy_injected message_id={message.get('id')} channel={message.get('channel')}")
     return last_id
 
@@ -13456,6 +13706,152 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
                 proc.terminate()
             except Exception:
                 pass
+
+
+def _mcp_proxy_notification_payload(server_name: str, message: dict[str, Any]) -> dict[str, Any] | None:
+    method = str(message.get("method") or "").strip()
+    if not method.startswith("notifications/"):
+        return None
+    params = message.get("params") if isinstance(message.get("params"), dict) else {}
+    payload = params.get("payload") if isinstance(params.get("payload"), dict) else {}
+    data = params.get("data") if isinstance(params.get("data"), dict) else {}
+    event = params.get("event") if isinstance(params.get("event"), dict) else {}
+    meta: dict[str, Any] = {
+        "mcp_server": server_name,
+        "mcp_method": method,
+    }
+    meta.update(_event_meta_from_sources(message, params, payload, data, event))
+    content = (
+        _event_payload_text(params)
+        or _event_payload_text(payload)
+        or _event_payload_text(data)
+        or _event_payload_text(event)
+    )
+    if not content and params:
+        content = json.dumps(params, ensure_ascii=False, separators=(",", ":"), default=str)
+    if not content:
+        return None
+    channel = str(meta.get("channel") or meta.get("room_id") or meta.get("room") or server_name)
+    return {
+        "channel": channel,
+        "sender_id": str(meta.get("sender_id") or meta.get("agent_id") or server_name),
+        "recipients": meta.get("recipient_id") or "all",
+        "thread_id": meta.get("thread_id"),
+        "parent_id": meta.get("parent_id"),
+        "kind": method.replace("notifications/claude/", "").replace("notifications/", "").replace("/", "."),
+        "message": content,
+        "meta": meta,
+    }
+
+
+def _mcp_proxy_observe_stdout_line(server_name: str, line: bytes) -> None:
+    try:
+        text = line.decode("utf-8", errors="replace").strip()
+        if not text or not text.startswith("{"):
+            return
+        payload = json.loads(text)
+    except Exception:
+        return
+    if not isinstance(payload, dict):
+        return
+    chat_payload = _mcp_proxy_notification_payload(server_name, payload)
+    if not chat_payload:
+        return
+    try:
+        saved = append_chat_message(chat_payload)
+        router_log(
+            "INFO",
+            f"mcp_proxy_notification server={server_name} method={payload.get('method')} message_id={saved.get('id')}",
+        )
+    except Exception as exc:
+        router_log("WARN", f"mcp_proxy_notification_failed server={server_name} error={type(exc).__name__}: {exc}")
+
+
+def _mcp_proxy_forward_stdin(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        while True:
+            chunk = sys.stdin.buffer.read(65536)
+            if not chunk:
+                break
+            if proc.stdin:
+                proc.stdin.write(chunk)
+                proc.stdin.flush()
+    except Exception:
+        pass
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+
+def _mcp_proxy_forward_stderr(proc: subprocess.Popen[bytes]) -> None:
+    try:
+        if not proc.stderr:
+            return
+        while True:
+            chunk = proc.stderr.read(4096)
+            if not chunk:
+                break
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.buffer.flush()
+    except Exception:
+        pass
+
+
+def run_mcp_stdio_proxy(server_name: str, server_config_path: Path) -> int:
+    try:
+        server = json.loads(server_config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        print(f"claude-any mcp-proxy: cannot read server config: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return 2
+    if not isinstance(server, dict) or not _mcp_server_is_stdio(server):
+        print("claude-any mcp-proxy: server config is not a stdio MCP server", file=sys.stderr, flush=True)
+        return 2
+    command = str(server.get("command") or "").strip()
+    args = [str(item) for item in server.get("args", [])] if isinstance(server.get("args"), list) else []
+    env = os.environ.copy()
+    raw_env = server.get("env")
+    if isinstance(raw_env, dict):
+        env.update({str(k): str(v) for k, v in raw_env.items() if str(k)})
+    cwd_value = server.get("cwd") or server.get("workingDirectory")
+    cwd = str(cwd_value) if cwd_value else None
+    try:
+        proc = subprocess.Popen(
+            [command, *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=cwd,
+            env=env,
+        )
+    except Exception as exc:
+        print(f"claude-any mcp-proxy: failed to start {command}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return 127
+    threading.Thread(target=_mcp_proxy_forward_stdin, args=(proc,), daemon=True, name=f"mcp-proxy-stdin-{server_name}").start()
+    threading.Thread(target=_mcp_proxy_forward_stderr, args=(proc,), daemon=True, name=f"mcp-proxy-stderr-{server_name}").start()
+    try:
+        if proc.stdout:
+            for line in iter(proc.stdout.readline, b""):
+                _mcp_proxy_observe_stdout_line(server_name, line)
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+        return proc.wait()
+    finally:
+        if proc.poll() is None:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
+
+def cmd_mcp_proxy(argv: list[str]) -> int:
+    parser = argparse.ArgumentParser(prog="claude-any mcp-proxy")
+    parser.add_argument("--server-name", required=True)
+    parser.add_argument("--server-config", required=True)
+    args = parser.parse_args(argv)
+    return run_mcp_stdio_proxy(args.server_name, Path(args.server_config).expanduser())
 
 
 def run_claude_update_check(claude: str, enabled: bool = True) -> None:
@@ -13805,10 +14201,18 @@ def launch_claude(
     mcp_config_paths: list[str] = []
     if should_attach_web_search(provider, cfg, web_search_override):
         mcp_config_paths.append(str(write_duckduckgo_mcp_config(cfg)))
-    if mcp_config_paths:
-        extra_args.extend(["--mcp-config", *mcp_config_paths])
+    claude_passthrough = list(launch_passthrough)
     if should_use_channel_stdin_proxy(use_router_mode, launch_passthrough):
         auto_start_sse_channels_from_mcp_configs(launch_passthrough)
+        proxy_config = write_mcp_proxy_config(
+            launch_passthrough,
+            extra_config_paths=[Path(path) for path in mcp_config_paths],
+        )
+        if proxy_config:
+            mcp_config_paths = [str(proxy_config)]
+            claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
+    if mcp_config_paths:
+        extra_args.extend(["--mcp-config", *mcp_config_paths])
     if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
         extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
     extra_args.extend(claude_channel_args(cfg, launch_passthrough))
@@ -13820,7 +14224,7 @@ def launch_claude(
     if model:
         cmd.extend(["--model", model])
     cmd.extend(extra_args)
-    cmd.extend(launch_passthrough)
+    cmd.extend(claude_passthrough)
     if should_use_channel_stdin_proxy(use_router_mode, launch_passthrough):
         return subprocess_call_with_channel_wake_proxy(cmd, env)
     return subprocess.call(cmd, env=env)
@@ -13844,6 +14248,7 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
   claude-any set-api-key PROVIDER KEY
   claude-any web-search [on|off]     Auto-attach DuckDuckGo MCP for non-native providers
   claude-any web-fetch [on|off]      Auto-attach fetch MCP for web page content
+  claude-any log-level [LEVEL]       Show or set router log level
   claude-any channels [cmd]          Configure external channel specs
   claude-any ollama-native [on|off]  Use Ollama's official Claude Code env path
   claude-any ollama-options [provider] [key=value ...]
@@ -13879,6 +14284,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-rate-limit-status on|off
   claude-any --ca-stream on|off
   claude-any --ca-stream-word-chunking on|off
+  claude-any --ca-log-level LEVEL    Set router log level: SILENT, ERROR, WARN, INFO, DEBUG, TRACE
   claude-any --ca-web-search         Force DuckDuckGo MCP for this launch
   claude-any --ca-no-web-search      Disable DuckDuckGo MCP for this launch
   claude-any --ca-web-fetch          Enable fetch MCP
@@ -14012,6 +14418,8 @@ def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | 
 
 
 def run_cli(argv: list[str]) -> int:
+    if argv and argv[0] == "mcp-proxy":
+        return cmd_mcp_proxy(argv[1:])
     if argv and argv[0] in ("help", "--help", "-h"):
         print(cli_usage())
         return 0
@@ -14066,6 +14474,9 @@ def run_cli(argv: list[str]) -> int:
             return 0
         if head in ("web-fetch", "webfetch"):
             cmd_web_fetch(argparse.Namespace(value=rest[0] if rest else None))
+            return 0
+        if head in ("log-level", "loglevel", "logging"):
+            cmd_log_level(argparse.Namespace(value=rest[0] if rest else None))
             return 0
         if head in ("channels", "channel"):
             cmd_channels(argparse.Namespace(values=rest))
@@ -14388,6 +14799,18 @@ def run_cli(argv: list[str]) -> int:
                 i += 1
             cmd_provider_options(argparse.Namespace(values=[f"stream_word_chunking={value}"]))
             skip_menu = True
+        elif arg == "--ca-log-level" or arg.startswith("--ca-log-level="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing level for --ca-log-level")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            for line in set_log_level_config(value):
+                print(line)
+            skip_menu = True
         elif arg == "--ca-web-search":
             web_search_override = True
             skip_menu = True
@@ -14515,6 +14938,9 @@ def build_parser() -> argparse.ArgumentParser:
     wf = sub.add_parser("web-fetch")
     wf.add_argument("value", nargs="?")
     wf.set_defaults(func=cmd_web_fetch)
+    ll = sub.add_parser("log-level")
+    ll.add_argument("value", nargs="?")
+    ll.set_defaults(func=cmd_log_level)
     ch = sub.add_parser("channels")
     ch.add_argument("values", nargs="*")
     ch.set_defaults(func=cmd_channels)

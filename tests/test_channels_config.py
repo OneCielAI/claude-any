@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -58,6 +59,41 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertEqual("mcp-ai-net", start.call_args.args[0]["name"])
         self.assertEqual("http://example.test/sse", start.call_args.args[0]["url"])
 
+    def test_mcp_proxy_config_wraps_stdio_server(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp_config = root / "mcp.json"
+            proxy_config = root / "mcp-proxy.json"
+            mcp_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ai-net": {"command": "node", "args": ["server.js"], "env": {"TOKEN": "x"}},
+                            "remote": {"type": "sse", "url": "http://example.test/sse"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "CONFIG_DIR", root), mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config):
+                written = claude_any.write_mcp_proxy_config(["--mcp-config", str(mcp_config)], cwd=root, home=root)
+
+            self.assertEqual(proxy_config, written)
+            data = json.loads(proxy_config.read_text(encoding="utf-8"))
+            wrapped = data["mcpServers"]["ai-net"]
+            self.assertEqual(claude_any.sys.executable, wrapped["command"])
+            self.assertIn("mcp-proxy", wrapped["args"])
+            self.assertIn("--server-name", wrapped["args"])
+            self.assertIn("ai-net", wrapped["args"])
+            self.assertEqual("sse", data["mcpServers"]["remote"]["type"])
+            server_config_path = Path(wrapped["args"][wrapped["args"].index("--server-config") + 1])
+            saved_server = json.loads(server_config_path.read_text(encoding="utf-8"))
+            self.assertEqual("node", saved_server["command"])
+
+    def test_strip_mcp_config_passthrough_removes_all_values(self):
+        args = claude_any.strip_mcp_config_passthrough(["--mcp-config", "a.json", "b.json", "-p", "hello"])
+        self.assertEqual(["-p", "hello"], args)
+
     def test_launch_with_external_channels_defers_to_claude_native(self):
         cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False}}
         with (
@@ -85,6 +121,7 @@ class ChannelConfigTests(unittest.TestCase):
             mock.patch.object(claude_any, "run_claude_update_check"),
             mock.patch.object(claude_any, "should_attach_web_search", return_value=False),
             mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False),
+            mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=None),
             mock.patch.object(claude_any, "subprocess_call_with_channel_wake_proxy") as proxy,
             mock.patch.object(claude_any.subprocess, "call", return_value=0) as call,
         ):
@@ -119,14 +156,50 @@ class ChannelConfigTests(unittest.TestCase):
             mock.patch.object(claude_any, "run_claude_update_check"),
             mock.patch.object(claude_any, "should_attach_web_search", return_value=False),
             mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False),
+            mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=None) as proxy_config,
             mock.patch.object(claude_any, "subprocess_call_with_channel_wake_proxy", return_value=0) as proxy,
         ):
             rc = claude_any.launch_claude([])
 
         self.assertEqual(0, rc)
         auto_start.assert_called_once_with([])
+        proxy_config.assert_called_once()
         launch_cmd = proxy.call_args.args[0]
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
+
+    def test_launch_without_external_channels_uses_generated_mcp_proxy_config(self):
+        cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False}}
+        with tempfile.TemporaryDirectory() as td:
+            proxy_path = Path(td) / "mcp-proxy.json"
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(claude_any, "run_prelaunch_menu", return_value=0))
+                stack.enter_context(mock.patch.object(claude_any, "load_config", return_value=cfg))
+                stack.enter_context(mock.patch.object(claude_any, "get_current_provider", return_value=("ollama-cloud", {})))
+                stack.enter_context(mock.patch.object(claude_any, "launch_readiness_errors", return_value=[]))
+                stack.enter_context(mock.patch.object(claude_any, "native_anthropic_enabled", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "ollama_native_compat_enabled", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "provider_native_compat_enabled", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "cleanup_managed_services_for_provider"))
+                stack.enter_context(mock.patch.object(claude_any, "start_router_if_needed"))
+                stack.enter_context(mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", return_value=[]))
+                stack.enter_context(mock.patch.object(claude_any, "env_vars", return_value={"CLAUDE_ANY_MODEL_ALIAS": "claude-any-test"}))
+                stack.enter_context(mock.patch.object(claude_any, "install_claude_any_slash_commands"))
+                stack.enter_context(mock.patch.object(claude_any, "install_tool_guard_hooks"))
+                stack.enter_context(mock.patch.object(claude_any, "install_claude_any_statusline"))
+                stack.enter_context(mock.patch.object(claude_any, "find_executable", return_value="claude"))
+                stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
+                stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=proxy_path))
+                proxy = stack.enter_context(mock.patch.object(claude_any, "subprocess_call_with_channel_wake_proxy", return_value=0))
+                rc = claude_any.launch_claude(["--mcp-config", "original.json", "-p", "hello"])
+
+        self.assertEqual(0, rc)
+        launch_cmd = proxy.call_args.args[0]
+        self.assertIn("--mcp-config", launch_cmd)
+        self.assertIn(str(proxy_path), launch_cmd)
+        self.assertNotIn("original.json", launch_cmd)
+        self.assertIn("-p", launch_cmd)
 
     def test_channels_command_toggles_official_plugin(self):
         cfg = {
