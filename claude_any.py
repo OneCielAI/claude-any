@@ -105,7 +105,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.87"
+VERSION = "0.1.88"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -4920,6 +4920,15 @@ def _write_sse_event(handler: BaseHTTPRequestHandler, event: str, data: Any, eve
     handler.wfile.flush()
 
 
+def _send_channel_mcp_sse_headers(handler: BaseHTTPRequestHandler) -> None:
+    handler.send_response(200)
+    handler.send_header("content-type", "text/event-stream")
+    handler.send_header("cache-control", "no-cache, no-transform")
+    handler.send_header("connection", "keep-alive")
+    handler.send_header("x-accel-buffering", "no")
+    handler.end_headers()
+
+
 def _channel_mcp_write_cursor_locked(last_id: int) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp_path = CHANNEL_MCP_CURSOR_PATH.with_suffix(".json.tmp")
@@ -5001,17 +5010,16 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
     with _CHANNEL_MCP_LOCK:
         _CHANNEL_MCP_SESSIONS[session] = {"created_at": time.time(), "last_id": last_id, "initialized": False}
     router_log("INFO", f"channel_mcp_session_started session={session} last_id={last_id}")
-    handler.send_response(200)
-    handler.send_header("content-type", "text/event-stream")
-    handler.send_header("cache-control", "no-cache")
-    handler.send_header("connection", "close")
-    handler.end_headers()
+    started_at = time.time()
+    close_reason = "finished"
+    _send_channel_mcp_sse_headers(handler)
     _write_sse_event(handler, "endpoint", f"/ca/mcp/messages?session={urllib.parse.quote(session)}")
     try:
         while True:
             with _CHANNEL_MCP_LOCK:
                 state = _CHANNEL_MCP_SESSIONS.get(session)
                 if not state:
+                    close_reason = "session_missing"
                     return True
                 last_id = int(state.get("last_id") or 0)
                 initialized = bool(state.get("initialized"))
@@ -5036,10 +5044,16 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
             handler.wfile.write(b": keepalive\n\n")
             handler.wfile.flush()
             with _CHAT_CONDITION:
-                _CHAT_CONDITION.wait(timeout=15.0)
-    except (BrokenPipeError, ConnectionError, ConnectionResetError):
+                _CHAT_CONDITION.wait(timeout=5.0)
+    except (BrokenPipeError, ConnectionError, ConnectionResetError) as exc:
+        close_reason = type(exc).__name__
+        return True
+    except Exception as exc:
+        close_reason = type(exc).__name__
+        router_log("ERROR", f"channel_mcp_session_failed session={session} error={type(exc).__name__}: {exc}")
         return True
     finally:
+        router_log("INFO", f"channel_mcp_session_closed session={session} reason={close_reason} age={time.time() - started_at:.1f}s")
         with _CHANNEL_MCP_LOCK:
             _CHANNEL_MCP_SESSIONS.pop(session, None)
 
@@ -14387,9 +14401,11 @@ def run_mcp_stdio_proxy(server_name: str, server_config_path: Path) -> int:
     try:
         server = json.loads(server_config_path.read_text(encoding="utf-8"))
     except Exception as exc:
+        router_log("ERROR", f"mcp_proxy_config_read_failed server={server_name} error={type(exc).__name__}: {exc}")
         print(f"claude-any mcp-proxy: cannot read server config: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return 2
     if not isinstance(server, dict) or not _mcp_server_is_stdio(server):
+        router_log("ERROR", f"mcp_proxy_invalid_config server={server_name}")
         print("claude-any mcp-proxy: server config is not a stdio MCP server", file=sys.stderr, flush=True)
         return 2
     command = str(server.get("command") or "").strip()
@@ -14411,6 +14427,7 @@ def run_mcp_stdio_proxy(server_name: str, server_config_path: Path) -> int:
             bufsize=0,
         )
     except Exception as exc:
+        router_log("ERROR", f"mcp_proxy_start_failed server={server_name} command={command} error={type(exc).__name__}: {exc}")
         print(f"claude-any mcp-proxy: failed to start {command}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return 127
     router_log("INFO", f"mcp_proxy_started server={server_name} command={command}")
@@ -14427,7 +14444,8 @@ def run_mcp_stdio_proxy(server_name: str, server_config_path: Path) -> int:
                 sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
         rc = proc.wait()
-        router_log("INFO", f"mcp_proxy_exited server={server_name} rc={rc}")
+        level = "INFO" if rc == 0 else "WARN"
+        router_log(level, f"mcp_proxy_exited server={server_name} rc={rc}")
         return rc
     finally:
         if proc.poll() is None:

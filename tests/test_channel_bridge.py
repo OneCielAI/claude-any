@@ -311,6 +311,31 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("tools", capabilities)
         self.assertIn("claude/channel", capabilities["experimental"])
 
+    def test_channel_mcp_sse_headers_keep_connection_alive(self):
+        class FakeHandler:
+            def __init__(self):
+                self.status = None
+                self.headers = []
+                self.ended = False
+
+            def send_response(self, status):
+                self.status = status
+
+            def send_header(self, name, value):
+                self.headers.append((name.lower(), value))
+
+            def end_headers(self):
+                self.ended = True
+
+        handler = FakeHandler()
+        claude_any._send_channel_mcp_sse_headers(handler)
+        headers = dict(handler.headers)
+        self.assertEqual(200, handler.status)
+        self.assertEqual("text/event-stream", headers["content-type"])
+        self.assertEqual("keep-alive", headers["connection"])
+        self.assertEqual("no", headers["x-accel-buffering"])
+        self.assertTrue(handler.ended)
+
     def test_channel_mcp_notifications_ignore_transport_noise(self):
         messages = [
             {"id": 1, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.ws.connected", "meta": {}},
