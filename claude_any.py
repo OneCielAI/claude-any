@@ -105,7 +105,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.94"
+VERSION = "0.1.95"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -1272,7 +1272,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "compat_prompt_for_non_anthropic": True,
         "channels": [],
         "development_channels": False,
-        "channel_delivery": "stdin",
+        "channel_delivery": "native",
     },
     "cleanup": {
         "managed_services_on_launch": True,
@@ -1462,6 +1462,16 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
         for pcfg in (cfg.get("providers") or {}).values():
             if isinstance(pcfg, dict) and "stream_enabled" not in pcfg:
                 pcfg["stream_enabled"] = True
+        migrations[marker] = True
+
+    marker = "default_channel_delivery_native_20260520"
+    if not migrations.get(marker):
+        ccfg = cfg.setdefault("claude_code", {})
+        if not isinstance(ccfg, dict):
+            ccfg = {}
+            cfg["claude_code"] = ccfg
+        if normalize_channel_delivery(ccfg.get("channel_delivery")) == "stdin":
+            ccfg["channel_delivery"] = "native"
         migrations[marker] = True
 
 
@@ -9687,9 +9697,11 @@ def normalize_channel_delivery(value: Any) -> str:
     text = str(value or "").strip().lower().replace("_", "-")
     if text in {"native", "native-channel", "native-channel-bridge", "claude-channel", "claude/native"}:
         return "native"
-    if text in {"stdin", "pty", "terminal", "wake", "wake-proxy", "legacy", "auto", ""}:
+    if text in {"stdin", "pty", "terminal", "wake", "wake-proxy", "legacy"}:
         return "stdin"
-    return "stdin"
+    if text in {"auto", ""}:
+        return "native"
+    return "native"
 
 
 def channel_delivery_mode(cfg: dict[str, Any] | None = None) -> str:
@@ -9697,7 +9709,7 @@ def channel_delivery_mode(cfg: dict[str, Any] | None = None) -> str:
     if env_value is not None:
         return normalize_channel_delivery(env_value)
     cfg = cfg or load_config()
-    return normalize_channel_delivery(cfg.setdefault("claude_code", {}).get("channel_delivery", "stdin"))
+    return normalize_channel_delivery(cfg.setdefault("claude_code", {}).get("channel_delivery", "native"))
 
 
 def set_channel_delivery_config(value: Any) -> list[str]:
@@ -13120,11 +13132,11 @@ def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
 def channel_delivery_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     current = channel_delivery_mode(cfg)
     rows = [
-        f"{'*' if current == 'stdin' else ' '} stdin  PTY wake proxy; works broadly, uses terminal input",
         f"{'*' if current == 'native' else ' '} native Claude Code claude/channel queue bridge",
+        f"{'*' if current == 'stdin' else ' '} stdin  PTY wake proxy; works broadly, uses terminal input",
         "Back",
     ]
-    return rows, ["stdin", "native", "back"]
+    return rows, ["native", "stdin", "back"]
 
 
 def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:

@@ -41,6 +41,20 @@ class ChannelConfigTests(unittest.TestCase):
             self.assertTrue(claude_any.should_use_native_channel_bridge(True, cfg, []))
             self.assertFalse(claude_any.should_use_channel_stdin_proxy(True, [], cfg))
 
+    def test_channel_delivery_mode_defaults_to_native_bridge(self):
+        cfg = {"claude_code": {}}
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_ANY_CHANNEL_DELIVERY", None)
+            self.assertEqual("native", claude_any.channel_delivery_mode(cfg))
+            self.assertTrue(claude_any.should_use_native_channel_bridge(True, cfg, []))
+            self.assertFalse(claude_any.should_use_channel_stdin_proxy(True, [], cfg))
+
+    def test_channel_delivery_migration_moves_old_default_to_native(self):
+        cfg = {"migrations": {}, "claude_code": {"channel_delivery": "stdin"}, "providers": {}}
+        claude_any.apply_config_migrations(cfg)
+        self.assertEqual("native", cfg["claude_code"]["channel_delivery"])
+        self.assertTrue(cfg["migrations"]["default_channel_delivery_native_20260520"])
+
     def test_prelaunch_menu_rows_show_channel_delivery(self):
         cfg = {"language": "en", "current_provider": "ollama-cloud", "claude_code": {"channel_delivery": "native"}}
         with mock.patch.dict(os.environ, {}, clear=False):
@@ -48,7 +62,7 @@ class ChannelConfigTests(unittest.TestCase):
             rows = claude_any.main_menu_rows(cfg, "ollama-cloud", {"current_model": "m", "advisor_model": ""}, "en")
             self.assertIn("7. Channel delivery  [native]", rows)
             delivery_rows, delivery_values = claude_any.channel_delivery_panel_rows(cfg)
-            self.assertEqual(["stdin", "native", "back"], delivery_values)
+            self.assertEqual(["native", "stdin", "back"], delivery_values)
             self.assertTrue(any(row.startswith("* native") for row in delivery_rows))
 
     def test_auto_discovers_mcp_servers_from_project_config(self):
@@ -212,8 +226,8 @@ class ChannelConfigTests(unittest.TestCase):
         launch_env = call.call_args.kwargs["env"]
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
 
-    def test_launch_without_external_channels_uses_stdin_proxy(self):
-        cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False}}
+    def test_launch_without_external_channels_uses_stdin_proxy_when_selected(self):
+        cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False, "channel_delivery": "stdin"}}
         with (
             mock.patch.object(claude_any, "run_prelaunch_menu", return_value=0),
             mock.patch.object(claude_any, "load_config", return_value=cfg),
@@ -244,8 +258,8 @@ class ChannelConfigTests(unittest.TestCase):
         launch_cmd = proxy.call_args.args[0]
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
 
-    def test_launch_without_external_channels_uses_generated_mcp_proxy_config(self):
-        cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False}}
+    def test_launch_without_external_channels_uses_generated_mcp_proxy_config_for_stdin(self):
+        cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False, "channel_delivery": "stdin"}}
         with tempfile.TemporaryDirectory() as td:
             proxy_path = Path(td) / "mcp-proxy.json"
             with ExitStack() as stack:
@@ -278,8 +292,8 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertNotIn("original.json", launch_cmd)
         self.assertIn("-p", launch_cmd)
 
-    def test_launch_with_native_channel_bridge_uses_router_mcp_not_pty(self):
-        cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False, "channel_delivery": "native"}}
+    def test_launch_with_native_channel_bridge_uses_router_mcp_not_pty_by_default(self):
+        cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False}}
         with tempfile.TemporaryDirectory() as td:
             channel_path = Path(td) / "channel-mcp.json"
             proxy_path = Path(td) / "mcp-proxy.json"
