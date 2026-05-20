@@ -1052,6 +1052,7 @@ UI_TEXT = {
         "advisor_model": "Advisor Model",
         "test": "Test compatibility",
         "options": "LLM options",
+        "channel_delivery": "Channel delivery",
         "log_level": "Log level",
         "presets": "LLM presets",
         "context_setup": "Context setup",
@@ -1073,6 +1074,7 @@ UI_TEXT = {
         "advisor_model": "Advisor Model",
         "test": "호환성 테스트",
         "options": "LLM 옵션",
+        "channel_delivery": "채널 전달 방식",
         "log_level": "로그 레벨",
         "presets": "LLM 프리셋",
         "context_setup": "컨텍스트 설정",
@@ -1094,6 +1096,7 @@ UI_TEXT = {
         "advisor_model": "Advisor Model",
         "test": "互換性テスト",
         "options": "LLMオプション",
+        "channel_delivery": "チャンネル配信方式",
         "log_level": "ログレベル",
         "presets": "LLMプリセット",
         "context_setup": "コンテキスト設定",
@@ -1115,6 +1118,7 @@ UI_TEXT = {
         "advisor_model": "Advisor Model",
         "test": "兼容性测试",
         "options": "LLM 选项",
+        "channel_delivery": "频道投递方式",
         "log_level": "日志级别",
         "presets": "LLM 预设",
         "context_setup": "上下文设置",
@@ -1261,6 +1265,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "compat_prompt_for_non_anthropic": True,
         "channels": [],
         "development_channels": False,
+        "channel_delivery": "stdin",
     },
     "cleanup": {
         "managed_services_on_launch": True,
@@ -4836,27 +4841,63 @@ def _channel_mcp_session_id() -> str:
     return f"s{os.getpid()}-{time.time_ns()}"
 
 
+def _native_channel_meta_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    return json.dumps(_json_safe_metadata(value), ensure_ascii=False, separators=(",", ":"), default=str)
+
+
+def _native_channel_meta(message: dict[str, Any]) -> dict[str, str]:
+    raw_meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    meta: dict[str, str] = {}
+    for key, value in raw_meta.items():
+        name = str(key or "").strip()
+        if not name:
+            continue
+        meta[name] = _native_channel_meta_value(value)
+    base = {
+        "claude_any_message_id": message.get("id"),
+        "channel": message.get("channel") or "default",
+        "sender_id": message.get("sender_id") or "channel",
+        "thread_id": message.get("thread_id"),
+        "parent_id": message.get("parent_id"),
+        "kind": message.get("kind"),
+    }
+    for key, value in base.items():
+        if value is not None:
+            meta[key] = _native_channel_meta_value(value)
+    if raw_meta:
+        meta["claude_any_meta_json"] = json.dumps(_json_safe_metadata(raw_meta), ensure_ascii=False, separators=(",", ":"), default=str)
+    return meta
+
+
 def _channel_mcp_notification(message: dict[str, Any]) -> dict[str, Any]:
     text = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
     channel = str(message.get("channel") or "default")
     sender = str(message.get("sender_id") or "channel")
     prefix = f"[{channel}] {sender}"
     content = f"{prefix}: {text}" if text else prefix
-    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
-    merged_meta = {
-        **meta,
-        "claude_any_message_id": message.get("id"),
-        "channel": channel,
-        "sender_id": sender,
-        "thread_id": message.get("thread_id"),
-        "parent_id": message.get("parent_id"),
-    }
     return {
         "jsonrpc": "2.0",
         "method": "notifications/claude/channel",
         "params": {
             "content": content,
-            "meta": merged_meta,
+            "meta": _native_channel_meta(message),
+        },
+    }
+
+
+def _channel_mcp_capabilities() -> dict[str, Any]:
+    return {
+        "tools": {"listChanged": False},
+        "experimental": {
+            "claude/channel": {},
         },
     }
 
@@ -4941,7 +4982,7 @@ def handle_channel_mcp_post(handler: BaseHTTPRequestHandler, path: str, body: di
                 "id": request_id,
                 "result": {
                     "protocolVersion": protocol,
-                    "capabilities": {"tools": {"listChanged": False}},
+                    "capabilities": _channel_mcp_capabilities(),
                     "serverInfo": {"name": "claude-any-router", "version": VERSION},
                 },
             },
@@ -8949,6 +8990,7 @@ def status_lines() -> list[str]:
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
         f"log_level: {log_level_status()}",
         f"channels: {channel_status_text(cfg)}",
+        f"channel_delivery: {channel_delivery_mode(cfg)}",
         f"router: {'bypassed for native provider compatibility' if direct_native else (('up' if router_up() else 'down') + ' ' + ROUTER_BASE)}",
         f"config: {CONFIG_PATH}",
     ]
@@ -9384,6 +9426,33 @@ def set_channel_development_enabled(enabled: bool) -> list[str]:
     return ["Channel wake delivery is always enabled by Claude Any."]
 
 
+def normalize_channel_delivery(value: Any) -> str:
+    text = str(value or "").strip().lower().replace("_", "-")
+    if text in {"native", "native-channel", "native-channel-bridge", "claude-channel", "claude/native"}:
+        return "native"
+    if text in {"stdin", "pty", "terminal", "wake", "wake-proxy", "legacy", "auto", ""}:
+        return "stdin"
+    return "stdin"
+
+
+def channel_delivery_mode(cfg: dict[str, Any] | None = None) -> str:
+    env_value = os.environ.get("CLAUDE_ANY_CHANNEL_DELIVERY")
+    if env_value is not None:
+        return normalize_channel_delivery(env_value)
+    cfg = cfg or load_config()
+    return normalize_channel_delivery(cfg.setdefault("claude_code", {}).get("channel_delivery", "stdin"))
+
+
+def set_channel_delivery_config(value: Any) -> list[str]:
+    mode = normalize_channel_delivery(value)
+    cfg = load_config()
+    cfg.setdefault("claude_code", {})["channel_delivery"] = mode
+    save_config(cfg)
+    if mode == "native":
+        return ["Channel delivery set to native claude/channel bridge."]
+    return ["Channel delivery set to stdin wake proxy."]
+
+
 def add_channel_spec(spec: str, *, development: bool = False) -> list[str]:
     spec = spec.strip()
     if not spec:
@@ -9422,6 +9491,7 @@ def cmd_channels(args: argparse.Namespace) -> None:
     values = list(getattr(args, "values", []) or [])
     if not values:
         print(f"channels: {channel_status_text(cfg)}")
+        print(f"delivery: {channel_delivery_mode(cfg)}")
         for name, spec in OFFICIAL_CHANNEL_PLUGINS.items():
             mark = "*" if spec in channel_specs(cfg) else " "
             print(f" {mark} {name:<10} {spec}")
@@ -9456,6 +9526,13 @@ def cmd_channels(args: argparse.Namespace) -> None:
         for line in clear_channel_specs():
             print(line)
         return
+    if head in ("delivery", "mode"):
+        if len(values) < 2:
+            print(f"channel_delivery: {channel_delivery_mode(cfg)}")
+            return
+        for line in set_channel_delivery_config(values[1]):
+            print(line)
+        return
     if head in OFFICIAL_CHANNEL_PLUGINS:
         spec = OFFICIAL_CHANNEL_PLUGINS[head]
         if spec in channel_specs(cfg):
@@ -9467,6 +9544,15 @@ def cmd_channels(args: argparse.Namespace) -> None:
         return
     for line in add_channel_spec(values[0]):
         print(line)
+
+
+def cmd_channel_delivery(args: argparse.Namespace) -> None:
+    value = getattr(args, "value", None)
+    if value:
+        for line in set_channel_delivery_config(value):
+            print(line)
+    else:
+        print(f"channel_delivery: {channel_delivery_mode()}")
 
 
 def cmd_ollama_native(args: argparse.Namespace) -> None:
@@ -12655,9 +12741,10 @@ def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lan
         f"4. {ui_text('model', lang)}  [{compact_text(pcfg.get('current_model', 'unset'), 62)}]",
         f"5. {ui_text('advisor_model', lang)}  [{compact_text(pcfg.get('advisor_model') or 'off', 62)}]",
         f"6. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
-        f"7. {ui_text('log_level', lang)}  [{log_level_status()}]",
-        f"8. {ui_text('test', lang)}",
-        f"9. {ui_text('launch', lang)}",
+        f"7. {ui_text('channel_delivery', lang)}  [{channel_delivery_mode(cfg)}]",
+        f"8. {ui_text('log_level', lang)}  [{log_level_status()}]",
+        f"9. {ui_text('test', lang)}",
+        f"10. {ui_text('launch', lang)}",
         ui_text("quit", lang),
     ]
 
@@ -12773,6 +12860,16 @@ def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     return rows, values
 
 
+def channel_delivery_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+    current = channel_delivery_mode(cfg)
+    rows = [
+        f"{'*' if current == 'stdin' else ' '} stdin  PTY wake proxy; works broadly, uses terminal input",
+        f"{'*' if current == 'native' else ' '} native Claude Code claude/channel queue bridge",
+        "Back",
+    ]
+    return rows, ["stdin", "native", "back"]
+
+
 def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
     rows = [
         "Type or paste API key as hidden input",
@@ -12869,6 +12966,9 @@ def render_prelaunch_screen(
             "advisor-model": "Advisor Model",
             "test": "Compatibility test",
             "options": ui_text("options", lang),
+            "channel-delivery": ui_text("channel_delivery", lang),
+            "log-level": ui_text("log_level", lang),
+            "channels": "Channels",
             "context": ui_text("context_setup", lang),
             "preset": ui_text("presets", lang),
             "timeout": ui_text("timeout_preset", lang),
@@ -13073,7 +13173,7 @@ def portable_language_menu() -> int:
 
 def portable_prelaunch_menu() -> int:
     enable_ansi()
-    main_idx = 9 if settings_ready_except_api_key() else 0
+    main_idx = 10 if settings_ready_except_api_key() else 0
     panel: str | None = None
     panel_idx = 0
     panel_rows: list[str] = []
@@ -13115,6 +13215,8 @@ def portable_prelaunch_menu() -> int:
             panel_rows, panel_values = ["Run compatibility test", "Back"], ["run", "back"]
         elif name == "options":
             panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
+        elif name == "channel-delivery":
+            panel_rows, panel_values = channel_delivery_panel_rows(cfg)
         elif name == "log-level":
             panel_rows, panel_values = log_level_panel_rows(cfg)
         elif name == "channels":
@@ -13295,7 +13397,7 @@ def portable_prelaunch_menu() -> int:
                         messages = lines[-8:] if lines else ["Test produced no output."]
                         panel_rows, panel_values = ["Run compatibility test again", "Back"], ["run", "back"]
                         refresh_checks()
-                        main_idx = 9 if "Compatibility: OK" in out else 4
+                        main_idx = 10 if "Compatibility: OK" in out else 4
                 elif panel == "log-level":
                     if value == "back":
                         close_panel()
@@ -13304,6 +13406,15 @@ def portable_prelaunch_menu() -> int:
                         refresh_checks()
                         cfg = load_config()
                         panel_rows, panel_values = log_level_panel_rows(cfg)
+                        panel_idx = max(0, min(panel_idx, len(panel_rows) - 1))
+                elif panel == "channel-delivery":
+                    if value == "back":
+                        close_panel()
+                    elif value:
+                        messages = set_channel_delivery_config(value)
+                        refresh_checks()
+                        cfg = load_config()
+                        panel_rows, panel_values = channel_delivery_panel_rows(cfg)
                         panel_idx = max(0, min(panel_idx, len(panel_rows) - 1))
                 elif panel == "channels":
                     if value == "back":
@@ -13431,13 +13542,17 @@ def portable_prelaunch_menu() -> int:
                 continue
 
             if key in ("up", "k"):
-                main_idx = (main_idx - 1) % 11
+                cfg = load_config()
+                provider, pcfg = get_current_provider(cfg)
+                main_idx = (main_idx - 1) % len(main_menu_rows(cfg, provider, pcfg, cfg.get("language", "en")))
             elif key in ("down", "j"):
-                main_idx = (main_idx + 1) % 11
+                cfg = load_config()
+                provider, pcfg = get_current_provider(cfg)
+                main_idx = (main_idx + 1) % len(main_menu_rows(cfg, provider, pcfg, cfg.get("language", "en")))
             elif key in ("esc", "q"):
                 return 10
             elif key == "enter":
-                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "log-level", "test", "launch", "quit"]
+                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "channel-delivery", "log-level", "test", "launch", "quit"]
                 action = actions[main_idx]
                 if action == "launch":
                     blockers = launch_readiness_errors()
@@ -13563,6 +13678,10 @@ def claude_channels_requested(cfg: dict[str, Any], passthrough: list[str], extra
     return native_channel_passthrough_requested(passthrough)
 
 
+def should_use_native_channel_bridge(use_router_mode: bool, cfg: dict[str, Any], passthrough: list[str]) -> bool:
+    return bool(use_router_mode and channel_delivery_mode(cfg) == "native" and not native_channel_passthrough_requested(passthrough))
+
+
 def write_web_tools_mcp_config(cfg: dict[str, Any]) -> Path:
     web = cfg.get("web_search", {})
     package = web.get("package") or "ddg-mcp-search"
@@ -13674,8 +13793,12 @@ def write_mcp_proxy_config(
     return MCP_PROXY_CONFIG
 
 
-def should_use_channel_stdin_proxy(use_router_mode: bool, passthrough: list[str]) -> bool:
-    return bool(use_router_mode and not native_channel_passthrough_requested(passthrough))
+def should_use_channel_stdin_proxy(use_router_mode: bool, passthrough: list[str], cfg: dict[str, Any] | None = None) -> bool:
+    if not use_router_mode or native_channel_passthrough_requested(passthrough):
+        return False
+    if cfg is not None and channel_delivery_mode(cfg) == "native":
+        return False
+    return True
 
 
 def format_channel_wake_prompt(message: dict[str, Any]) -> str:
@@ -14490,7 +14613,9 @@ def launch_claude(
     env["PATH"] = str(HOME / ".local" / "bin") + os.pathsep + env.get("PATH", "")
     launch_env = env_vars(cfg)
     launch_passthrough = normalize_channel_passthrough(passthrough)
-    if claude_channels_requested(cfg, launch_passthrough):
+    native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
+    stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg)
+    if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
     if use_native_anthropic:
@@ -14525,8 +14650,10 @@ def launch_claude(
     mcp_config_paths: list[str] = []
     if should_attach_web_search(provider, cfg, web_search_override):
         mcp_config_paths.append(str(write_duckduckgo_mcp_config(cfg)))
+    if native_channel_bridge:
+        mcp_config_paths.append(str(write_channel_mcp_config()))
     claude_passthrough = list(launch_passthrough)
-    if should_use_channel_stdin_proxy(use_router_mode, launch_passthrough):
+    if stdin_channel_proxy or native_channel_bridge:
         auto_start_sse_channels_from_mcp_configs(launch_passthrough)
         proxy_config = write_mcp_proxy_config(
             launch_passthrough,
@@ -14549,7 +14676,7 @@ def launch_claude(
         cmd.extend(["--model", model])
     cmd.extend(extra_args)
     cmd.extend(claude_passthrough)
-    if should_use_channel_stdin_proxy(use_router_mode, launch_passthrough):
+    if stdin_channel_proxy:
         return subprocess_call_with_channel_wake_proxy(cmd, env)
     return subprocess.call(cmd, env=env)
 
@@ -14574,6 +14701,8 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
   claude-any web-fetch [on|off]      Auto-attach fetch MCP for web page content
   claude-any log-level [LEVEL]       Show or set router log level
   claude-any channels [cmd]          Configure external channel specs
+  claude-any channel-delivery [stdin|native]
+                                      Select PTY wake proxy or native claude/channel bridge
   claude-any ollama-native [on|off]  Use Ollama's official Claude Code env path
   claude-any ollama-options [provider] [key=value ...]
                                       Set Ollama num_ctx/options/keep_alive/think
@@ -14614,6 +14743,8 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-web-fetch          Enable fetch MCP
   claude-any --ca-no-web-fetch       Disable fetch MCP
   claude-any --ca-channel SPEC       Add an official/approved Claude Code channel
+  claude-any --ca-channel-delivery MODE
+                                      Set channel delivery: stdin or native
   claude-any --ca-clear-channels     Clear saved channel specs
   claude-any --ca-no-self-update-check
                                       Skip Claude Any npm self-update check
@@ -14738,6 +14869,10 @@ def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | 
     for channel_value in dev_channel_values:
         add_channel_spec(channel_value)
         skip_menu = True
+    channel_delivery = os.environ.get("CLAUDE_ANY_CHANNEL_DELIVERY", "").strip()
+    if channel_delivery:
+        set_channel_delivery_config(channel_delivery)
+        skip_menu = True
     return skip_menu, web_search_override, update_check_override, self_update_check_override, force_menu
 
 
@@ -14804,6 +14939,13 @@ def run_cli(argv: list[str]) -> int:
             return 0
         if head in ("channels", "channel"):
             cmd_channels(argparse.Namespace(values=rest))
+            return 0
+        if head in ("channel-delivery", "channel_delivery"):
+            if rest:
+                for line in set_channel_delivery_config(rest[0]):
+                    print(line)
+            else:
+                print(f"channel_delivery: {channel_delivery_mode()}")
             return 0
         if head in ("ollama-native", "ollama-compat"):
             cmd_ollama_native(argparse.Namespace(value=rest[0] if rest else None))
@@ -15163,6 +15305,18 @@ def run_cli(argv: list[str]) -> int:
             for line in add_channel_spec(value):
                 print(line)
             skip_menu = True
+        elif arg == "--ca-channel-delivery" or arg.startswith("--ca-channel-delivery="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing mode for --ca-channel-delivery")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            for line in set_channel_delivery_config(value):
+                print(line)
+            skip_menu = True
         elif arg == "--ca-dev-channel" or arg.startswith("--ca-dev-channel="):
             value = arg.split("=", 1)[1] if "=" in arg else None
             if value is None:
@@ -15268,6 +15422,9 @@ def build_parser() -> argparse.ArgumentParser:
     ch = sub.add_parser("channels")
     ch.add_argument("values", nargs="*")
     ch.set_defaults(func=cmd_channels)
+    cd = sub.add_parser("channel-delivery")
+    cd.add_argument("value", nargs="?")
+    cd.set_defaults(func=cmd_channel_delivery)
     on = sub.add_parser("ollama-native")
     on.add_argument("value", nargs="?")
     on.set_defaults(func=cmd_ollama_native)

@@ -285,7 +285,31 @@ class ChannelBridgeTests(unittest.TestCase):
         )
         self.assertEqual("notifications/claude/channel", notification["method"])
         self.assertIn("hello Sarah", notification["params"]["content"])
-        self.assertEqual(7, notification["params"]["meta"]["claude_any_message_id"])
+        self.assertEqual("7", notification["params"]["meta"]["claude_any_message_id"])
+
+    def test_router_channel_mcp_notification_stringifies_meta_for_native_schema(self):
+        notification = claude_any._channel_mcp_notification(
+            {
+                "id": 8,
+                "channel": "room",
+                "sender_id": "agent",
+                "thread_id": "root",
+                "message": "native wake",
+                "kind": "message",
+                "meta": {"room_id": "room", "mcp_json": {"method": "notifications/message"}, "count": 3},
+            }
+        )
+        meta = notification["params"]["meta"]
+        self.assertTrue(all(isinstance(key, str) and isinstance(value, str) for key, value in meta.items()))
+        self.assertEqual("8", meta["claude_any_message_id"])
+        self.assertEqual("3", meta["count"])
+        self.assertIn("notifications/message", meta["mcp_json"])
+        self.assertIn("mcp_json", meta["claude_any_meta_json"])
+
+    def test_channel_mcp_capabilities_declare_native_channel(self):
+        capabilities = claude_any._channel_mcp_capabilities()
+        self.assertIn("tools", capabilities)
+        self.assertIn("claude/channel", capabilities["experimental"])
 
     def test_mcp_proxy_notification_maps_to_chat_payload(self):
         payload = claude_any._mcp_proxy_notification_payload(
