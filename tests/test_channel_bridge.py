@@ -373,7 +373,35 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("hello Sarah", events[0][1]["params"]["content"])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_mcp_skipped_noise" in item and "transport_connected" in item for item in log_messages))
-        self.assertTrue(any("channel_mcp_notification_sent" in item and "message_id=2" in item for item in log_messages))
+        self.assertTrue(any("channel_mcp_notification_prepared" in item and "message_id=2" in item for item in log_messages))
+
+    def test_channel_mcp_session_start_prefers_client_last_event_id_for_replay(self):
+        class Handler:
+            path = "/ca/mcp/sse"
+            headers = {"Last-Event-ID": "10"}
+
+        with (
+            mock.patch.object(claude_any, "_channel_mcp_ensure_cursor_initialized", return_value=12),
+            mock.patch.object(claude_any, "_channel_mcp_update_cursor") as update_cursor,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            last_id = claude_any._channel_mcp_session_start_last_id(Handler())
+        self.assertEqual(10, last_id)
+        update_cursor.assert_not_called()
+        self.assertTrue(any("channel_mcp_resume" in str(call.args[1]) and "client_last_id=10" in str(call.args[1]) for call in router_log.call_args_list))
+
+    def test_channel_mcp_session_start_advances_cursor_from_client_ack(self):
+        class Handler:
+            path = "/ca/mcp/sse?lastEventId=15"
+            headers = {}
+
+        with (
+            mock.patch.object(claude_any, "_channel_mcp_ensure_cursor_initialized", return_value=12),
+            mock.patch.object(claude_any, "_channel_mcp_update_cursor") as update_cursor,
+        ):
+            last_id = claude_any._channel_mcp_session_start_last_id(Handler())
+        self.assertEqual(15, last_id)
+        update_cursor.assert_called_once_with(15)
 
     def test_channel_mcp_cursor_initializes_at_current_tail(self):
         with tempfile.TemporaryDirectory(prefix="ca-channel-cursor-") as td:

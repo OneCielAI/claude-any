@@ -105,7 +105,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.92"
+VERSION = "0.1.93"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -5083,6 +5083,45 @@ def _channel_mcp_update_cursor(last_id: int) -> None:
             router_log("WARN", f"channel_mcp_cursor_write_failed error={type(exc).__name__}: {exc}")
 
 
+def _channel_mcp_parse_event_id(value: Any) -> int | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return max(0, int(text))
+    except Exception:
+        return None
+
+
+def _channel_mcp_client_last_event_id(handler: BaseHTTPRequestHandler) -> int | None:
+    try:
+        event_id = _channel_mcp_parse_event_id(handler.headers.get("Last-Event-ID"))
+        if event_id is not None:
+            return event_id
+    except Exception:
+        pass
+    try:
+        params = _query_params(handler)
+        for key in ("lastEventId", "last_event_id", "last_id"):
+            event_id = _channel_mcp_parse_event_id(_first_param(params, key))
+            if event_id is not None:
+                return event_id
+    except Exception:
+        pass
+    return None
+
+
+def _channel_mcp_session_start_last_id(handler: BaseHTTPRequestHandler) -> int:
+    cursor_last_id = _channel_mcp_ensure_cursor_initialized()
+    client_last_id = _channel_mcp_client_last_event_id(handler)
+    if client_last_id is None:
+        return cursor_last_id
+    if client_last_id > cursor_last_id:
+        _channel_mcp_update_cursor(client_last_id)
+    router_log("INFO", f"channel_mcp_resume client_last_id={client_last_id} cursor_last_id={cursor_last_id}")
+    return client_last_id
+
+
 def _channel_mcp_notifications_for_messages(
     messages: list[dict[str, Any]],
     session: str = "",
@@ -5102,7 +5141,7 @@ def _channel_mcp_notifications_for_messages(
         events.append((last_id, _channel_mcp_notification(message)))
         router_log(
             "INFO",
-            f"channel_mcp_notification_sent session={session or '-'} message_id={message.get('id')} channel={message.get('channel')}",
+            f"channel_mcp_notification_prepared session={session or '-'} message_id={message.get('id')} channel={message.get('channel')}",
         )
     return last_id, events
 
@@ -5114,7 +5153,7 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
     if path != "/ca/mcp/sse":
         return False
     session = _channel_mcp_session_id()
-    last_id = _channel_mcp_ensure_cursor_initialized()
+    last_id = _channel_mcp_session_start_last_id(handler)
     with _CHANNEL_MCP_LOCK:
         _CHANNEL_MCP_SESSIONS[session] = {"created_at": time.time(), "last_id": last_id, "initialized": False, "outbox": []}
     router_log("INFO", f"channel_mcp_session_started session={session} last_id={last_id}")
@@ -5149,7 +5188,9 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
                 last_id = max(last_id, delivered_last_id)
                 for event_id, notification in events:
                     _write_sse_event(handler, "message", notification, event_id)
-                _channel_mcp_update_cursor(last_id)
+                    router_log("INFO", f"channel_mcp_notification_written session={session} message_id={event_id}")
+                if not events:
+                    _channel_mcp_update_cursor(last_id)
                 with _CHANNEL_MCP_LOCK:
                     state = _CHANNEL_MCP_SESSIONS.get(session)
                     if state:
