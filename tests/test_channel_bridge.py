@@ -181,6 +181,58 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual("room_phase1sim", payload["channel"])
         self.assertEqual("notifications/message", payload["meta"]["mcp_method"])
 
+    def test_mcp_proxy_observer_reads_content_length_framed_notification(self):
+        body = __import__("json").dumps(
+            {
+                "jsonrpc": "2.0",
+                "method": "notifications/message",
+                "params": {
+                    "data": {
+                        "room_id": "room_phase1sim",
+                        "payload": {"message": {"content": "wake from framed mcp"}},
+                        "sender_id": "robert",
+                    }
+                },
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+        frame = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+        with mock.patch.object(claude_any, "append_chat_message", return_value={"id": 11}) as append:
+            observer = claude_any._McpStdoutObserver("ai-net")
+            observer.feed(frame[:10])
+            observer.feed(frame[10:])
+        append.assert_called_once()
+        payload = append.call_args.args[0]
+        self.assertEqual("wake from framed mcp", payload["message"])
+        self.assertEqual("robert", payload["sender_id"])
+        self.assertEqual("room_phase1sim", payload["channel"])
+
+    def test_mcp_proxy_observer_accepts_content_type_before_length(self):
+        body = b'{"jsonrpc":"2.0","method":"notifications/message","params":{"content":"typed frame"}}'
+        frame = b"Content-Type: application/vscode-jsonrpc; charset=utf-8\r\n" + f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
+        with mock.patch.object(claude_any, "append_chat_message", return_value={"id": 13}) as append:
+            observer = claude_any._McpStdoutObserver("generic")
+            observer.feed(frame)
+        append.assert_called_once()
+        self.assertEqual("typed frame", append.call_args.args[0]["message"])
+
+    def test_mcp_proxy_observer_reads_jsonl_notification(self):
+        line = (
+            __import__("json").dumps(
+                {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/message",
+                    "params": {"content": "wake from json line", "room_id": "room"},
+                }
+            )
+            + "\n"
+        ).encode("utf-8")
+        with mock.patch.object(claude_any, "append_chat_message", return_value={"id": 12}) as append:
+            observer = claude_any._McpStdoutObserver("generic")
+            observer.feed(line)
+        append.assert_called_once()
+        self.assertEqual("wake from json line", append.call_args.args[0]["message"])
+
     def test_channel_mcp_config_points_to_router_sse(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "channel-mcp.json"

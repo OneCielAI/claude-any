@@ -104,7 +104,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.77"
+VERSION = "0.1.78"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -8316,6 +8316,21 @@ class RouterHandler(BaseHTTPRequestHandler):
         except Exception:
             pass
 
+    def do_HEAD(self) -> None:
+        cfg = load_config()
+        if reject_external_router_request(self, cfg):
+            return
+        parsed = urllib.parse.urlparse(self.path)
+        path = parsed.path
+        if path in ("/", "/health", "/healthz"):
+            self.send_response(200)
+            self.send_header("content-type", "text/plain; charset=utf-8")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.send_header("content-type", "application/json")
+        self.end_headers()
+
     def do_GET(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
@@ -13744,14 +13759,7 @@ def _mcp_proxy_notification_payload(server_name: str, message: dict[str, Any]) -
     }
 
 
-def _mcp_proxy_observe_stdout_line(server_name: str, line: bytes) -> None:
-    try:
-        text = line.decode("utf-8", errors="replace").strip()
-        if not text or not text.startswith("{"):
-            return
-        payload = json.loads(text)
-    except Exception:
-        return
+def _mcp_proxy_observe_json_message(server_name: str, payload: Any) -> None:
     if not isinstance(payload, dict):
         return
     chat_payload = _mcp_proxy_notification_payload(server_name, payload)
@@ -13765,6 +13773,126 @@ def _mcp_proxy_observe_stdout_line(server_name: str, line: bytes) -> None:
         )
     except Exception as exc:
         router_log("WARN", f"mcp_proxy_notification_failed server={server_name} error={type(exc).__name__}: {exc}")
+
+
+def _mcp_proxy_observe_stdout_line(server_name: str, line: bytes) -> None:
+    try:
+        text = line.decode("utf-8", errors="replace").strip()
+        if not text or not text.startswith("{"):
+            return
+        payload = json.loads(text)
+    except Exception:
+        return
+    _mcp_proxy_observe_json_message(server_name, payload)
+
+
+def _mcp_proxy_header_end(buffer: bytes) -> tuple[int, int] | None:
+    crlf = buffer.find(b"\r\n\r\n")
+    lf = buffer.find(b"\n\n")
+    candidates: list[tuple[int, int]] = []
+    if crlf >= 0:
+        candidates.append((crlf, 4))
+    if lf >= 0:
+        candidates.append((lf, 2))
+    return min(candidates, key=lambda item: item[0]) if candidates else None
+
+
+def _mcp_proxy_frame_header(buffer: bytes) -> tuple[int, int, int] | None:
+    header = _mcp_proxy_header_end(buffer)
+    if not header:
+        return None
+    header_end, delimiter_len = header
+    length = _mcp_proxy_content_length(buffer[:header_end])
+    if length is None:
+        return None
+    return header_end, delimiter_len, length
+
+
+def _mcp_proxy_content_length(header_bytes: bytes) -> int | None:
+    try:
+        header_text = header_bytes.decode("ascii", errors="replace")
+    except Exception:
+        return None
+    for line in re.split(r"\r?\n", header_text):
+        name, sep, value = line.partition(":")
+        if sep and name.strip().lower() == "content-length":
+            try:
+                length = int(value.strip())
+            except Exception:
+                return None
+            return length if length >= 0 else None
+    return None
+
+
+class _McpStdoutObserver:
+    def __init__(self, server_name: str) -> None:
+        self.server_name = server_name
+        self.buffer = bytearray()
+
+    def feed(self, chunk: bytes) -> None:
+        if not chunk:
+            return
+        self.buffer.extend(chunk)
+        self._drain()
+
+    def _drop_until_candidate(self) -> bool:
+        data = bytes(self.buffer)
+        if not data:
+            return False
+        stripped = data.lstrip()
+        if len(stripped) != len(data):
+            del self.buffer[: len(data) - len(stripped)]
+            data = stripped
+        if _mcp_proxy_frame_header(data) or data.startswith(b"{"):
+            return True
+        lowered = data.lower()
+        content_idx = lowered.find(b"content-length:")
+        json_idx = data.find(b"{")
+        candidates = [idx for idx in (content_idx, json_idx) if idx >= 0]
+        newline_idx = data.find(b"\n")
+        if candidates:
+            keep_from = min(candidates)
+            if newline_idx >= 0 and newline_idx < keep_from:
+                del self.buffer[: newline_idx + 1]
+            elif keep_from > 0:
+                del self.buffer[:keep_from]
+            return True
+        if newline_idx >= 0:
+            del self.buffer[: newline_idx + 1]
+            return True
+        if len(self.buffer) > 1024 * 1024:
+            del self.buffer[:-4096]
+        return False
+
+    def _drain(self) -> None:
+        while self.buffer:
+            if not self._drop_until_candidate():
+                return
+            data = bytes(self.buffer)
+            frame = _mcp_proxy_frame_header(data)
+            if frame:
+                header_end, delimiter_len, length = frame
+                body_start = header_end + delimiter_len
+                body_end = body_start + length
+                if len(data) < body_end:
+                    return
+                body = data[body_start:body_end]
+                del self.buffer[:body_end]
+                try:
+                    payload = json.loads(body.decode("utf-8", errors="replace"))
+                except Exception:
+                    continue
+                _mcp_proxy_observe_json_message(self.server_name, payload)
+                continue
+            if data.startswith(b"{"):
+                newline_idx = data.find(b"\n")
+                if newline_idx < 0:
+                    return
+                line = data[:newline_idx]
+                del self.buffer[: newline_idx + 1]
+                _mcp_proxy_observe_stdout_line(self.server_name, line)
+                continue
+            return
 
 
 def _mcp_proxy_forward_stdin(proc: subprocess.Popen[bytes]) -> None:
@@ -13825,19 +13953,27 @@ def run_mcp_stdio_proxy(server_name: str, server_config_path: Path) -> int:
             stderr=subprocess.PIPE,
             cwd=cwd,
             env=env,
+            bufsize=0,
         )
     except Exception as exc:
         print(f"claude-any mcp-proxy: failed to start {command}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return 127
+    router_log("INFO", f"mcp_proxy_started server={server_name} command={command}")
     threading.Thread(target=_mcp_proxy_forward_stdin, args=(proc,), daemon=True, name=f"mcp-proxy-stdin-{server_name}").start()
     threading.Thread(target=_mcp_proxy_forward_stderr, args=(proc,), daemon=True, name=f"mcp-proxy-stderr-{server_name}").start()
     try:
+        observer = _McpStdoutObserver(server_name)
         if proc.stdout:
-            for line in iter(proc.stdout.readline, b""):
-                _mcp_proxy_observe_stdout_line(server_name, line)
-                sys.stdout.buffer.write(line)
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                observer.feed(chunk)
+                sys.stdout.buffer.write(chunk)
                 sys.stdout.buffer.flush()
-        return proc.wait()
+        rc = proc.wait()
+        router_log("INFO", f"mcp_proxy_exited server={server_name} rc={rc}")
+        return rc
     finally:
         if proc.poll() is None:
             try:
