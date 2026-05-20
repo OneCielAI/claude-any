@@ -109,6 +109,20 @@ class ChannelConfigTests(unittest.TestCase):
             saved_server = json.loads(server_config_path.read_text(encoding="utf-8"))
             self.assertEqual("node", saved_server["command"])
 
+    def test_web_fetch_mcp_config_marks_jsonl_stdio(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "web-tools-mcp.json"
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "WEB_TOOLS_MCP_CONFIG", path),
+                mock.patch.object(claude_any, "find_executable", side_effect=lambda name: f"/bin/{name}"),
+            ):
+                written = claude_any.write_web_tools_mcp_config({"web_search": {"fetch_enabled": True}})
+            self.assertEqual(path, written)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual("jsonl", data["mcpServers"]["web_fetch"]["claude_any_stdio"])
+
     def test_strip_mcp_config_passthrough_removes_all_values(self):
         args = claude_any.strip_mcp_config_passthrough(["--mcp-config", "a.json", "b.json", "-p", "hello"])
         self.assertEqual(["-p", "hello"], args)

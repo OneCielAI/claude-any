@@ -105,7 +105,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.90"
+VERSION = "0.1.91"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -13870,6 +13870,7 @@ def write_web_tools_mcp_config(cfg: dict[str, Any]) -> Path:
         servers["web_fetch"] = {
             "command": uvx,
             "args": fetch_args,
+            "claude_any_stdio": "jsonl",
         }
     data = {"mcpServers": servers}
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -14447,6 +14448,131 @@ def _mcp_proxy_forward_stdin(proc: subprocess.Popen[bytes]) -> None:
             pass
 
 
+def _mcp_proxy_stdio_mode(server: dict[str, Any]) -> str:
+    mode = str(server.get("claude_any_stdio") or server.get("stdio_mode") or "").strip().lower()
+    if mode in ("jsonl", "json-lines", "json_lines", "newline-json", "line-json"):
+        return "jsonl"
+    return "framed"
+
+
+def _mcp_proxy_write_proc_jsonl(proc: subprocess.Popen[bytes], body: bytes) -> None:
+    line = body.strip()
+    if not line or not proc.stdin:
+        return
+    proc.stdin.write(line + b"\n")
+    proc.stdin.flush()
+
+
+def _mcp_proxy_drain_stdin_jsonl_buffer(proc: subprocess.Popen[bytes], buffer: bytearray, *, final: bool = False) -> None:
+    while buffer:
+        data = bytes(buffer)
+        stripped = data.lstrip()
+        if len(stripped) != len(data):
+            del buffer[: len(data) - len(stripped)]
+            data = stripped
+        frame = _mcp_proxy_frame_header(data)
+        if frame:
+            header_end, delimiter_len, length = frame
+            body_start = header_end + delimiter_len
+            body_end = body_start + length
+            if len(data) < body_end:
+                return
+            body = data[body_start:body_end]
+            del buffer[:body_end]
+            _mcp_proxy_write_proc_jsonl(proc, body)
+            continue
+        if data.startswith(b"{"):
+            newline_idx = data.find(b"\n")
+            if newline_idx >= 0:
+                line = data[:newline_idx]
+                del buffer[: newline_idx + 1]
+                _mcp_proxy_write_proc_jsonl(proc, line)
+                continue
+            if final:
+                del buffer[:]
+                _mcp_proxy_write_proc_jsonl(proc, data)
+            return
+        lowered = data.lower()
+        content_idx = lowered.find(b"content-length:")
+        json_idx = data.find(b"{")
+        candidates = [idx for idx in (content_idx, json_idx) if idx >= 0]
+        newline_idx = data.find(b"\n")
+        if candidates:
+            keep_from = min(candidates)
+            if keep_from > 0:
+                del buffer[:keep_from]
+            continue
+        if newline_idx >= 0:
+            del buffer[: newline_idx + 1]
+            continue
+        if len(buffer) > 1024 * 1024:
+            del buffer[:-4096]
+        return
+
+
+def _mcp_proxy_forward_stdin_jsonl(proc: subprocess.Popen[bytes]) -> None:
+    buffer = bytearray()
+    try:
+        stdin_fd = sys.stdin.fileno()
+        while True:
+            chunk = os.read(stdin_fd, 65536)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            _mcp_proxy_drain_stdin_jsonl_buffer(proc, buffer)
+        _mcp_proxy_drain_stdin_jsonl_buffer(proc, buffer, final=True)
+    except Exception:
+        pass
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+
+def _mcp_proxy_write_stdout_frame(body: bytes) -> None:
+    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
+    sys.stdout.buffer.flush()
+
+
+def _mcp_proxy_emit_jsonl_stdout_line(server_name: str, line: bytes) -> None:
+    body = line.strip()
+    if not body:
+        return
+    try:
+        payload = json.loads(body.decode("utf-8", errors="replace"))
+    except Exception:
+        try:
+            sys.stderr.buffer.write(body + b"\n")
+            sys.stderr.buffer.flush()
+        except Exception:
+            pass
+        return
+    _mcp_proxy_observe_json_message(server_name, payload)
+    _mcp_proxy_write_stdout_frame(body)
+
+
+def _mcp_proxy_forward_stdout_jsonl(server_name: str, proc: subprocess.Popen[bytes]) -> None:
+    if not proc.stdout:
+        return
+    buffer = bytearray()
+    while True:
+        chunk = proc.stdout.read(65536)
+        if not chunk:
+            break
+        buffer.extend(chunk)
+        while True:
+            newline_idx = buffer.find(b"\n")
+            if newline_idx < 0:
+                break
+            line = bytes(buffer[:newline_idx])
+            del buffer[: newline_idx + 1]
+            _mcp_proxy_emit_jsonl_stdout_line(server_name, line)
+    if buffer.strip():
+        _mcp_proxy_emit_jsonl_stdout_line(server_name, bytes(buffer))
+
+
 def _mcp_proxy_forward_stderr(proc: subprocess.Popen[bytes]) -> None:
     try:
         if not proc.stderr:
@@ -14494,12 +14620,16 @@ def run_mcp_stdio_proxy(server_name: str, server_config_path: Path) -> int:
         router_log("ERROR", f"mcp_proxy_start_failed server={server_name} command={command} error={type(exc).__name__}: {exc}")
         print(f"claude-any mcp-proxy: failed to start {command}: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return 127
-    router_log("INFO", f"mcp_proxy_started server={server_name} command={command}")
-    threading.Thread(target=_mcp_proxy_forward_stdin, args=(proc,), daemon=True, name=f"mcp-proxy-stdin-{server_name}").start()
+    stdio_mode = _mcp_proxy_stdio_mode(server)
+    router_log("INFO", f"mcp_proxy_started server={server_name} command={command} stdio={stdio_mode}")
+    stdin_target = _mcp_proxy_forward_stdin_jsonl if stdio_mode == "jsonl" else _mcp_proxy_forward_stdin
+    threading.Thread(target=stdin_target, args=(proc,), daemon=True, name=f"mcp-proxy-stdin-{server_name}").start()
     threading.Thread(target=_mcp_proxy_forward_stderr, args=(proc,), daemon=True, name=f"mcp-proxy-stderr-{server_name}").start()
     try:
-        observer = _McpStdoutObserver(server_name)
-        if proc.stdout:
+        if stdio_mode == "jsonl":
+            _mcp_proxy_forward_stdout_jsonl(server_name, proc)
+        elif proc.stdout:
+            observer = _McpStdoutObserver(server_name)
             while True:
                 chunk = proc.stdout.read(65536)
                 if not chunk:

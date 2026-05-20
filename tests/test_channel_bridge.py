@@ -587,6 +587,60 @@ class ChannelBridgeTests(unittest.TestCase):
             self.assertTrue(chat_log.exists())
             self.assertIn("wake from subprocess", chat_log.read_text(encoding="utf-8"))
 
+    def test_mcp_proxy_subcommand_bridges_jsonl_stdio_server(self):
+        with tempfile.TemporaryDirectory(prefix="ca-mcp-jsonl-test-") as td:
+            root = Path(td)
+            server = root / "fake_jsonl_server.py"
+            server.write_text(
+                textwrap.dedent(
+                    r'''
+                    import json
+                    import sys
+
+                    line = sys.stdin.buffer.readline()
+                    if line:
+                        request = json.loads(line.decode("utf-8"))
+                        print(json.dumps({"jsonrpc": "2.0", "id": request.get("id"), "result": {"protocolVersion": "2024-11-05", "capabilities": {}}}), flush=True)
+                        print(json.dumps({"jsonrpc": "2.0", "method": "notifications/message", "params": {"content": "wake from jsonl subprocess"}}), flush=True)
+                    '''
+                ),
+                encoding="utf-8",
+            )
+            config = root / "server.json"
+            config.write_text(
+                json.dumps({"command": sys.executable, "args": [str(server)], "claude_any_stdio": "jsonl"}),
+                encoding="utf-8",
+            )
+            request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+            body = json.dumps(request).encode("utf-8")
+            input_frame = b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+            env = os.environ.copy()
+            env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(claude_any.__file__).resolve()),
+                    "mcp-proxy",
+                    "--server-name",
+                    "fake-jsonl",
+                    "--server-config",
+                    str(config),
+                ],
+                input=input_frame,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(0, proc.returncode, proc.stderr.decode("utf-8", errors="replace"))
+            self.assertIn(b"Content-Length:", proc.stdout)
+            self.assertIn(b'"id": 1', proc.stdout)
+            self.assertNotIn(b"Content-Length:", proc.stderr)
+            chat_log = root / "config" / "chat-messages.jsonl"
+            self.assertTrue(chat_log.exists())
+            self.assertIn("wake from jsonl subprocess", chat_log.read_text(encoding="utf-8"))
+
     def test_channel_mcp_config_points_to_router_sse(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "channel-mcp.json"
