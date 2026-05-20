@@ -104,7 +104,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.81"
+VERSION = "0.1.82"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -13751,9 +13751,9 @@ def _write_fd_all(fd: int, data: bytes) -> None:
 
 def _channel_wake_input_bytes(prompt: str) -> bytes:
     # Ctrl-U clears any stale line editor text before submitting the synthetic prompt.
-    # Claude Code's interactive input is terminal-driven; send carriage return,
-    # the same byte a TTY normally delivers for Enter in raw mode.
-    return b"\x15" + prompt.encode("utf-8", errors="replace") + b"\r"
+    # Claude Code's interactive input is terminal-driven. In the PTY proxy path,
+    # observed Enter keypresses arrive as LF, so submit with LF rather than CR.
+    return b"\x15" + prompt.encode("utf-8", errors="replace") + b"\n"
 
 
 def _inject_pending_channel_messages(master_fd: int, last_id: int) -> int:

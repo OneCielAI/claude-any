@@ -228,7 +228,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(2, last_id)
         self.assertIn(b"wake up", write_all.call_args.args[1])
         self.assertTrue(write_all.call_args.args[1].startswith(b"\x15"))
-        self.assertTrue(write_all.call_args.args[1].endswith(b"\r"))
+        self.assertTrue(write_all.call_args.args[1].endswith(b"\n"))
 
     def test_inject_pending_channel_messages_batches_and_ignores_connection_noise(self):
         messages = [
