@@ -105,7 +105,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.91"
+VERSION = "0.1.92"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -1675,6 +1675,11 @@ def executable_candidates(name: str) -> list[str]:
 
 def executable_extra_dirs() -> list[Path]:
     dirs = [HOME / ".local" / "bin"]
+    for env_name in ("UV_INSTALL_DIR", "CARGO_HOME"):
+        root = os.environ.get(env_name)
+        if root:
+            path = Path(root)
+            dirs.append(path if path.name == "bin" else path / "bin")
     if os.name == "nt":
         pyver = f"Python{sys.version_info.major}{sys.version_info.minor}"
         for env_name in ("APPDATA", "LOCALAPPDATA"):
@@ -1688,7 +1693,27 @@ def executable_extra_dirs() -> list[Path]:
         except Exception:
             pass
         dirs.append(Path(sys.executable).resolve().parent / "Scripts")
-    return dirs
+    else:
+        dirs.extend(
+            [
+                HOME / ".cargo" / "bin",
+                HOME / ".npm-global" / "bin",
+                HOME / ".bun" / "bin",
+                Path(sys.executable).resolve().parent,
+                Path("/usr/local/bin"),
+                Path("/usr/bin"),
+                Path("/bin"),
+                Path("/opt/homebrew/bin"),
+            ]
+        )
+    out: list[Path] = []
+    seen: set[str] = set()
+    for directory in dirs:
+        key = str(directory)
+        if key and key not in seen:
+            seen.add(key)
+            out.append(directory)
+    return out
 
 
 def find_executable(name: str) -> str | None:
@@ -1702,6 +1727,29 @@ def find_executable(name: str) -> str | None:
             if path.exists():
                 return str(path)
     return None
+
+
+def resolve_executable_for_subprocess(command: str) -> str:
+    command = str(command or "").strip()
+    if not command:
+        return command
+    pathish = Path(command).is_absolute() or os.sep in command or bool(os.altsep and os.altsep in command)
+    if pathish:
+        return command
+    return find_executable(command) or command
+
+
+def resolve_mcp_server_process(command: str, args: list[str]) -> tuple[str, list[str]]:
+    command = str(command or "").strip()
+    resolved = resolve_executable_for_subprocess(command)
+    name = Path(command).name.lower()
+    if resolved == command and name in ("uvx", "uvx.exe", "uvx.cmd", "uvx.bat"):
+        uv = find_executable("uv")
+        if uv:
+            return uv, ["tool", "run", *args]
+        if importlib.util.find_spec("uv") is not None:
+            return sys.executable, ["-m", "uv", "tool", "run", *args]
+    return resolved, args
 
 
 def shell_command_string(args: list[str]) -> str:
@@ -9392,7 +9440,7 @@ def _mcp_server_is_stdio(server: dict[str, Any]) -> bool:
     server_type = str(server.get("type") or "").strip().lower()
     if server_type and server_type not in ("stdio", "command"):
         return False
-    command = str(server.get("command") or "").strip()
+    command = resolve_executable_for_subprocess(str(server.get("command") or "").strip())
     if not command:
         return False
     args = [str(item) for item in server.get("args", []) if item is not None] if isinstance(server.get("args", []), list) else []
@@ -13854,7 +13902,6 @@ def write_web_tools_mcp_config(cfg: dict[str, Any]) -> Path:
     web = cfg.get("web_search", {})
     package = web.get("package") or "ddg-mcp-search"
     npx = find_executable("npx") or ("npx.cmd" if os.name == "nt" else "npx")
-    uvx = find_executable("uvx") or "uvx"
     servers: dict[str, Any] = {
         "duckduckgo": {
             "command": npx,
@@ -13867,11 +13914,29 @@ def write_web_tools_mcp_config(cfg: dict[str, Any]) -> Path:
             fetch_args.extend(["--user-agent", str(web["fetch_user_agent"])])
         if web.get("fetch_ignore_robots_txt", False):
             fetch_args.append("--ignore-robots-txt")
-        servers["web_fetch"] = {
-            "command": uvx,
-            "args": fetch_args,
-            "claude_any_stdio": "jsonl",
-        }
+        fetch_command = find_executable("uvx")
+        fetch_command_args = fetch_args
+        if not fetch_command:
+            uv = find_executable("uv")
+            if uv:
+                fetch_command = uv
+                fetch_command_args = ["tool", "run", *fetch_args]
+            elif importlib.util.find_spec("uv") is not None:
+                fetch_command = sys.executable
+                fetch_command_args = ["-m", "uv", "tool", "run", *fetch_args]
+            else:
+                pipx = find_executable("pipx")
+                if pipx:
+                    fetch_command = pipx
+                    fetch_command_args = ["run", *fetch_args]
+        if fetch_command:
+            servers["web_fetch"] = {
+                "command": fetch_command,
+                "args": fetch_command_args,
+                "claude_any_stdio": "jsonl",
+            }
+        else:
+            router_log("WARN", "web_fetch_disabled_missing_runner install=uvx_or_uv")
     data = {"mcpServers": servers}
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     WEB_TOOLS_MCP_CONFIG.write_text(json.dumps(data, indent=2) + "\n")
@@ -14600,6 +14665,7 @@ def run_mcp_stdio_proxy(server_name: str, server_config_path: Path) -> int:
         return 2
     command = str(server.get("command") or "").strip()
     args = [str(item) for item in server.get("args", [])] if isinstance(server.get("args"), list) else []
+    command, args = resolve_mcp_server_process(command, args)
     env = os.environ.copy()
     raw_env = server.get("env")
     if isinstance(raw_env, dict):

@@ -123,6 +123,50 @@ class ChannelConfigTests(unittest.TestCase):
             data = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual("jsonl", data["mcpServers"]["web_fetch"]["claude_any_stdio"])
 
+    def test_web_fetch_mcp_config_falls_back_to_uv_tool_run(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "web-tools-mcp.json"
+
+            def fake_find(name):
+                return "/bin/uv" if name == "uv" else None
+
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "WEB_TOOLS_MCP_CONFIG", path),
+                mock.patch.object(claude_any, "find_executable", side_effect=fake_find),
+            ):
+                claude_any.write_web_tools_mcp_config({"web_search": {"fetch_enabled": True}})
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual("/bin/uv", data["mcpServers"]["web_fetch"]["command"])
+            self.assertEqual(["tool", "run", "mcp-server-fetch"], data["mcpServers"]["web_fetch"]["args"])
+
+    def test_web_fetch_mcp_config_skips_fetch_when_no_python_runner_exists(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "web-tools-mcp.json"
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "WEB_TOOLS_MCP_CONFIG", path),
+                mock.patch.object(claude_any, "find_executable", return_value=None),
+                mock.patch.object(claude_any.importlib.util, "find_spec", return_value=None),
+                mock.patch.object(claude_any, "router_log") as log,
+            ):
+                claude_any.write_web_tools_mcp_config({"web_search": {"fetch_enabled": True}})
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertNotIn("web_fetch", data["mcpServers"])
+            self.assertIn("duckduckgo", data["mcpServers"])
+            self.assertTrue(any("web_fetch_disabled_missing_runner" in call.args[1] for call in log.call_args_list))
+
+    def test_mcp_proxy_resolves_legacy_uvx_config_to_uv_tool_run(self):
+        def fake_find(name):
+            return "/bin/uv" if name == "uv" else None
+
+        with mock.patch.object(claude_any, "find_executable", side_effect=fake_find):
+            command, args = claude_any.resolve_mcp_server_process("uvx", ["mcp-server-fetch"])
+        self.assertEqual("/bin/uv", command)
+        self.assertEqual(["tool", "run", "mcp-server-fetch"], args)
+
     def test_strip_mcp_config_passthrough_removes_all_values(self):
         args = claude_any.strip_mcp_config_passthrough(["--mcp-config", "a.json", "b.json", "-p", "hello"])
         self.assertEqual(["-p", "hello"], args)
