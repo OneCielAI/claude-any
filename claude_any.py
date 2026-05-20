@@ -105,7 +105,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.88"
+VERSION = "0.1.89"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -3834,6 +3834,12 @@ def write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> 
     handler.wfile.write(body)
 
 
+def write_empty_response(handler: BaseHTTPRequestHandler, status: int = 202) -> None:
+    handler.send_response(status)
+    handler.send_header("content-length", "0")
+    handler.end_headers()
+
+
 def reject_external_router_request(handler: BaseHTTPRequestHandler, cfg: dict[str, Any] | None = None) -> bool:
     if router_request_allowed(handler, cfg):
         return False
@@ -4929,6 +4935,47 @@ def _send_channel_mcp_sse_headers(handler: BaseHTTPRequestHandler) -> None:
     handler.end_headers()
 
 
+def _channel_mcp_enqueue(session: str, payload: dict[str, Any]) -> bool:
+    if not session:
+        return False
+    with _CHANNEL_MCP_LOCK:
+        state = _CHANNEL_MCP_SESSIONS.get(session)
+        if not state:
+            return False
+        outbox = state.setdefault("outbox", [])
+        if isinstance(outbox, list):
+            outbox.append(payload)
+        else:
+            state["outbox"] = [payload]
+    with _CHAT_CONDITION:
+        _CHAT_CONDITION.notify_all()
+    return True
+
+
+def _channel_mcp_take_outbox(session: str) -> list[dict[str, Any]]:
+    with _CHANNEL_MCP_LOCK:
+        state = _CHANNEL_MCP_SESSIONS.get(session)
+        if not state:
+            return []
+        outbox = state.get("outbox")
+        if not isinstance(outbox, list) or not outbox:
+            return []
+        state["outbox"] = []
+        return [item for item in outbox if isinstance(item, dict)]
+
+
+def _channel_mcp_initialize_response(request_id: Any, protocol: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "protocolVersion": protocol,
+            "capabilities": _channel_mcp_capabilities(),
+            "serverInfo": {"name": "claude-any-router", "version": VERSION},
+        },
+    }
+
+
 def _channel_mcp_write_cursor_locked(last_id: int) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp_path = CHANNEL_MCP_CURSOR_PATH.with_suffix(".json.tmp")
@@ -5008,7 +5055,7 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
     session = _channel_mcp_session_id()
     last_id = _channel_mcp_ensure_cursor_initialized()
     with _CHANNEL_MCP_LOCK:
-        _CHANNEL_MCP_SESSIONS[session] = {"created_at": time.time(), "last_id": last_id, "initialized": False}
+        _CHANNEL_MCP_SESSIONS[session] = {"created_at": time.time(), "last_id": last_id, "initialized": False, "outbox": []}
     router_log("INFO", f"channel_mcp_session_started session={session} last_id={last_id}")
     started_at = time.time()
     close_reason = "finished"
@@ -5023,6 +5070,12 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
                     return True
                 last_id = int(state.get("last_id") or 0)
                 initialized = bool(state.get("initialized"))
+            outbox = _channel_mcp_take_outbox(session)
+            if outbox:
+                for payload in outbox:
+                    _write_sse_event(handler, "message", payload)
+                router_log("INFO", f"channel_mcp_rpc_flushed session={session} count={len(outbox)}")
+                continue
             if not initialized:
                 handler.wfile.write(b": waiting-for-initialize\n\n")
                 handler.wfile.flush()
@@ -5068,6 +5121,7 @@ def handle_channel_mcp_post(handler: BaseHTTPRequestHandler, path: str, body: di
             _CHANNEL_MCP_SESSIONS[session]["last_seen_at"] = time.time()
     method = str(body.get("method") or "")
     request_id = body.get("id")
+    response: dict[str, Any] | None = None
     if method == "initialize":
         protocol = "2024-11-05"
         req_params = body.get("params") if isinstance(body.get("params"), dict) else {}
@@ -5076,32 +5130,29 @@ def handle_channel_mcp_post(handler: BaseHTTPRequestHandler, path: str, body: di
         with _CHANNEL_MCP_LOCK:
             if session and session in _CHANNEL_MCP_SESSIONS:
                 _CHANNEL_MCP_SESSIONS[session]["initialized"] = True
-        with _CHAT_CONDITION:
-            _CHAT_CONDITION.notify_all()
-        write_json(
-            handler,
-            {
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {
-                    "protocolVersion": protocol,
-                    "capabilities": _channel_mcp_capabilities(),
-                    "serverInfo": {"name": "claude-any-router", "version": VERSION},
-                },
-            },
-        )
+        response = _channel_mcp_initialize_response(request_id, protocol)
         router_log("INFO", f"channel_mcp_initialized session={session or '-'} protocol={protocol}")
-        return True
-    if method == "tools/list":
-        write_json(handler, {"jsonrpc": "2.0", "id": request_id, "result": {"tools": []}})
-        return True
-    if method == "ping":
-        write_json(handler, {"jsonrpc": "2.0", "id": request_id, "result": {}})
-        return True
-    if request_id is None:
-        write_json(handler, {"ok": True})
-        return True
-    write_json(handler, {"jsonrpc": "2.0", "id": request_id, "result": {}})
+    elif method == "tools/list":
+        response = {"jsonrpc": "2.0", "id": request_id, "result": {"tools": []}}
+    elif method == "ping":
+        response = {"jsonrpc": "2.0", "id": request_id, "result": {}}
+    elif request_id is not None:
+        response = {"jsonrpc": "2.0", "id": request_id, "result": {}}
+    if response is not None:
+        if not _channel_mcp_enqueue(session, response):
+            router_log("WARN", f"channel_mcp_rpc_enqueue_failed session={session or '-'} method={method}")
+            write_json(
+                handler,
+                {
+                    "jsonrpc": "2.0",
+                    "id": request_id,
+                    "error": {"code": -32000, "message": "MCP SSE session is not connected"},
+                },
+                404,
+            )
+            return True
+        router_log("INFO", f"channel_mcp_rpc_queued session={session or '-'} method={method} request_id={request_id}")
+    write_empty_response(handler, 202)
     return True
 
 

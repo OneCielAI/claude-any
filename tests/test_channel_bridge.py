@@ -336,6 +336,28 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual("no", headers["x-accel-buffering"])
         self.assertTrue(handler.ended)
 
+    def test_channel_mcp_rpc_responses_are_queued_for_sse(self):
+        session = "session-rpc"
+        with claude_any._CHANNEL_MCP_LOCK:
+            original = dict(claude_any._CHANNEL_MCP_SESSIONS)
+            claude_any._CHANNEL_MCP_SESSIONS.clear()
+            claude_any._CHANNEL_MCP_SESSIONS[session] = {"outbox": []}
+        try:
+            response = claude_any._channel_mcp_initialize_response(1, "2025-11-25")
+            self.assertTrue(claude_any._channel_mcp_enqueue(session, response))
+            outbox = claude_any._channel_mcp_take_outbox(session)
+            self.assertEqual([response], outbox)
+            self.assertEqual([], claude_any._channel_mcp_take_outbox(session))
+            self.assertEqual("claude-any-router", outbox[0]["result"]["serverInfo"]["name"])
+            self.assertIn("claude/channel", outbox[0]["result"]["capabilities"]["experimental"])
+        finally:
+            with claude_any._CHANNEL_MCP_LOCK:
+                claude_any._CHANNEL_MCP_SESSIONS.clear()
+                claude_any._CHANNEL_MCP_SESSIONS.update(original)
+
+    def test_channel_mcp_enqueue_rejects_missing_session(self):
+        self.assertFalse(claude_any._channel_mcp_enqueue("missing-session", {"jsonrpc": "2.0"}))
+
     def test_channel_mcp_notifications_ignore_transport_noise(self):
         messages = [
             {"id": 1, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.ws.connected", "meta": {}},
