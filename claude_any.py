@@ -104,7 +104,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.84"
+VERSION = "0.1.85"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -124,6 +124,10 @@ _CHANNEL_SSE_LOCK = threading.Lock()
 _CHANNEL_SSE_CONNECTIONS: dict[str, dict[str, Any]] = {}
 _CHANNEL_MCP_LOCK = threading.Lock()
 _CHANNEL_MCP_SESSIONS: dict[str, dict[str, Any]] = {}
+_NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
+_MCP_NOTIFICATION_DEDUP_TTL_SECONDS = 3.0
+_MCP_NOTIFICATION_DEDUP_LOCK = threading.Lock()
+_MCP_NOTIFICATION_DEDUP_RECENT: dict[str, tuple[str, float]] = {}
 EVENT_BUS = EventBus()
 ADVISOR_FEEDBACK_MARKER = "CLAUDE_ANY_ADVISOR_FEEDBACK"
 PLAN_GUARD_MARKER = "[claude-any-plan-guard]"
@@ -4913,6 +4917,30 @@ def _write_sse_event(handler: BaseHTTPRequestHandler, event: str, data: Any, eve
     handler.wfile.flush()
 
 
+def _channel_mcp_notifications_for_messages(
+    messages: list[dict[str, Any]],
+    session: str = "",
+) -> tuple[int, list[tuple[int, dict[str, Any]]]]:
+    last_id = 0
+    events: list[tuple[int, dict[str, Any]]] = []
+    for message in messages:
+        message_id = int(message.get("id") or 0)
+        last_id = max(last_id, message_id)
+        noise_reason = _channel_wake_message_noise_reason(message)
+        if noise_reason:
+            router_log(
+                "INFO",
+                f"channel_mcp_skipped_noise session={session or '-'} message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
+            )
+            continue
+        events.append((last_id, _channel_mcp_notification(message)))
+        router_log(
+            "INFO",
+            f"channel_mcp_notification_sent session={session or '-'} message_id={message.get('id')} channel={message.get('channel')}",
+        )
+    return last_id, events
+
+
 def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
     if path == "/ca/mcp/health":
         write_json(handler, {"ok": True, "name": "claude-any-router", "sse": "/ca/mcp/sse"})
@@ -4938,9 +4966,10 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
                 last_id = int(state.get("last_id") or 0)
             messages = read_chat_messages(last_id, None, None, 100)
             if messages:
-                for message in messages:
-                    last_id = max(last_id, int(message.get("id") or 0))
-                    _write_sse_event(handler, "message", _channel_mcp_notification(message), last_id)
+                delivered_last_id, events = _channel_mcp_notifications_for_messages(messages, session)
+                last_id = max(last_id, delivered_last_id)
+                for event_id, notification in events:
+                    _write_sse_event(handler, "message", notification, event_id)
                 with _CHANNEL_MCP_LOCK:
                     state = _CHANNEL_MCP_SESSIONS.get(session)
                     if state:
@@ -4987,6 +5016,7 @@ def handle_channel_mcp_post(handler: BaseHTTPRequestHandler, path: str, body: di
                 },
             },
         )
+        router_log("INFO", f"channel_mcp_initialized session={session or '-'} protocol={protocol}")
         return True
     if method == "tools/list":
         write_json(handler, {"jsonrpc": "2.0", "id": request_id, "result": {"tools": []}})
@@ -14069,11 +14099,64 @@ def _mcp_proxy_notification_payload(server_name: str, message: dict[str, Any]) -
     }
 
 
+def _mcp_proxy_notification_dedupe_key(server_name: str, chat_payload: dict[str, Any]) -> str:
+    meta = chat_payload.get("meta") if isinstance(chat_payload.get("meta"), dict) else {}
+    body = re.sub(r"\s+", " ", str(chat_payload.get("message") or "")).strip()
+    room = str(meta.get("room_id") or meta.get("room") or chat_payload.get("channel") or server_name)
+    sender = str(chat_payload.get("sender_id") or meta.get("sender_id") or meta.get("agent_id") or server_name)
+    thread = str(chat_payload.get("thread_id") or meta.get("thread_id") or "")
+    parent = str(chat_payload.get("parent_id") or meta.get("parent_id") or "")
+    event_id = ""
+    for key in ("message_id", "event_id", "cursor", "sequence", "seq"):
+        value = meta.get(key)
+        if value is not None and str(value).strip():
+            event_id = str(value).strip()
+            break
+    return json.dumps(
+        [server_name, room, sender, thread, parent, event_id, body],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
+def _mcp_proxy_should_skip_duplicate_notification(server_name: str, chat_payload: dict[str, Any]) -> tuple[bool, str | None]:
+    meta = chat_payload.get("meta") if isinstance(chat_payload.get("meta"), dict) else {}
+    method = str(meta.get("mcp_method") or "")
+    if not method.startswith("notifications/"):
+        return False, None
+    key = _mcp_proxy_notification_dedupe_key(server_name, chat_payload)
+    now = time.time()
+    with _MCP_NOTIFICATION_DEDUP_LOCK:
+        stale = [
+            item_key
+            for item_key, (_, seen_at) in _MCP_NOTIFICATION_DEDUP_RECENT.items()
+            if now - seen_at > _MCP_NOTIFICATION_DEDUP_TTL_SECONDS
+        ]
+        for item_key in stale:
+            _MCP_NOTIFICATION_DEDUP_RECENT.pop(item_key, None)
+        previous = _MCP_NOTIFICATION_DEDUP_RECENT.get(key)
+        _MCP_NOTIFICATION_DEDUP_RECENT[key] = (method, now)
+    if not previous:
+        return False, None
+    previous_method, previous_seen_at = previous
+    is_native_pair = _NATIVE_CHANNEL_NOTIFICATION_METHOD in {previous_method, method}
+    if previous_method != method and is_native_pair and now - previous_seen_at <= _MCP_NOTIFICATION_DEDUP_TTL_SECONDS:
+        return True, previous_method
+    return False, None
+
+
 def _mcp_proxy_observe_json_message(server_name: str, payload: Any) -> None:
     if not isinstance(payload, dict):
         return
     chat_payload = _mcp_proxy_notification_payload(server_name, payload)
     if not chat_payload:
+        return
+    skip_duplicate, previous_method = _mcp_proxy_should_skip_duplicate_notification(server_name, chat_payload)
+    if skip_duplicate:
+        router_log(
+            "INFO",
+            f"mcp_proxy_notification_skipped_duplicate server={server_name} method={payload.get('method')} previous_method={previous_method}",
+        )
         return
     try:
         saved = append_chat_message(chat_payload)

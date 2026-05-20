@@ -311,6 +311,21 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("tools", capabilities)
         self.assertIn("claude/channel", capabilities["experimental"])
 
+    def test_channel_mcp_notifications_ignore_transport_noise(self):
+        messages = [
+            {"id": 1, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.ws.connected", "meta": {}},
+            {"id": 2, "channel": "ai-net", "sender_id": "robert", "message": "hello Sarah", "meta": {"room_id": "ai-net"}},
+        ]
+        with mock.patch.object(claude_any, "router_log") as router_log:
+            last_id, events = claude_any._channel_mcp_notifications_for_messages(messages, "session-1")
+        self.assertEqual(2, last_id)
+        self.assertEqual(1, len(events))
+        self.assertEqual(2, events[0][0])
+        self.assertIn("hello Sarah", events[0][1]["params"]["content"])
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_mcp_skipped_noise" in item and "transport_connected" in item for item in log_messages))
+        self.assertTrue(any("channel_mcp_notification_sent" in item and "message_id=2" in item for item in log_messages))
+
     def test_mcp_proxy_notification_maps_to_chat_payload(self):
         payload = claude_any._mcp_proxy_notification_payload(
             "ai-net",
@@ -333,6 +348,46 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual("room_phase1sim", payload["channel"])
         self.assertEqual("notifications/message", payload["meta"]["mcp_method"])
         self.assertEqual("wake from server", payload["meta"]["mcp_json"]["params"]["data"]["payload"]["message"]["content"])
+
+    def test_mcp_proxy_observer_deduplicates_generic_and_native_channel_notifications(self):
+        generic = {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"content": "hello team", "room_id": "room_phase1sim", "sender_id": "robert", "thread_id": "root"},
+        }
+        native = {
+            "jsonrpc": "2.0",
+            "method": "notifications/claude/channel",
+            "params": {"content": "hello team", "room_id": "room_phase1sim", "sender_id": "robert", "thread_id": "root"},
+        }
+        claude_any._MCP_NOTIFICATION_DEDUP_RECENT.clear()
+        try:
+            with (
+                mock.patch.object(claude_any, "append_chat_message", return_value={"id": 21}) as append,
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                claude_any._mcp_proxy_observe_json_message("ai-net", generic)
+                claude_any._mcp_proxy_observe_json_message("ai-net", native)
+            append.assert_called_once()
+            log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+            self.assertTrue(any("mcp_proxy_notification_skipped_duplicate" in item for item in log_messages))
+        finally:
+            claude_any._MCP_NOTIFICATION_DEDUP_RECENT.clear()
+
+    def test_mcp_proxy_observer_allows_repeated_same_method_notifications(self):
+        message = {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"content": "repeatable alert", "room_id": "room_phase1sim", "sender_id": "robert"},
+        }
+        claude_any._MCP_NOTIFICATION_DEDUP_RECENT.clear()
+        try:
+            with mock.patch.object(claude_any, "append_chat_message", return_value={"id": 22}) as append:
+                claude_any._mcp_proxy_observe_json_message("ai-net", message)
+                claude_any._mcp_proxy_observe_json_message("ai-net", message)
+            self.assertEqual(2, append.call_count)
+        finally:
+            claude_any._MCP_NOTIFICATION_DEDUP_RECENT.clear()
 
     def test_mcp_proxy_observer_reads_content_length_framed_notification(self):
         body = __import__("json").dumps(
