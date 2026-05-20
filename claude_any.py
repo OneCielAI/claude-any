@@ -104,7 +104,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.78"
+VERSION = "0.1.79"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -9106,8 +9106,8 @@ def _mcp_server_is_stdio(server: dict[str, Any]) -> bool:
     command = str(server.get("command") or "").strip()
     if not command:
         return False
-    joined = " ".join([command, *[str(item) for item in server.get("args", []) if item is not None]])
-    return "mcp-proxy" not in joined
+    args = [str(item) for item in server.get("args", []) if item is not None] if isinstance(server.get("args", []), list) else []
+    return "mcp-proxy" not in args
 
 
 def _mcp_config_passthrough_values(passthrough: list[str]) -> list[str]:
@@ -13897,8 +13897,9 @@ class _McpStdoutObserver:
 
 def _mcp_proxy_forward_stdin(proc: subprocess.Popen[bytes]) -> None:
     try:
+        stdin_fd = sys.stdin.fileno()
         while True:
-            chunk = sys.stdin.buffer.read(65536)
+            chunk = os.read(stdin_fd, 65536)
             if not chunk:
                 break
             if proc.stdin:
@@ -15124,6 +15125,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
+    if len(sys.argv) >= 2 and sys.argv[1] == "mcp-proxy":
+        raise SystemExit(cmd_mcp_proxy(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "cli":
         raise SystemExit(run_cli(sys.argv[2:]))
     if len(sys.argv) >= 2 and sys.argv[1] == "launch":

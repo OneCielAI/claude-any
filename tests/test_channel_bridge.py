@@ -1,3 +1,8 @@
+import json
+import os
+import subprocess
+import sys
+import textwrap
 import unittest
 import tempfile
 from pathlib import Path
@@ -232,6 +237,74 @@ class ChannelBridgeTests(unittest.TestCase):
             observer.feed(line)
         append.assert_called_once()
         self.assertEqual("wake from json line", append.call_args.args[0]["message"])
+
+    def test_mcp_proxy_subcommand_round_trips_stdio_frame(self):
+        with tempfile.TemporaryDirectory(prefix="ca-mcp-test-") as td:
+            root = Path(td)
+            server = root / "fake_server.py"
+            server.write_text(
+                textwrap.dedent(
+                    r'''
+                    import json
+                    import sys
+
+                    def read_frame():
+                        header = b""
+                        while b"\r\n\r\n" not in header:
+                            chunk = sys.stdin.buffer.read(1)
+                            if not chunk:
+                                return None
+                            header += chunk
+                        length = 0
+                        for line in header.decode("ascii", "replace").split("\r\n"):
+                            if line.lower().startswith("content-length:"):
+                                length = int(line.split(":", 1)[1].strip())
+                        return sys.stdin.buffer.read(length)
+
+                    def write_frame(payload):
+                        body = json.dumps(payload).encode("utf-8")
+                        sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
+                        sys.stdout.buffer.flush()
+
+                    frame = read_frame()
+                    if frame:
+                        request = json.loads(frame.decode("utf-8"))
+                        write_frame({"jsonrpc": "2.0", "id": request.get("id"), "result": {"protocolVersion": "2024-11-05", "capabilities": {}}})
+                        write_frame({"jsonrpc": "2.0", "method": "notifications/message", "params": {"content": "wake from subprocess"}})
+                    '''
+                ),
+                encoding="utf-8",
+            )
+            config = root / "server.json"
+            config.write_text(json.dumps({"command": sys.executable, "args": [str(server)]}), encoding="utf-8")
+            request = {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}
+            body = json.dumps(request).encode("utf-8")
+            input_frame = b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+            env = os.environ.copy()
+            env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
+            proc = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(claude_any.__file__).resolve()),
+                    "mcp-proxy",
+                    "--server-name",
+                    "fake",
+                    "--server-config",
+                    str(config),
+                ],
+                input=input_frame,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                timeout=5,
+                check=False,
+            )
+            self.assertEqual(0, proc.returncode, proc.stderr.decode("utf-8", errors="replace"))
+            self.assertIn(b"Content-Length:", proc.stdout)
+            self.assertIn(b'"id": 1', proc.stdout)
+            chat_log = root / "config" / "chat-messages.jsonl"
+            self.assertTrue(chat_log.exists())
+            self.assertIn("wake from subprocess", chat_log.read_text(encoding="utf-8"))
 
     def test_channel_mcp_config_points_to_router_sse(self):
         with tempfile.TemporaryDirectory() as td:
