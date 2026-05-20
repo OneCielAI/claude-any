@@ -209,6 +209,18 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("room_phase1sim", prompt)
         self.assertNotIn("\n", prompt)
 
+    def test_channel_wake_enter_bytes_can_be_overridden(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_WAKE_ENTER": "cr"}):
+            self.assertTrue(claude_any._channel_wake_input_bytes("wake").endswith(b"\r"))
+        with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_WAKE_ENTER": "crlf"}):
+            self.assertTrue(claude_any._channel_wake_input_bytes("wake").endswith(b"\r\n"))
+
+    def test_channel_enter_bytes_from_user_input_tracks_observed_submit_key(self):
+        self.assertEqual(b"\n", claude_any._channel_enter_bytes_from_user_input(b"\n"))
+        self.assertEqual(b"\r", claude_any._channel_enter_bytes_from_user_input(b"\r"))
+        self.assertEqual(b"\r\n", claude_any._channel_enter_bytes_from_user_input(b"hello\r\n"))
+        self.assertIsNone(claude_any._channel_enter_bytes_from_user_input(b"abc"))
+
     def test_inject_pending_channel_messages_writes_prompt_to_child_stdin(self):
         messages = [
             {
@@ -230,6 +242,14 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(write_all.call_args.args[1].startswith(b"\x15"))
         self.assertTrue(write_all.call_args.args[1].endswith(b"\n"))
 
+        with (
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_write_fd_all") as write_all_cr,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            claude_any._inject_pending_channel_messages(99, 1, b"\r")
+        self.assertTrue(write_all_cr.call_args.args[1].endswith(b"\r"))
+
     def test_inject_pending_channel_messages_batches_and_ignores_connection_noise(self):
         messages = [
             {"id": 1, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.ws.connected", "meta": {}},
@@ -250,7 +270,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn(b"ai-net.ws.connected", payload)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_stdin_proxy_skipped_noise" in item for item in log_messages))
-        self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2,3" in item for item in log_messages))
+        self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2,3" in item and "enter=lf" in item for item in log_messages))
 
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(

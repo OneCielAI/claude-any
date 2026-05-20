@@ -104,7 +104,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.82"
+VERSION = "0.1.83"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -13749,14 +13749,52 @@ def _write_fd_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
-def _channel_wake_input_bytes(prompt: str) -> bytes:
+def _channel_wake_enter_bytes(value: str | bytes | None = None) -> bytes:
+    raw: str | bytes | None = value
+    if raw is None:
+        raw = os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_ENTER")
+    if isinstance(raw, bytes):
+        return raw if raw in (b"\n", b"\r", b"\r\n") else b"\n"
+    normalized = str(raw or "").strip().lower()
+    if normalized in {"", "lf", "nl", "newline", "linefeed", "\\n"}:
+        return b"\n"
+    if normalized in {"cr", "return", "carriage-return", "carriage_return", "\\r"}:
+        return b"\r"
+    if normalized in {"crlf", "cr-lf", "return-newline", "\\r\\n"}:
+        return b"\r\n"
+    return b"\n"
+
+
+def _channel_enter_bytes_from_user_input(data: bytes) -> bytes | None:
+    if not data:
+        return None
+    if data in (b"\n", b"\r", b"\r\n"):
+        return data
+    last_lf = data.rfind(b"\n")
+    last_cr = data.rfind(b"\r")
+    if last_lf < 0 and last_cr < 0:
+        return None
+    if last_lf > last_cr:
+        return b"\r\n" if last_lf > 0 and data[last_lf - 1 : last_lf] == b"\r" else b"\n"
+    return b"\r\n" if last_cr + 1 < len(data) and data[last_cr + 1 : last_cr + 2] == b"\n" else b"\r"
+
+
+def _channel_enter_label(enter_bytes: bytes) -> str:
+    if enter_bytes == b"\r":
+        return "cr"
+    if enter_bytes == b"\r\n":
+        return "crlf"
+    return "lf"
+
+
+def _channel_wake_input_bytes(prompt: str, enter_bytes: bytes | None = None) -> bytes:
     # Ctrl-U clears any stale line editor text before submitting the synthetic prompt.
-    # Claude Code's interactive input is terminal-driven. In the PTY proxy path,
-    # observed Enter keypresses arrive as LF, so submit with LF rather than CR.
-    return b"\x15" + prompt.encode("utf-8", errors="replace") + b"\n"
+    # Claude Code's interactive input is terminal-driven; the submit byte can
+    # differ by PTY/input stack, so callers pass the observed Enter sequence.
+    return b"\x15" + prompt.encode("utf-8", errors="replace") + _channel_wake_enter_bytes(enter_bytes)
 
 
-def _inject_pending_channel_messages(master_fd: int, last_id: int) -> int:
+def _inject_pending_channel_messages(master_fd: int, last_id: int, enter_bytes: bytes | None = None) -> int:
     pending: list[dict[str, Any]] = []
     for message in read_chat_messages(last_id, None, None, 100):
         try:
@@ -13773,10 +13811,14 @@ def _inject_pending_channel_messages(master_fd: int, last_id: int) -> int:
         pending.append(message)
     if pending:
         prompt = format_channel_wake_batch_prompt(pending)
-        _write_fd_all(master_fd, _channel_wake_input_bytes(prompt))
+        submit_bytes = _channel_wake_enter_bytes(enter_bytes)
+        _write_fd_all(master_fd, _channel_wake_input_bytes(prompt, submit_bytes))
         ids = ",".join(str(message.get("id") or "") for message in pending)
         channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
-        router_log("INFO", f"channel_stdin_proxy_injected count={len(pending)} message_ids={ids} channels={channels}")
+        router_log(
+            "INFO",
+            f"channel_stdin_proxy_injected count={len(pending)} message_ids={ids} channels={channels} enter={_channel_enter_label(submit_bytes)}",
+        )
     return last_id
 
 
@@ -13806,6 +13848,7 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
     stdout_fd = sys.stdout.fileno()
     old_attrs = termios.tcgetattr(stdin_fd)
     last_channel_poll = 0.0
+    channel_enter_bytes = _channel_wake_enter_bytes()
     try:
         tty.setraw(stdin_fd)
         while proc.poll() is None:
@@ -13816,6 +13859,9 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
             if stdin_fd in readable:
                 data = os.read(stdin_fd, 4096)
                 if data:
+                    observed_enter = _channel_enter_bytes_from_user_input(data)
+                    if observed_enter:
+                        channel_enter_bytes = observed_enter
                     _write_fd_all(master_fd, data)
             if master_fd in readable:
                 try:
@@ -13830,7 +13876,7 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
                 marker = _chat_messages_file_marker()
                 if marker != last_channel_marker:
                     last_channel_marker = marker
-                    last_id = _inject_pending_channel_messages(master_fd, last_id)
+                    last_id = _inject_pending_channel_messages(master_fd, last_id, channel_enter_bytes)
         while True:
             try:
                 readable, _, _ = select.select([master_fd], [], [], 0)
