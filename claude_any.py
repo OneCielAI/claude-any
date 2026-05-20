@@ -104,7 +104,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.79"
+VERSION = "0.1.80"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -13620,6 +13620,39 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     )
 
 
+def _channel_wake_message_is_noise(message: dict[str, Any]) -> bool:
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip().lower()
+    kind = str(message.get("kind") or "").strip().lower()
+    if not body:
+        return True
+    if kind in {"connection", "connected", "heartbeat", "keepalive"}:
+        return True
+    return bool(re.fullmatch(r"[a-z0-9_.:-]{1,80}\.(ws|sse)\.connected", body))
+
+
+def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
+    if len(messages) == 1:
+        return format_channel_wake_prompt(messages[0])
+    parts: list[str] = []
+    for message in messages:
+        channel = str(message.get("channel") or "default")
+        sender = str(message.get("sender_id") or "channel")
+        mid = str(message.get("id") or "")
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        room = str(meta.get("room_id") or meta.get("room") or channel)
+        thread = str(message.get("thread_id") or meta.get("thread_id") or "")
+        body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
+        fields = [f"id={mid}", f"room={room}", f"from={sender}"]
+        if thread:
+            fields.append(f"thread={thread}")
+        parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False))
+    return (
+        f"[claude-any external channel messages] {len(messages)} new messages: "
+        + " ; ".join(parts)
+        + ". If relevant to current work, respond or act now; otherwise keep working."
+    )
+
+
 def _write_fd_all(fd: int, data: bytes) -> None:
     view = memoryview(data)
     while view:
@@ -13629,18 +13662,27 @@ def _write_fd_all(fd: int, data: bytes) -> None:
 
 def _channel_wake_input_bytes(prompt: str) -> bytes:
     # Ctrl-U clears any stale line editor text before submitting the synthetic prompt.
-    return b"\x15" + prompt.encode("utf-8", errors="replace") + b"\n"
+    # Claude Code's interactive input is terminal-driven; send carriage return,
+    # the same byte a TTY normally delivers for Enter in raw mode.
+    return b"\x15" + prompt.encode("utf-8", errors="replace") + b"\r"
 
 
 def _inject_pending_channel_messages(master_fd: int, last_id: int) -> int:
+    pending: list[dict[str, Any]] = []
     for message in read_chat_messages(last_id, None, None, 100):
         try:
             last_id = max(last_id, int(message.get("id") or 0))
         except Exception:
             continue
-        prompt = format_channel_wake_prompt(message)
+        if _channel_wake_message_is_noise(message):
+            continue
+        pending.append(message)
+    if pending:
+        prompt = format_channel_wake_batch_prompt(pending)
         _write_fd_all(master_fd, _channel_wake_input_bytes(prompt))
-        router_log("INFO", f"channel_stdin_proxy_injected message_id={message.get('id')} channel={message.get('channel')}")
+        ids = ",".join(str(message.get("id") or "") for message in pending)
+        channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
+        router_log("INFO", f"channel_stdin_proxy_injected count={len(pending)} message_ids={ids} channels={channels}")
     return last_id
 
 

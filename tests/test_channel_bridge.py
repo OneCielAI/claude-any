@@ -147,7 +147,26 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(2, last_id)
         self.assertIn(b"wake up", write_all.call_args.args[1])
         self.assertTrue(write_all.call_args.args[1].startswith(b"\x15"))
-        self.assertTrue(write_all.call_args.args[1].endswith(b"\n"))
+        self.assertTrue(write_all.call_args.args[1].endswith(b"\r"))
+
+    def test_inject_pending_channel_messages_batches_and_ignores_connection_noise(self):
+        messages = [
+            {"id": 1, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.ws.connected", "meta": {}},
+            {"id": 2, "channel": "ai-net", "sender_id": "robert", "message": "hello Sarah", "meta": {"room_id": "ai-net"}},
+            {"id": 3, "channel": "ai-net", "sender_id": "samuel", "message": "status please", "meta": {"room_id": "ai-net"}},
+        ]
+        with (
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_write_fd_all") as write_all,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            last_id = claude_any._inject_pending_channel_messages(99, 0)
+        self.assertEqual(3, last_id)
+        payload = write_all.call_args.args[1]
+        self.assertIn(b"external channel messages", payload)
+        self.assertIn(b"hello Sarah", payload)
+        self.assertIn(b"status please", payload)
+        self.assertNotIn(b"ai-net.ws.connected", payload)
 
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(
