@@ -326,6 +326,35 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_mcp_skipped_noise" in item and "transport_connected" in item for item in log_messages))
         self.assertTrue(any("channel_mcp_notification_sent" in item and "message_id=2" in item for item in log_messages))
 
+    def test_channel_mcp_cursor_initializes_at_current_tail(self):
+        with tempfile.TemporaryDirectory(prefix="ca-channel-cursor-") as td:
+            root = Path(td)
+            cursor_path = root / "cursor.json"
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHANNEL_MCP_CURSOR_PATH", cursor_path),
+                mock.patch.object(claude_any, "_CHANNEL_MCP_CURSOR_LAST_ID", None),
+                mock.patch.object(claude_any, "_chat_init_next_id", return_value=42),
+            ):
+                last_id = claude_any._channel_mcp_ensure_cursor_initialized()
+                self.assertEqual(41, last_id)
+                self.assertEqual({"last_id": 41}, json.loads(cursor_path.read_text(encoding="utf-8")))
+
+    def test_channel_mcp_cursor_persists_across_reconnects(self):
+        with tempfile.TemporaryDirectory(prefix="ca-channel-cursor-") as td:
+            root = Path(td)
+            cursor_path = root / "cursor.json"
+            cursor_path.write_text('{"last_id":9}\n', encoding="utf-8")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHANNEL_MCP_CURSOR_PATH", cursor_path),
+                mock.patch.object(claude_any, "_CHANNEL_MCP_CURSOR_LAST_ID", None),
+            ):
+                self.assertEqual(9, claude_any._channel_mcp_ensure_cursor_initialized())
+                claude_any._channel_mcp_update_cursor(12)
+                self.assertEqual(12, claude_any._channel_mcp_ensure_cursor_initialized())
+                self.assertEqual({"last_id": 12}, json.loads(cursor_path.read_text(encoding="utf-8")))
+
     def test_mcp_proxy_notification_maps_to_chat_payload(self):
         payload = claude_any._mcp_proxy_notification_payload(
             "ai-net",
@@ -512,7 +541,10 @@ class ChannelBridgeTests(unittest.TestCase):
     def test_channel_mcp_config_points_to_router_sse(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "channel-mcp.json"
-            with mock.patch.object(claude_any, "CHANNEL_MCP_CONFIG", path):
+            with (
+                mock.patch.object(claude_any, "CHANNEL_MCP_CONFIG", path),
+                mock.patch.object(claude_any, "_channel_mcp_ensure_cursor_initialized", return_value=0),
+            ):
                 written = claude_any.write_channel_mcp_config()
             data = __import__("json").loads(written.read_text(encoding="utf-8"))
         self.assertEqual("sse", data["mcpServers"]["claude-any-router"]["type"])

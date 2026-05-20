@@ -58,6 +58,7 @@ MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
+CHANNEL_MCP_CURSOR_PATH = CONFIG_DIR / "channel-mcp-cursor.json"
 MCP_PROXY_CONFIG = CONFIG_DIR / "mcp-proxy.json"
 ROUTER_HOST = os.environ.get("CLAUDE_ANY_ROUTER_CLIENT_HOST", "127.0.0.1").strip() or "127.0.0.1"
 ROUTER_PORT = 8799
@@ -104,7 +105,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.86"
+VERSION = "0.1.87"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -124,6 +125,8 @@ _CHANNEL_SSE_LOCK = threading.Lock()
 _CHANNEL_SSE_CONNECTIONS: dict[str, dict[str, Any]] = {}
 _CHANNEL_MCP_LOCK = threading.Lock()
 _CHANNEL_MCP_SESSIONS: dict[str, dict[str, Any]] = {}
+_CHANNEL_MCP_CURSOR_LOCK = threading.Lock()
+_CHANNEL_MCP_CURSOR_LAST_ID: int | None = None
 _NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
 _MCP_NOTIFICATION_DEDUP_TTL_SECONDS = 3.0
 _MCP_NOTIFICATION_DEDUP_LOCK = threading.Lock()
@@ -4917,6 +4920,52 @@ def _write_sse_event(handler: BaseHTTPRequestHandler, event: str, data: Any, eve
     handler.wfile.flush()
 
 
+def _channel_mcp_write_cursor_locked(last_id: int) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = CHANNEL_MCP_CURSOR_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps({"last_id": max(0, int(last_id))}, separators=(",", ":")) + "\n", encoding="utf-8")
+    tmp_path.replace(CHANNEL_MCP_CURSOR_PATH)
+
+
+def _channel_mcp_read_cursor_locked() -> int:
+    global _CHANNEL_MCP_CURSOR_LAST_ID
+    if _CHANNEL_MCP_CURSOR_LAST_ID is not None:
+        return _CHANNEL_MCP_CURSOR_LAST_ID
+    if CHANNEL_MCP_CURSOR_PATH.exists():
+        try:
+            data = json.loads(CHANNEL_MCP_CURSOR_PATH.read_text(encoding="utf-8"))
+            _CHANNEL_MCP_CURSOR_LAST_ID = max(0, int(data.get("last_id") or 0))
+            return _CHANNEL_MCP_CURSOR_LAST_ID
+        except Exception as exc:
+            router_log("WARN", f"channel_mcp_cursor_read_failed error={type(exc).__name__}: {exc}")
+    _CHANNEL_MCP_CURSOR_LAST_ID = max(0, _chat_init_next_id() - 1)
+    try:
+        _channel_mcp_write_cursor_locked(_CHANNEL_MCP_CURSOR_LAST_ID)
+    except Exception as exc:
+        router_log("WARN", f"channel_mcp_cursor_write_failed error={type(exc).__name__}: {exc}")
+    return _CHANNEL_MCP_CURSOR_LAST_ID
+
+
+def _channel_mcp_ensure_cursor_initialized() -> int:
+    with _CHANNEL_MCP_CURSOR_LOCK:
+        return _channel_mcp_read_cursor_locked()
+
+
+def _channel_mcp_update_cursor(last_id: int) -> None:
+    global _CHANNEL_MCP_CURSOR_LAST_ID
+    if last_id < 0:
+        return
+    with _CHANNEL_MCP_CURSOR_LOCK:
+        current = _channel_mcp_read_cursor_locked()
+        if last_id <= current:
+            return
+        _CHANNEL_MCP_CURSOR_LAST_ID = int(last_id)
+        try:
+            _channel_mcp_write_cursor_locked(_CHANNEL_MCP_CURSOR_LAST_ID)
+        except Exception as exc:
+            router_log("WARN", f"channel_mcp_cursor_write_failed error={type(exc).__name__}: {exc}")
+
+
 def _channel_mcp_notifications_for_messages(
     messages: list[dict[str, Any]],
     session: str = "",
@@ -4948,9 +4997,10 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
     if path != "/ca/mcp/sse":
         return False
     session = _channel_mcp_session_id()
-    last_id = _chat_init_next_id() - 1
+    last_id = _channel_mcp_ensure_cursor_initialized()
     with _CHANNEL_MCP_LOCK:
         _CHANNEL_MCP_SESSIONS[session] = {"created_at": time.time(), "last_id": last_id, "initialized": False}
+    router_log("INFO", f"channel_mcp_session_started session={session} last_id={last_id}")
     handler.send_response(200)
     handler.send_header("content-type", "text/event-stream")
     handler.send_header("cache-control", "no-cache")
@@ -4964,12 +5014,20 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
                 if not state:
                     return True
                 last_id = int(state.get("last_id") or 0)
+                initialized = bool(state.get("initialized"))
+            if not initialized:
+                handler.wfile.write(b": waiting-for-initialize\n\n")
+                handler.wfile.flush()
+                with _CHAT_CONDITION:
+                    _CHAT_CONDITION.wait(timeout=1.0)
+                continue
             messages = read_chat_messages(last_id, None, None, 100)
             if messages:
                 delivered_last_id, events = _channel_mcp_notifications_for_messages(messages, session)
                 last_id = max(last_id, delivered_last_id)
                 for event_id, notification in events:
                     _write_sse_event(handler, "message", notification, event_id)
+                _channel_mcp_update_cursor(last_id)
                 with _CHANNEL_MCP_LOCK:
                     state = _CHANNEL_MCP_SESSIONS.get(session)
                     if state:
@@ -5004,6 +5062,8 @@ def handle_channel_mcp_post(handler: BaseHTTPRequestHandler, path: str, body: di
         with _CHANNEL_MCP_LOCK:
             if session and session in _CHANNEL_MCP_SESSIONS:
                 _CHANNEL_MCP_SESSIONS[session]["initialized"] = True
+        with _CHAT_CONDITION:
+            _CHAT_CONDITION.notify_all()
         write_json(
             handler,
             {
@@ -13767,6 +13827,7 @@ def write_channel_mcp_config() -> Path:
         os.chmod(CHANNEL_MCP_CONFIG, 0o600)
     except Exception:
         pass
+    _channel_mcp_ensure_cursor_initialized()
     return CHANNEL_MCP_CONFIG
 
 
