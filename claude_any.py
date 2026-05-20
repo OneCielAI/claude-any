@@ -105,7 +105,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.95"
+VERSION = "0.1.96"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -14160,20 +14160,41 @@ def _write_fd_all(fd: int, data: bytes) -> None:
         view = view[written:]
 
 
+def _channel_platform_default_enter_bytes(platform: str | None = None, os_name: str | None = None) -> bytes:
+    sys_platform = str(platform if platform is not None else sys.platform).lower()
+    os_family = str(os_name if os_name is not None else os.name).lower()
+    if os_family == "nt" or sys_platform.startswith(("win", "cygwin", "msys")):
+        return b"\r\n"
+    if os_family == "posix":
+        return b"\r\n"
+    return b"\r\n"
+
+
 def _channel_wake_enter_bytes(value: str | bytes | None = None) -> bytes:
     raw: str | bytes | None = value
     if raw is None:
         raw = os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_ENTER")
+        if raw is None:
+            return _channel_platform_default_enter_bytes()
     if isinstance(raw, bytes):
-        return raw if raw in (b"\n", b"\r", b"\r\n") else b"\n"
+        return raw if raw in (b"\n", b"\r", b"\r\n") else _channel_platform_default_enter_bytes()
     normalized = str(raw or "").strip().lower()
-    if normalized in {"", "lf", "nl", "newline", "linefeed", "\\n"}:
+    if normalized in {"", "auto", "default", "platform"}:
+        return _channel_platform_default_enter_bytes()
+    if normalized in {"lf", "nl", "newline", "linefeed", "\\n"}:
         return b"\n"
     if normalized in {"cr", "return", "carriage-return", "carriage_return", "\\r"}:
         return b"\r"
     if normalized in {"crlf", "cr-lf", "return-newline", "\\r\\n"}:
         return b"\r\n"
-    return b"\n"
+    return _channel_platform_default_enter_bytes()
+
+
+def _channel_wake_enter_env_is_fixed() -> bool:
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_ENTER")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() not in {"", "auto", "default", "platform"}
 
 
 def _channel_enter_bytes_from_user_input(data: bytes) -> bytes | None:
@@ -14269,6 +14290,10 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
     old_attrs = termios.tcgetattr(stdin_fd)
     last_channel_poll = 0.0
     channel_enter_bytes = _channel_wake_enter_bytes()
+    router_log(
+        "INFO",
+        f"channel_stdin_proxy_enter_default enter={_channel_enter_label(channel_enter_bytes)} os={os.name} platform={sys.platform}",
+    )
     try:
         tty.setraw(stdin_fd)
         while proc.poll() is None:
@@ -14280,7 +14305,12 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
                 data = os.read(stdin_fd, 4096)
                 if data:
                     observed_enter = _channel_synthetic_enter_bytes_from_user_input(data)
-                    if observed_enter and not os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_ENTER"):
+                    if observed_enter and not _channel_wake_enter_env_is_fixed():
+                        if observed_enter != channel_enter_bytes:
+                            router_log(
+                                "INFO",
+                                f"channel_stdin_proxy_enter_observed enter={_channel_enter_label(observed_enter)}",
+                            )
                         channel_enter_bytes = observed_enter
                     _write_fd_all(master_fd, data)
             if master_fd in readable:

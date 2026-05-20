@@ -211,10 +211,24 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn("\n", prompt)
 
     def test_channel_wake_enter_bytes_can_be_overridden(self):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
+        ):
+            self.assertTrue(claude_any._channel_wake_input_bytes("wake").endswith(b"\r\n"))
+            self.assertEqual(b"\r\n", claude_any._channel_wake_enter_bytes("auto"))
+            self.assertEqual(b"\r\n", claude_any._channel_wake_enter_bytes("unknown"))
+            self.assertEqual(b"\n", claude_any._channel_wake_enter_bytes("lf"))
         with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_WAKE_ENTER": "cr"}):
             self.assertTrue(claude_any._channel_wake_input_bytes("wake").endswith(b"\r"))
         with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_WAKE_ENTER": "crlf"}):
             self.assertTrue(claude_any._channel_wake_input_bytes("wake").endswith(b"\r\n"))
+
+    def test_channel_platform_default_enter_bytes_is_submit_safe(self):
+        self.assertEqual(b"\r\n", claude_any._channel_platform_default_enter_bytes("linux", "posix"))
+        self.assertEqual(b"\r\n", claude_any._channel_platform_default_enter_bytes("darwin", "posix"))
+        self.assertEqual(b"\r\n", claude_any._channel_platform_default_enter_bytes("win32", "nt"))
+        self.assertEqual(b"\r\n", claude_any._channel_platform_default_enter_bytes("msys", "posix"))
 
     def test_channel_enter_bytes_from_user_input_tracks_observed_submit_key(self):
         self.assertEqual(b"\n", claude_any._channel_enter_bytes_from_user_input(b"\n"))
@@ -239,6 +253,7 @@ class ChannelBridgeTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
             mock.patch.object(claude_any, "router_log"),
         ):
@@ -246,7 +261,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(2, last_id)
         self.assertIn(b"wake up", write_all.call_args.args[1])
         self.assertTrue(write_all.call_args.args[1].startswith(b"\x15"))
-        self.assertTrue(write_all.call_args.args[1].endswith(b"\n"))
+        self.assertTrue(write_all.call_args.args[1].endswith(b"\r\n"))
 
         with (
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
@@ -264,6 +279,7 @@ class ChannelBridgeTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
@@ -276,7 +292,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn(b"ai-net.ws.connected", payload)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_stdin_proxy_skipped_noise" in item for item in log_messages))
-        self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2,3" in item and "enter=lf" in item for item in log_messages))
+        self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2,3" in item and "enter=crlf" in item for item in log_messages))
 
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(
