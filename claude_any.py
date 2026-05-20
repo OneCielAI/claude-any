@@ -105,7 +105,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.89"
+VERSION = "0.1.90"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -3840,6 +3840,15 @@ def write_empty_response(handler: BaseHTTPRequestHandler, status: int = 202) -> 
     handler.end_headers()
 
 
+def write_accepted_response(handler: BaseHTTPRequestHandler) -> None:
+    body = b"Accepted"
+    handler.send_response(202)
+    handler.send_header("content-type", "text/plain")
+    handler.send_header("content-length", str(len(body)))
+    handler.end_headers()
+    handler.wfile.write(body)
+
+
 def reject_external_router_request(handler: BaseHTTPRequestHandler, cfg: dict[str, Any] | None = None) -> bool:
     if router_request_allowed(handler, cfg):
         return False
@@ -4965,6 +4974,10 @@ def _channel_mcp_take_outbox(session: str) -> list[dict[str, Any]]:
 
 
 def _channel_mcp_initialize_response(request_id: Any, protocol: str) -> dict[str, Any]:
+    # This endpoint implements the legacy HTTP+SSE transport, whose stable
+    # protocol version is 2024-11-05 even when newer clients initiate the
+    # handshake with a newer preferred protocol.
+    protocol = "2024-11-05"
     return {
         "jsonrpc": "2.0",
         "id": request_id,
@@ -5060,7 +5073,7 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
     started_at = time.time()
     close_reason = "finished"
     _send_channel_mcp_sse_headers(handler)
-    _write_sse_event(handler, "endpoint", f"/ca/mcp/messages?session={urllib.parse.quote(session)}")
+    _write_sse_event(handler, "endpoint", f"/ca/mcp/messages?sessionId={urllib.parse.quote(session)}")
     try:
         while True:
             with _CHANNEL_MCP_LOCK:
@@ -5115,7 +5128,7 @@ def handle_channel_mcp_post(handler: BaseHTTPRequestHandler, path: str, body: di
     if path != "/ca/mcp/messages":
         return False
     params = _query_params(handler)
-    session = _first_param(params, "session")
+    session = _first_param(params, "sessionId") or _first_param(params, "session")
     with _CHANNEL_MCP_LOCK:
         if session and session in _CHANNEL_MCP_SESSIONS:
             _CHANNEL_MCP_SESSIONS[session]["last_seen_at"] = time.time()
@@ -5152,7 +5165,7 @@ def handle_channel_mcp_post(handler: BaseHTTPRequestHandler, path: str, body: di
             )
             return True
         router_log("INFO", f"channel_mcp_rpc_queued session={session or '-'} method={method} request_id={request_id}")
-    write_empty_response(handler, 202)
+    write_accepted_response(handler)
     return True
 
 

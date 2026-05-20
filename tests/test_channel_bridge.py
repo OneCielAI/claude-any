@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 import tempfile
+import urllib.parse
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest import mock
@@ -349,6 +350,7 @@ class ChannelBridgeTests(unittest.TestCase):
             self.assertEqual([response], outbox)
             self.assertEqual([], claude_any._channel_mcp_take_outbox(session))
             self.assertEqual("claude-any-router", outbox[0]["result"]["serverInfo"]["name"])
+            self.assertEqual("2024-11-05", outbox[0]["result"]["protocolVersion"])
             self.assertIn("claude/channel", outbox[0]["result"]["capabilities"]["experimental"])
         finally:
             with claude_any._CHANNEL_MCP_LOCK:
@@ -596,6 +598,12 @@ class ChannelBridgeTests(unittest.TestCase):
             data = __import__("json").loads(written.read_text(encoding="utf-8"))
         self.assertEqual("sse", data["mcpServers"]["claude-any-router"]["type"])
         self.assertTrue(data["mcpServers"]["claude-any-router"]["url"].endswith("/ca/mcp/sse"))
+
+    def test_channel_mcp_endpoint_uses_legacy_session_id_param(self):
+        session = "session-123"
+        endpoint = f"/ca/mcp/messages?sessionId={session}"
+        params = urllib.parse.parse_qs(urllib.parse.urlparse(endpoint).query)
+        self.assertEqual(session, params["sessionId"][0])
 
 
 if __name__ == "__main__":
