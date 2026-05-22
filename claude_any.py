@@ -79,6 +79,9 @@ NCP_PYPI_PACKAGE = "nvd-claude-proxy"
 PROVIDER_ALIASES = {
     "anthropic": "anthropic",
     "claude": "anthropic",
+    "claude-native": "anthropic",
+    "native": "anthropic",
+    "claude-code": "anthropic",
     "ollama": "ollama",
     "ollama-cloud": "ollama-cloud",
     "cloud-ollama": "ollama-cloud",
@@ -93,7 +96,7 @@ PROVIDER_ALIASES = {
 }
 
 PROVIDER_LABELS = {
-    "anthropic": "Anthropic",
+    "anthropic": "Claude Native",
     "ollama": "Ollama",
     "ollama-cloud": "Ollama Cloud",
     "vllm": "vLLM",
@@ -13166,18 +13169,24 @@ def apply_common_claude_env(provider: str, pcfg: dict[str, Any], env: dict[str, 
 
 
 def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
+    """Build the environment overrides claude-any adds when spawning `claude`.
+
+    Claude Native mode contract: when the selected provider is native
+    Anthropic, claude-any MUST NOT inject anything that would alter Claude
+    Code's default model selection, backend URL, advisor flow, output-token
+    cap, auto-compact window, or any other Claude-Code-visible behavior.
+    The only override is an optional ``ANTHROPIC_API_KEY`` if the user has
+    one stored in claude-any's config (Claude Code's OAuth credentials win
+    otherwise). ``CLAUDE_ANY_PROVIDER=anthropic`` is set purely as a marker
+    for claude-any's own helpers (statusline, hooks) so they can self-suppress.
+    """
     cfg = cfg or load_config()
     provider, pcfg = get_current_provider(cfg)
     if native_anthropic_enabled(provider):
-        env = {
-            "CLAUDE_ANY_PROVIDER": provider,
-            "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-        }
+        env = {"CLAUDE_ANY_PROVIDER": provider}
         if meaningful_key(pcfg.get("api_key")):
             env["ANTHROPIC_API_KEY"] = str(pcfg["api_key"])
-        if pcfg.get("current_model"):
-            env["CLAUDE_ANY_MODEL_ALIAS"] = str(pcfg["current_model"])
-        return apply_common_claude_env(provider, pcfg, env)
+        return env
     if ollama_native_compat_enabled(provider, pcfg):
         model = launch_model_id(provider, pcfg)
         return apply_common_claude_env(provider, pcfg, {
@@ -13501,14 +13510,50 @@ def stop_router_processes(quiet: bool = False) -> bool:
     return stopped
 
 
+def stop_router_with_guarantee(reason: str, max_wait_seconds: float = 5.0, quiet: bool = True) -> bool:
+    """Kill the claude-any router and verify it actually stopped.
+
+    Unlike ``stop_router_processes`` (which signals termination and returns
+    without checking), this polls ``router_up()`` until the deadline. Raises
+    ``RuntimeError`` if the router is still serving after ``max_wait_seconds``.
+
+    Used by Claude Native mode launches so the user has a hard guarantee that
+    no claude-any router process can intercept the subsequent ``claude`` call.
+    """
+    if not router_up():
+        router_log("INFO", f"router_kill_guarantee reason={reason} state=already_down")
+        return False
+    stop_router_processes(quiet=quiet)
+    deadline = time.time() + max(0.1, max_wait_seconds)
+    while time.time() < deadline:
+        if not router_up():
+            elapsed_ms = int((max_wait_seconds - (deadline - time.time())) * 1000)
+            router_log("INFO", f"router_kill_guarantee reason={reason} state=killed elapsed_ms={elapsed_ms}")
+            return True
+        time.sleep(0.1)
+    router_log("ERROR", f"router_kill_guarantee reason={reason} state=still_up_after_{max_wait_seconds:.1f}s")
+    raise RuntimeError(
+        f"claude-any router is still serving on {ROUTER_BASE} after a {max_wait_seconds:.1f}s "
+        f"shutdown attempt for '{reason}'. Aborting to prevent the subsequent claude launch "
+        f"from accidentally routing through it. Investigate the PID at {PID_PATH} or use "
+        f"`claude-any stop` manually."
+    )
+
+
 def cleanup_managed_services_for_provider(provider: str, pcfg: dict[str, Any], cfg: dict[str, Any], quiet: bool = False) -> None:
+    if native_anthropic_enabled(provider):
+        # Claude Native mode: hard guarantee that the router is not alive when
+        # the subsequent `claude` is spawned. Ignore the
+        # `cleanup.managed_services_on_launch` opt-out: a stale router process
+        # paired with native mode is exactly the cross-contamination pattern
+        # this provider is meant to prevent, so the toggle does not apply here.
+        stop_router_with_guarantee("native_anthropic_launch", quiet=quiet)
+        if provider != "nvidia-hosted" or provider_native_compat_enabled(provider, pcfg):
+            stop_ncp_proxy(quiet=quiet)
+        return
     if not cfg.get("cleanup", {}).get("managed_services_on_launch", True):
         return
-    if (
-        native_anthropic_enabled(provider)
-        or ollama_native_compat_enabled(provider, pcfg)
-        or provider_native_compat_enabled(provider, pcfg)
-    ):
+    if ollama_native_compat_enabled(provider, pcfg) or provider_native_compat_enabled(provider, pcfg):
         stop_router_processes(quiet=quiet)
     if provider != "nvidia-hosted" or provider_native_compat_enabled(provider, pcfg):
         stop_ncp_proxy(quiet=quiet)
@@ -16167,9 +16212,14 @@ def launch_claude(
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
     if use_native_anthropic:
+        # Claude Native guarantee — strip every env var claude-any (or a
+        # prior claude-any session) might have left behind that would change
+        # Claude Code's default model selection, backend, advisor flow, or
+        # other behavior. See env_vars() docstring for the contract.
         for key in (
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_MODEL",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
@@ -16177,10 +16227,19 @@ def launch_claude(
             "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
+            "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+            "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
+            "CLAUDE_CODE_ATTRIBUTION_HEADER",
+            "CLAUDE_ANY_ADVISOR_MODEL",
+            "CLAUDE_ANY_MODEL_ALIAS",
         ):
             env.pop(key, None)
         if "ANTHROPIC_API_KEY" in launch_env:
             env.pop("ANTHROPIC_AUTH_TOKEN", None)
+        router_log(
+            "INFO",
+            "claude_native_launch model=<defer-to-claude-code> advisor=off backend=<default-anthropic>",
+        )
     env.update(launch_env)
     if not use_native_anthropic:
         for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
