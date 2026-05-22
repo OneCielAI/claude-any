@@ -9,6 +9,7 @@ import importlib.util
 import json
 import math
 import os
+import queue
 import re
 import signal
 import shlex
@@ -105,7 +106,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.96"
+VERSION = "0.1.97"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -9498,6 +9499,233 @@ def _mcp_server_is_stdio(server: dict[str, Any]) -> bool:
     return "mcp-proxy" not in args
 
 
+def _channel_probe_initialize_payload() -> bytes:
+    payload = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {},
+            "clientInfo": {"name": "claude-any-channel-probe", "version": VERSION},
+        },
+    }
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def _channel_probe_parse_framed_responses(buffer: bytes) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(buffer):
+        header_end = buffer.find(b"\r\n\r\n", idx)
+        if header_end < 0:
+            return out
+        header = buffer[idx:header_end].decode("ascii", errors="replace")
+        length: int | None = None
+        for line in header.split("\r\n"):
+            if line.lower().startswith("content-length:"):
+                try:
+                    length = int(line.split(":", 1)[1].strip())
+                except Exception:
+                    return out
+                break
+        if length is None:
+            return out
+        body_start = header_end + 4
+        body_end = body_start + length
+        if len(buffer) < body_end:
+            return out
+        try:
+            msg = json.loads(buffer[body_start:body_end].decode("utf-8", errors="replace"))
+        except Exception:
+            idx = body_end
+            continue
+        if isinstance(msg, dict):
+            out.append(msg)
+        idx = body_end
+    return out
+
+
+def _channel_probe_parse_jsonl_responses(buffer: bytes) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for raw_line in buffer.split(b"\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line.decode("utf-8", errors="replace"))
+        except Exception:
+            continue
+        if isinstance(msg, dict):
+            out.append(msg)
+    return out
+
+
+def _channel_probe_find_initialize_response(buffer: bytes, framed: bool) -> dict[str, Any] | None:
+    msgs = _channel_probe_parse_framed_responses(buffer) if framed else _channel_probe_parse_jsonl_responses(buffer)
+    for msg in msgs:
+        if msg.get("id") == 1 and "result" in msg:
+            return msg
+    return None
+
+
+def _channel_probe_capability_present(initialize_response: dict[str, Any]) -> bool:
+    result = initialize_response.get("result")
+    if not isinstance(result, dict):
+        return False
+    capabilities = result.get("capabilities")
+    if not isinstance(capabilities, dict):
+        return False
+    experimental = capabilities.get("experimental")
+    if not isinstance(experimental, dict):
+        return False
+    value = experimental.get("claude/channel")
+    return value is not None and value is not False
+
+
+def probe_stdio_mcp_for_channel_capability(server_name: str, server: dict[str, Any], timeout: float = 3.0) -> bool:
+    if not _mcp_server_is_stdio(server):
+        return False
+    command = str(server.get("command") or "").strip()
+    args_raw = server.get("args", [])
+    args = [str(item) for item in args_raw] if isinstance(args_raw, list) else []
+    if not command:
+        return False
+    command, args = resolve_mcp_server_process(command, args)
+    env = os.environ.copy()
+    raw_env = server.get("env")
+    if isinstance(raw_env, dict):
+        env.update({str(k): str(v) for k, v in raw_env.items() if str(k)})
+    cwd_value = server.get("cwd") or server.get("workingDirectory")
+    cwd = str(cwd_value) if cwd_value else None
+    framed = _mcp_proxy_stdio_mode(server) != "jsonl"
+
+    proc: subprocess.Popen[bytes] | None = None
+    try:
+        proc = subprocess.Popen(
+            [command, *args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            cwd=cwd,
+            env=env,
+            bufsize=0,
+            close_fds=True,
+        )
+    except Exception as exc:
+        router_log("DEBUG", f"channel_probe_spawn_failed server={server_name} error={type(exc).__name__}: {exc}")
+        return False
+
+    chunks_queue: queue.Queue[bytes | None] = queue.Queue()
+
+    def _reader() -> None:
+        try:
+            assert proc is not None
+            stdout = proc.stdout
+            if stdout is None:
+                return
+            while True:
+                chunk = stdout.read(4096)
+                if not chunk:
+                    break
+                chunks_queue.put(chunk)
+        except Exception:
+            pass
+        finally:
+            chunks_queue.put(None)
+
+    threading.Thread(target=_reader, daemon=True, name=f"channel-probe-stdout-{server_name}").start()
+
+    body = _channel_probe_initialize_payload()
+    if framed:
+        frame = b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+    else:
+        frame = body + b"\n"
+    try:
+        if proc.stdin:
+            proc.stdin.write(frame)
+            proc.stdin.flush()
+    except Exception:
+        pass
+
+    deadline = time.time() + timeout
+    stdout_buf = bytearray()
+    capable = False
+    try:
+        while time.time() < deadline:
+            wait = min(0.2, max(0.001, deadline - time.time()))
+            try:
+                chunk = chunks_queue.get(timeout=wait)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                break
+            stdout_buf.extend(chunk)
+            response = _channel_probe_find_initialize_response(bytes(stdout_buf), framed)
+            if response is not None:
+                capable = _channel_probe_capability_present(response)
+                break
+    finally:
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.terminate()
+            proc.wait(timeout=1.0)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    router_log(
+        "INFO",
+        f"channel_probe_result server={server_name} channel_capable={capable} bytes={len(stdout_buf)}",
+    )
+    return capable
+
+
+def detect_channel_capable_mcp_servers(
+    mcp_config_paths: Iterable[str],
+    cwd: Path,
+    *,
+    include_router_self: bool = True,
+    timeout_per_server: float = 3.0,
+) -> list[str]:
+    """Probe MCP servers declared in given config files; return names that declare experimental['claude/channel']."""
+    capable: list[str] = []
+    seen: set[str] = set()
+    if include_router_self:
+        capable.append("claude-any-router")
+        seen.add("claude-any-router")
+    for path_str in mcp_config_paths:
+        if not path_str:
+            continue
+        path = Path(path_str)
+        if not path.exists():
+            continue
+        for name, server in _read_mcp_servers_from_json(path, cwd):
+            if name in seen:
+                continue
+            seen.add(name)
+            if name == "claude-any-router":
+                continue
+            if not _mcp_server_is_stdio(server):
+                # Non-stdio (sse/http) probing not implemented; skip silently.
+                continue
+            try:
+                if probe_stdio_mcp_for_channel_capability(name, server, timeout=timeout_per_server):
+                    capable.append(name)
+            except Exception as exc:
+                router_log(
+                    "WARN",
+                    f"channel_probe_exception server={name} error={type(exc).__name__}: {exc}",
+                )
+    return capable
+
+
 def _mcp_config_passthrough_values(passthrough: list[str]) -> list[str]:
     values: list[str] = []
     i = 0
@@ -13939,8 +14167,21 @@ def native_channel_passthrough_requested(passthrough: list[str]) -> bool:
     return has_passthrough_option(passthrough, "--channels", "--dangerously-load-development-channels")
 
 
-def claude_channel_args(cfg: dict[str, Any], passthrough: list[str], extra_specs: list[str] | None = None) -> list[str]:
-    return []
+def claude_channel_args(
+    cfg: dict[str, Any],
+    passthrough: list[str],
+    extra_specs: list[str] | None = None,
+    *,
+    native_channel_bridge: bool = False,
+) -> list[str]:
+    if not native_channel_bridge:
+        return []
+    if native_channel_passthrough_requested(passthrough):
+        return []
+    specs = list(channel_specs_for_launch(cfg, passthrough, extra_specs))
+    if not specs:
+        return []
+    return ["--dangerously-load-development-channels", *specs]
 
 
 def claude_channels_requested(cfg: dict[str, Any], passthrough: list[str], extra_specs: list[str] | None = None) -> bool:
@@ -15180,7 +15421,28 @@ def launch_claude(
         extra_args.extend(["--mcp-config", *mcp_config_paths])
     if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
         extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
-    extra_args.extend(claude_channel_args(cfg, launch_passthrough))
+    detected_channel_specs: list[str] = []
+    if native_channel_bridge and mcp_config_paths:
+        try:
+            detected_servers = detect_channel_capable_mcp_servers(
+                mcp_config_paths,
+                Path(os.getcwd()),
+            )
+            detected_channel_specs = [f"server:{name}" for name in detected_servers]
+            router_log(
+                "INFO",
+                f"channel_probe_detected count={len(detected_servers)} servers={','.join(detected_servers) or '-'}",
+            )
+        except Exception as exc:
+            router_log("WARN", f"channel_probe_failed error={type(exc).__name__}: {exc}")
+    extra_args.extend(
+        claude_channel_args(
+            cfg,
+            launch_passthrough,
+            extra_specs=detected_channel_specs,
+            native_channel_bridge=native_channel_bridge,
+        )
+    )
     cmd = [
         claude,
         "--dangerously-skip-permissions",
