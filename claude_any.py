@@ -9504,6 +9504,28 @@ def _mcp_server_is_stdio(server: dict[str, Any]) -> bool:
     return "mcp-proxy" not in args
 
 
+def _channel_probe_strategy_for(server: dict[str, Any]) -> str:
+    """How to frame the initialize request we send to this stdio server.
+
+    Default is ``"jsonl"`` (newline-delimited JSON), which is the MCP
+    stdio wire format per modelcontextprotocol.io:
+        "Messages are delimited by newlines, and MUST NOT contain embedded
+         newlines."
+
+    Servers that need LSP-style ``Content-Length: N\\r\\n\\r\\n`` framing
+    (not spec for MCP, but seen in some legacy implementations) can opt in
+    with ``"claude_any_stdio": "framed"`` in their MCP config entry. This
+    is distinct from ``_mcp_proxy_stdio_mode``, whose history pre-dates
+    the framing audit and whose default we do not change here.
+    """
+    if not isinstance(server, dict):
+        return "jsonl"
+    mode = str(server.get("claude_any_stdio") or server.get("stdio_mode") or "").strip().lower()
+    if mode in ("framed", "framed-only", "content-length", "lsp"):
+        return "framed"
+    return "jsonl"
+
+
 def _channel_probe_initialize_payload() -> bytes:
     payload = {
         "jsonrpc": "2.0",
@@ -9889,7 +9911,8 @@ def probe_stdio_mcp_for_channel_capability_detailed(
         env.update({str(k): str(v) for k, v in raw_env.items() if str(k)})
     cwd_value = server.get("cwd") or server.get("workingDirectory")
     cwd = str(cwd_value) if cwd_value else None
-    framed = _mcp_proxy_stdio_mode(server) != "jsonl"
+    strategy = _channel_probe_strategy_for(server)
+    framed = strategy == "framed"
     effective_timeout = timeout if timeout is not None else channel_probe_default_timeout()
 
     proc: subprocess.Popen[bytes] | None = None

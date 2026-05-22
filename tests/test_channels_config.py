@@ -1,5 +1,6 @@
 import json
 import os
+import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -686,6 +687,144 @@ class ChannelProbeDetailedReasonTests(unittest.TestCase):
         self.assertEqual("timeout", slow["reason"])
         self.assertEqual(15000, slow["elapsed_ms"])
         self.assertFalse(slow["response_received"])
+
+
+class ChannelProbeStdioStrategyTests(unittest.TestCase):
+    def test_default_strategy_is_jsonl(self):
+        # MCP stdio spec uses newline-delimited JSON, so an entry with no
+        # opt-in stays on NDJSON.
+        self.assertEqual("jsonl", claude_any._channel_probe_strategy_for({}))
+        self.assertEqual(
+            "jsonl",
+            claude_any._channel_probe_strategy_for({"command": "node", "args": ["server.js"]}),
+        )
+
+    def test_jsonl_alias_returns_jsonl(self):
+        for value in ("jsonl", "JSONL", "  jsonl  ", "newline-json"):
+            self.assertEqual(
+                "jsonl",
+                claude_any._channel_probe_strategy_for({"claude_any_stdio": value}),
+                msg=f"value={value!r}",
+            )
+
+    def test_framed_opt_in_returns_framed(self):
+        for value in ("framed", "framed-only", "content-length", "lsp", "LSP", "  framed  "):
+            self.assertEqual(
+                "framed",
+                claude_any._channel_probe_strategy_for({"claude_any_stdio": value}),
+                msg=f"value={value!r}",
+            )
+
+    def test_alternate_field_name_stdio_mode_also_recognized(self):
+        self.assertEqual(
+            "framed",
+            claude_any._channel_probe_strategy_for({"stdio_mode": "framed"}),
+        )
+
+    def test_unrecognized_value_falls_back_to_jsonl(self):
+        # An unknown opt-in string is treated as MCP-spec NDJSON, not as
+        # an error, to avoid breaking config-driven launches on a typo.
+        self.assertEqual(
+            "jsonl",
+            claude_any._channel_probe_strategy_for({"claude_any_stdio": "bizarre"}),
+        )
+
+    def test_non_dict_input_returns_jsonl(self):
+        self.assertEqual("jsonl", claude_any._channel_probe_strategy_for("not-a-dict"))  # type: ignore[arg-type]
+        self.assertEqual("jsonl", claude_any._channel_probe_strategy_for(None))  # type: ignore[arg-type]
+
+    def test_probe_against_real_ndjson_subprocess_detects_capable(self):
+        """End-to-end: spawn a real Python subprocess that reads a single
+        newline-delimited JSON-RPC initialize request and writes back a
+        spec-compliant response declaring `experimental.claude/channel`.
+        The default probe strategy (jsonl) must detect it as capable.
+
+        This is the regression guard for the bug where the probe was
+        sending LSP-style Content-Length-framed input to MCP servers,
+        which spec-correct servers (using NDJSON per
+        modelcontextprotocol.io stdio transport) could not parse.
+        """
+        script = (
+            "import sys, json\n"
+            "line = sys.stdin.readline()\n"
+            "req = json.loads(line)\n"
+            "resp = {\n"
+            "    'jsonrpc': '2.0',\n"
+            "    'id': req.get('id', 1),\n"
+            "    'result': {\n"
+            "        'protocolVersion': '2024-11-05',\n"
+            "        'capabilities': {'experimental': {'claude/channel': {}}},\n"
+            "        'serverInfo': {'name': 'fake-ndjson', 'version': '0.0.1'},\n"
+            "    },\n"
+            "}\n"
+            "sys.stdout.write(json.dumps(resp) + '\\n')\n"
+            "sys.stdout.flush()\n"
+        )
+        server_config = {
+            "command": sys.executable,
+            "args": ["-c", script],
+        }
+        with mock.patch.object(claude_any, "router_log"):
+            detail = claude_any.probe_stdio_mcp_for_channel_capability_detailed(
+                "fake-ndjson", server_config, timeout=5.0
+            )
+        self.assertTrue(
+            detail["capable"],
+            msg=f"NDJSON-spec server was not detected as capable. detail={detail}",
+        )
+        self.assertEqual("capable", detail["reason"])
+        self.assertTrue(detail["response_received"])
+
+    def test_probe_against_real_framed_subprocess_with_explicit_opt_in(self):
+        """End-to-end opt-in path: a server that declares
+        `claude_any_stdio: "framed"` receives an LSP-style
+        Content-Length-prefixed initialize and is expected to reply in the
+        same form. This proves the opt-in legacy path still works after
+        the default flipped to NDJSON.
+        """
+        script = (
+            "import sys, json, re\n"
+            "buf = b''\n"
+            "stdin = sys.stdin.buffer\n"
+            "while True:\n"
+            "    c = stdin.read(1)\n"
+            "    if not c:\n"
+            "        break\n"
+            "    buf += c\n"
+            "    if buf.endswith(b'\\r\\n\\r\\n'):\n"
+            "        break\n"
+            "m = re.search(rb'Content-Length:\\s*(\\d+)', buf)\n"
+            "assert m, 'no Content-Length header on stdin: ' + repr(buf)\n"
+            "n = int(m.group(1))\n"
+            "body = stdin.read(n)\n"
+            "req = json.loads(body)\n"
+            "resp = {\n"
+            "    'jsonrpc': '2.0',\n"
+            "    'id': req.get('id', 1),\n"
+            "    'result': {\n"
+            "        'protocolVersion': '2024-11-05',\n"
+            "        'capabilities': {'experimental': {'claude/channel': {}}},\n"
+            "        'serverInfo': {'name': 'fake-framed', 'version': '0.0.1'},\n"
+            "    },\n"
+            "}\n"
+            "out = json.dumps(resp).encode()\n"
+            "sys.stdout.buffer.write(b'Content-Length: ' + str(len(out)).encode() + b'\\r\\n\\r\\n' + out)\n"
+            "sys.stdout.buffer.flush()\n"
+        )
+        server_config = {
+            "command": sys.executable,
+            "args": ["-c", script],
+            "claude_any_stdio": "framed",
+        }
+        with mock.patch.object(claude_any, "router_log"):
+            detail = claude_any.probe_stdio_mcp_for_channel_capability_detailed(
+                "fake-framed", server_config, timeout=5.0
+            )
+        self.assertTrue(
+            detail["capable"],
+            msg=f"Framed opt-in path broke. detail={detail}",
+        )
+        self.assertEqual("capable", detail["reason"])
 
 
 class _FakeSSEResponse:
