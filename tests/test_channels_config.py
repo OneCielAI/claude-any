@@ -514,7 +514,17 @@ class ChannelProbeCacheTests(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            with mock.patch.object(claude_any, "probe_stdio_mcp_for_channel_capability", return_value=True) as probe:
+            with mock.patch.object(
+                claude_any,
+                "probe_stdio_mcp_for_channel_capability_detailed",
+                return_value={
+                    "capable": True,
+                    "reason": "capable",
+                    "response_bytes": 256,
+                    "response_received": True,
+                    "elapsed_ms": 800,
+                },
+            ) as probe:
                 records = claude_any._probe_mcp_servers_to_records([str(mcp_config)], root)
         names = {r["name"] for r in records}
         self.assertIn("claude-any-router", names)
@@ -524,6 +534,7 @@ class ChannelProbeCacheTests(unittest.TestCase):
         self.assertEqual(1, probe.call_count)
         ai_net_record = next(r for r in records if r["name"] == "ai-net")
         self.assertTrue(ai_net_record["capable"])
+        self.assertEqual("capable", ai_net_record["reason"])
         sse_record = next(r for r in records if r["name"] == "sse-only")
         self.assertFalse(sse_record["capable"])
         self.assertEqual("non_stdio_probe_not_implemented", sse_record["reason"])
@@ -538,7 +549,19 @@ class ChannelProbeCacheTests(unittest.TestCase):
                 json.dumps({"mcpServers": {"ai-net": {"command": "node", "args": ["server.js"]}}}),
                 encoding="utf-8",
             )
-            stack.enter_context(mock.patch.object(claude_any, "probe_stdio_mcp_for_channel_capability", return_value=True))
+            stack.enter_context(
+                mock.patch.object(
+                    claude_any,
+                    "probe_stdio_mcp_for_channel_capability_detailed",
+                    return_value={
+                        "capable": True,
+                        "reason": "capable",
+                        "response_bytes": 128,
+                        "response_received": True,
+                        "elapsed_ms": 500,
+                    },
+                )
+            )
             result = claude_any.refresh_channel_probe_cache(cwd=project, home=root)
         self.assertGreater(result["probed_at"], 0)
         names = {r["name"] for r in result["servers"]}
@@ -553,7 +576,7 @@ class ChannelProbeCacheTests(unittest.TestCase):
                 "probed_at": 1700000000.0,
                 "servers": [
                     {"name": "ai-net", "capable": True, "transport": "stdio"},
-                    {"name": "boring", "capable": False, "transport": "stdio", "reason": "no_experimental_claude_channel_or_timeout"},
+                    {"name": "boring", "capable": False, "transport": "stdio", "reason": "timeout"},
                 ],
             })
             cfg = {"claude_code": {"channels": ["server:ai-net"]}}
@@ -569,6 +592,56 @@ class ChannelProbeCacheTests(unittest.TestCase):
         self.assertNotIn(values[first_selectable], ("__heading__", "__noop__"))
         # The Re-probe action must be present.
         self.assertIn("__reprobe__", values)
+        # The reason from the detailed probe must surface to the user
+        # (so they can see whether it was timeout vs missing capability).
+        self.assertTrue(any("timeout" in row for row in rows))
+
+
+class ChannelProbeDetailedReasonTests(unittest.TestCase):
+    def test_default_timeout_can_be_overridden_via_env(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS": "42"}, clear=False):
+            self.assertEqual(42.0, claude_any.channel_probe_default_timeout())
+        with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS": "garbage"}, clear=False):
+            self.assertEqual(
+                claude_any.CHANNEL_PROBE_DEFAULT_TIMEOUT_SECONDS,
+                claude_any.channel_probe_default_timeout(),
+            )
+        with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS": "-1"}, clear=False):
+            self.assertEqual(
+                claude_any.CHANNEL_PROBE_DEFAULT_TIMEOUT_SECONDS,
+                claude_any.channel_probe_default_timeout(),
+            )
+
+    def test_default_timeout_is_at_least_ten_seconds(self):
+        # The default must be large enough for typical npx/tsx cold start;
+        # users testing remote MCP servers complained that 3s was too short.
+        self.assertGreaterEqual(claude_any.CHANNEL_PROBE_DEFAULT_TIMEOUT_SECONDS, 10.0)
+
+    def test_records_carry_detailed_reason_from_probe(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp_config = root / ".mcp.json"
+            mcp_config.write_text(
+                json.dumps({"mcpServers": {"slow-net": {"command": "node", "args": ["server.js"]}}}),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                claude_any,
+                "probe_stdio_mcp_for_channel_capability_detailed",
+                return_value={
+                    "capable": False,
+                    "reason": "timeout",
+                    "response_bytes": 0,
+                    "response_received": False,
+                    "elapsed_ms": 15000,
+                },
+            ):
+                records = claude_any._probe_mcp_servers_to_records([str(mcp_config)], root)
+        slow = next(r for r in records if r["name"] == "slow-net")
+        self.assertFalse(slow["capable"])
+        self.assertEqual("timeout", slow["reason"])
+        self.assertEqual(15000, slow["elapsed_ms"])
+        self.assertFalse(slow["response_received"])
 
 
 if __name__ == "__main__":

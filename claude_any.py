@@ -107,7 +107,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.98"
+VERSION = "0.1.99"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -9588,14 +9588,62 @@ def _channel_probe_capability_present(initialize_response: dict[str, Any]) -> bo
     return value is not None and value is not False
 
 
-def probe_stdio_mcp_for_channel_capability(server_name: str, server: dict[str, Any], timeout: float = 3.0) -> bool:
+CHANNEL_PROBE_DEFAULT_TIMEOUT_SECONDS = 15.0
+
+
+def channel_probe_default_timeout() -> float:
+    """Default per-server probe timeout. Configurable via
+    CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS so users with slow MCP servers
+    (npx cold start, remote API init) can extend it without code changes."""
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS")
+    if raw is None:
+        return CHANNEL_PROBE_DEFAULT_TIMEOUT_SECONDS
+    try:
+        value = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return CHANNEL_PROBE_DEFAULT_TIMEOUT_SECONDS
+    if value <= 0:
+        return CHANNEL_PROBE_DEFAULT_TIMEOUT_SECONDS
+    return value
+
+
+def probe_stdio_mcp_for_channel_capability_detailed(
+    server_name: str,
+    server: dict[str, Any],
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Probe a stdio MCP server with an MCP `initialize` request and report
+    detail. The returned dict contains:
+
+      - capable (bool): True only when the server's initialize response
+        carries `capabilities.experimental['claude/channel']`.
+      - reason (str): one of 'capable', 'timeout',
+        'no_experimental_claude_channel', 'spawn_failed:<exc>',
+        'no_command', 'not_stdio'.
+      - response_bytes (int): how many bytes of stdout were observed.
+      - response_received (bool): whether an initialize response was parsed.
+      - elapsed_ms (int): wall time of the probe.
+    """
+    started = time.time()
     if not _mcp_server_is_stdio(server):
-        return False
+        return {
+            "capable": False,
+            "reason": "not_stdio",
+            "response_bytes": 0,
+            "response_received": False,
+            "elapsed_ms": 0,
+        }
     command = str(server.get("command") or "").strip()
     args_raw = server.get("args", [])
     args = [str(item) for item in args_raw] if isinstance(args_raw, list) else []
     if not command:
-        return False
+        return {
+            "capable": False,
+            "reason": "no_command",
+            "response_bytes": 0,
+            "response_received": False,
+            "elapsed_ms": 0,
+        }
     command, args = resolve_mcp_server_process(command, args)
     env = os.environ.copy()
     raw_env = server.get("env")
@@ -9604,6 +9652,7 @@ def probe_stdio_mcp_for_channel_capability(server_name: str, server: dict[str, A
     cwd_value = server.get("cwd") or server.get("workingDirectory")
     cwd = str(cwd_value) if cwd_value else None
     framed = _mcp_proxy_stdio_mode(server) != "jsonl"
+    effective_timeout = timeout if timeout is not None else channel_probe_default_timeout()
 
     proc: subprocess.Popen[bytes] | None = None
     try:
@@ -9619,7 +9668,13 @@ def probe_stdio_mcp_for_channel_capability(server_name: str, server: dict[str, A
         )
     except Exception as exc:
         router_log("DEBUG", f"channel_probe_spawn_failed server={server_name} error={type(exc).__name__}: {exc}")
-        return False
+        return {
+            "capable": False,
+            "reason": f"spawn_failed:{type(exc).__name__}",
+            "response_bytes": 0,
+            "response_received": False,
+            "elapsed_ms": int((time.time() - started) * 1000),
+        }
 
     chunks_queue: queue.Queue[bytes | None] = queue.Queue()
 
@@ -9653,9 +9708,10 @@ def probe_stdio_mcp_for_channel_capability(server_name: str, server: dict[str, A
     except Exception:
         pass
 
-    deadline = time.time() + timeout
+    deadline = time.time() + effective_timeout
     stdout_buf = bytearray()
     capable = False
+    response_received = False
     try:
         while time.time() < deadline:
             wait = min(0.2, max(0.001, deadline - time.time()))
@@ -9668,6 +9724,7 @@ def probe_stdio_mcp_for_channel_capability(server_name: str, server: dict[str, A
             stdout_buf.extend(chunk)
             response = _channel_probe_find_initialize_response(bytes(stdout_buf), framed)
             if response is not None:
+                response_received = True
                 capable = _channel_probe_capability_present(response)
                 break
     finally:
@@ -9685,11 +9742,31 @@ def probe_stdio_mcp_for_channel_capability(server_name: str, server: dict[str, A
             except Exception:
                 pass
 
+    if capable:
+        reason = "capable"
+    elif response_received:
+        reason = "no_experimental_claude_channel"
+    else:
+        reason = "timeout"
+    elapsed_ms = int((time.time() - started) * 1000)
     router_log(
         "INFO",
-        f"channel_probe_result server={server_name} channel_capable={capable} bytes={len(stdout_buf)}",
+        "channel_probe_result server=%s channel_capable=%s reason=%s bytes=%d elapsed_ms=%d timeout_s=%.1f"
+        % (server_name, capable, reason, len(stdout_buf), elapsed_ms, effective_timeout),
     )
-    return capable
+    return {
+        "capable": capable,
+        "reason": reason,
+        "response_bytes": len(stdout_buf),
+        "response_received": response_received,
+        "elapsed_ms": elapsed_ms,
+    }
+
+
+def probe_stdio_mcp_for_channel_capability(server_name: str, server: dict[str, Any], timeout: float | None = None) -> bool:
+    """Thin bool wrapper around the detailed probe. Preserves the older API
+    for `detect_channel_capable_mcp_servers` and any external callers."""
+    return probe_stdio_mcp_for_channel_capability_detailed(server_name, server, timeout=timeout)["capable"]
 
 
 def detect_channel_capable_mcp_servers(
@@ -9859,7 +9936,7 @@ def _probe_mcp_servers_to_records(
     cwd: Path,
     *,
     include_router_self: bool = True,
-    timeout_per_server: float = 3.0,
+    timeout_per_server: float | None = None,
 ) -> list[dict[str, Any]]:
     """Probe every MCP server referenced from the given config paths and
     return one record per server (capable and non-capable alike) for cache
@@ -9888,6 +9965,8 @@ def _probe_mcp_servers_to_records(
                 "transport": transport,
                 "source_path": str(path),
                 "response_bytes": 0,
+                "response_received": False,
+                "elapsed_ms": 0,
                 "reason": "",
             }
             if isinstance(server.get("url"), str):
@@ -9897,10 +9976,14 @@ def _probe_mcp_servers_to_records(
                 records.append(record)
                 continue
             try:
-                capable = probe_stdio_mcp_for_channel_capability(name, server, timeout=timeout_per_server)
-                record["capable"] = bool(capable)
-                if not capable:
-                    record["reason"] = "no_experimental_claude_channel_or_timeout"
+                detail = probe_stdio_mcp_for_channel_capability_detailed(
+                    name, server, timeout=timeout_per_server
+                )
+                record["capable"] = bool(detail.get("capable"))
+                record["reason"] = str(detail.get("reason") or "")
+                record["response_bytes"] = int(detail.get("response_bytes") or 0)
+                record["response_received"] = bool(detail.get("response_received"))
+                record["elapsed_ms"] = int(detail.get("elapsed_ms") or 0)
             except Exception as exc:
                 record["reason"] = f"probe_exception:{type(exc).__name__}"
                 router_log("WARN", f"channel_probe_exception server={name} error={type(exc).__name__}: {exc}")
@@ -9940,7 +10023,7 @@ def refresh_channel_probe_cache(
     passthrough: list[str] | None = None,
     cwd: Path | None = None,
     home: Path | None = None,
-    timeout_per_server: float = 3.0,
+    timeout_per_server: float | None = None,
 ) -> dict[str, Any]:
     """Re-scan known MCP config files, probe each stdio entry for the
     channel capability, write the result to disk and return it. Only called
@@ -10247,7 +10330,8 @@ def cmd_channels(args: argparse.Namespace) -> None:
         non_capable = [r for r in servers if not r.get("capable")]
         probed_at = result.get("probed_at") or 0
         ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(probed_at)) if probed_at else "-"
-        print(f"channel probe complete (cached at {ts_str})")
+        timeout_s = channel_probe_default_timeout()
+        print(f"channel probe complete (cached at {ts_str}, timeout {timeout_s:.1f}s per server)")
         print(f"  capable     : {len(capable)}")
         for r in capable:
             transport = r.get("transport") or "?"
@@ -10255,10 +10339,23 @@ def cmd_channels(args: argparse.Namespace) -> None:
             suffix = " built-in" if source == "<built-in>" else f" {source}"
             print(f"    * {r.get('name')} ({transport}){suffix}")
         print(f"  non-capable : {len(non_capable)}")
+        timeout_seen = False
         for r in non_capable:
             transport = r.get("transport") or "?"
             reason = r.get("reason") or "-"
-            print(f"      {r.get('name')} ({transport}) reason={reason}")
+            elapsed = r.get("elapsed_ms")
+            bytes_seen = r.get("response_bytes")
+            extra = []
+            if isinstance(elapsed, int) and elapsed:
+                extra.append(f"elapsed={elapsed}ms")
+            if isinstance(bytes_seen, int) and bytes_seen:
+                extra.append(f"bytes={bytes_seen}")
+            extra_str = (" " + " ".join(extra)) if extra else ""
+            print(f"      {r.get('name')} ({transport}) reason={reason}{extra_str}")
+            if reason == "timeout":
+                timeout_seen = True
+        if timeout_seen:
+            print("  hint: some servers timed out; increase CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS if cold start is the cause.")
         return
     if head in ("delivery", "mode"):
         if len(values) < 2:
