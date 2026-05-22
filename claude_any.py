@@ -9610,6 +9610,217 @@ def channel_probe_default_timeout() -> float:
 CHANNEL_PROBE_STDERR_CAP_BYTES = 4096
 CHANNEL_PROBE_STDOUT_PREVIEW_BYTES = 200
 CHANNEL_PROBE_STDERR_PREVIEW_CHARS = 500
+CHANNEL_PROBE_SSE_OPEN_TIMEOUT_SECONDS = 5.0
+CHANNEL_PROBE_SSE_INIT_POST_TIMEOUT_SECONDS = 5.0
+
+
+def _decode_sse_events(buf: bytearray) -> tuple[list[tuple[str, str]], bytearray]:
+    """Drain complete SSE events from buf. Each event is (event_name, data).
+    Multi-line `data:` fields are joined with '\\n'. Returns the parsed
+    events and the leftover (incomplete) buffer."""
+    events: list[tuple[str, str]] = []
+    text = bytes(buf).decode("utf-8", errors="replace")
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    while True:
+        sep = text.find("\n\n")
+        if sep < 0:
+            break
+        event_text = text[:sep]
+        text = text[sep + 2:]
+        event_name = "message"
+        data_lines: list[str] = []
+        for line in event_text.split("\n"):
+            if not line or line.startswith(":"):
+                continue
+            if line.startswith("event:"):
+                event_name = line[len("event:"):].lstrip()
+            elif line.startswith("data:"):
+                payload = line[len("data:"):]
+                if payload.startswith(" "):
+                    payload = payload[1:]
+                data_lines.append(payload)
+        events.append((event_name, "\n".join(data_lines)))
+    return events, bytearray(text.encode("utf-8"))
+
+
+def probe_sse_mcp_for_channel_capability_detailed(
+    server_name: str,
+    server: dict[str, Any],
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Probe an SSE-typed MCP server with an MCP `initialize` round-trip.
+
+    MCP SSE transport: GET the server URL with `Accept: text/event-stream`.
+    The server emits an `event: endpoint` whose `data:` is the URL to POST
+    JSON-RPC requests to. POST initialize to that endpoint, then continue
+    reading the SSE stream until the matching response arrives.
+    """
+    started = time.time()
+    url = str(server.get("url") or "").strip()
+    if not url:
+        return {
+            "capable": False,
+            "reason": "no_url",
+            "response_bytes": 0,
+            "response_received": False,
+            "elapsed_ms": 0,
+            "exit_code": None,
+            "stderr_bytes": 0,
+            "stderr_preview": "",
+            "stdout_preview": "",
+        }
+    effective_timeout = timeout if timeout is not None else channel_probe_default_timeout()
+    open_timeout = min(CHANNEL_PROBE_SSE_OPEN_TIMEOUT_SECONDS, effective_timeout)
+
+    request_headers: dict[str, str] = {"Accept": "text/event-stream", "Cache-Control": "no-cache"}
+    custom_headers = server.get("headers")
+    if isinstance(custom_headers, dict):
+        for key, value in custom_headers.items():
+            if key and value is not None:
+                request_headers[str(key)] = str(value)
+
+    try:
+        get_req = urllib.request.Request(url, headers=request_headers, method="GET")
+        sse_resp = urllib.request.urlopen(get_req, timeout=open_timeout)
+    except Exception as exc:
+        return {
+            "capable": False,
+            "reason": f"sse_open_failed:{type(exc).__name__}",
+            "response_bytes": 0,
+            "response_received": False,
+            "elapsed_ms": int((time.time() - started) * 1000),
+            "exit_code": None,
+            "stderr_bytes": 0,
+            "stderr_preview": str(exc)[:CHANNEL_PROBE_STDERR_PREVIEW_CHARS],
+            "stdout_preview": "",
+        }
+
+    chunks_q: queue.Queue[bytes | None] = queue.Queue()
+
+    def _sse_reader() -> None:
+        try:
+            while True:
+                chunk = sse_resp.read(4096)
+                if not chunk:
+                    break
+                chunks_q.put(chunk)
+        except Exception:
+            pass
+        finally:
+            chunks_q.put(None)
+
+    threading.Thread(target=_sse_reader, daemon=True, name=f"channel-probe-sse-{server_name}").start()
+
+    deadline = time.time() + effective_timeout
+    sse_buf = bytearray()
+    bytes_seen = 0
+    endpoint_url: str | None = None
+    init_posted = False
+    init_post_error: str | None = None
+    capable = False
+    response_received = False
+    response_data_preview = ""
+
+    post_headers = {"Content-Type": "application/json"}
+    for key, value in request_headers.items():
+        if key.lower() not in ("accept", "cache-control"):
+            post_headers[key] = value
+
+    try:
+        while time.time() < deadline:
+            wait = min(0.2, max(0.001, deadline - time.time()))
+            try:
+                chunk = chunks_q.get(timeout=wait)
+            except queue.Empty:
+                continue
+            if chunk is None:
+                break
+            sse_buf.extend(chunk)
+            bytes_seen += len(chunk)
+            events, sse_buf = _decode_sse_events(sse_buf)
+            for event_name, data_text in events:
+                if not init_posted and event_name == "endpoint":
+                    target = data_text.strip()
+                    if not target:
+                        continue
+                    endpoint_url = urllib.parse.urljoin(url, target)
+                    init_body = _channel_probe_initialize_payload()
+                    try:
+                        post_req = urllib.request.Request(
+                            endpoint_url,
+                            data=init_body,
+                            headers=post_headers,
+                            method="POST",
+                        )
+                        with urllib.request.urlopen(
+                            post_req,
+                            timeout=min(CHANNEL_PROBE_SSE_INIT_POST_TIMEOUT_SECONDS, max(1.0, deadline - time.time())),
+                        ) as post_resp:
+                            post_resp.read()
+                        init_posted = True
+                    except Exception as exc:
+                        init_post_error = f"{type(exc).__name__}: {exc}"
+                        break
+                    continue
+                if not init_posted or not data_text:
+                    continue
+                try:
+                    msg = json.loads(data_text)
+                except Exception:
+                    continue
+                if not isinstance(msg, dict):
+                    continue
+                if msg.get("id") == 1 and "result" in msg:
+                    response_received = True
+                    capable = _channel_probe_capability_present(msg)
+                    response_data_preview = _decode_preview(
+                        data_text.encode("utf-8"), CHANNEL_PROBE_STDOUT_PREVIEW_BYTES
+                    )
+                    break
+            if response_received or init_post_error:
+                break
+    finally:
+        try:
+            sse_resp.close()
+        except Exception:
+            pass
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    if capable:
+        reason = "capable"
+    elif response_received:
+        reason = "no_experimental_claude_channel"
+    elif init_post_error:
+        reason = f"sse_init_post_failed:{init_post_error.split(':', 1)[0]}"
+    elif init_posted:
+        reason = "timeout_waiting_for_initialize_response"
+    elif endpoint_url:
+        reason = "timeout_after_endpoint_event"
+    else:
+        reason = "timeout_no_endpoint_event"
+
+    stderr_preview = init_post_error[:CHANNEL_PROBE_STDERR_PREVIEW_CHARS] if init_post_error else ""
+    stdout_preview = response_data_preview if (response_data_preview and not capable) else ""
+
+    router_log(
+        "INFO",
+        "channel_probe_result server=%s channel_capable=%s reason=%s transport=sse url=%s bytes=%d elapsed_ms=%d timeout_s=%.1f"
+        % (server_name, capable, reason, url, bytes_seen, elapsed_ms, effective_timeout),
+    )
+    if stderr_preview:
+        router_log("INFO", f"channel_probe_sse_error server={server_name} preview={stderr_preview!r}")
+
+    return {
+        "capable": capable,
+        "reason": reason,
+        "response_bytes": bytes_seen,
+        "response_received": response_received,
+        "elapsed_ms": elapsed_ms,
+        "exit_code": None,
+        "stderr_bytes": len(stderr_preview),
+        "stderr_preview": stderr_preview,
+        "stdout_preview": stdout_preview,
+    }
 
 
 def _decode_preview(buf: bytes | bytearray, limit_chars: int) -> str:
@@ -10058,14 +10269,17 @@ def _probe_mcp_servers_to_records(
             }
             if isinstance(server.get("url"), str):
                 record["url"] = str(server.get("url"))
-            if not _mcp_server_is_stdio(server):
-                record["reason"] = "non_stdio_probe_not_implemented"
+            probe_fn: Callable[..., dict[str, Any]] | None = None
+            if _mcp_server_is_stdio(server):
+                probe_fn = probe_stdio_mcp_for_channel_capability_detailed
+            elif transport == "sse" and isinstance(server.get("url"), str):
+                probe_fn = probe_sse_mcp_for_channel_capability_detailed
+            else:
+                record["reason"] = "transport_not_probed"
                 records.append(record)
                 continue
             try:
-                detail = probe_stdio_mcp_for_channel_capability_detailed(
-                    name, server, timeout=timeout_per_server
-                )
+                detail = probe_fn(name, server, timeout=timeout_per_server)
                 record["capable"] = bool(detail.get("capable"))
                 record["reason"] = str(detail.get("reason") or "")
                 record["response_bytes"] = int(detail.get("response_bytes") or 0)

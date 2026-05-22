@@ -67,18 +67,6 @@ cd claude-any
 claude-any
 ```
 
-### Building a channel-capable MCP server
-
-If you maintain an MCP server and want it to show up as a Claude Code
-channel, the only thing you need to do is follow Anthropic's official
-[Channels reference](https://code.claude.com/docs/en/channels-reference).
-claude-any imposes no extra requirements on top of that contract.
-
-[docs/mcp-channel-server-guide.md](mcp-channel-server-guide.md) is a
-short pointer to the official spec plus optional notes on how to read
-claude-any's pre-launch diagnostics if a user reports your server as
-not channel-capable.
-
 ### Releasing (maintainers)
 
 The `Publish to npm` workflow publishes to the registry on every push to

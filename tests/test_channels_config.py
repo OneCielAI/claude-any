@@ -514,30 +514,44 @@ class ChannelProbeCacheTests(unittest.TestCase):
                 }),
                 encoding="utf-8",
             )
-            with mock.patch.object(
-                claude_any,
-                "probe_stdio_mcp_for_channel_capability_detailed",
-                return_value={
-                    "capable": True,
-                    "reason": "capable",
-                    "response_bytes": 256,
-                    "response_received": True,
-                    "elapsed_ms": 800,
-                },
-            ) as probe:
+            with (
+                mock.patch.object(
+                    claude_any,
+                    "probe_stdio_mcp_for_channel_capability_detailed",
+                    return_value={
+                        "capable": True,
+                        "reason": "capable",
+                        "response_bytes": 256,
+                        "response_received": True,
+                        "elapsed_ms": 800,
+                    },
+                ) as stdio_probe,
+                mock.patch.object(
+                    claude_any,
+                    "probe_sse_mcp_for_channel_capability_detailed",
+                    return_value={
+                        "capable": True,
+                        "reason": "capable",
+                        "response_bytes": 512,
+                        "response_received": True,
+                        "elapsed_ms": 400,
+                    },
+                ) as sse_probe,
+            ):
                 records = claude_any._probe_mcp_servers_to_records([str(mcp_config)], root)
         names = {r["name"] for r in records}
         self.assertIn("claude-any-router", names)
         self.assertIn("ai-net", names)
         self.assertIn("sse-only", names)
-        # Only the stdio (non-router) server should be probed.
-        self.assertEqual(1, probe.call_count)
+        # Non-router stdio server is probed via stdio, sse-only via SSE.
+        self.assertEqual(1, stdio_probe.call_count)
+        self.assertEqual(1, sse_probe.call_count)
         ai_net_record = next(r for r in records if r["name"] == "ai-net")
         self.assertTrue(ai_net_record["capable"])
         self.assertEqual("capable", ai_net_record["reason"])
         sse_record = next(r for r in records if r["name"] == "sse-only")
-        self.assertFalse(sse_record["capable"])
-        self.assertEqual("non_stdio_probe_not_implemented", sse_record["reason"])
+        self.assertTrue(sse_record["capable"])
+        self.assertEqual("capable", sse_record["reason"])
 
     def test_refresh_writes_cache_with_capable_server(self):
         with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
@@ -672,6 +686,167 @@ class ChannelProbeDetailedReasonTests(unittest.TestCase):
         self.assertEqual("timeout", slow["reason"])
         self.assertEqual(15000, slow["elapsed_ms"])
         self.assertFalse(slow["response_received"])
+
+
+class _FakeSSEResponse:
+    """Imitates the file-like object urlopen returns for SSE GETs."""
+
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = list(chunks)
+        self._closed = False
+
+    def read(self, _n: int = -1) -> bytes:
+        if self._closed:
+            return b""
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+    def close(self) -> None:
+        self._closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+
+class _FakePostResponse:
+    def read(self) -> bytes:
+        return b""
+
+    def close(self) -> None:
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        self.close()
+
+
+class ChannelProbeSSETests(unittest.TestCase):
+    def test_sse_event_parser_splits_messages_and_endpoint(self):
+        events, leftover = claude_any._decode_sse_events(
+            bytearray(
+                b"event: endpoint\r\ndata: /messages?session=abc\r\n\r\n"
+                b"data: {\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n\n"
+                b"data: incomplete"
+            )
+        )
+        self.assertEqual(("endpoint", "/messages?session=abc"), events[0])
+        self.assertEqual("message", events[1][0])
+        self.assertIn("jsonrpc", events[1][1])
+        # Trailing partial event stays in the buffer.
+        self.assertIn(b"incomplete", bytes(leftover))
+
+    def _build_sse_capable_response(self) -> _FakeSSEResponse:
+        init_response = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"experimental": {"claude/channel": {}}},
+                "serverInfo": {"name": "fake", "version": "0.0.1"},
+            },
+        })
+        return _FakeSSEResponse([
+            b"event: endpoint\ndata: /messages?session=xyz\n\n",
+            f"data: {init_response}\n\n".encode("utf-8"),
+        ])
+
+    def _build_sse_no_capability_response(self) -> _FakeSSEResponse:
+        init_response = json.dumps({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "serverInfo": {"name": "fake", "version": "0.0.1"},
+            },
+        })
+        return _FakeSSEResponse([
+            b"event: endpoint\ndata: /messages?session=xyz\n\n",
+            f"data: {init_response}\n\n".encode("utf-8"),
+        ])
+
+    def test_sse_probe_reports_capable(self):
+        get_resp = self._build_sse_capable_response()
+        post_resp = _FakePostResponse()
+
+        def fake_urlopen(req, timeout=None):
+            method = getattr(req, "get_method", lambda: "GET")()
+            return get_resp if method == "GET" else post_resp
+
+        with mock.patch.object(claude_any.urllib.request, "urlopen", side_effect=fake_urlopen):
+            detail = claude_any.probe_sse_mcp_for_channel_capability_detailed(
+                "fake-sse",
+                {"type": "sse", "url": "http://example.test/sse"},
+                timeout=3.0,
+            )
+        self.assertTrue(detail["capable"])
+        self.assertEqual("capable", detail["reason"])
+        self.assertTrue(detail["response_received"])
+
+    def test_sse_probe_reports_no_capability_when_absent(self):
+        get_resp = self._build_sse_no_capability_response()
+        post_resp = _FakePostResponse()
+
+        def fake_urlopen(req, timeout=None):
+            method = getattr(req, "get_method", lambda: "GET")()
+            return get_resp if method == "GET" else post_resp
+
+        with mock.patch.object(claude_any.urllib.request, "urlopen", side_effect=fake_urlopen):
+            detail = claude_any.probe_sse_mcp_for_channel_capability_detailed(
+                "fake-sse",
+                {"type": "sse", "url": "http://example.test/sse"},
+                timeout=3.0,
+            )
+        self.assertFalse(detail["capable"])
+        self.assertEqual("no_experimental_claude_channel", detail["reason"])
+
+    def test_sse_probe_times_out_when_no_endpoint_event(self):
+        # SSE stream that emits a heartbeat comment but never an endpoint event.
+        get_resp = _FakeSSEResponse([b": heartbeat\n\n"])
+
+        def fake_urlopen(req, timeout=None):
+            method = getattr(req, "get_method", lambda: "GET")()
+            if method == "GET":
+                return get_resp
+            return _FakePostResponse()
+
+        with mock.patch.object(claude_any.urllib.request, "urlopen", side_effect=fake_urlopen):
+            detail = claude_any.probe_sse_mcp_for_channel_capability_detailed(
+                "fake-sse",
+                {"type": "sse", "url": "http://example.test/sse"},
+                timeout=0.3,
+            )
+        self.assertFalse(detail["capable"])
+        self.assertEqual("timeout_no_endpoint_event", detail["reason"])
+
+    def test_sse_probe_handles_open_failure(self):
+        def fake_urlopen(req, timeout=None):
+            raise __import__("urllib").error.URLError("connection refused")
+
+        with mock.patch.object(claude_any.urllib.request, "urlopen", side_effect=fake_urlopen):
+            detail = claude_any.probe_sse_mcp_for_channel_capability_detailed(
+                "fake-sse",
+                {"type": "sse", "url": "http://example.test/sse"},
+                timeout=2.0,
+            )
+        self.assertFalse(detail["capable"])
+        self.assertTrue(detail["reason"].startswith("sse_open_failed:"))
+        self.assertIn("connection refused", detail["stderr_preview"])
+
+    def test_sse_probe_handles_no_url(self):
+        detail = claude_any.probe_sse_mcp_for_channel_capability_detailed(
+            "fake-sse",
+            {"type": "sse"},
+            timeout=2.0,
+        )
+        self.assertFalse(detail["capable"])
+        self.assertEqual("no_url", detail["reason"])
 
 
 if __name__ == "__main__":
