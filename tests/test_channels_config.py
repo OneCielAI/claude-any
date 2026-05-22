@@ -375,5 +375,201 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertFalse(cfg["claude_code"]["development_channels"])
 
 
+class PassthroughChannelImportTests(unittest.TestCase):
+    def test_parse_extracts_channels_and_dangerously_loaded_specs(self):
+        specs = claude_any.parse_passthrough_channel_specs([
+            "--channels",
+            "server:ai-net",
+            "plugin:fakechat@claude-plugins-official",
+            "-p",
+            "hi",
+            "--dangerously-load-development-channels",
+            "server:other",
+        ])
+        self.assertEqual(
+            [
+                "server:ai-net",
+                "plugin:fakechat@claude-plugins-official",
+                "server:other",
+            ],
+            specs,
+        )
+
+    def test_parse_extracts_inline_equals_form(self):
+        specs = claude_any.parse_passthrough_channel_specs([
+            "--channels=server:ai-net",
+            "--dangerously-load-development-channels=plugin:telegram@claude-plugins-official",
+        ])
+        self.assertEqual(
+            ["server:ai-net", "plugin:telegram@claude-plugins-official"],
+            specs,
+        )
+
+    def test_parse_skips_unrelated_args(self):
+        self.assertEqual([], claude_any.parse_passthrough_channel_specs(["-p", "hi", "--model", "x"]))
+
+    def test_parse_ignores_untagged_values(self):
+        # A bare token after --channels that does not look like a channel spec
+        # must not be misinterpreted as a spec.
+        specs = claude_any.parse_passthrough_channel_specs(["--channels", "just-a-word"])
+        self.assertEqual([], specs)
+
+    def test_auto_import_adds_new_specs(self):
+        cfg = {"claude_code": {"channels": []}, "providers": {}}
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config") as save,
+            mock.patch.object(claude_any, "invalidate_config_cache"),
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            added = claude_any.auto_import_passthrough_channels(["--channels", "server:ai-net"])
+        self.assertEqual(["server:ai-net"], added)
+        self.assertEqual(["server:ai-net"], cfg["claude_code"]["channels"])
+        save.assert_called_once()
+
+    def test_auto_import_skips_already_present_specs(self):
+        cfg = {"claude_code": {"channels": ["server:ai-net"]}, "providers": {}}
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config") as save,
+            mock.patch.object(claude_any, "invalidate_config_cache"),
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            added = claude_any.auto_import_passthrough_channels(["--channels", "server:ai-net"])
+        self.assertEqual([], added)
+        save.assert_not_called()
+
+    def test_auto_import_noop_for_empty_passthrough(self):
+        with (
+            mock.patch.object(claude_any, "load_config") as load,
+            mock.patch.object(claude_any, "save_config") as save,
+        ):
+            self.assertEqual([], claude_any.auto_import_passthrough_channels([]))
+        load.assert_not_called()
+        save.assert_not_called()
+
+
+class ChannelProbeCacheTests(unittest.TestCase):
+    def _isolate_cache(self, stack, td):
+        root = Path(td)
+        stack.enter_context(mock.patch.object(claude_any, "CONFIG_DIR", root))
+        stack.enter_context(mock.patch.object(claude_any, "CHANNEL_PROBE_CACHE_PATH", root / "channel-probe-cache.json"))
+        stack.enter_context(mock.patch.object(claude_any, "router_log"))
+        return root
+
+    def test_cache_read_returns_empty_when_missing(self):
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            self._isolate_cache(stack, td)
+            data = claude_any.read_channel_probe_cache()
+        self.assertEqual([], data["servers"])
+        self.assertEqual(0.0, data["probed_at"])
+
+    def test_cache_round_trip(self):
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            root = self._isolate_cache(stack, td)
+            cache = {
+                "version": 1,
+                "probed_at": 1700000000.0,
+                "servers": [
+                    {"name": "ai-net", "capable": True, "transport": "stdio", "source_path": str(root / ".mcp.json")},
+                ],
+            }
+            claude_any._write_channel_probe_cache(cache)
+            data = claude_any.read_channel_probe_cache()
+        self.assertEqual(1700000000.0, data["probed_at"])
+        self.assertEqual("ai-net", data["servers"][0]["name"])
+
+    def test_cached_capable_names_always_includes_router_self(self):
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            self._isolate_cache(stack, td)
+            # Empty cache → only built-in router.
+            self.assertEqual(["claude-any-router"], claude_any.cached_channel_capable_server_names())
+
+    def test_cached_capable_names_returns_capable_plus_router(self):
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            self._isolate_cache(stack, td)
+            claude_any._write_channel_probe_cache({
+                "version": 1,
+                "probed_at": 1700000000.0,
+                "servers": [
+                    {"name": "ai-net", "capable": True, "transport": "stdio"},
+                    {"name": "boring", "capable": False, "transport": "stdio"},
+                ],
+            })
+            names = claude_any.cached_channel_capable_server_names()
+        self.assertIn("claude-any-router", names)
+        self.assertIn("ai-net", names)
+        self.assertNotIn("boring", names)
+
+    def test_probe_records_include_router_self_and_skip_recursion(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp_config = root / ".mcp.json"
+            mcp_config.write_text(
+                json.dumps({
+                    "mcpServers": {
+                        "ai-net": {"command": "node", "args": ["server.js"]},
+                        "sse-only": {"type": "sse", "url": "http://example.test/sse"},
+                    }
+                }),
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "probe_stdio_mcp_for_channel_capability", return_value=True) as probe:
+                records = claude_any._probe_mcp_servers_to_records([str(mcp_config)], root)
+        names = {r["name"] for r in records}
+        self.assertIn("claude-any-router", names)
+        self.assertIn("ai-net", names)
+        self.assertIn("sse-only", names)
+        # Only the stdio (non-router) server should be probed.
+        self.assertEqual(1, probe.call_count)
+        ai_net_record = next(r for r in records if r["name"] == "ai-net")
+        self.assertTrue(ai_net_record["capable"])
+        sse_record = next(r for r in records if r["name"] == "sse-only")
+        self.assertFalse(sse_record["capable"])
+        self.assertEqual("non_stdio_probe_not_implemented", sse_record["reason"])
+
+    def test_refresh_writes_cache_with_capable_server(self):
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            root = self._isolate_cache(stack, td)
+            project = root / "work"
+            project.mkdir()
+            mcp_config = project / ".mcp.json"
+            mcp_config.write_text(
+                json.dumps({"mcpServers": {"ai-net": {"command": "node", "args": ["server.js"]}}}),
+                encoding="utf-8",
+            )
+            stack.enter_context(mock.patch.object(claude_any, "probe_stdio_mcp_for_channel_capability", return_value=True))
+            result = claude_any.refresh_channel_probe_cache(cwd=project, home=root)
+        self.assertGreater(result["probed_at"], 0)
+        names = {r["name"] for r in result["servers"]}
+        self.assertIn("claude-any-router", names)
+        self.assertIn("ai-net", names)
+
+    def test_panel_rows_show_auto_detected_section(self):
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            self._isolate_cache(stack, td)
+            claude_any._write_channel_probe_cache({
+                "version": 1,
+                "probed_at": 1700000000.0,
+                "servers": [
+                    {"name": "ai-net", "capable": True, "transport": "stdio"},
+                    {"name": "boring", "capable": False, "transport": "stdio", "reason": "no_experimental_claude_channel_or_timeout"},
+                ],
+            })
+            cfg = {"claude_code": {"channels": ["server:ai-net"]}}
+            rows, values = claude_any.channel_panel_rows(cfg)
+        self.assertIn("[Auto-detected channel-capable]", rows)
+        self.assertIn("[Detected but not channel-capable]", rows)
+        # ai-net should appear as a selected spec (* mark).
+        self.assertTrue(any("server:ai-net" == v for v in values))
+        ai_row = rows[values.index("server:ai-net")]
+        self.assertTrue(ai_row.startswith("*"))
+        # Headings and noop placeholders must not be selectable on Enter.
+        first_selectable = claude_any._channel_panel_first_selectable(values)
+        self.assertNotIn(values[first_selectable], ("__heading__", "__noop__"))
+        # The Re-probe action must be present.
+        self.assertIn("__reprobe__", values)
+
+
 if __name__ == "__main__":
     unittest.main()

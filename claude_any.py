@@ -60,6 +60,7 @@ WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
 CHANNEL_MCP_CURSOR_PATH = CONFIG_DIR / "channel-mcp-cursor.json"
+CHANNEL_PROBE_CACHE_PATH = CONFIG_DIR / "channel-probe-cache.json"
 MCP_PROXY_CONFIG = CONFIG_DIR / "mcp-proxy.json"
 ROUTER_HOST = os.environ.get("CLAUDE_ANY_ROUTER_CLIENT_HOST", "127.0.0.1").strip() or "127.0.0.1"
 ROUTER_PORT = 8799
@@ -106,7 +107,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.97"
+VERSION = "0.1.98"
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -1061,6 +1062,7 @@ UI_TEXT = {
         "test": "Test compatibility",
         "options": "LLM options",
         "channel_delivery": "Channel delivery",
+        "channels": "Channels",
         "log_level": "Log level",
         "presets": "LLM presets",
         "context_setup": "Context setup",
@@ -1083,6 +1085,7 @@ UI_TEXT = {
         "test": "호환성 테스트",
         "options": "LLM 옵션",
         "channel_delivery": "채널 전달 방식",
+        "channels": "채널",
         "log_level": "로그 레벨",
         "presets": "LLM 프리셋",
         "context_setup": "컨텍스트 설정",
@@ -1105,6 +1108,7 @@ UI_TEXT = {
         "test": "互換性テスト",
         "options": "LLMオプション",
         "channel_delivery": "チャンネル配信方式",
+        "channels": "チャンネル",
         "log_level": "ログレベル",
         "presets": "LLMプリセット",
         "context_setup": "コンテキスト設定",
@@ -1127,6 +1131,7 @@ UI_TEXT = {
         "test": "兼容性测试",
         "options": "LLM 选项",
         "channel_delivery": "频道投递方式",
+        "channels": "频道",
         "log_level": "日志级别",
         "presets": "LLM 预设",
         "context_setup": "上下文设置",
@@ -9821,6 +9826,215 @@ def auto_discovered_mcp_channel_specs(
     return _dedupe_strings(specs)
 
 
+CHANNEL_PROBE_CACHE_VERSION = 1
+
+
+def _builtin_router_probe_record() -> dict[str, Any]:
+    return {
+        "name": "claude-any-router",
+        "capable": True,
+        "transport": "sse",
+        "source_path": "<built-in>",
+        "url": f"{ROUTER_BASE}/ca/mcp/sse",
+        "response_bytes": 0,
+        "reason": "built-in",
+    }
+
+
+def _server_transport_label(server: dict[str, Any]) -> str:
+    if not isinstance(server, dict):
+        return "unknown"
+    declared = str(server.get("type") or "").strip().lower()
+    if declared:
+        return declared
+    if server.get("url"):
+        return "sse"
+    if server.get("command"):
+        return "stdio"
+    return "unknown"
+
+
+def _probe_mcp_servers_to_records(
+    paths: Iterable[str],
+    cwd: Path,
+    *,
+    include_router_self: bool = True,
+    timeout_per_server: float = 3.0,
+) -> list[dict[str, Any]]:
+    """Probe every MCP server referenced from the given config paths and
+    return one record per server (capable and non-capable alike) for cache
+    consumers and menu rendering."""
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if include_router_self:
+        records.append(_builtin_router_probe_record())
+        seen.add("claude-any-router")
+    for path_str in paths:
+        if not path_str:
+            continue
+        path = Path(path_str)
+        if not path.exists() or not path.is_file():
+            continue
+        for name, server in _read_mcp_servers_from_json(path, cwd):
+            if name in seen:
+                continue
+            seen.add(name)
+            if name == "claude-any-router":
+                continue
+            transport = _server_transport_label(server)
+            record: dict[str, Any] = {
+                "name": name,
+                "capable": False,
+                "transport": transport,
+                "source_path": str(path),
+                "response_bytes": 0,
+                "reason": "",
+            }
+            if isinstance(server.get("url"), str):
+                record["url"] = str(server.get("url"))
+            if not _mcp_server_is_stdio(server):
+                record["reason"] = "non_stdio_probe_not_implemented"
+                records.append(record)
+                continue
+            try:
+                capable = probe_stdio_mcp_for_channel_capability(name, server, timeout=timeout_per_server)
+                record["capable"] = bool(capable)
+                if not capable:
+                    record["reason"] = "no_experimental_claude_channel_or_timeout"
+            except Exception as exc:
+                record["reason"] = f"probe_exception:{type(exc).__name__}"
+                router_log("WARN", f"channel_probe_exception server={name} error={type(exc).__name__}: {exc}")
+            records.append(record)
+    return records
+
+
+def read_channel_probe_cache() -> dict[str, Any]:
+    if not CHANNEL_PROBE_CACHE_PATH.exists():
+        return {"version": CHANNEL_PROBE_CACHE_VERSION, "probed_at": 0.0, "servers": []}
+    try:
+        data = json.loads(CHANNEL_PROBE_CACHE_PATH.read_text(encoding="utf-8"))
+    except Exception as exc:
+        router_log("WARN", f"channel_probe_cache_read_failed error={type(exc).__name__}: {exc}")
+        return {"version": CHANNEL_PROBE_CACHE_VERSION, "probed_at": 0.0, "servers": []}
+    if not isinstance(data, dict):
+        return {"version": CHANNEL_PROBE_CACHE_VERSION, "probed_at": 0.0, "servers": []}
+    data.setdefault("version", CHANNEL_PROBE_CACHE_VERSION)
+    data.setdefault("probed_at", 0.0)
+    servers = data.get("servers")
+    data["servers"] = [item for item in servers if isinstance(item, dict)] if isinstance(servers, list) else []
+    return data
+
+
+def _write_channel_probe_cache(cache: dict[str, Any]) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CHANNEL_PROBE_CACHE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(cache, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    tmp.replace(CHANNEL_PROBE_CACHE_PATH)
+    try:
+        os.chmod(CHANNEL_PROBE_CACHE_PATH, 0o600)
+    except Exception:
+        pass
+
+
+def refresh_channel_probe_cache(
+    passthrough: list[str] | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+    timeout_per_server: float = 3.0,
+) -> dict[str, Any]:
+    """Re-scan known MCP config files, probe each stdio entry for the
+    channel capability, write the result to disk and return it. Only called
+    on explicit user action (menu refresh or CLI subcommand)."""
+    cwd = cwd or Path.cwd()
+    paths = [str(p) for p in claude_mcp_config_paths(passthrough or [], cwd, home)]
+    records = _probe_mcp_servers_to_records(paths, cwd, timeout_per_server=timeout_per_server)
+    cache = {
+        "version": CHANNEL_PROBE_CACHE_VERSION,
+        "probed_at": time.time(),
+        "servers": records,
+    }
+    _write_channel_probe_cache(cache)
+    capable = [r["name"] for r in records if r.get("capable")]
+    router_log(
+        "INFO",
+        f"channel_probe_cache_refreshed total={len(records)} capable={len(capable)} servers={','.join(capable) or '-'}",
+    )
+    return cache
+
+
+def cached_channel_probe_servers() -> list[dict[str, Any]]:
+    cache = read_channel_probe_cache()
+    servers = cache.get("servers")
+    if isinstance(servers, list):
+        return [item for item in servers if isinstance(item, dict)]
+    return []
+
+
+def cached_channel_capable_server_names() -> list[str]:
+    """Capable server names from cache, with claude-any-router always
+    present (because the router's own MCP bridge is built into claude-any)."""
+    names = [str(r.get("name")) for r in cached_channel_probe_servers() if r.get("capable") and r.get("name")]
+    if "claude-any-router" not in names:
+        names.insert(0, "claude-any-router")
+    return _dedupe_strings(names)
+
+
+def parse_passthrough_channel_specs(passthrough: list[str]) -> list[str]:
+    """Extract channel specs from passthrough args of either
+    --channels or --dangerously-load-development-channels (and the
+    =VALUE inline form)."""
+    specs: list[str] = []
+    i = 0
+    while i < len(passthrough):
+        arg = passthrough[i]
+        if arg in ("--channels", "--dangerously-load-development-channels"):
+            i += 1
+            while i < len(passthrough) and is_channel_spec_tagged(passthrough[i]):
+                specs.append(passthrough[i])
+                i += 1
+            continue
+        if arg.startswith("--channels=") or arg.startswith("--dangerously-load-development-channels="):
+            value = arg.split("=", 1)[1].strip()
+            if value and is_channel_spec_tagged(value):
+                specs.append(value)
+            i += 1
+            continue
+        i += 1
+    return _dedupe_strings(specs)
+
+
+def auto_import_passthrough_channels(passthrough: list[str]) -> list[str]:
+    """Add channel specs that arrived as CLI passthrough to the persisted
+    cfg.channels list, so they show up alongside auto-detected entries in
+    the menu and survive subsequent launches. Returns the newly added specs."""
+    specs = parse_passthrough_channel_specs(passthrough)
+    if not specs:
+        return []
+    cfg = load_config()
+    existing = set(channel_specs(cfg))
+    if all(spec in existing for spec in specs):
+        return []
+    cc = cfg.setdefault("claude_code", {})
+    merged = list(channel_specs(cfg))
+    added: list[str] = []
+    for spec in specs:
+        if spec in existing:
+            continue
+        merged.append(spec)
+        existing.add(spec)
+        added.append(spec)
+    if not added:
+        return []
+    cc["channels"] = merged
+    save_config(cfg)
+    invalidate_config_cache()
+    router_log(
+        "INFO",
+        f"channels_auto_imported_from_passthrough count={len(added)} specs={','.join(added)}",
+    )
+    return added
+
+
 def _mcp_sse_servers_from_mapping(mapping: Any) -> list[dict[str, Any]]:
     if not isinstance(mapping, dict):
         return []
@@ -10022,6 +10236,29 @@ def cmd_channels(args: argparse.Namespace) -> None:
     if head in ("clear", "reset"):
         for line in clear_channel_specs():
             print(line)
+        return
+    if head in ("detect", "probe", "refresh"):
+        try:
+            result = refresh_channel_probe_cache()
+        except Exception as exc:
+            raise SystemExit(f"Channel probe failed: {type(exc).__name__}: {exc}")
+        servers = result.get("servers") or []
+        capable = [r for r in servers if r.get("capable")]
+        non_capable = [r for r in servers if not r.get("capable")]
+        probed_at = result.get("probed_at") or 0
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(probed_at)) if probed_at else "-"
+        print(f"channel probe complete (cached at {ts_str})")
+        print(f"  capable     : {len(capable)}")
+        for r in capable:
+            transport = r.get("transport") or "?"
+            source = r.get("source_path") or ""
+            suffix = " built-in" if source == "<built-in>" else f" {source}"
+            print(f"    * {r.get('name')} ({transport}){suffix}")
+        print(f"  non-capable : {len(non_capable)}")
+        for r in non_capable:
+            transport = r.get("transport") or "?"
+            reason = r.get("reason") or "-"
+            print(f"      {r.get('name')} ({transport}) reason={reason}")
         return
     if head in ("delivery", "mode"):
         if len(values) < 2:
@@ -13239,9 +13476,10 @@ def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lan
         f"5. {ui_text('advisor_model', lang)}  [{compact_text(pcfg.get('advisor_model') or 'off', 62)}]",
         f"6. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
         f"7. {ui_text('channel_delivery', lang)}  [{channel_delivery_mode(cfg)}]",
-        f"8. {ui_text('log_level', lang)}  [{log_level_status()}]",
-        f"9. {ui_text('test', lang)}",
-        f"10. {ui_text('launch', lang)}",
+        f"8. {ui_text('channels', lang)}  [{channel_status_text(cfg)}]",
+        f"9. {ui_text('log_level', lang)}  [{log_level_status()}]",
+        f"10. {ui_text('test', lang)}",
+        f"11. {ui_text('launch', lang)}",
         ui_text("quit", lang),
     ]
 
@@ -13338,13 +13576,71 @@ def advisor_model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[
 
 
 def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
-    channels = channel_specs(cfg)
+    channels = set(channel_specs(cfg))
+    cache = read_channel_probe_cache()
+    records = cache.get("servers") or []
+    probed_at = cache.get("probed_at") or 0
+    capable_records = [r for r in records if r.get("capable")]
+    non_capable_records = [r for r in records if not r.get("capable")]
+
     rows: list[str] = []
     values: list[str] = []
-    for name, spec in OFFICIAL_CHANNEL_PLUGINS.items():
+
+    rows.append("[Auto-detected channel-capable]")
+    values.append("__heading__")
+    if capable_records:
+        for r in capable_records:
+            name = str(r.get("name") or "")
+            spec = f"server:{name}"
+            mark = "*" if spec in channels else " "
+            transport = str(r.get("transport") or "?")
+            source = str(r.get("source_path") or "")
+            if source == "<built-in>":
+                rows.append(f"{mark} {name:<14} ({transport}, built-in)")
+            else:
+                rows.append(f"{mark} {name:<14} ({transport})")
+            values.append(spec)
+    else:
+        hint = "press Re-probe now" if not probed_at else "none capable"
+        rows.append(f"  ({hint})")
+        values.append("__noop__")
+
+    if non_capable_records:
+        rows.append("[Detected but not channel-capable]")
+        values.append("__heading__")
+        for r in non_capable_records:
+            name = str(r.get("name") or "")
+            transport = str(r.get("transport") or "?")
+            reason = str(r.get("reason") or "-")
+            rows.append(f"  {name:<14} ({transport}) {reason}")
+            values.append("__noop__")
+
+    rows.append("[Official plugins]")
+    values.append("__heading__")
+    for plugin_name, spec in OFFICIAL_CHANNEL_PLUGINS.items():
         mark = "*" if spec in channels else " "
-        rows.append(f"{mark} {name:<10} {spec}")
+        rows.append(f"{mark} {plugin_name:<10} {spec}")
         values.append(spec)
+
+    covered: set[str] = set(OFFICIAL_CHANNEL_PLUGINS.values())
+    for r in capable_records:
+        covered.add(f"server:{r.get('name')}")
+    custom_specs = [spec for spec in channel_specs(cfg) if spec not in covered]
+    if custom_specs:
+        rows.append("[Configured custom / imported]")
+        values.append("__heading__")
+        for spec in custom_specs:
+            rows.append(f"* {spec}")
+            values.append(spec)
+
+    rows.append("[Actions]")
+    values.append("__heading__")
+    if probed_at:
+        ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(probed_at))
+        rows.append(f"Re-probe now (last: {ts_str})")
+    else:
+        rows.append("Re-probe now (no cache yet)")
+    values.append("__reprobe__")
     rows.append("+ Add custom channel...")
     values.append("__add_custom__")
     if channels:
@@ -13355,6 +13651,25 @@ def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     rows.append("Back")
     values.append("back")
     return rows, values
+
+
+def _channel_panel_first_selectable(values: list[str]) -> int:
+    for idx, value in enumerate(values):
+        if value not in ("__heading__", "__noop__"):
+            return idx
+    return 0
+
+
+def _channel_panel_step(values: list[str], start: int, delta: int) -> int:
+    if not values:
+        return 0
+    n = len(values)
+    idx = start
+    for _ in range(n):
+        idx = (idx + delta) % n
+        if values[idx] not in ("__heading__", "__noop__"):
+            return idx
+    return start
 
 
 def channel_delivery_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
@@ -13668,9 +13983,10 @@ def portable_language_menu() -> int:
     return 0
 
 
-def portable_prelaunch_menu() -> int:
+def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
+    passthrough = list(passthrough or [])
     enable_ansi()
-    main_idx = 10 if settings_ready_except_api_key() else 0
+    main_idx = 11 if settings_ready_except_api_key() else 0
     panel: str | None = None
     panel_idx = 0
     panel_rows: list[str] = []
@@ -13718,6 +14034,8 @@ def portable_prelaunch_menu() -> int:
             panel_rows, panel_values = log_level_panel_rows(cfg)
         elif name == "channels":
             panel_rows, panel_values = channel_panel_rows(cfg)
+            if panel_values:
+                panel_idx = _channel_panel_first_selectable(panel_values)
         elif name == "context":
             panel_rows, panel_values = context_setup_panel_rows(provider, pcfg, cfg.get("language", "en"))
         elif name == "preset":
@@ -13785,11 +14103,17 @@ def portable_prelaunch_menu() -> int:
             if panel:
                 panel_name = panel
                 if key in ("up", "k"):
-                    panel_idx = (panel_idx - 1) % max(1, len(panel_rows))
+                    if panel == "channels":
+                        panel_idx = _channel_panel_step(panel_values, panel_idx, -1)
+                    else:
+                        panel_idx = (panel_idx - 1) % max(1, len(panel_rows))
                     panel_last_idx[panel_name] = panel_idx
                     continue
                 if key in ("down", "j"):
-                    panel_idx = (panel_idx + 1) % max(1, len(panel_rows))
+                    if panel == "channels":
+                        panel_idx = _channel_panel_step(panel_values, panel_idx, 1)
+                    else:
+                        panel_idx = (panel_idx + 1) % max(1, len(panel_rows))
                     panel_last_idx[panel_name] = panel_idx
                     continue
                 if key in ("esc", "left", "q"):
@@ -13894,7 +14218,7 @@ def portable_prelaunch_menu() -> int:
                         messages = lines[-8:] if lines else ["Test produced no output."]
                         panel_rows, panel_values = ["Run compatibility test again", "Back"], ["run", "back"]
                         refresh_checks()
-                        main_idx = 10 if "Compatibility: OK" in out else 4
+                        main_idx = 11 if "Compatibility: OK" in out else 4
                 elif panel == "log-level":
                     if value == "back":
                         close_panel()
@@ -13916,23 +14240,43 @@ def portable_prelaunch_menu() -> int:
                 elif panel == "channels":
                     if value == "back":
                         close_panel()
+                    elif value in ("__heading__", "__noop__"):
+                        continue
+                    elif value == "__reprobe__":
+                        panel_rows, panel_values = ["Re-probing MCP channel capability..."], []
+                        first_render = render_prelaunch_screen(main_idx, panel, 0, panel_rows, checks, messages, first_render)
+                        try:
+                            result = refresh_channel_probe_cache(passthrough)
+                            capable = [r for r in result.get("servers") or [] if r.get("capable")]
+                            messages = [f"Probe complete: {len(capable)} channel-capable server(s)."]
+                        except Exception as exc:
+                            messages = [f"Re-probe failed: {type(exc).__name__}: {exc}"]
+                        cfg = load_config()
+                        panel_rows, panel_values = channel_panel_rows(cfg)
+                        if panel_values:
+                            panel_idx = _channel_panel_first_selectable(panel_values)
                     elif value == "__add_custom__":
                         spec = prompt_menu_value("Channel spec (for example plugin:ainet@local or server:ainet)", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                         if spec:
                             messages = add_channel_spec(spec)
                             cfg = load_config()
                             panel_rows, panel_values = channel_panel_rows(cfg)
+                            if panel_values:
+                                panel_idx = _channel_panel_first_selectable(panel_values)
                     elif value == "__remove__":
                         spec = prompt_menu_value("Channel spec to remove", "", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                         if spec:
                             messages = remove_channel_spec(spec)
                             cfg = load_config()
                             panel_rows, panel_values = channel_panel_rows(cfg)
+                            if panel_values:
+                                panel_idx = _channel_panel_first_selectable(panel_values)
                     elif value == "__clear__":
                         messages = clear_channel_specs()
                         cfg = load_config()
                         panel_rows, panel_values = channel_panel_rows(cfg)
-                        panel_idx = 0
+                        if panel_values:
+                            panel_idx = _channel_panel_first_selectable(panel_values)
                     elif value:
                         if value in channel_specs(cfg):
                             messages = remove_channel_spec(value)
@@ -14049,7 +14393,7 @@ def portable_prelaunch_menu() -> int:
             elif key in ("esc", "q"):
                 return 10
             elif key == "enter":
-                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "channel-delivery", "log-level", "test", "launch", "quit"]
+                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "channel-delivery", "channels", "log-level", "test", "launch", "quit"]
                 action = actions[main_idx]
                 if action == "launch":
                     blockers = launch_readiness_errors()
@@ -14096,14 +14440,16 @@ def run_prelaunch_menu(passthrough: list[str], skip_menu: bool = False, force_me
         rc = run_external_menu("claude-any-menu")
         if rc is not None:
             return rc
-    return portable_prelaunch_menu()
+    return portable_prelaunch_menu(passthrough)
 
 
 def start_router_if_needed() -> None:
     if router_up():
+        router_log("INFO", f"router_check_state running=True spawn=False base={ROUTER_BASE}")
         return
     stop_router_processes(quiet=True)
     if router_up():
+        router_log("INFO", f"router_check_state running=True spawn=False after_stop=True base={ROUTER_BASE}")
         return
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(Path(__file__).resolve()), "serve"]
@@ -14114,11 +14460,13 @@ def start_router_if_needed() -> None:
             kwargs["creationflags"] = flags
     else:
         kwargs["start_new_session"] = True
+    router_log("INFO", f"router_check_state running=False spawn=True base={ROUTER_BASE}")
     with open(LOG_PATH, "ab", buffering=0) as log:
         subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, **kwargs)
     deadline = time.time() + 30
     while time.time() < deadline:
         if router_up():
+            router_log("INFO", f"router_spawned running=True base={ROUTER_BASE} elapsed={time.time()-(deadline-30):.1f}s")
             return
         time.sleep(0.5)
     raise RuntimeError(f"claude-any router did not start. See {LOG_PATH}")
@@ -15344,6 +15692,7 @@ def launch_claude(
         update_check = False
         self_update_check = False
     run_claude_any_update_check(enabled=self_update_check)
+    auto_import_passthrough_channels(passthrough)
     rc = run_prelaunch_menu(passthrough, skip_menu=skip_menu, force_menu=force_menu)
     if rc == 10:
         return 0
@@ -15422,19 +15771,17 @@ def launch_claude(
     if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
         extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
     detected_channel_specs: list[str] = []
-    if native_channel_bridge and mcp_config_paths:
+    if native_channel_bridge:
         try:
-            detected_servers = detect_channel_capable_mcp_servers(
-                mcp_config_paths,
-                Path(os.getcwd()),
-            )
-            detected_channel_specs = [f"server:{name}" for name in detected_servers]
+            capable_names = cached_channel_capable_server_names()
+            detected_channel_specs = [f"server:{name}" for name in capable_names]
+            cache_age = read_channel_probe_cache().get("probed_at") or 0
             router_log(
                 "INFO",
-                f"channel_probe_detected count={len(detected_servers)} servers={','.join(detected_servers) or '-'}",
+                f"channel_probe_loaded source=cache cache_age_ts={int(cache_age)} count={len(capable_names)} servers={','.join(capable_names) or '-'}",
             )
         except Exception as exc:
-            router_log("WARN", f"channel_probe_failed error={type(exc).__name__}: {exc}")
+            router_log("WARN", f"channel_probe_cache_load_failed error={type(exc).__name__}: {exc}")
     extra_args.extend(
         claude_channel_args(
             cfg,
@@ -15452,9 +15799,122 @@ def launch_claude(
         cmd.extend(["--model", model])
     cmd.extend(extra_args)
     cmd.extend(claude_passthrough)
+    _log_claude_command_for_diagnostics(cmd, env)
+    capture_stderr = env_bool(os.environ.get("CLAUDE_ANY_CAPTURE_CC_STDERR"), False)
     if stdin_channel_proxy:
         return subprocess_call_with_channel_wake_proxy(cmd, env)
+    if capture_stderr:
+        return _subprocess_call_capturing_stderr(cmd, env)
     return subprocess.call(cmd, env=env)
+
+
+CLAUDE_CODE_STDERR_LOG = CONFIG_DIR / "claude-code-stderr.log"
+
+
+def _log_claude_command_for_diagnostics(cmd: list[str], env: dict[str, str]) -> None:
+    try:
+        mcp_idx = cmd.index("--mcp-config") if "--mcp-config" in cmd else -1
+        mcp_value = cmd[mcp_idx + 1] if 0 <= mcp_idx < len(cmd) - 1 else "-"
+    except Exception:
+        mcp_value = "-"
+    channel_specs_in_cmd: list[str] = []
+    if "--dangerously-load-development-channels" in cmd:
+        start = cmd.index("--dangerously-load-development-channels") + 1
+        for arg in cmd[start:]:
+            if arg.startswith("--"):
+                break
+            channel_specs_in_cmd.append(arg)
+    router_log(
+        "INFO",
+        "claude_launch_cmd mcp_config=%s channels=%s argv_len=%d"
+        % (
+            mcp_value,
+            ",".join(channel_specs_in_cmd) or "-",
+            len(cmd),
+        ),
+    )
+    relevant_env_keys = (
+        "ANTHROPIC_BASE_URL",
+        "ANTHROPIC_MODEL",
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_ANY_PROVIDER",
+        "CLAUDE_ANY_MODEL_ALIAS",
+        "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+    )
+    env_summary = []
+    for key in relevant_env_keys:
+        if key in env:
+            val = env[key]
+            if "KEY" in key or "TOKEN" in key:
+                val = mask_secret(val)
+            env_summary.append(f"{key}={val}")
+    if env_summary:
+        router_log("INFO", "claude_launch_env " + " ".join(env_summary))
+
+
+def _subprocess_call_capturing_stderr(cmd: list[str], env: dict[str, str]) -> int:
+    """Like subprocess.call but tees Claude Code's stderr into
+    ~/.config/claude-any/claude-code-stderr.log so the user can collect
+    the exact context around messages like
+    `--dangerously-load-development-channels ignored (server:...)`.
+
+    Enabled via CLAUDE_ANY_CAPTURE_CC_STDERR=1."""
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        if CLAUDE_CODE_STDERR_LOG.exists() and CLAUDE_CODE_STDERR_LOG.stat().st_size > 2_000_000:
+            CLAUDE_CODE_STDERR_LOG.replace(CLAUDE_CODE_STDERR_LOG.with_suffix(".log.1"))
+    except Exception:
+        pass
+    try:
+        log_handle = CLAUDE_CODE_STDERR_LOG.open("ab", buffering=0)
+    except Exception as exc:
+        router_log("WARN", f"claude_stderr_capture_open_failed error={type(exc).__name__}: {exc}")
+        return subprocess.call(cmd, env=env)
+    header = f"\n===== claude launch at {time.strftime('%Y-%m-%dT%H:%M:%S')} =====\n".encode("utf-8")
+    try:
+        log_handle.write(header)
+    except Exception:
+        pass
+    try:
+        proc = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE)
+    except Exception as exc:
+        router_log("WARN", f"claude_stderr_capture_spawn_failed error={type(exc).__name__}: {exc}")
+        try:
+            log_handle.close()
+        except Exception:
+            pass
+        return subprocess.call(cmd, env=env)
+
+    def _tee_stderr() -> None:
+        try:
+            if proc.stderr is None:
+                return
+            while True:
+                chunk = proc.stderr.read(4096)
+                if not chunk:
+                    break
+                try:
+                    sys.stderr.buffer.write(chunk)
+                    sys.stderr.buffer.flush()
+                except Exception:
+                    pass
+                try:
+                    log_handle.write(chunk)
+                except Exception:
+                    pass
+        finally:
+            try:
+                log_handle.close()
+            except Exception:
+                pass
+
+    tee_thread = threading.Thread(target=_tee_stderr, daemon=True, name="claude-stderr-tee")
+    tee_thread.start()
+    rc = proc.wait()
+    tee_thread.join(timeout=2.0)
+    router_log("INFO", f"claude_exit code={rc} stderr_log={CLAUDE_CODE_STDERR_LOG}")
+    return rc
 
 
 def cli_usage() -> str:
