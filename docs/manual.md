@@ -69,15 +69,15 @@ claude-any
 
 ### Building a channel-capable MCP server
 
-If you maintain an MCP server and want claude-any to pick it up as a
-channel transport (so Claude Code can route channel notifications
-through it), see [docs/mcp-channel-server-guide.md](mcp-channel-server-guide.md).
+If you maintain an MCP server and want it to show up as a Claude Code
+channel, the only thing you need to do is follow Anthropic's official
+[Channels reference](https://code.claude.com/docs/en/channels-reference).
+claude-any imposes no extra requirements on top of that contract.
 
-In short: use standard MCP `Content-Length`-framed stdio (the official
-SDK's `StdioServerTransport` does this), declare
-`capabilities.experimental['claude/channel']` in your initialize
-response, and emit channel events as `notifications/claude/channel`
-notifications.
+[docs/mcp-channel-server-guide.md](mcp-channel-server-guide.md) is a
+short pointer to the official spec plus optional notes on how to read
+claude-any's pre-launch diagnostics if a user reports your server as
+not channel-capable.
 
 ### Releasing (maintainers)
 

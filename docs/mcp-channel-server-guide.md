@@ -1,223 +1,86 @@
-# Building an MCP Server That Works as a Claude Code Channel
+# Making Your MCP Server Discoverable as a Claude Code Channel
 
-This is a development guide for **MCP server authors** who want their
-server to be discovered by [claude-any](https://www.npmjs.com/package/@oneciel-ai/claude-any)
-and surfaced under `--dangerously-load-development-channels` so Claude
-Code can route channel notifications through it.
+If you want your MCP server to be picked up as a **Claude Code channel**
+— so Claude Code can route inbound messages and external events into a
+running session through your server — there is only one thing to do:
 
-Audience: someone who already runs an MCP server over stdio and wants
-Claude Code to treat it as a channel transport. If you have not built
-an MCP server before, start at <https://modelcontextprotocol.io>.
+> **Follow the official Anthropic Claude Code Channels spec.**
 
-claude-any probes your server with a real MCP `initialize` request, looks
-at the response's `capabilities.experimental['claude/channel']`, and only
-then offers it as a `server:NAME` channel in the pre-launch menu. If your
-server is not picked up, follow this guide to make it conformant; in
-return, claude-any will not need a per-server workaround.
+Authoritative references:
 
-## 1. Use the MCP-standard stdio framing
+- Channels reference (the contract — capability key, notification
+  method, example server, transport):
+  <https://code.claude.com/docs/en/channels-reference>
+- MCP overview (server lifecycle inside Claude Code):
+  <https://code.claude.com/docs/en/mcp>
+- MCP protocol (stdio wire format — Content-Length framing):
+  <https://modelcontextprotocol.io>
+- Official channel implementations (Telegram, Discord, iMessage,
+  fakechat) to copy from:
+  <https://github.com/anthropics/claude-plugins-official/tree/main/external_plugins>
 
-MCP defines stdio transport as **JSON-RPC 2.0 messages prefixed with an
-LSP-style `Content-Length` header**, not bare newline-delimited JSON.
-Every message a server emits and every message it consumes must look
-like:
+claude-any imposes **no extra requirements** on top of that contract.
+If Claude Code accepts your server as a channel, claude-any will too;
+if it doesn't, claude-any can't either. Anything below this line is
+optional debugging info from the claude-any side — it is not a spec.
 
-```
-Content-Length: <byte length of JSON body>\r\n
-\r\n
-<JSON body>
-```
+## Verify against Claude Code directly
 
-Concretely the bytes on the wire for an `initialize` response look like:
-
-```
-Content-Length: 152\r\n
-\r\n
-{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2024-11-05","capabilities":{"experimental":{"claude/channel":{}}},"serverInfo":{"name":"my-server","version":"1.0.0"}}}
-```
-
-If you use the official `@modelcontextprotocol/sdk` `StdioServerTransport`
-class you get this framing for free — do not replace the transport with
-a hand-rolled `process.stdin.on('line', ...)` reader. Bare line-delimited
-JSON ("JSONL") is **not** the MCP stdio wire format and will cause
-clients (including Claude Code and the claude-any probe) to silently
-ignore your responses.
-
-How to tell whether you are speaking framed stdio:
-
-1. Send any message and capture the raw bytes you put on stdout.
-2. The first bytes must be the ASCII letters `Content-Length:`.
-3. The body that follows the `\r\n\r\n` separator must be exactly the
-   number of bytes given in the header (no trailing newline).
-
-If you see your server emitting a line like
-`{"method":"notifications/message","params":{...}}\n` with no
-`Content-Length:` prefix, you are in JSONL mode and need to switch.
-
-## 2. Declare the channel capability in the initialize response
-
-A channel-capable server announces itself during the standard MCP
-handshake by including `claude/channel` under `capabilities.experimental`.
-A minimal response looks like:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "protocolVersion": "2024-11-05",
-    "capabilities": {
-      "experimental": {
-        "claude/channel": {}
-      }
-    },
-    "serverInfo": {
-      "name": "my-server",
-      "version": "1.0.0"
-    }
-  }
-}
-```
-
-Notes:
-
-- The value can be `{}` today. Future revisions may add fields; an empty
-  object is forward-compatible.
-- Omitting `experimental` entirely, or including `experimental` without
-  `claude/channel`, marks your server as not channel-capable. claude-any
-  will list it under "Detected but not channel-capable" in the menu.
-- The probe expects `protocolVersion: "2024-11-05"`. If your server only
-  speaks a newer protocol, the probe accepts whatever the server returns
-  as long as `result` is present and the capability is declared.
-
-## 3. Emit channel notifications using the `notifications/claude/channel` method
-
-When you have a message to deliver into Claude Code, send a JSON-RPC
-**notification** (no `id` field) on stdout with the framed encoding:
-
-```json
-{
-  "jsonrpc": "2.0",
-  "method": "notifications/claude/channel",
-  "params": {
-    "content": "[room_id] sender: text body",
-    "meta": {
-      "channel": "room_id",
-      "sender_id": "sender",
-      "thread_id": "optional",
-      "message_id": "optional"
-    }
-  }
-}
-```
-
-`params.content` is what Claude Code will read; `params.meta` is the
-structured form that claude-any preserves. Both come through to the
-Claude Code session over `/ca/mcp/sse`.
-
-Do **not** use the generic `notifications/message` method for channel
-delivery — that is a different transport-level log channel. claude-any
-will accept `notifications/message` as a fallback for compatibility but
-real channel notifications should be `notifications/claude/channel`.
-
-## 4. How claude-any probes your server
-
-Useful to know so you can reproduce exactly what claude-any does:
-
-1. Spawn your server with the command/args/env you declared in the user's
-   MCP config (e.g. `~/.mcp.json`, `~/.claude/settings.json`, or
-   `~/.claude.json`).
-2. Write a single framed `initialize` request to stdin.
-3. Wait up to **15 seconds** (configurable via the user's
-   `CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS` env var) for a framed
-   response with the same id.
-4. Inspect `result.capabilities.experimental['claude/channel']`. Anything
-   that is not `null` and not `false` counts as capable.
-5. Close stdin and terminate the child.
-
-The probe captures up to 4KB of your stderr; anything you log there will
-end up in the user's `~/.config/claude-any/router.log` under a
-`channel_probe_stderr server=<name>` line, which makes it the right
-place to print fatal startup errors but the wrong place to dump a
-verbose info-level log.
-
-## 5. Diagnosing common failure reasons
-
-When claude-any reports your server as not channel-capable, look at the
-`reason` field on the relevant menu row, or run:
+The canonical end-to-end check, with no claude-any in the picture:
 
 ```sh
-claude-any channels detect
+# Register your server in ~/.claude.json or a project .mcp.json,
+# then start Claude Code with it loaded as a development channel.
+claude --dangerously-load-development-channels server:<your-name>
+
+# Inside the session
+/mcp
 ```
 
-| reason | meaning | typical fix |
+If `/mcp` shows your server as connected and channel notifications you
+emit show up as `<channel source="<your-name>" ...>` blocks in the
+session, you are done.
+
+If Claude Code reports `--dangerously-load-development-channels ignored
+(server:<your-name>)` or `/mcp` shows your server as failed, the
+problem is between your server and Claude Code, not between your server
+and claude-any. The session debug log Claude Code points you at —
+`~/.claude/debug/<session-id>.txt` — contains the stderr trace that
+explains it. Fix it there first.
+
+## Optional: claude-any-side diagnostics
+
+These notes are only useful if a user is running your server through
+claude-any and asks for help interpreting claude-any's pre-launch menu.
+None of these are requirements your server has to satisfy.
+
+When claude-any does its own MCP `initialize` round-trip to decide
+which configured stdio servers should be listed under "Auto-detected
+channel-capable", it can mark your server with one of these reasons.
+Each one maps to a real underlying bug, not to a claude-any quirk:
+
+| claude-any reason | what it usually means about your server | where to look |
 | --- | --- | --- |
 | `capable` | All good. | — |
-| `no_experimental_claude_channel` | Server responded with a valid framed initialize result but `capabilities.experimental['claude/channel']` was missing. | Add the capability to your initialize result. See section 2. |
-| `timeout` | Process is still running but never produced a framed initialize response within the timeout. | Either your startup is genuinely longer than the timeout (rare — users can raise `CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS`), or your transport is JSONL instead of framed. See section 1. |
-| `exited_without_response` | Process died before responding. | Look at the `stderr` preview claude-any logged. Usually a missing env var, missing dependency, or runtime error during init. |
-| `spawn_failed:<exception>` | The OS could not even start your command. | Wrong `command` path, missing executable, missing permissions. |
-| `not_stdio` / `no_command` | The MCP server entry has no `command`, or the user declared it as a non-stdio transport (e.g. `type: "sse"`). | Probing non-stdio servers is not implemented; users can still wire those manually. |
+| `no_experimental_claude_channel` | Your server replied to `initialize` with a valid MCP response, but `result.capabilities.experimental['claude/channel']` was absent. | The Anthropic Channels reference (Server options) explains the exact key. |
+| `timeout` | Either your startup is genuinely long, or your stdio transport is bare newline-delimited JSON instead of MCP's required Content-Length framing — in which case Claude Code itself won't talk to you either. | Confirm you're using the official SDK's `StdioServerTransport` (or another implementation that produces Content-Length headers per the MCP stdio transport spec). |
+| `exited_without_response` | Your server died before responding to `initialize`. | Run your server manually with `echo` piping a Content-Length-framed initialize message, or just check the stderr that claude-any captures and logs. |
+| `spawn_failed:<exc>` | The OS could not start your command at all. | Wrong path, missing executable, missing permissions. |
 
-If you cannot reproduce locally, ask the user to share two log lines:
+The set of failure modes above mirrors what plain Claude Code would
+also experience; claude-any just surfaces it earlier in a menu instead
+of waiting for you to hit `/mcp` in a live session.
 
-```sh
-grep "channel_probe_result server=<your-name>" ~/.config/claude-any/router.log | tail -1
-grep "channel_probe_stderr server=<your-name>" ~/.config/claude-any/router.log | tail -1
-```
+## A note about JSON-RPC notification methods
 
-The first line tells you which reason fired and how many bytes of stdout
-were read; the second includes up to 500 characters of your stderr.
+Claude Code listens for `notifications/claude/channel` specifically — a
+spec-defined method name. Generic `notifications/message` (sometimes
+used informally for "log this somewhere") is **not** the channel
+notification method. If your server emits `notifications/message` for
+inbound chat events, Claude Code will not route them into the session
+as channel content. The Channels reference (Notification format) has
+the exact shape.
 
-## 6. Minimal example (TypeScript, `@modelcontextprotocol/sdk`)
-
-```ts
-import { Server } from "@modelcontextprotocol/sdk/server/index.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-
-const server = new Server(
-  { name: "my-channel-server", version: "1.0.0" },
-  {
-    capabilities: {
-      // The presence of experimental.claude/channel is what claude-any
-      // looks for during the channel probe.
-      experimental: { "claude/channel": {} },
-    },
-  }
-);
-
-// Wherever your server learns about an inbound message it wants to
-// surface inside the Claude Code session:
-async function notifyChannel(content: string, meta: Record<string, unknown> = {}) {
-  await server.notification({
-    method: "notifications/claude/channel",
-    params: { content, meta },
-  });
-}
-
-// StdioServerTransport produces the required Content-Length framing.
-// Do not write to stdout yourself.
-await server.connect(new StdioServerTransport());
-```
-
-If you ship a hand-rolled stdio server in another language, the
-equivalent contract is: write `Content-Length: <N>\r\n\r\n<JSON>` to
-stdout for every message, and read the same shape from stdin.
-
-## 7. Local verification
-
-Once you've adopted the changes above, the fastest end-to-end check is:
-
-```sh
-# Make sure your MCP server is registered in one of the standard places
-# (project .mcp.json, ~/.mcp.json, or ~/.claude.json mcpServers section).
-
-npm i -g @oneciel-ai/claude-any@nightly
-claude-any channels detect
-```
-
-You should see your server name appear under `capable` with no stderr
-preview attached and a non-zero `bytes` value. If you do, claude-any
-will offer it under `[Auto-detected channel-capable]` in the pre-launch
-menu and pass `--dangerously-load-development-channels server:<name>`
-into Claude Code on launch.
+That's it. If you got this far the answer to "what does claude-any
+require of my server?" is: nothing on top of the Anthropic-defined
+spec.
