@@ -67,6 +67,18 @@ cd claude-any
 claude-any
 ```
 
+### Building a channel-capable MCP server
+
+If you maintain an MCP server and want claude-any to pick it up as a
+channel transport (so Claude Code can route channel notifications
+through it), see [docs/mcp-channel-server-guide.md](mcp-channel-server-guide.md).
+
+In short: use standard MCP `Content-Length`-framed stdio (the official
+SDK's `StdioServerTransport` does this), declare
+`capabilities.experimental['claude/channel']` in your initialize
+response, and emit channel events as `notifications/claude/channel`
+notifications.
+
 ### Releasing (maintainers)
 
 The `Publish to npm` workflow publishes to the registry on every push to
