@@ -617,6 +617,36 @@ class ChannelProbeDetailedReasonTests(unittest.TestCase):
         # users testing remote MCP servers complained that 3s was too short.
         self.assertGreaterEqual(claude_any.CHANNEL_PROBE_DEFAULT_TIMEOUT_SECONDS, 10.0)
 
+    def test_records_carry_stderr_preview_when_present(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp_config = root / ".mcp.json"
+            mcp_config.write_text(
+                json.dumps({"mcpServers": {"crashy": {"command": "node", "args": ["server.js"]}}}),
+                encoding="utf-8",
+            )
+            stderr_text = "ReferenceError: AINET_BASE_URL is not defined\n  at server.js:42"
+            with mock.patch.object(
+                claude_any,
+                "probe_stdio_mcp_for_channel_capability_detailed",
+                return_value={
+                    "capable": False,
+                    "reason": "exited_without_response",
+                    "response_bytes": 0,
+                    "response_received": False,
+                    "exit_code": 1,
+                    "stderr_bytes": len(stderr_text),
+                    "stderr_preview": stderr_text,
+                    "stdout_preview": "",
+                    "elapsed_ms": 380,
+                },
+            ):
+                records = claude_any._probe_mcp_servers_to_records([str(mcp_config)], root)
+        crashy = next(r for r in records if r["name"] == "crashy")
+        self.assertEqual("exited_without_response", crashy["reason"])
+        self.assertEqual(1, crashy["exit_code"])
+        self.assertIn("ReferenceError", crashy["stderr_preview"])
+
     def test_records_carry_detailed_reason_from_probe(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

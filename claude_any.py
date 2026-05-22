@@ -9607,6 +9607,20 @@ def channel_probe_default_timeout() -> float:
     return value
 
 
+CHANNEL_PROBE_STDERR_CAP_BYTES = 4096
+CHANNEL_PROBE_STDOUT_PREVIEW_BYTES = 200
+CHANNEL_PROBE_STDERR_PREVIEW_CHARS = 500
+
+
+def _decode_preview(buf: bytes | bytearray, limit_chars: int) -> str:
+    text = bytes(buf).decode("utf-8", errors="replace")
+    text = text.replace("\x00", " ")
+    text = " ".join(text.split())
+    if len(text) > limit_chars:
+        text = text[:limit_chars] + "..."
+    return text
+
+
 def probe_stdio_mcp_for_channel_capability_detailed(
     server_name: str,
     server: dict[str, Any],
@@ -9618,10 +9632,15 @@ def probe_stdio_mcp_for_channel_capability_detailed(
       - capable (bool): True only when the server's initialize response
         carries `capabilities.experimental['claude/channel']`.
       - reason (str): one of 'capable', 'timeout',
-        'no_experimental_claude_channel', 'spawn_failed:<exc>',
-        'no_command', 'not_stdio'.
-      - response_bytes (int): how many bytes of stdout were observed.
+        'exited_without_response', 'no_experimental_claude_channel',
+        'spawn_failed:<exc>', 'no_command', 'not_stdio'.
+      - response_bytes (int): bytes of stdout observed.
       - response_received (bool): whether an initialize response was parsed.
+      - exit_code (int|None): child process exit code if known.
+      - stderr_bytes (int): bytes of stderr captured (capped).
+      - stderr_preview (str): truncated stderr text for non-capable cases.
+      - stdout_preview (str): truncated stdout text when no parseable
+        response was found.
       - elapsed_ms (int): wall time of the probe.
     """
     started = time.time()
@@ -9631,6 +9650,10 @@ def probe_stdio_mcp_for_channel_capability_detailed(
             "reason": "not_stdio",
             "response_bytes": 0,
             "response_received": False,
+            "exit_code": None,
+            "stderr_bytes": 0,
+            "stderr_preview": "",
+            "stdout_preview": "",
             "elapsed_ms": 0,
         }
     command = str(server.get("command") or "").strip()
@@ -9642,6 +9665,10 @@ def probe_stdio_mcp_for_channel_capability_detailed(
             "reason": "no_command",
             "response_bytes": 0,
             "response_received": False,
+            "exit_code": None,
+            "stderr_bytes": 0,
+            "stderr_preview": "",
+            "stdout_preview": "",
             "elapsed_ms": 0,
         }
     command, args = resolve_mcp_server_process(command, args)
@@ -9660,7 +9687,7 @@ def probe_stdio_mcp_for_channel_capability_detailed(
             [command, *args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
             cwd=cwd,
             env=env,
             bufsize=0,
@@ -9673,12 +9700,18 @@ def probe_stdio_mcp_for_channel_capability_detailed(
             "reason": f"spawn_failed:{type(exc).__name__}",
             "response_bytes": 0,
             "response_received": False,
+            "exit_code": None,
+            "stderr_bytes": 0,
+            "stderr_preview": str(exc)[:CHANNEL_PROBE_STDERR_PREVIEW_CHARS],
+            "stdout_preview": "",
             "elapsed_ms": int((time.time() - started) * 1000),
         }
 
-    chunks_queue: queue.Queue[bytes | None] = queue.Queue()
+    stdout_chunks: queue.Queue[bytes | None] = queue.Queue()
+    stderr_buf = bytearray()
+    stderr_lock = threading.Lock()
 
-    def _reader() -> None:
+    def _stdout_reader() -> None:
         try:
             assert proc is not None
             stdout = proc.stdout
@@ -9688,13 +9721,31 @@ def probe_stdio_mcp_for_channel_capability_detailed(
                 chunk = stdout.read(4096)
                 if not chunk:
                     break
-                chunks_queue.put(chunk)
+                stdout_chunks.put(chunk)
         except Exception:
             pass
         finally:
-            chunks_queue.put(None)
+            stdout_chunks.put(None)
 
-    threading.Thread(target=_reader, daemon=True, name=f"channel-probe-stdout-{server_name}").start()
+    def _stderr_reader() -> None:
+        try:
+            assert proc is not None
+            stderr = proc.stderr
+            if stderr is None:
+                return
+            while True:
+                chunk = stderr.read(1024)
+                if not chunk:
+                    break
+                with stderr_lock:
+                    remaining = CHANNEL_PROBE_STDERR_CAP_BYTES - len(stderr_buf)
+                    if remaining > 0:
+                        stderr_buf.extend(chunk[:remaining])
+        except Exception:
+            pass
+
+    threading.Thread(target=_stdout_reader, daemon=True, name=f"channel-probe-stdout-{server_name}").start()
+    threading.Thread(target=_stderr_reader, daemon=True, name=f"channel-probe-stderr-{server_name}").start()
 
     body = _channel_probe_initialize_payload()
     if framed:
@@ -9712,14 +9763,16 @@ def probe_stdio_mcp_for_channel_capability_detailed(
     stdout_buf = bytearray()
     capable = False
     response_received = False
+    eof_seen = False
     try:
         while time.time() < deadline:
             wait = min(0.2, max(0.001, deadline - time.time()))
             try:
-                chunk = chunks_queue.get(timeout=wait)
+                chunk = stdout_chunks.get(timeout=wait)
             except queue.Empty:
                 continue
             if chunk is None:
+                eof_seen = True
                 break
             stdout_buf.extend(chunk)
             response = _channel_probe_find_initialize_response(bytes(stdout_buf), framed)
@@ -9742,23 +9795,53 @@ def probe_stdio_mcp_for_channel_capability_detailed(
             except Exception:
                 pass
 
+    exit_code = proc.returncode if proc else None
     if capable:
         reason = "capable"
     elif response_received:
         reason = "no_experimental_claude_channel"
+    elif eof_seen:
+        reason = "exited_without_response"
     else:
         reason = "timeout"
+
+    with stderr_lock:
+        stderr_bytes = len(stderr_buf)
+        stderr_preview = _decode_preview(stderr_buf, CHANNEL_PROBE_STDERR_PREVIEW_CHARS) if not capable else ""
+    stdout_preview = ""
+    if not capable and not response_received and stdout_buf:
+        stdout_preview = _decode_preview(bytes(stdout_buf)[:CHANNEL_PROBE_STDOUT_PREVIEW_BYTES], CHANNEL_PROBE_STDOUT_PREVIEW_BYTES)
     elapsed_ms = int((time.time() - started) * 1000)
+
     router_log(
         "INFO",
-        "channel_probe_result server=%s channel_capable=%s reason=%s bytes=%d elapsed_ms=%d timeout_s=%.1f"
-        % (server_name, capable, reason, len(stdout_buf), elapsed_ms, effective_timeout),
+        "channel_probe_result server=%s channel_capable=%s reason=%s framed=%s bytes=%d stderr_bytes=%d exit_code=%s elapsed_ms=%d timeout_s=%.1f"
+        % (
+            server_name,
+            capable,
+            reason,
+            framed,
+            len(stdout_buf),
+            stderr_bytes,
+            "None" if exit_code is None else str(exit_code),
+            elapsed_ms,
+            effective_timeout,
+        ),
     )
+    if stderr_preview:
+        router_log("INFO", f"channel_probe_stderr server={server_name} preview={stderr_preview!r}")
+    if stdout_preview:
+        router_log("INFO", f"channel_probe_stdout server={server_name} preview={stdout_preview!r}")
+
     return {
         "capable": capable,
         "reason": reason,
         "response_bytes": len(stdout_buf),
         "response_received": response_received,
+        "exit_code": exit_code,
+        "stderr_bytes": stderr_bytes,
+        "stderr_preview": stderr_preview,
+        "stdout_preview": stdout_preview,
         "elapsed_ms": elapsed_ms,
     }
 
@@ -9967,6 +10050,10 @@ def _probe_mcp_servers_to_records(
                 "response_bytes": 0,
                 "response_received": False,
                 "elapsed_ms": 0,
+                "exit_code": None,
+                "stderr_bytes": 0,
+                "stderr_preview": "",
+                "stdout_preview": "",
                 "reason": "",
             }
             if isinstance(server.get("url"), str):
@@ -9984,6 +10071,10 @@ def _probe_mcp_servers_to_records(
                 record["response_bytes"] = int(detail.get("response_bytes") or 0)
                 record["response_received"] = bool(detail.get("response_received"))
                 record["elapsed_ms"] = int(detail.get("elapsed_ms") or 0)
+                record["exit_code"] = detail.get("exit_code")
+                record["stderr_bytes"] = int(detail.get("stderr_bytes") or 0)
+                record["stderr_preview"] = str(detail.get("stderr_preview") or "")
+                record["stdout_preview"] = str(detail.get("stdout_preview") or "")
             except Exception as exc:
                 record["reason"] = f"probe_exception:{type(exc).__name__}"
                 router_log("WARN", f"channel_probe_exception server={name} error={type(exc).__name__}: {exc}")
@@ -10340,22 +10431,41 @@ def cmd_channels(args: argparse.Namespace) -> None:
             print(f"    * {r.get('name')} ({transport}){suffix}")
         print(f"  non-capable : {len(non_capable)}")
         timeout_seen = False
+        exited_seen = False
         for r in non_capable:
             transport = r.get("transport") or "?"
             reason = r.get("reason") or "-"
             elapsed = r.get("elapsed_ms")
             bytes_seen = r.get("response_bytes")
+            stderr_bytes = r.get("stderr_bytes")
+            exit_code = r.get("exit_code")
             extra = []
             if isinstance(elapsed, int) and elapsed:
                 extra.append(f"elapsed={elapsed}ms")
             if isinstance(bytes_seen, int) and bytes_seen:
-                extra.append(f"bytes={bytes_seen}")
+                extra.append(f"stdout={bytes_seen}B")
+            if isinstance(stderr_bytes, int) and stderr_bytes:
+                extra.append(f"stderr={stderr_bytes}B")
+            if exit_code is not None:
+                extra.append(f"exit={exit_code}")
             extra_str = (" " + " ".join(extra)) if extra else ""
             print(f"      {r.get('name')} ({transport}) reason={reason}{extra_str}")
+            stderr_preview = r.get("stderr_preview")
+            if stderr_preview:
+                print(f"        stderr: {stderr_preview}")
+            stdout_preview = r.get("stdout_preview")
+            if stdout_preview:
+                print(f"        stdout: {stdout_preview}")
             if reason == "timeout":
                 timeout_seen = True
+            if reason == "exited_without_response":
+                exited_seen = True
         if timeout_seen:
-            print("  hint: some servers timed out; increase CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS if cold start is the cause.")
+            print("  hint: timeout means the server stayed running but never sent an initialize response in time.")
+            print("        increase CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS if cold start is the cause,")
+            print("        or check that the server speaks Content-Length-framed stdio (not bare JSONL).")
+        if exited_seen:
+            print("  hint: exited_without_response means the child died before responding. Check stderr above.")
         return
     if head in ("delivery", "mode"):
         if len(values) < 2:
