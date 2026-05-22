@@ -69,17 +69,44 @@ claude-any
 
 ### Releasing (maintainers)
 
-The `Publish to npm` workflow publishes to the registry whenever a new GitHub
-Release is published. It reads the `NPM_TOKEN` repository secret, which must
-hold a granular npm access token for `@oneciel-ai/claude-any` with
-*Bypass 2FA for publishing* enabled.
+The `Publish to npm` workflow publishes to the registry on every push to
+either the `main` or the `nightly` branch. It reads the `NPM_TOKEN`
+repository secret, which must hold a granular npm access token for
+`@oneciel-ai/claude-any` with *Bypass 2FA for publishing* enabled.
 
-Release flow:
+Two channels exist:
 
-1. Bump `version` in `package.json` and `VERSION` in `claude_any.py`.
-2. Add a Changelog entry.
-3. `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
-4. `gh release create vX.Y.Z --title "..." --notes "..."` — triggers the workflow.
+- `main` → published with npm dist-tag `latest`. Version comes from
+  `package.json` verbatim. This is what `npm install -g @oneciel-ai/claude-any`
+  pulls.
+- `nightly` → published with npm dist-tag `nightly`. The workflow appends
+  `-nightly.YYYYMMDD-HHmm` (UTC) to the `package.json` version inside the
+  CI runner only — no commit is made. Each push produces a unique version.
+  Users opt in with `npm install -g @oneciel-ai/claude-any@nightly`.
+
+Nightly flow (ongoing work):
+
+1. Commit to `nightly`. CI runs lint + tests and `Publish to npm`
+   emits a fresh `X.Y.Z-nightly.YYYYMMDD-HHmm` artifact.
+2. Real users on `latest` are unaffected; only those who explicitly
+   installed `@nightly` will pull it.
+
+Stable release flow (promoting nightly into a real release):
+
+1. Open a PR from `nightly` to `main` using the `release.md` template
+   (compare URL with `?template=release.md`).
+2. The PR bumps `version` in `package.json` and `VERSION` in
+   `claude_any.py` to the new stable `X.Y.Z`. Highlights since the last
+   stable are written in the PR body — those bullets become the GitHub
+   Release notes.
+3. Merge the PR. `Publish to npm` fires on main and pushes `X.Y.Z` with
+   dist-tag `latest`.
+4. Create the matching GitHub Release: `gh release create vX.Y.Z
+   --title "vX.Y.Z" --notes "..."`. The release is the persistent record
+   of stable release notes; no changelog file is maintained.
+5. Fast-forward `nightly` to `main` so subsequent nightlies sit on top
+   of the just-released code:
+   `git checkout nightly && git merge --ff-only main && git push origin nightly`.
 
 
 macOS has not been fully tested by the maintainer yet. The project uses

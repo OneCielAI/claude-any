@@ -116,6 +116,24 @@ npm install -g @oneciel-ai/claude-any
 claude-any
 ```
 
+### Nightly channel
+
+Pre-release builds are published from the `nightly` branch with the
+`nightly` npm dist-tag. Use them if you want the latest fixes before the
+next stable release; expect occasional churn.
+
+```sh
+npm install -g @oneciel-ai/claude-any@nightly
+```
+
+To go back to stable:
+
+```sh
+npm install -g @oneciel-ai/claude-any@latest
+```
+
+Nightly version numbers follow `X.Y.Z-nightly.YYYYMMDD-HHmm` (UTC).
+
 ## Run Claude Code Headlessly
 
 Use headless mode when a script, SSH session, CI job, or parent agent needs to
