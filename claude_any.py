@@ -3114,9 +3114,8 @@ def model_cache_key(provider: str, pcfg: dict[str, Any]) -> str:
             "provider": provider,
             "base_url": pcfg.get("base_url", ""),
             "api": api_state,
-            "current": pcfg.get("current_model", ""),
             "custom": pcfg.get("custom_models", []),
-            "schema": 3,
+            "schema": 4,
         },
         sort_keys=True,
     )
@@ -3149,6 +3148,18 @@ def write_model_list_cache(provider: str, pcfg: dict[str, Any], models: list[str
         pass
 
 
+def cached_or_configured_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    ids = read_model_list_cache(provider, pcfg) or []
+    for mid in pcfg.get("custom_models", []) or []:
+        mid = normalize_model_id(provider, mid)
+        if mid and mid not in ids:
+            ids.append(mid)
+    cur = normalize_model_id(provider, pcfg.get("current_model") or "")
+    if cur and cur not in ids and not cur.startswith(f"claude-any-{provider}-"):
+        ids.insert(0, cur)
+    return sorted_model_ids(unique_model_ids(provider, ids))
+
+
 def model_ids_from_response(data: Any) -> list[str]:
     ids: list[str] = []
     candidates: Any
@@ -3168,7 +3179,7 @@ def model_ids_from_response(data: Any) -> list[str]:
         if isinstance(item, str):
             mid = item
         elif isinstance(item, dict):
-            mid = item.get("id") or item.get("name") or item.get("model")
+            mid = item.get("id") or item.get("key") or item.get("name") or item.get("model")
         else:
             mid = None
         if mid and str(mid).strip():
@@ -3792,6 +3803,17 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
             data = http_json(join_url(base, "/v1/models"), headers=nvidia_hosted_list_headers(), timeout=8.0)
             ids = model_ids_from_response(data)
             fetched = True
+        elif provider == "lm-studio":
+            headers = provider_model_list_headers(provider, pcfg)
+            for path in ("/api/v0/models", "/api/v1/models", "/v1/models", "/models"):
+                try:
+                    data = http_json(join_url(lm_studio_api_base(pcfg) if path.startswith("/api/") else base, path), headers=headers, timeout=2.0)
+                    ids = [normalize_model_id(provider, mid) for mid in model_ids_from_response(data)]
+                    fetched = True
+                    if ids:
+                        break
+                except Exception:
+                    continue
         else:
             headers = provider_model_list_headers(provider, pcfg)
             for path in ("/v1/models", "/models"):
@@ -4118,8 +4140,8 @@ def upstream_model_context_limit(provider: str, pcfg: dict[str, Any], timeout: f
     return positive_int(info.get("max_model_len"))
 
 
-def model_map_for(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
-    ids = upstream_model_ids(provider, pcfg)
+def model_map_for(provider: str, pcfg: dict[str, Any], fetch: bool = True) -> dict[str, str]:
+    ids = upstream_model_ids(provider, pcfg) if fetch else cached_or_configured_model_ids(provider, pcfg)
     return {alias_for(provider, mid): mid for mid in ids}
 
 
@@ -9305,7 +9327,7 @@ def set_base_url_config(provider: str, url: str) -> list[str]:
 def set_model_config(value: str) -> list[str]:
     cfg = load_config()
     provider, pcfg = get_current_provider(cfg)
-    mmap = model_map_for(provider, pcfg)
+    mmap = model_map_for(provider, pcfg, fetch=False)
     model_id = normalize_model_id(provider, unslug_provider_alias(provider, value, mmap) or value)
     pcfg["current_model"] = model_id
     preset = model_preset(model_id)
@@ -9497,12 +9519,14 @@ def cmd_model(args: argparse.Namespace) -> None:
     provider, pcfg = get_current_provider(cfg)
     if not args.value:
         print(f"Model menu for {provider} (current: {pcfg.get('current_model')})")
-        models = upstream_model_ids(provider, pcfg)
+        models = cached_or_configured_model_ids(provider, pcfg)
         for i, mid in enumerate(models[:100], 1):
             mark = "*" if mid == pcfg.get("current_model") else " "
             print(f" {mark} {i:>3}. {alias_for(provider, mid)}    [{mid}]")
         if len(models) > 100:
             print(f" ... {len(models) - 100} more")
+        if read_model_list_cache(provider, pcfg) is None:
+            print("\nProvider model list is not cached yet. Use the menu refresh row or run: claude-anyctl models")
         print("\nSet direct/custom model with: /set-model MODEL_ID")
         print("Or from terminal: claude-anyctl model MODEL_ID")
         return
@@ -11383,7 +11407,11 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
     if provider in ("vllm", "lm-studio", "self-hosted-nim"):
-        server_limit = upstream_model_context_limit(provider, pcfg, timeout=1.5) or 0
+        server_limit = (
+            model_context_hint_from_model_id(model)
+            if provider == "lm-studio"
+            else upstream_model_context_limit(provider, pcfg, timeout=1.5)
+        ) or 0
         ctx = server_limit or positive_int(pcfg.get("context_window")) or 0
         if ctx >= 524288:
             return "million-context"
@@ -11700,10 +11728,7 @@ def apply_lm_studio_loaded_context_guard(pcfg: dict[str, Any], load: bool = Fals
                 f"LM Studio load error: {type(exc).__name__}: {exc}",
             ]
 
-    try:
-        info = lm_studio_runtime_info(pcfg, timeout=0.75)
-    except Exception:
-        info = None
+    info = None
     target = lm_studio_target_context(pcfg, info)
     loaded = positive_int((info or {}).get("loaded_context_len"))
     state = str((info or {}).get("state") or "")
@@ -11728,6 +11753,8 @@ def apply_lm_studio_loaded_context_guard(pcfg: dict[str, Any], load: bool = Fals
             messages.append("LM Studio will reload this model with the target context when you launch or test.")
     elif state and state != "loaded":
         messages.append("LM Studio will load this model with the target context when you launch or test.")
+    elif target:
+        messages.append("LM Studio will prepare this model with the target context when you launch or test.")
     return messages
 
 
@@ -12245,7 +12272,10 @@ def apply_llm_preset_to_provider(
             apply_provider_option(provider, pcfg, token)
     else:
         native_default = "false" if provider == "nvidia-hosted" else "true"
-        server_limit = upstream_model_context_limit(provider, pcfg) if provider in ("vllm", "lm-studio", "self-hosted-nim") else None
+        if provider == "lm-studio":
+            server_limit = provider_model_context_capacity(provider, pcfg)
+        else:
+            server_limit = upstream_model_context_limit(provider, pcfg) if provider in ("vllm", "self-hosted-nim") else None
         if provider == "nvidia-hosted":
             tokens_by_preset = {
                 "balanced": [
@@ -12504,14 +12534,15 @@ def apply_llm_preset_to_provider(
     ]
     lines.extend(context_msgs)
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
-        server_limit = upstream_model_context_limit(provider, pcfg)
+        server_limit = provider_model_context_capacity(provider, pcfg) if provider == "lm-studio" else upstream_model_context_limit(provider, pcfg)
         required_context = required_context_for_preset(preset_id, provider) or 65536
         if server_limit:
-            lines.append(f"Server max_model_len: {server_limit}")
+            label = "Model max context" if provider == "lm-studio" else "Server max_model_len"
+            lines.append(f"{label}: {server_limit}")
             if preset_id in CONTEXT_HEAVY_PRESETS and server_limit < required_context:
                 lines.append(f"This preset requires restarting the server with --max-model-len {required_context} or higher.")
                 lines.append("Client settings were capped to the server-reported context length.")
-        elif preset_id in CONTEXT_HEAVY_PRESETS:
+        elif preset_id in CONTEXT_HEAVY_PRESETS and provider != "lm-studio":
             lines.append("Could not verify server max_model_len; vLLM/NIM must be started with a matching context limit.")
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         lines.append(
@@ -14492,12 +14523,20 @@ def log_level_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     return rows, values
 
 
-def model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
-    values = unique_model_ids(provider, upstream_model_ids(provider, pcfg))
+def model_panel_rows(provider: str, pcfg: dict[str, Any], fetch: bool = True) -> tuple[list[str], list[str]]:
+    values = unique_model_ids(provider, upstream_model_ids(provider, pcfg) if fetch else cached_or_configured_model_ids(provider, pcfg))
     rows: list[str] = []
     current = pcfg.get("current_model")
     seen_aliases: set[str] = set()
     deduped_values: list[str] = []
+    if not fetch:
+        cache = read_model_list_cache(provider, pcfg)
+        if cache is None:
+            rows.append("Refresh provider model list...")
+            deduped_values.append("__refresh_models__")
+        else:
+            rows.append("Refresh provider model list")
+            deduped_values.append("__refresh_models__")
     for mid in values:
         alias = alias_for(provider, mid)
         alias_key = alias.casefold()
@@ -14996,10 +15035,8 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
         elif name == "base-url":
             panel_rows, panel_values = base_url_panel_rows(provider, pcfg)
         elif name == "model":
-            panel_rows, panel_values = ["Loading models from current provider..."], []
-            first_render = render_prelaunch_screen(main_idx, panel, panel_idx, panel_rows, checks, messages, first_render)
             try:
-                panel_rows, panel_values = model_panel_rows(provider, pcfg)
+                panel_rows, panel_values = model_panel_rows(provider, pcfg, fetch=False)
             except Exception as exc:
                 panel_rows, panel_values = [f"Model list failed: {type(exc).__name__}: {exc}", "+ Custom model id..."], []
         elif name == "advisor-model":
@@ -15121,6 +15158,19 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                 elif panel == "model":
                     if value == "back":
                         close_panel()
+                        continue
+                    if value == "__refresh_models__":
+                        panel_rows, panel_values = ["Refreshing provider model list..."], []
+                        first_render = render_prelaunch_screen(main_idx, panel, 0, panel_rows, checks, messages, first_render)
+                        try:
+                            panel_rows, panel_values = model_panel_rows(provider, pcfg, fetch=True)
+                            messages = [f"Model list refreshed: {max(0, len(panel_values) - 3)} model(s)."]
+                        except Exception as exc:
+                            messages = [f"Model list refresh failed: {type(exc).__name__}: {exc}"]
+                            panel_rows, panel_values = model_panel_rows(provider, pcfg, fetch=False)
+                        panel_idx = 0
+                        panel_last_idx["model"] = 0
+                        refresh_checks()
                         continue
                     if value == "__custom__" or panel_idx >= len(panel_values):
                         model_value = prompt_menu_value("Model id or alias", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)

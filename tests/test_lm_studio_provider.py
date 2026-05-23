@@ -111,32 +111,73 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertEqual(4096, info["loaded_context_len"])
         self.assertEqual("loaded", info["state"])
 
+    def test_lm_studio_model_panel_uses_cache_without_fetching(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
+        pcfg["current_model"] = "qwen3.6-35b-a3b-mtp@q4_k_m"
+        pcfg["custom_models"] = ["wyvern-qwen36-27b"]
+
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "http_json") as http_json,
+        ):
+            rows, values = claude_any.model_panel_rows("lm-studio", pcfg, fetch=False)
+
+        http_json.assert_not_called()
+        self.assertEqual("__refresh_models__", values[0])
+        self.assertIn("qwen3.6-35b-a3b-mtp@q4_k_m", values)
+        self.assertIn("wyvern-qwen36-27b", values)
+        self.assertTrue(any("Refresh provider model list" in row for row in rows))
+
+    def test_lm_studio_set_model_does_not_fetch_model_list(self):
+        cfg = {
+            "current_provider": "lm-studio",
+            "providers": {"lm-studio": dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])},
+        }
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config"),
+            mock.patch.object(claude_any, "clear_model_cache"),
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "http_json") as http_json,
+        ):
+            messages = claude_any.set_model_config("qwen3.6-35b-a3b-mtp@q4_k_m")
+
+        http_json.assert_not_called()
+        self.assertEqual("qwen3.6-35b-a3b-mtp@q4_k_m", cfg["providers"]["lm-studio"]["current_model"])
+        self.assertTrue(any("Model for lm-studio set" in message for message in messages))
+
+    def test_lm_studio_model_list_prefers_fast_api_v0_endpoint(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
+        pcfg["base_url"] = "http://lmstudio.local:1234/v1"
+        payload = {"data": [{"id": "qwen3.6-27b-mtp"}, {"id": "wyvern-qwen36-27b"}]}
+
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "write_model_list_cache"),
+            mock.patch.object(claude_any, "http_json", return_value=payload) as http_json,
+        ):
+            models = claude_any.upstream_model_ids("lm-studio", pcfg)
+
+        self.assertEqual("http://lmstudio.local:1234/api/v0/models", http_json.call_args.args[0])
+        self.assertIn("qwen3.6-27b-mtp", models)
+        self.assertIn("wyvern-qwen36-27b", models)
+
     def test_lm_studio_loaded_context_guard_defers_reload_during_menu_selection(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
         pcfg["current_model"] = "qwen3.6-35b-a3b-mtp@bf16"
         pcfg["native_compat"] = True
         pcfg["context_window"] = 65536
-        payload = {
-            "data": [
-                {
-                    "id": "qwen3.6-35b-a3b-mtp@bf16",
-                    "state": "loaded",
-                    "max_context_length": 262144,
-                    "loaded_context_length": 4096,
-                }
-            ]
-        }
-
         with (
-            mock.patch.object(claude_any, "http_json", return_value=payload),
+            mock.patch.object(claude_any, "http_json") as http_json,
             mock.patch.object(claude_any, "post_json") as post_json,
         ):
             messages = claude_any.apply_lm_studio_loaded_context_guard(pcfg)
 
         self.assertTrue(pcfg["native_compat"])
         self.assertEqual(65536, pcfg["context_window"])
+        http_json.assert_not_called()
         post_json.assert_not_called()
-        self.assertTrue(any("will reload" in message for message in messages))
+        self.assertTrue(any("will prepare" in message for message in messages))
 
     def test_lm_studio_loaded_context_guard_can_reload_when_requested(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
