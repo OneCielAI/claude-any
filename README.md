@@ -410,9 +410,9 @@ Claude Any was built through real integration tests: provider switching, model
 discovery, API-key entry, compatibility tests, web-search tooling, timeout
 handling, and native Claude Code behavior. The main lesson was that
 Anthropic-compatible Messages endpoints are the cleanest integration path when a
-provider supports them. Ollama, vLLM, and NIM can expose Anthropic-compatible
-routes that preserve more of Claude Code's tooling model than a generic
-OpenAI-compatible chat route.
+provider supports them. Ollama, LM Studio, vLLM, and NIM can expose
+Anthropic-compatible routes that preserve more of Claude Code's tooling model
+than a generic OpenAI-compatible chat route.
 
 Local inference was also tested with Qwen 3.6 27B Q4 through Ollama and vLLM on
 RTX 5090 and MSI GB10-class hardware. It worked, but the speed should not be

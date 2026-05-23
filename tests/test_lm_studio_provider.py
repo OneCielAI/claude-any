@@ -12,10 +12,16 @@ class LMStudioProviderTests(unittest.TestCase):
         pcfg = claude_any.DEFAULT_CONFIG["providers"]["lm-studio"]
         self.assertEqual("http://127.0.0.1:1234/v1", pcfg["base_url"])
         self.assertEqual("local-model", pcfg["current_model"])
-        self.assertFalse(claude_any.provider_native_compat_enabled("lm-studio", pcfg))
+        self.assertTrue(claude_any.provider_native_compat_enabled("lm-studio", pcfg))
 
-    def test_default_base_url_points_to_lm_studio_openai_api(self):
+    def test_default_base_url_points_to_lm_studio_api(self):
         self.assertEqual("http://127.0.0.1:1234/v1", claude_any.default_base_url("lm-studio"))
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
+        self.assertEqual("http://127.0.0.1:1234", claude_any.native_anthropic_base_url("lm-studio", pcfg))
+        self.assertEqual(
+            "http://127.0.0.1:1234/v1/messages",
+            claude_any.join_url(claude_any.native_anthropic_base_url("lm-studio", pcfg), "/v1/messages"),
+        )
         self.assertEqual(
             "http://127.0.0.1:1234/v1/chat/completions",
             claude_any.join_url(claude_any.default_base_url("lm-studio"), "/v1/chat/completions"),
@@ -58,26 +64,39 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertIn("context_window=32768", status)
         self.assertIn("reserve=1024", status)
         self.assertIn("stream=on", status)
-        self.assertNotIn("native=", status)
+        self.assertIn("native=True", status)
 
         rows, values = claude_any.llm_option_panel_rows("lm-studio", pcfg, "en")
         self.assertIn("context_window", values)
         self.assertIn("context_reserve_tokens", values)
         self.assertIn("temperature", values)
         self.assertIn("stream_enabled", values)
-        self.assertNotIn("native_compat", values)
+        self.assertIn("native_compat", values)
         self.assertTrue(any("Context window" in row for row in rows))
 
         context_rows, context_values = claude_any.context_setup_panel_rows("lm-studio", pcfg, "en")
         self.assertTrue(any(value.startswith("context-") for value in context_values))
         self.assertFalse(any("managed by Claude Code" in row for row in context_rows))
 
-    def test_lm_studio_routes_through_openai_compatible_forwarder(self):
+    def test_lm_studio_native_env_uses_anthropic_base_url(self):
+        cfg = {
+            "current_provider": "lm-studio",
+            "providers": {"lm-studio": dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])},
+        }
+
+        env = claude_any.env_vars(cfg)
+
+        self.assertEqual("http://127.0.0.1:1234", env["ANTHROPIC_BASE_URL"])
+        self.assertEqual("local-model", env["ANTHROPIC_MODEL"])
+        self.assertEqual("lm-studio", env["CLAUDE_ANY_PROVIDER"])
+
+    def test_lm_studio_routes_through_openai_compatible_forwarder_when_native_disabled(self):
         cfg = {
             "current_provider": "lm-studio",
             "providers": {"lm-studio": dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])},
             "router_debug_message_preview_chars": 0,
         }
+        cfg["providers"]["lm-studio"]["native_compat"] = False
         handler = object.__new__(claude_any.RouterHandler)
         handler.path = "/v1/messages"
         handler.headers = {"content-length": "2"}

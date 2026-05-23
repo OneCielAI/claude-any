@@ -394,8 +394,8 @@ PROVIDER_NOTES = {
             "Do not enter an OpenAI-only chat completions endpoint; use a compatibility proxy for those servers.",
         ],
         "lm-studio": [
-            "LM Studio: uses the local OpenAI-compatible server.",
-            "Start LM Studio's Local Server and use http://127.0.0.1:1234/v1 as the base URL.",
+            "LM Studio: uses the local Anthropic-compatible /v1/messages server by default.",
+            "Start LM Studio's Local Server and use http://127.0.0.1:1234/v1 as the base URL; set native=false only for router fallback.",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: enter the NIM server root that exposes Anthropic-compatible /v1/messages.",
@@ -424,8 +424,8 @@ PROVIDER_NOTES = {
             "OpenAI 전용 chat completions endpoint를 넣지 마세요. 그런 서버는 호환 프록시가 필요합니다.",
         ],
         "lm-studio": [
-            "LM Studio: 로컬 OpenAI 호환 서버를 사용합니다.",
-            "LM Studio의 Local Server를 켜고 base URL은 http://127.0.0.1:1234/v1 을 사용하세요.",
+            "LM Studio: 기본적으로 로컬 Anthropic 호환 /v1/messages 서버를 직접 사용합니다.",
+            "LM Studio의 Local Server를 켜고 base URL은 http://127.0.0.1:1234/v1 을 사용하세요. 라우터 fallback이 필요할 때만 native=false를 쓰세요.",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: Anthropic 호환 /v1/messages를 노출하는 NIM 서버 root를 넣으세요.",
@@ -454,8 +454,8 @@ PROVIDER_NOTES = {
             "OpenAI専用chat completions endpointは入力しないでください。その場合は互換プロキシが必要です。",
         ],
         "lm-studio": [
-            "LM Studio: ローカルのOpenAI互換サーバーを使います。",
-            "LM StudioのLocal Serverを起動し、base URLは http://127.0.0.1:1234/v1 を使ってください。",
+            "LM Studio: 既定ではローカルのAnthropic互換 /v1/messages サーバーを直接使います。",
+            "LM StudioのLocal Serverを起動し、base URLは http://127.0.0.1:1234/v1 を使ってください。router fallbackが必要な時だけnative=falseにします。",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: Anthropic互換/v1/messagesを公開するNIMサーバーrootを入力してください。",
@@ -484,8 +484,8 @@ PROVIDER_NOTES = {
             "不要输入仅OpenAI chat completions的端点；这类服务器需要兼容代理。",
         ],
         "lm-studio": [
-            "LM Studio: 使用本地 OpenAI-compatible 服务器。",
-            "启动 LM Studio 的 Local Server，并使用 http://127.0.0.1:1234/v1 作为 base URL。",
+            "LM Studio: 默认直接使用本地 Anthropic-compatible /v1/messages 服务器。",
+            "启动 LM Studio 的 Local Server，并使用 http://127.0.0.1:1234/v1 作为 base URL；仅在需要路由 fallback 时设置 native=false。",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: 请输入暴露 Anthropic-compatible /v1/messages 的 NIM 服务器 root。",
@@ -804,7 +804,7 @@ def provider_options_summary(provider: str, pcfg: dict) -> str:
     if provider in ("vllm", "lm-studio", "self-hosted-nim"):
         parts.insert(0, f"ctx {pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve {pcfg.get('context_reserve_tokens', 'default')}")
-        if provider in ("vllm", "self-hosted-nim"):
+        if provider in ("vllm", "lm-studio", "self-hosted-nim"):
             parts.append(f"native {str(bool(pcfg.get('native_compat', True))).lower()}")
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         parts.append(f"stream {'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
@@ -1183,10 +1183,10 @@ PROVIDER_OPTION_DESCRIPTIONS = {
         "zh": "编辑 claude-any 兼容性测试/路由器上游超时（毫秒）。Claude Code native 网络有自身超时行为。",
     },
     "__edit_native__": {
-        "en": "Toggle direct Anthropic Messages compatibility. Use it for vLLM/self-hosted NIM servers that implement /v1/messages.",
-        "ko": "Anthropic Messages 호환 엔드포인트에 직접 연결할지 정합니다. /v1/messages를 구현한 vLLM/self-hosted NIM에서 사용합니다.",
-        "ja": "Anthropic Messages互換エンドポイントへ直接接続するかを切り替えます。/v1/messages対応のvLLM/self-hosted NIMで使います。",
-        "zh": "切换是否直接连接 Anthropic Messages 兼容端点。用于实现 /v1/messages 的 vLLM/self-hosted NIM。",
+        "en": "Toggle direct Anthropic Messages compatibility. Use it for LM Studio, vLLM, or self-hosted NIM servers that implement /v1/messages.",
+        "ko": "Anthropic Messages 호환 엔드포인트에 직접 연결할지 정합니다. /v1/messages를 구현한 LM Studio, vLLM, self-hosted NIM에서 사용합니다.",
+        "ja": "Anthropic Messages互換エンドポイントへ直接接続するかを切り替えます。/v1/messages対応のLM Studio、vLLM、self-hosted NIMで使います。",
+        "zh": "切换是否直接连接 Anthropic Messages 兼容端点。用于实现 /v1/messages 的 LM Studio、vLLM 或 self-hosted NIM。",
     },
     "__custom__": {
         "en": "Enter provider option as KEY=VALUE, or unset:KEY to remove it.",
@@ -1264,7 +1264,7 @@ def build_provider_options_submenu() -> dict:
             ("__edit_reserve__", f"Edit context reserve [{pcfg.get('context_reserve_tokens', 'default')}]", False),
             *choices,
         ]
-        if provider in ("vllm", "self-hosted-nim"):
+        if provider in ("vllm", "lm-studio", "self-hosted-nim"):
             choices.append(("__edit_native__", f"Edit native mode [{str(native).lower()}]", False))
     choices.extend([
         ("__custom__", "Custom KEY=VALUE or unset:KEY...", False),
@@ -1284,7 +1284,7 @@ def build_provider_options_submenu() -> dict:
             ("context_window=32768", f"context_window 32768 (current {pcfg.get('context_window', 'default')})", pcfg.get("context_window") == 32768),
             ("context_window=65536", f"context_window 65536 (current {pcfg.get('context_window', 'default')})", pcfg.get("context_window") == 65536),
         ])
-        if provider in ("vllm", "self-hosted-nim"):
+        if provider in ("vllm", "lm-studio", "self-hosted-nim"):
             choices.extend([
                 ("native=true", "native true", bool(pcfg.get("native_compat", True))),
                 ("native=false", "native false", not bool(pcfg.get("native_compat", True))),

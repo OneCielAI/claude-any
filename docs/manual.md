@@ -243,7 +243,8 @@ Links:
 
 ### LM Studio
 
-LM Studio uses its local OpenAI-compatible server through the Claude Any router.
+LM Studio exposes an Anthropic-compatible `/v1/messages` endpoint. Claude Any
+uses that native path by default so Claude Code can talk to LM Studio directly.
 Start LM Studio's Local Server and use this base URL:
 
 ```text
@@ -251,7 +252,9 @@ http://127.0.0.1:1234/v1
 ```
 
 Then choose a model loaded in LM Studio, or set it headlessly with
-`--ca-provider lm-studio --ca-model MODEL_ID`.
+`--ca-provider lm-studio --ca-model MODEL_ID`. If you need the older router
+conversion path, set provider option `native=false`; the same base URL also
+works for LM Studio's OpenAI-compatible `/v1/chat/completions` fallback.
 
 ### NVIDIA Hosted NIM
 
@@ -354,7 +357,7 @@ claude-any \
   --ca-context-window 65536 \
   --ca-max-output-tokens 4096
 
-# LM Studio local OpenAI-compatible server
+# LM Studio local Anthropic-compatible server
 claude-any \
   --ca-provider lm-studio \
   --ca-base-url http://127.0.0.1:1234/v1 \

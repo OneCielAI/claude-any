@@ -1178,8 +1178,8 @@ PROVIDER_NOTES = {
             "Do not enter an OpenAI-only chat completions endpoint; use a compatibility proxy for those servers.",
         ],
         "lm-studio": [
-            "LM Studio: uses the local OpenAI-compatible server.",
-            "Start LM Studio's Local Server and use http://127.0.0.1:1234/v1 as the base URL.",
+            "LM Studio: uses the local Anthropic-compatible /v1/messages server by default.",
+            "Start LM Studio's Local Server and use http://127.0.0.1:1234/v1 as the base URL; set native=false only for router fallback.",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: enter the NIM server root that exposes Anthropic-compatible /v1/messages.",
@@ -1208,8 +1208,8 @@ PROVIDER_NOTES = {
             "OpenAI 전용 chat completions endpoint를 넣지 마세요. 그런 서버는 호환 프록시가 필요합니다.",
         ],
         "lm-studio": [
-            "LM Studio: 로컬 OpenAI 호환 서버를 사용합니다.",
-            "LM Studio의 Local Server를 켜고 base URL은 http://127.0.0.1:1234/v1 을 사용하세요.",
+            "LM Studio: 기본적으로 로컬 Anthropic 호환 /v1/messages 서버를 직접 사용합니다.",
+            "LM Studio의 Local Server를 켜고 base URL은 http://127.0.0.1:1234/v1 을 사용하세요. 라우터 fallback이 필요할 때만 native=false를 쓰세요.",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: Anthropic 호환 /v1/messages를 노출하는 NIM 서버 root를 넣으세요.",
@@ -1238,8 +1238,8 @@ PROVIDER_NOTES = {
             "OpenAI専用chat completions endpointは入力しないでください。その場合は互換プロキシが必要です。",
         ],
         "lm-studio": [
-            "LM Studio: ローカルのOpenAI互換サーバーを使います。",
-            "LM StudioのLocal Serverを起動し、base URLは http://127.0.0.1:1234/v1 を使ってください。",
+            "LM Studio: 既定ではローカルのAnthropic互換 /v1/messages サーバーを直接使います。",
+            "LM StudioのLocal Serverを起動し、base URLは http://127.0.0.1:1234/v1 を使ってください。router fallbackが必要な時だけnative=falseにします。",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: Anthropic互換/v1/messagesを公開するNIMサーバーrootを入力してください。",
@@ -1268,8 +1268,8 @@ PROVIDER_NOTES = {
             "不要输入仅OpenAI chat completions的端点；这类服务器需要兼容代理。",
         ],
         "lm-studio": [
-            "LM Studio: 使用本地 OpenAI-compatible 服务器。",
-            "启动 LM Studio 的 Local Server，并使用 http://127.0.0.1:1234/v1 作为 base URL。",
+            "LM Studio: 默认直接使用本地 Anthropic-compatible /v1/messages 服务器。",
+            "启动 LM Studio 的 Local Server，并使用 http://127.0.0.1:1234/v1 作为 base URL；仅在需要路由 fallback 时设置 native=false。",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: 请输入暴露 Anthropic-compatible /v1/messages 的 NIM 服务器 root。",
@@ -1392,7 +1392,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "current_model": "local-model",
             "advisor_model": "",
             "custom_models": ["local-model"],
-            "native_compat": False,
+            "native_compat": True,
             "rate_limit_rpm": 0,
             "rate_limit_status": True,
             "context_window": 32768,
@@ -1464,6 +1464,13 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
         pcfg = cfg.get("providers", {}).get("nvidia-hosted", {})
         if isinstance(pcfg, dict) and bool(pcfg.get("native_compat", False)):
             pcfg["native_compat"] = False
+        migrations[marker] = True
+
+    marker = "lm_studio_native_default_20260523"
+    if not migrations.get(marker):
+        pcfg = cfg.get("providers", {}).get("lm-studio", {})
+        if isinstance(pcfg, dict):
+            pcfg["native_compat"] = True
         migrations[marker] = True
 
     marker = "default_timeout_5m_20260513"
@@ -3861,6 +3868,10 @@ def nim_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return provider == "self-hosted-nim" and bool(pcfg.get("native_compat", True))
 
 
+def lm_studio_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return provider == "lm-studio" and bool(pcfg.get("native_compat", True))
+
+
 def nvidia_hosted_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     # NVIDIA's self-hosted NIM server exposes Anthropic-compatible /v1/messages.
     # The hosted API Catalog endpoint at integrate.api.nvidia.com currently
@@ -3872,6 +3883,7 @@ def nvidia_hosted_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> 
 def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return (
         vllm_native_compat_enabled(provider, pcfg)
+        or lm_studio_native_compat_enabled(provider, pcfg)
         or nim_native_compat_enabled(provider, pcfg)
         or nvidia_hosted_native_compat_enabled(provider, pcfg)
     )
@@ -3929,7 +3941,7 @@ def provider_upstream_request_base(provider: str, pcfg: dict[str, Any]) -> str:
 
 def native_anthropic_base_url(provider: str, pcfg: dict[str, Any]) -> str:
     base = pcfg.get("base_url", "http://127.0.0.1:8000").rstrip("/")
-    if provider == "nvidia-hosted" and base.endswith("/v1"):
+    if provider in ("lm-studio", "nvidia-hosted") and base.endswith("/v1"):
         return base[:-3].rstrip("/")
     return base
 
@@ -8858,7 +8870,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to Ollama-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_ollama_api_chat(self, provider, pcfg, body)
                 return
-            if provider in ("lm-studio", "nvidia-hosted"):
+            if provider in ("lm-studio", "nvidia-hosted") and not provider_native_compat_enabled(provider, pcfg):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to OpenAI-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_openai_compatible_chat(self, provider, pcfg, body)
                 return
@@ -9276,6 +9288,8 @@ def provider_mode_label(provider: str, pcfg: dict[str, Any]) -> str:
         return "ollama-native"
     if vllm_native_compat_enabled(provider, pcfg):
         return "vllm-native"
+    if lm_studio_native_compat_enabled(provider, pcfg):
+        return "lm-studio-native"
     if nim_native_compat_enabled(provider, pcfg):
         return "nim-native"
     if nvidia_hosted_native_compat_enabled(provider, pcfg):
@@ -11044,7 +11058,7 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
-    if provider in ("vllm", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim"):
         native_default = True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
@@ -11910,7 +11924,7 @@ def apply_llm_preset_to_provider(
         for token in with_preset_timeout_tokens(tokens_by_preset[preset_id], preset_id):
             apply_provider_option(provider, pcfg, token)
     else:
-        native_default = "false" if provider in ("lm-studio", "nvidia-hosted") else "true"
+        native_default = "false" if provider == "nvidia-hosted" else "true"
         server_limit = upstream_model_context_limit(provider, pcfg) if provider in ("vllm", "lm-studio", "self-hosted-nim") else None
         if provider == "nvidia-hosted":
             tokens_by_preset = {
@@ -12147,7 +12161,7 @@ def apply_llm_preset_to_provider(
             ],
             }
         for token in with_preset_timeout_tokens(tokens_by_preset[preset_id], preset_id):
-            if provider in ("lm-studio", "nvidia-hosted") and token.startswith("native="):
+            if provider == "nvidia-hosted" and token.startswith("native="):
                 continue
             apply_provider_option(provider, pcfg, token)
         if server_limit:
@@ -12455,7 +12469,7 @@ def llm_option_current_bool(provider: str, pcfg: dict[str, Any], key: str) -> bo
     if key == "stream_word_chunking":
         return bool(pcfg.get("stream_word_chunking", False))
     if key == "native_compat":
-        default = False if provider in ("lm-studio", "nvidia-hosted") else True
+        default = False if provider == "nvidia-hosted" else True
         return bool(pcfg.get("native_compat", default))
     if key == "think":
         return bool(pcfg.get("think", False))
@@ -12510,7 +12524,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
             add("Temperature", "temperature", pcfg.get("temperature", "default"))
             add("Top P", "top_p", pcfg.get("top_p", "default"))
             add("Top K", "top_k", pcfg.get("top_k", "default"))
-            if provider in ("vllm", "self-hosted-nim"):
+            if provider in ("vllm", "lm-studio", "self-hosted-nim"):
                 add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", True)))
             add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
             if bool(pcfg.get("stream_enabled", True)):
@@ -12633,7 +12647,7 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         elif key in ("rate_limit_status", "rpm_status"):
             pcfg["rate_limit_status"] = True
         elif key in ("native", "native_compat"):
-            if provider in ("lm-studio", "nvidia-hosted"):
+            if provider == "nvidia-hosted":
                 raise SystemExit(
                     f"{provider} does not expose Anthropic /v1/messages; use router mode. "
                     "Use self-hosted-nim or vLLM for native /v1/messages."
@@ -12693,7 +12707,7 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         pcfg["rate_limit_rpm"] = fixed
         return
     if key in ("native", "native_compat"):
-        if provider in ("lm-studio", "nvidia-hosted"):
+        if provider == "nvidia-hosted":
             raise SystemExit(
                 f"{provider} does not expose Anthropic /v1/messages; use router mode. "
                 "Use self-hosted-nim or vLLM for native /v1/messages."
@@ -13074,6 +13088,8 @@ def _cmd_test(args: argparse.Namespace) -> None:
         mode = "ollama-native"
     elif vllm_native_compat_enabled(provider, pcfg):
         mode = "vllm-native"
+    elif lm_studio_native_compat_enabled(provider, pcfg):
+        mode = "lm-studio-native"
     elif nim_native_compat_enabled(provider, pcfg):
         mode = "nim-native"
     elif nvidia_hosted_native_compat_enabled(provider, pcfg):
@@ -13733,7 +13749,7 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
         elif provider == "self-hosted-nim":
             errors.append("Start NIM or set a reachable Anthropic-compatible Base URL before launching Claude Code.")
         elif provider == "lm-studio":
-            errors.append("Start LM Studio's Local Server or set a reachable OpenAI-compatible Base URL before launching Claude Code.")
+            errors.append("Start LM Studio's Local Server or set a reachable Anthropic-compatible Base URL before launching Claude Code.")
         else:
             errors.append("Set a reachable Base URL before launching Claude Code.")
     if provider == "nvidia-hosted" and not (nvidia_api_key() or meaningful_key(pcfg.get("api_key"))):
