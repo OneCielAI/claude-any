@@ -379,6 +379,31 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIs(out, body)
         load_config.assert_not_called()
 
+    def test_body_with_pending_channel_messages_skips_persisted_direct_pending_messages(self):
+        body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
+        messages = [
+            {
+                "id": 3,
+                "channel": "room",
+                "sender_id": "sarah",
+                "message": "direct marked before scheduling",
+                "meta": {"room_id": "room", "llm_direct_pending": True},
+            }
+        ]
+        with (
+            mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+            mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            out = claude_any.body_with_pending_channel_messages(body)
+
+        self.assertIs(out, body)
+        write_cursor.assert_called_with(3)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("llm_direct_pending" in item for item in log_messages))
+
     def test_body_with_pending_channel_messages_skips_direct_delivered_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
         messages = [{"id": 3, "channel": "room", "sender_id": "sarah", "message": "already sent", "meta": {"room_id": "room"}}]
@@ -420,6 +445,47 @@ class ChannelBridgeTests(unittest.TestCase):
         write_cursor.assert_called_with(3)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("llm_direct_inflight" in item for item in log_messages))
+
+    def test_channel_sse_dispatch_marks_direct_llm_pending_before_append(self):
+        captured: list[dict[str, object]] = []
+        original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
+
+        def fake_append(payload):
+            captured.append(payload)
+            saved = dict(payload)
+            saved["id"] = 7
+            return saved
+
+        try:
+            claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+            claude_any._CHANNEL_SSE_CONNECTIONS["mcp-ai-net-sse"] = {
+                "name": "mcp-ai-net-sse",
+                "channel": "room_4pyr8vvwm2cd",
+            }
+            payload = {
+                "channel": "room_4pyr8vvwm2cd",
+                "sender_id": "sarah",
+                "message": "새 이벤트",
+                "kind": "message",
+                "meta": {"room_id": "room_4pyr8vvwm2cd"},
+                "visibility": "user",
+                "delivery": ["native", "stdin", "llm"],
+            }
+            with (
+                mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+                mock.patch.object(claude_any, "_sse_payload_to_chat_payload", return_value=payload),
+                mock.patch.object(claude_any, "append_chat_message", side_effect=fake_append),
+                mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery", return_value=True) as schedule,
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                claude_any._channel_sse_dispatch("mcp-ai-net-sse", "message", ["{}"])
+        finally:
+            claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+            claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
+
+        self.assertEqual(1, len(captured))
+        self.assertTrue(captured[0]["meta"]["llm_direct_pending"])
+        schedule.assert_called_once()
 
     def test_channel_direct_llm_worker_posts_prompt_to_router(self):
         class FakeResponse:

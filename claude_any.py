@@ -5254,6 +5254,7 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], eve
     payload = _sse_payload_to_chat_payload(data_text, event_name, defaults, event_id=event_id)
     if not payload:
         return
+    payload = _mark_channel_payload_direct_llm_pending(payload)
     saved = append_chat_message(payload)
     schedule_channel_direct_llm_delivery(saved)
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
@@ -16144,6 +16145,28 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
     )
 
 
+def _mark_channel_payload_direct_llm_pending(payload: dict[str, Any]) -> dict[str, Any]:
+    try:
+        cfg = load_config()
+        if channel_delivery_mode(cfg) != "llm":
+            return payload
+        if _channel_llm_message_skip_reason(payload):
+            return payload
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_direct_mark_failed error={type(exc).__name__}: {exc}")
+        return payload
+    out = dict(payload)
+    meta = dict(out.get("meta") if isinstance(out.get("meta"), dict) else {})
+    meta["llm_direct_pending"] = True
+    out["meta"] = meta
+    return out
+
+
+def _channel_message_is_direct_llm_owned(message: dict[str, Any]) -> bool:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    return bool(meta.get("llm_direct_pending") or meta.get("llm_direct_delivered"))
+
+
 def _anthropic_message_text(message: dict[str, Any]) -> str:
     parts: list[str] = []
     for block in message.get("content") or []:
@@ -16307,6 +16330,12 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                 router_log(
                     "INFO",
                     f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
+                )
+                continue
+            if _channel_message_is_direct_llm_owned(message):
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
                 )
                 continue
             try:
