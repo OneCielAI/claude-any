@@ -16253,12 +16253,13 @@ def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
                     "recipients": "internal",
                     "kind": "channel_llm_response",
                     "message": text,
-                    "visibility": "internal",
-                    "delivery": [],
+                    "visibility": "user",
+                    "delivery": ["native"],
                     "meta": {
                         "source_message_id": message_id,
                         "provider": provider,
                         "model": model,
+                        "llm_direct_delivered": True,
                     },
                 }
             )

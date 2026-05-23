@@ -533,7 +533,11 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("<< room_4pyr8vvwm2cd >> 에서 SSE 메시지가 도착", prompt)
         self.assertIn("새 이벤트", prompt)
         append.assert_called_once()
-        self.assertEqual("channel_llm_response", append.call_args.args[0]["kind"])
+        response_payload = append.call_args.args[0]
+        self.assertEqual("channel_llm_response", response_payload["kind"])
+        self.assertEqual("user", response_payload["visibility"])
+        self.assertEqual(["native"], response_payload["delivery"])
+        self.assertTrue(response_payload["meta"]["llm_direct_delivered"])
 
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(
