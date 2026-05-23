@@ -9725,10 +9725,10 @@ def probe_sse_mcp_for_channel_capability_detailed(
     def _sse_reader() -> None:
         try:
             while True:
-                chunk = sse_resp.read(4096)
-                if not chunk:
+                line = sse_resp.readline()
+                if not line:
                     break
-                chunks_q.put(chunk)
+                chunks_q.put(line)
         except Exception:
             pass
         finally:

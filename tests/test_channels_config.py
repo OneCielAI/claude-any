@@ -832,6 +832,7 @@ class _FakeSSEResponse:
 
     def __init__(self, chunks: list[bytes]):
         self._chunks = list(chunks)
+        self._line_buf = bytearray()
         self._closed = False
 
     def read(self, _n: int = -1) -> bytes:
@@ -840,6 +841,22 @@ class _FakeSSEResponse:
         if not self._chunks:
             return b""
         return self._chunks.pop(0)
+
+    def readline(self, _limit: int = -1) -> bytes:
+        if self._closed:
+            return b""
+        while b"\n" not in self._line_buf and self._chunks:
+            self._line_buf.extend(self._chunks.pop(0))
+        if not self._line_buf:
+            return b""
+        newline_at = self._line_buf.find(b"\n")
+        if newline_at < 0:
+            out = bytes(self._line_buf)
+            self._line_buf.clear()
+            return out
+        out = bytes(self._line_buf[: newline_at + 1])
+        del self._line_buf[: newline_at + 1]
+        return out
 
     def close(self) -> None:
         self._closed = True
@@ -927,6 +944,46 @@ class ChannelProbeSSETests(unittest.TestCase):
         self.assertTrue(detail["capable"])
         self.assertEqual("capable", detail["reason"])
         self.assertTrue(detail["response_received"])
+
+    def test_sse_probe_uses_line_oriented_reader_for_small_endpoint_event(self):
+        class LineOnlySSEResponse(_FakeSSEResponse):
+            read_called = False
+
+            def read(self, _n: int = -1) -> bytes:
+                self.read_called = True
+                raise AssertionError("SSE probe should read lines, not wait for a large chunk")
+
+        get_resp = LineOnlySSEResponse([
+            b"event: endpoint\n",
+            b"data: /messages?session=xyz\n",
+            b"\n",
+            b"data: "
+            + json.dumps({
+                "jsonrpc": "2.0",
+                "id": 1,
+                "result": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {"experimental": {"claude/channel": {}}},
+                    "serverInfo": {"name": "fake", "version": "0.0.1"},
+                },
+            }).encode("utf-8")
+            + b"\n\n",
+        ])
+        post_resp = _FakePostResponse()
+
+        def fake_urlopen(req, timeout=None):
+            method = getattr(req, "get_method", lambda: "GET")()
+            return get_resp if method == "GET" else post_resp
+
+        with mock.patch.object(claude_any.urllib.request, "urlopen", side_effect=fake_urlopen):
+            detail = claude_any.probe_sse_mcp_for_channel_capability_detailed(
+                "fake-sse",
+                {"type": "sse", "url": "http://example.test/sse"},
+                timeout=3.0,
+            )
+        self.assertFalse(get_resp.read_called)
+        self.assertTrue(detail["capable"], msg=f"line-oriented SSE probe failed: {detail}")
+        self.assertEqual("capable", detail["reason"])
 
     def test_sse_probe_reports_no_capability_when_absent(self):
         get_resp = self._build_sse_no_capability_response()
