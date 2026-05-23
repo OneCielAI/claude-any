@@ -15570,7 +15570,7 @@ def claude_channels_requested(cfg: dict[str, Any], passthrough: list[str], extra
 
 
 def should_use_native_channel_bridge(use_router_mode: bool, cfg: dict[str, Any], passthrough: list[str]) -> bool:
-    return bool(use_router_mode and channel_delivery_mode(cfg) == "native" and not native_channel_passthrough_requested(passthrough))
+    return bool(channel_delivery_mode(cfg) == "native" and not native_channel_passthrough_requested(passthrough))
 
 
 def write_web_tools_mcp_config(cfg: dict[str, Any]) -> Path:
@@ -16744,14 +16744,14 @@ def launch_claude(
     use_provider_native = provider_native_compat_enabled(provider, pcfg)
     use_router_mode = not (use_native_anthropic or use_ollama_native or use_provider_native)
     cleanup_managed_services_for_provider(provider, pcfg, cfg, quiet=True)
-    if use_router_mode:
-        start_router_if_needed()
     env = os.environ.copy()
     env["PATH"] = str(HOME / ".local" / "bin") + os.pathsep + env.get("PATH", "")
     launch_env = env_vars(cfg)
     launch_passthrough = normalize_channel_passthrough(passthrough)
     native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
     stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg)
+    if use_router_mode or native_channel_bridge:
+        start_router_if_needed()
     if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
