@@ -371,6 +371,33 @@ def save_ollama_model_catalog(catalog: dict[str, Any]) -> None:
         router_log("WARN", f"ollama catalog: failed to save cache: {exc}")
 
 
+def ollama_catalog_model_ids(provider: str = "ollama-cloud", catalog: dict[str, Any] | None = None) -> list[str]:
+    catalog = catalog if isinstance(catalog, dict) else load_ollama_model_catalog()
+    models = catalog.get("models") if isinstance(catalog, dict) else None
+    if not isinstance(models, dict):
+        return []
+    ids: list[str] = []
+    for entry in models.values():
+        if not isinstance(entry, dict):
+            continue
+        raw_models = entry.get("models")
+        if isinstance(raw_models, list):
+            for raw_model in raw_models:
+                mid = normalize_model_id(provider, str(raw_model))
+                if mid:
+                    ids.append(mid)
+        base = str(entry.get("id") or "").strip()
+        if base:
+            ids.append(normalize_model_id(provider, base))
+            tags = entry.get("tags")
+            if isinstance(tags, list):
+                for tag in tags:
+                    tag_text = str(tag or "").strip()
+                    if tag_text and tag_text.lower() not in ("latest", ""):
+                        ids.append(normalize_model_id(provider, f"{base}:{tag_text}"))
+    return sorted_model_ids(unique_model_ids(provider, ids))
+
+
 def ollama_catalog_is_stale(catalog: dict[str, Any], ttl_seconds: int = OLLAMA_MODEL_CATALOG_TTL_SECONDS) -> bool:
     if not isinstance(catalog, dict) or not isinstance(catalog.get("models"), dict):
         return True
@@ -3182,6 +3209,8 @@ def write_model_list_cache(provider: str, pcfg: dict[str, Any], models: list[str
 
 def cached_or_configured_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
     ids = read_model_list_cache(provider, pcfg) or []
+    if provider == "ollama-cloud":
+        ids.extend(ollama_catalog_model_ids(provider))
     for mid in pcfg.get("custom_models", []) or []:
         mid = normalize_model_id(provider, mid)
         if mid and mid not in ids:
@@ -3859,6 +3888,9 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
                     continue
     except Exception:
         ids = []
+    if provider == "ollama-cloud" and not ids:
+        ids = ollama_catalog_model_ids(provider)
+        fetched = bool(ids)
     if not fetched:
         return []
     for mid in pcfg.get("custom_models", []) or []:

@@ -128,6 +128,64 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertIn("wyvern-qwen36-27b", values)
         self.assertTrue(any("Refresh provider model list" in row for row in rows))
 
+    def test_ollama_cloud_model_panel_uses_catalog_without_fetching(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["ollama-cloud"])
+        pcfg["current_model"] = ""
+        pcfg["custom_models"] = []
+        catalog = {
+            "models": {
+                "deepseek-v4-pro": {
+                    "id": "deepseek-v4-pro",
+                    "models": ["deepseek-v4-pro:cloud"],
+                    "tags": ["cloud"],
+                },
+                "glm-5.1": {
+                    "id": "glm-5.1",
+                    "models": ["glm-5.1:cloud"],
+                    "tags": ["cloud"],
+                },
+            }
+        }
+
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "load_ollama_model_catalog", return_value=catalog),
+            mock.patch.object(claude_any, "http_json") as http_json,
+        ):
+            rows, values = claude_any.model_panel_rows("ollama-cloud", pcfg, fetch=False)
+
+        http_json.assert_not_called()
+        self.assertEqual("__refresh_models__", values[0])
+        self.assertIn("deepseek-v4-pro", values)
+        self.assertIn("glm-5.1", values)
+        self.assertNotIn("deepseek-v4-pro:cloud", values)
+        self.assertTrue(any("Refresh provider model list" in row for row in rows))
+
+    def test_ollama_cloud_model_refresh_falls_back_to_catalog(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["ollama-cloud"])
+        pcfg["current_model"] = ""
+        pcfg["custom_models"] = []
+        catalog = {
+            "models": {
+                "deepseek-v4-pro": {
+                    "id": "deepseek-v4-pro",
+                    "models": ["deepseek-v4-pro:cloud"],
+                    "tags": ["cloud"],
+                }
+            }
+        }
+
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "load_ollama_model_catalog", return_value=catalog),
+            mock.patch.object(claude_any, "write_model_list_cache") as write_cache,
+            mock.patch.object(claude_any, "http_json", side_effect=RuntimeError("offline")),
+        ):
+            models = claude_any.upstream_model_ids("ollama-cloud", pcfg)
+
+        self.assertIn("deepseek-v4-pro", models)
+        write_cache.assert_called_once()
+
     def test_lm_studio_set_model_does_not_fetch_model_list(self):
         cfg = {
             "current_provider": "lm-studio",
