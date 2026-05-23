@@ -216,6 +216,21 @@ PROVIDERS = [
     ("self-hosted-nim", "Self Hosted NIM"),
 ]
 APP_NAME = "Claude Any"
+
+
+def app_version() -> str:
+    try:
+        package = json.loads(Path(__file__).with_name("package.json").read_text(encoding="utf-8"))
+        return str(package.get("version") or "").strip()
+    except Exception:
+        return ""
+
+
+def app_title() -> str:
+    version = app_version()
+    return f"{APP_NAME} v{version}" if version else APP_NAME
+
+
 CREDITS = "Credits: One Ciel LLC"
 LANGUAGES = {
     "en": "English",
@@ -1501,15 +1516,16 @@ def add(stdscr, y: int, x: int, text: str, style: str = "") -> None:
 
 def draw_intro_panel(stdscr) -> int:
     h, w = _term_size()
+    title = app_title()
     if h < 20:
-        _write(0, 0, animated_text(APP_NAME) + f" - {CREDITS}")
+        _write(0, 0, animated_text(title) + f" - {CREDITS}")
         return 1
 
     panel_w = max(40, w - 2)
     panel_h = 8 if h >= 24 else 7
     border = cp(4)
     add(stdscr, 0, 0, "+" + "-" * (panel_w - 2) + "+", border)
-    _write(0, 4, " " + animated_text(APP_NAME) + " ", border)
+    _write(0, 4, " " + animated_text(title) + " ", border)
     for y in range(1, panel_h - 1):
         add(stdscr, y, 0, "|", border)
         add(stdscr, y, panel_w - 1, "|", border)
@@ -1531,7 +1547,7 @@ def draw_intro_panel(stdscr) -> int:
         add(stdscr, 4, right, "Adds DuckDuckGo web search tooling for non-native providers.", cp(5))
         add(stdscr, 5, right, "Use --ca-* flags for headless runs; Claude flags pass through.", cp(5))
     else:
-        add(stdscr, 1, 3, f"{APP_NAME} routes Claude Code through selectable providers.", _style(bold=True) + cp(5))
+        add(stdscr, 1, 3, f"{title} routes Claude Code through selectable providers.", _style(bold=True) + cp(5))
         add(stdscr, 2, 3, "Anthropic, Ollama, LM Studio, vLLM, Nvidia Hosted, and self-hosted NIM.", cp(5))
         add(stdscr, 3, 3, "DuckDuckGo web search is attached for non-native providers.", cp(5))
         add(stdscr, 4, 3, "Headless setup uses --ca-* flags; Claude flags pass through.", cp(5))
