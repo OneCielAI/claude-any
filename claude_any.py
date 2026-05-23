@@ -234,6 +234,7 @@ MODEL_PRESETS: dict[str, dict[str, Any]] = {
     "deepseek-r1": {"compat_max_tokens": 64, "thinking": True, "num_ctx_min": 32768, "num_ctx_max": 131072},
     "llama3.3:70b": {"compat_max_tokens": 16, "thinking": False, "num_ctx_min": 32768, "num_ctx_max": 131072},
 }
+LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT = 32768
 
 
 def nvidia_hosted_context_default(model_id: str) -> int:
@@ -247,13 +248,34 @@ def nvidia_hosted_context_default(model_id: str) -> int:
     return 65536
 
 
+def model_lookup_ids(model_id: str) -> list[str]:
+    raw = (model_id or "").strip()
+    if not raw:
+        return []
+    out = [raw]
+    low = raw.lower().replace("_", "-")
+    compact = re.sub(r"[^a-z0-9]+", "", low)
+
+    def add(value: str) -> None:
+        if value and value not in out:
+            out.append(value)
+
+    if ("qwen3.6" in low or "qwen36" in compact) and "27b" in low:
+        add("qwen3.6:27b")
+    if ("qwen3.6" in low or "qwen36" in compact) and "35b" in low:
+        add("qwen3.6:35b-a3b")
+        add("qwen3.6:35b")
+    return out
+
+
 def model_preset(model_id: str) -> dict[str, Any]:
     """Return preset dict for a model ID, checking exact match then prefix match."""
-    if model_id in MODEL_PRESETS:
-        return MODEL_PRESETS[model_id]
-    for key, value in MODEL_PRESETS.items():
-        if model_id.startswith(key) or key.startswith(model_id.split(":")[0]):
-            return value
+    for candidate in model_lookup_ids(model_id):
+        if candidate in MODEL_PRESETS:
+            return MODEL_PRESETS[candidate]
+        for key, value in MODEL_PRESETS.items():
+            if candidate.startswith(key) or key.startswith(candidate.split(":", 1)[0]):
+                return value
     return {}
 
 
@@ -484,51 +506,62 @@ def refresh_ollama_model_catalog(include_contexts: bool = True, timeout: float =
 
 
 def ollama_catalog_context_for_model(model_id: str) -> tuple[int | None, str | None, str | None]:
-    parts = ollama_model_catalog_key(model_id)
-    if not parts:
-        return None, None, None
-    key, base, tag = parts
     catalog = load_ollama_model_catalog()
-    entry = catalog.get("models", {}).get(key) if isinstance(catalog.get("models"), dict) else None
-    if not isinstance(entry, dict):
+    models = catalog.get("models", {})
+    if not isinstance(models, dict):
         return None, None, None
-    windows = entry.get("context_windows")
-    source = str(entry.get("context_source") or catalog.get("source") or "")
-    if isinstance(windows, dict):
-        candidates = [tag]
-        if tag in ("latest", ""):
+    for candidate_model in model_lookup_ids(model_id):
+        parts = ollama_model_catalog_key(candidate_model)
+        if not parts:
+            continue
+        key, base, tag = parts
+        entry = models.get(key)
+        if not isinstance(entry, dict):
+            continue
+        windows = entry.get("context_windows")
+        source = str(entry.get("context_source") or catalog.get("source") or "")
+        if isinstance(windows, dict):
+            candidates = [tag]
+            if tag in ("latest", ""):
+                candidates.extend(["cloud", "latest"])
             candidates.extend(["cloud", "latest"])
-        candidates.extend(["cloud", "latest"])
-        for candidate in candidates:
-            value = positive_int(windows.get(candidate))
-            if value:
-                return value, f"{base}:{candidate}", source or None
-    value = positive_int(entry.get("context_window"))
-    if value:
-        return value, base, source or None
+            for candidate in candidates:
+                value = positive_int(windows.get(candidate))
+                if value:
+                    return value, f"{base}:{candidate}", source or None
+        value = positive_int(entry.get("context_window"))
+        if value:
+            return value, base, source or None
     return None, None, None
 
 
 def ollama_catalog_timeout_for_model(model_id: str) -> int | None:
-    parts = ollama_model_catalog_key(model_id)
-    if not parts:
-        return None
-    key, _, tag = parts
     catalog = load_ollama_model_catalog()
-    entry = catalog.get("models", {}).get(key) if isinstance(catalog.get("models"), dict) else None
-    if not isinstance(entry, dict):
+    models = catalog.get("models", {})
+    if not isinstance(models, dict):
         return None
-    per_tag = entry.get("recommended_timeout_ms_by_tag")
-    if isinstance(per_tag, dict):
-        candidates = [tag]
-        if tag in ("latest", ""):
+    for candidate_model in model_lookup_ids(model_id):
+        parts = ollama_model_catalog_key(candidate_model)
+        if not parts:
+            continue
+        key, _, tag = parts
+        entry = models.get(key)
+        if not isinstance(entry, dict):
+            continue
+        per_tag = entry.get("recommended_timeout_ms_by_tag")
+        if isinstance(per_tag, dict):
+            candidates = [tag]
+            if tag in ("latest", ""):
+                candidates.extend(["cloud", "latest"])
             candidates.extend(["cloud", "latest"])
-        candidates.extend(["cloud", "latest"])
-        for candidate in candidates:
-            value = positive_int(per_tag.get(candidate))
-            if value:
-                return value
-    return positive_int(entry.get("recommended_timeout_ms"))
+            for candidate in candidates:
+                value = positive_int(per_tag.get(candidate))
+                if value:
+                    return value
+        value = positive_int(entry.get("recommended_timeout_ms"))
+        if value:
+            return value
+    return None
 
 
 def update_ollama_catalog_context(model_id: str, limit: int, matched_model: str | None, source_url: str | None) -> None:
@@ -3797,9 +3830,98 @@ def model_context_field(item: dict[str, Any]) -> int | None:
     return None
 
 
+def lm_studio_api_base(pcfg: dict[str, Any]) -> str:
+    base = provider_upstream_request_base("lm-studio", pcfg)
+    if base.endswith("/v1"):
+        return base[:-3].rstrip("/")
+    return base
+
+
+def lm_studio_model_id_matches(left: str, right: str) -> bool:
+    return (left or "").strip().lower() == (right or "").strip().lower()
+
+
+def lm_studio_runtime_info(pcfg: dict[str, Any], timeout: float = 3.0) -> dict[str, Any] | None:
+    base = lm_studio_api_base(pcfg)
+    if not base:
+        return None
+    current = current_upstream_model_id("lm-studio", pcfg)
+
+    try:
+        data = http_json(join_url(base, "/api/v0/models"), headers=provider_model_list_headers("lm-studio", pcfg), timeout=timeout)
+        items = data.get("data") if isinstance(data, dict) else None
+        if isinstance(items, list):
+            selected: dict[str, Any] | None = None
+            fallback: dict[str, Any] | None = None
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if fallback is None:
+                    fallback = item
+                if lm_studio_model_id_matches(str(item.get("id") or ""), current):
+                    selected = item
+                    break
+            selected = selected or fallback
+            if selected:
+                return {
+                    "models_url": join_url(base, "/api/v0/models"),
+                    "requested_model": current,
+                    "runtime_model": str(selected.get("id") or ""),
+                    "max_model_len": positive_int(selected.get("max_context_length")) or model_context_field(selected),
+                    "loaded_context_len": positive_int(selected.get("loaded_context_length")),
+                    "state": selected.get("state"),
+                    "capabilities": selected.get("capabilities"),
+                    "type": selected.get("type"),
+                    "root": selected.get("arch"),
+                }
+    except Exception:
+        pass
+
+    try:
+        data = http_json(join_url(base, "/api/v1/models"), headers=provider_model_list_headers("lm-studio", pcfg), timeout=timeout)
+        items = data.get("models") if isinstance(data, dict) else None
+        if isinstance(items, list):
+            selected = None
+            fallback = None
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                if fallback is None:
+                    fallback = item
+                if lm_studio_model_id_matches(str(item.get("key") or ""), current):
+                    selected = item
+                    break
+            selected = selected or fallback
+            if selected:
+                loaded_context = None
+                instances = selected.get("loaded_instances")
+                if isinstance(instances, list) and instances:
+                    config = instances[0].get("config") if isinstance(instances[0], dict) else None
+                    if isinstance(config, dict):
+                        loaded_context = positive_int(config.get("context_length"))
+                return {
+                    "models_url": join_url(base, "/api/v1/models"),
+                    "requested_model": current,
+                    "runtime_model": str(selected.get("key") or ""),
+                    "max_model_len": positive_int(selected.get("max_context_length")) or model_context_field(selected),
+                    "loaded_context_len": loaded_context,
+                    "state": "loaded" if loaded_context else "not-loaded",
+                    "capabilities": selected.get("capabilities"),
+                    "type": selected.get("type"),
+                    "root": selected.get("architecture"),
+                }
+    except Exception:
+        pass
+    return None
+
+
 def upstream_model_runtime_info(provider: str, pcfg: dict[str, Any], timeout: float = 3.0) -> dict[str, Any] | None:
     if provider not in ("vllm", "lm-studio", "self-hosted-nim"):
         return None
+    if provider == "lm-studio":
+        info = lm_studio_runtime_info(pcfg, timeout=timeout)
+        if info:
+            return info
     base = provider_upstream_request_base(provider, pcfg)
     if not base:
         return None
@@ -11412,6 +11534,42 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
     return messages
 
 
+def apply_lm_studio_loaded_context_guard(pcfg: dict[str, Any]) -> list[str]:
+    info = upstream_model_runtime_info("lm-studio", pcfg, timeout=1.5)
+    if not info:
+        return ["LM Studio runtime context could not be verified; using model DB recommendations only."]
+    loaded = positive_int(info.get("loaded_context_len"))
+    state = str(info.get("state") or "")
+    max_len = positive_int(info.get("max_model_len"))
+    messages: list[str] = []
+    if max_len:
+        messages.append(f"LM Studio model max context: {max_len:,} tokens.")
+    if loaded:
+        messages.append(f"LM Studio loaded context: {loaded:,} tokens.")
+        if loaded < LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT:
+            pcfg["native_compat"] = False
+            pcfg["context_window"] = loaded
+            current_output = positive_int(pcfg.get("max_output_tokens")) or 4096
+            pcfg["max_output_tokens"] = min(current_output, max(512, loaded // 4))
+            messages.append(
+                "LM Studio native disabled: loaded context is below the Claude Code safety floor "
+                f"({LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT:,} tokens). Reload the model with a larger context."
+            )
+        else:
+            pcfg["native_compat"] = True
+            current_window = positive_int(pcfg.get("context_window"))
+            if current_window and current_window > loaded:
+                pcfg["context_window"] = loaded
+                messages.append(f"Context window capped to LM Studio loaded context: {loaded:,} tokens.")
+        return messages
+    if state and state != "loaded":
+        pcfg["native_compat"] = False
+        messages.append(
+            "LM Studio native disabled: selected model is not loaded, so the active context length cannot be verified."
+        )
+    return messages
+
+
 def required_context_for_preset(preset_id: str, provider: str | None = None) -> int | None:
     provider = provider or ""
     if preset_id == "million-context-1m":
@@ -12173,6 +12331,8 @@ def apply_llm_preset_to_provider(
                 else:
                     pcfg["max_output_tokens"] = min(positive_int(pcfg.get("max_output_tokens")) or 4096, max(1024, server_limit // 8))
     context_msgs.extend(cap_context_settings_to_model_capacity(provider, pcfg))
+    if provider == "lm-studio":
+        context_msgs.extend(apply_lm_studio_loaded_context_guard(pcfg))
     context_msgs.extend(apply_recommended_timeout_for_model_context(provider, pcfg))
     pcfg["llm_preset"] = preset_id
     family = model_option_family(provider, pcfg)
@@ -13008,6 +13168,11 @@ def compatibility_runtime_lines(provider: str, pcfg: dict[str, Any], native: boo
             lines.append(f"Runtime max_model_len: {runtime_limit}")
         else:
             lines.append("Runtime max_model_len: not reported by /v1/models")
+        loaded_context = positive_int(info.get("loaded_context_len"))
+        if provider == "lm-studio" and loaded_context:
+            lines.append(f"Runtime loaded_context_length: {loaded_context}")
+        if provider == "lm-studio" and info.get("state"):
+            lines.append(f"Runtime model state: {info.get('state')}")
     else:
         runtime_limit = None
         lines.append("Runtime max_model_len: unavailable (/v1/models did not return model metadata)")
@@ -13106,6 +13271,23 @@ def _cmd_test(args: argparse.Namespace) -> None:
     print(f"Model: {model}")
     for line in compatibility_runtime_lines(provider, pcfg, native):
         print(line)
+    if provider == "lm-studio":
+        info = upstream_model_runtime_info(provider, pcfg, timeout=1.5)
+        loaded = positive_int(info.get("loaded_context_len")) if info else None
+        state = str(info.get("state") or "") if info else ""
+        if loaded and loaded < LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT:
+            print("Compatibility: FAIL")
+            print(
+                "Reason: LM Studio loaded context is "
+                f"{loaded:,} tokens; Claude Code needs at least {LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT:,}."
+            )
+            print("Diagnosis: reload the model in LM Studio with a larger context length, then retry.")
+            sys.exit(1)
+        if state and state != "loaded":
+            print("Compatibility: FAIL")
+            print("Reason: the selected LM Studio model is not loaded, so the active context length cannot be verified.")
+            print(f"Diagnosis: load the model in LM Studio with at least {LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT:,} context tokens, then retry.")
+            sys.exit(1)
     if provider == "vllm":
         hint = vllm_tool_parser_hint(model)
         if hint:
@@ -13756,6 +13938,21 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
         errors.append("Launch blocked: NVIDIA hosted requires an NVIDIA API key.")
     if provider == "ollama-cloud" and not meaningful_key(pcfg.get("api_key")):
         errors.append("Launch blocked: Ollama Cloud requires an API key.")
+    if provider == "lm-studio":
+        info = upstream_model_runtime_info(provider, pcfg, timeout=1.5)
+        loaded = positive_int(info.get("loaded_context_len")) if info else None
+        state = str(info.get("state") or "") if info else ""
+        if loaded and loaded < LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT:
+            errors.append(
+                "Launch blocked: LM Studio loaded context is "
+                f"{loaded:,} tokens; Claude Code needs at least {LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT:,}. "
+                "Reload the model with a larger context length."
+            )
+        elif state and state != "loaded":
+            errors.append(
+                "Launch blocked: selected LM Studio model is not loaded, so the active context length cannot be verified. "
+                f"Load it with at least {LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT:,} context tokens."
+            )
     return errors
 
 

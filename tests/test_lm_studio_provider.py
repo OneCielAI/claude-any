@@ -57,6 +57,152 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertEqual(0.9, request["top_p"])
         self.assertTrue(any(message.get("role") == "user" for message in request["messages"]))
 
+    def test_lm_studio_qwen36_id_uses_qwen36_27b_preset(self):
+        self.assertEqual(
+            claude_any.MODEL_PRESETS["qwen3.6:27b"],
+            claude_any.model_preset("qwen3.6-27b-mtp"),
+        )
+        self.assertEqual(
+            claude_any.MODEL_PRESETS["qwen3.6:27b"],
+            claude_any.model_preset("wyvern-qwen36-27b"),
+        )
+
+    def test_lm_studio_qwen36_id_uses_catalog_context_alias(self):
+        catalog = {
+            "source": "test-catalog",
+            "models": {
+                "qwen3.6": {
+                    "context_windows": {"27b": 262144},
+                    "recommended_timeout_ms_by_tag": {"27b": 120000},
+                }
+            },
+        }
+
+        with mock.patch.object(claude_any, "load_ollama_model_catalog", return_value=catalog):
+            context, matched, source = claude_any.ollama_catalog_context_for_model("qwen3.6-27b-mtp")
+            timeout = claude_any.ollama_catalog_timeout_for_model("qwen3.6-27b-mtp")
+
+        self.assertEqual(262144, context)
+        self.assertEqual("qwen3.6:27b", matched)
+        self.assertEqual("test-catalog", source)
+        self.assertEqual(120000, timeout)
+
+    def test_lm_studio_runtime_info_reads_loaded_context_from_api_v0(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
+        pcfg["base_url"] = "http://lmstudio.local:1234/v1"
+        pcfg["current_model"] = "qwen3.6-35b-a3b-mtp@bf16"
+        payload = {
+            "data": [
+                {
+                    "id": "qwen3.6-35b-a3b-mtp@bf16",
+                    "state": "loaded",
+                    "max_context_length": 262144,
+                    "loaded_context_length": 4096,
+                    "capabilities": ["tool_use"],
+                }
+            ]
+        }
+
+        with mock.patch.object(claude_any, "http_json", return_value=payload) as http_json:
+            info = claude_any.upstream_model_runtime_info("lm-studio", pcfg)
+
+        self.assertEqual("http://lmstudio.local:1234/api/v0/models", http_json.call_args.args[0])
+        self.assertEqual(262144, info["max_model_len"])
+        self.assertEqual(4096, info["loaded_context_len"])
+        self.assertEqual("loaded", info["state"])
+
+    def test_lm_studio_loaded_context_guard_disables_native_when_too_small(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
+        pcfg["current_model"] = "qwen3.6-35b-a3b-mtp@bf16"
+        pcfg["native_compat"] = True
+        pcfg["context_window"] = 32768
+        payload = {
+            "data": [
+                {
+                    "id": "qwen3.6-35b-a3b-mtp@bf16",
+                    "state": "loaded",
+                    "max_context_length": 262144,
+                    "loaded_context_length": 4096,
+                }
+            ]
+        }
+
+        with mock.patch.object(claude_any, "http_json", return_value=payload):
+            messages = claude_any.apply_lm_studio_loaded_context_guard(pcfg)
+
+        self.assertFalse(pcfg["native_compat"])
+        self.assertEqual(4096, pcfg["context_window"])
+        self.assertLessEqual(pcfg["max_output_tokens"], 1024)
+        self.assertTrue(any("native disabled" in message for message in messages))
+
+    def test_lm_studio_loaded_context_guard_keeps_native_when_large_enough(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
+        pcfg["current_model"] = "qwen3.6-35b-a3b-mtp@bf16"
+        pcfg["native_compat"] = False
+        pcfg["context_window"] = 65536
+        payload = {
+            "data": [
+                {
+                    "id": "qwen3.6-35b-a3b-mtp@bf16",
+                    "state": "loaded",
+                    "max_context_length": 262144,
+                    "loaded_context_length": 65536,
+                }
+            ]
+        }
+
+        with mock.patch.object(claude_any, "http_json", return_value=payload):
+            claude_any.apply_lm_studio_loaded_context_guard(pcfg)
+
+        self.assertTrue(pcfg["native_compat"])
+        self.assertEqual(65536, pcfg["context_window"])
+
+    def test_lm_studio_loaded_context_guard_disables_native_when_not_loaded(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
+        pcfg["current_model"] = "qwen3.6-27b-mtp"
+        pcfg["native_compat"] = True
+        payload = {
+            "data": [
+                {
+                    "id": "qwen3.6-27b-mtp",
+                    "state": "not-loaded",
+                    "max_context_length": 262144,
+                }
+            ]
+        }
+
+        with mock.patch.object(claude_any, "http_json", return_value=payload):
+            messages = claude_any.apply_lm_studio_loaded_context_guard(pcfg)
+
+        self.assertFalse(pcfg["native_compat"])
+        self.assertTrue(any("not loaded" in message for message in messages))
+
+    def test_lm_studio_launch_blocks_small_loaded_context(self):
+        cfg = {
+            "current_provider": "lm-studio",
+            "providers": {"lm-studio": dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])},
+        }
+        cfg["providers"]["lm-studio"]["current_model"] = "qwen3.6-35b-a3b-mtp@bf16"
+        payload = {
+            "data": [
+                {
+                    "id": "qwen3.6-35b-a3b-mtp@bf16",
+                    "state": "loaded",
+                    "max_context_length": 262144,
+                    "loaded_context_length": 4096,
+                }
+            ]
+        }
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "base_url_status_line", return_value="Base URL: model list reachable (/v1/models)"),
+            mock.patch.object(claude_any, "http_json", return_value=payload),
+        ):
+            errors = claude_any.launch_readiness_errors()
+
+        self.assertTrue(any("loaded context is 4,096" in error for error in errors))
+
     def test_lm_studio_options_are_provider_specific(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
 
