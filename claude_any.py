@@ -15697,6 +15697,28 @@ def should_use_native_channel_bridge(use_router_mode: bool, cfg: dict[str, Any],
     return bool(channel_delivery_mode(cfg) == "native" and not native_channel_passthrough_requested(passthrough))
 
 
+def claude_code_channels_auth_available(claude: str) -> tuple[bool, str]:
+    try:
+        proc = subprocess.run(
+            [claude, "auth", "status"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=5,
+        )
+    except Exception as exc:
+        return True, f"auth_status_unavailable:{type(exc).__name__}"
+    if proc.returncode != 0:
+        return True, f"auth_status_rc_{proc.returncode}"
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except Exception:
+        return True, "auth_status_unparseable"
+    if not bool(data.get("loggedIn")):
+        return False, "not_logged_in"
+    return True, str(data.get("authMethod") or "logged_in")
+
+
 def write_web_tools_mcp_config(cfg: dict[str, Any]) -> Path:
     web = cfg.get("web_search", {})
     package = web.get("package") or "ddg-mcp-search"
@@ -16879,15 +16901,6 @@ def launch_claude(
     if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
-        if use_router_mode:
-            # Claude Code Channels are tied to the user's claude.ai login
-            # session. In router mode the local gateway does not need the
-            # dummy Anthropic token, and leaving it set can make Claude Code
-            # treat the session as API-token auth where channels are gated off.
-            env.pop("ANTHROPIC_AUTH_TOKEN", None)
-            env.pop("ANTHROPIC_API_KEY", None)
-            launch_env.pop("ANTHROPIC_AUTH_TOKEN", None)
-            launch_env.pop("ANTHROPIC_API_KEY", None)
     if use_native_anthropic:
         # Claude Native guarantee — strip every env var claude-any (or a
         # prior claude-any session) might have left behind that would change
@@ -16930,6 +16943,12 @@ def launch_claude(
         raise RuntimeError("claude executable was not found in PATH or ~/.local/bin")
     run_claude_update_check(claude, enabled=update_check)
     claude = find_executable("claude") or claude
+    if native_channel_bridge:
+        auth_ok, auth_reason = claude_code_channels_auth_available(claude)
+        if not auth_ok:
+            router_log("WARN", f"channel_native_unavailable_fallback reason={auth_reason} delivery=stdin")
+            native_channel_bridge = False
+            stdin_channel_proxy = True
     extra_args: list[str] = []
     mcp_config_paths: list[str] = []
     if should_attach_web_search(provider, cfg, web_search_override):

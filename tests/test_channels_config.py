@@ -231,7 +231,7 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertNotIn("--channels", launch_cmd)
         launch_env = call.call_args.kwargs["env"]
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
-        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", launch_env)
+        self.assertEqual("not-used", launch_env["ANTHROPIC_AUTH_TOKEN"])
 
     def test_launch_without_external_channels_uses_stdin_proxy_when_selected(self):
         cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False, "channel_delivery": "stdin"}}
@@ -286,6 +286,7 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "install_claude_any_statusline"))
                 stack.enter_context(mock.patch.object(claude_any, "find_executable", return_value="claude"))
                 stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
+                stack.enter_context(mock.patch.object(claude_any, "claude_code_channels_auth_available", return_value=(True, "claude.ai")))
                 stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=proxy_path))
@@ -321,6 +322,7 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "install_claude_any_statusline"))
                 stack.enter_context(mock.patch.object(claude_any, "find_executable", return_value="claude"))
                 stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
+                stack.enter_context(mock.patch.object(claude_any, "claude_code_channels_auth_available", return_value=(True, "claude.ai")))
                 stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=False))
@@ -343,7 +345,7 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertNotIn("original.json", launch_cmd)
         launch_env = call.call_args.kwargs["env"]
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
-        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", launch_env)
+        self.assertEqual("not-used", launch_env["ANTHROPIC_AUTH_TOKEN"])
 
     def test_native_channel_bridge_applies_to_native_provider_launches(self):
         cfg = {
