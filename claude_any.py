@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import getpass
+import hashlib
 import html as html_lib
 import importlib.util
 import json
@@ -116,6 +117,20 @@ OFFICIAL_CHANNEL_PLUGINS = {
 }
 APP_NAME = "Claude Any"
 VERSION = "0.1.99"
+
+
+def claude_any_source_fingerprint() -> str:
+    try:
+        return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
+    except Exception:
+        try:
+            stat = Path(__file__).stat()
+            return f"{int(stat.st_mtime_ns)}-{int(stat.st_size)}"
+        except Exception:
+            return "unknown"
+
+
+SOURCE_FINGERPRINT = claude_any_source_fingerprint()
 CREDITS = "Credits: One Ciel LLC"
 
 LOG_LEVELS = {"SILENT": 0, "ERROR": 1, "WARN": 2, "INFO": 3, "DEBUG": 4, "TRACE": 5}
@@ -9152,7 +9167,19 @@ class RouterHandler(BaseHTTPRequestHandler):
             write_text_response(self, render_router_home_html(cfg, provider, pcfg), content_type="text/html; charset=utf-8")
             return
         if path in ("/health", "/healthz"):
-            write_json(self, {"ok": True, "provider": provider, "model": current_alias(cfg), "chat": "/ca/chat/health", "plan": "/ca/plan/artifacts", "events": "/ca/events"})
+            write_json(
+                self,
+                {
+                    "ok": True,
+                    "version": VERSION,
+                    "source_fingerprint": SOURCE_FINGERPRINT,
+                    "provider": provider,
+                    "model": current_alias(cfg),
+                    "chat": "/ca/chat/health",
+                    "plan": "/ca/plan/artifacts",
+                    "events": "/ca/events",
+                },
+            )
             return
         if path == "/v1/models":
             data = list_model_objects(provider, pcfg)
@@ -9308,12 +9335,22 @@ def serve(_: argparse.Namespace) -> None:
             pass
 
 
-def router_up() -> bool:
+def router_health() -> dict[str, Any] | None:
     try:
-        http_json(f"{ROUTER_BASE}/health", timeout=1.0)
-        return True
+        data = http_json(f"{ROUTER_BASE}/health", timeout=1.0)
+        return data if isinstance(data, dict) else None
     except Exception:
+        return None
+
+
+def router_up() -> bool:
+    return router_health() is not None
+
+
+def router_health_matches_current(health: dict[str, Any] | None) -> bool:
+    if health is None:
         return False
+    return str(health.get("version") or "") == VERSION and str(health.get("source_fingerprint") or "") == SOURCE_FINGERPRINT
 
 
 def invalid_nvidia_hosted_base_url(value: str | None) -> bool:
@@ -15621,13 +15658,40 @@ def run_prelaunch_menu(passthrough: list[str], skip_menu: bool = False, force_me
 
 
 def start_router_if_needed() -> None:
-    if router_up():
+    health = router_health()
+    if health is not None:
+        if router_health_matches_current(health):
+            router_log("INFO", f"router_check_state running=True spawn=False base={ROUTER_BASE}")
+            return
+        running_version = str(health.get("version") or "")
+        running_fingerprint = str(health.get("source_fingerprint") or "")
+        router_log(
+            "WARN",
+            "router_version_mismatch_restart "
+            f"running_version={running_version or '-'} current_version={VERSION} "
+            f"running_source={running_fingerprint or '-'} current_source={SOURCE_FINGERPRINT}",
+        )
+        stop_router_processes(quiet=True)
+        deadline = time.time() + 5
+        while time.time() < deadline and router_up():
+            time.sleep(0.1)
+    health = router_health()
+    if router_health_matches_current(health):
         router_log("INFO", f"router_check_state running=True spawn=False base={ROUTER_BASE}")
         return
+    if health is not None:
+        raise RuntimeError(
+            f"stale claude-any router is still serving on {ROUTER_BASE}; run `claude-any stop` and launch again."
+        )
     stop_router_processes(quiet=True)
-    if router_up():
+    health = router_health()
+    if router_health_matches_current(health):
         router_log("INFO", f"router_check_state running=True spawn=False after_stop=True base={ROUTER_BASE}")
         return
+    if health is not None:
+        raise RuntimeError(
+            f"stale claude-any router is still serving on {ROUTER_BASE}; run `claude-any stop` and launch again."
+        )
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(Path(__file__).resolve()), "serve"]
     kwargs: dict[str, Any] = {}
