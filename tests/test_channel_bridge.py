@@ -38,7 +38,7 @@ class ChannelBridgeTests(unittest.TestCase):
         assert payload is not None
         self.assertEqual(payload["message"], "hello")
         self.assertEqual(payload["kind"], "channel")
-        self.assertEqual(payload["channel"], "default")
+        self.assertEqual(payload["channel"], "room_phase1sim")
         self.assertEqual(payload["sender_id"], "ai-net")
         self.assertEqual(payload["recipients"], "claude")
         self.assertEqual(payload["thread_id"], "root")
@@ -76,9 +76,40 @@ class ChannelBridgeTests(unittest.TestCase):
         assert payload is not None
         self.assertEqual(payload["message"], "hello from ai-net")
         self.assertEqual(payload["sender_id"], "agent_a")
+        self.assertEqual(payload["channel"], "room_phase1sim")
         self.assertEqual(payload["meta"]["room_id"], "room_phase1sim")
         self.assertEqual(payload["meta"]["mcp_method"], "notifications/message")
         self.assertEqual(payload["meta"]["sse_json"]["params"]["data"]["type"], "message.created")
+
+    def test_sse_payload_maps_direct_ai_net_chat_object(self):
+        payload = claude_any._sse_payload_to_chat_payload(
+            json.dumps(
+                {
+                    "id": 4,
+                    "channel": "ai-net",
+                    "sender_id": "Sarah",
+                    "recipients": ["Robert"],
+                    "thread_id": "dm-sarah-robert",
+                    "message": "Robert님, DM 확인 부탁드립니다.",
+                    "kind": "message",
+                    "meta": {
+                        "room_id": "dm_robert_sarah",
+                        "recipient_id": "Robert",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            "message",
+            {"name": "mcp-ai-net-sse", "channel": "ai-net-sse", "sender_id": "ai-net-sse", "recipient": "all"},
+        )
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual("Robert님, DM 확인 부탁드립니다.", payload["message"])
+        self.assertEqual("ai-net", payload["channel"])
+        self.assertEqual("Sarah", payload["sender_id"])
+        self.assertEqual(["Robert"], payload["recipients"])
+        self.assertEqual("dm-sarah-robert", payload["thread_id"])
+        self.assertEqual("dm_robert_sarah", payload["meta"]["room_id"])
 
     def test_sse_payload_preserves_event_id_and_redacts_sensitive_metadata(self):
         payload = claude_any._sse_payload_to_chat_payload(

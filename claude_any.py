@@ -5043,17 +5043,24 @@ def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict
             event.get("payload") if isinstance(event.get("payload"), dict) else {}
         )
         meta.update(_event_meta_from_sources(parsed, params, payload, data, event, nested_payload))
-        content = _event_payload_text(params) or _event_payload_text(payload) or _event_payload_text(data) or _event_payload_text(event) or content
+        content = (
+            _event_payload_text(params)
+            or _event_payload_text(payload)
+            or _event_payload_text(data)
+            or _event_payload_text(event)
+            or _event_payload_text(parsed)
+            or content
+        )
         kind = method.replace("notifications/claude/", "").replace("/", ".") if method else "sse"
+        if not parsed.get("method") and meta.get("kind"):
+            kind = str(meta.get("kind"))
     if allowed_events and method not in allowed_events and (event_name or "message") not in allowed_events:
         return None
-    channel = defaults.get("channel") or "default"
-    if str(channel) == "default" and meta.get("channel"):
-        channel = meta.get("channel")
+    channel = meta.get("channel") or meta.get("room_id") or meta.get("room") or defaults.get("channel") or "default"
     return {
         "channel": channel,
-        "sender_id": meta.get("sender_id") or meta.get("agent_id") or defaults.get("sender_id") or "sse",
-        "recipients": meta.get("recipient_id") or defaults.get("recipient") or defaults.get("recipients") or "all",
+        "sender_id": meta.get("sender_id") or meta.get("sender") or meta.get("agent_id") or defaults.get("sender_id") or "sse",
+        "recipients": meta.get("recipients") or meta.get("recipient_id") or meta.get("recipient") or defaults.get("recipient") or defaults.get("recipients") or "all",
         "thread_id": meta.get("thread_id"),
         "parent_id": meta.get("parent_id"),
         "kind": kind,
