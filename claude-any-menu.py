@@ -1748,7 +1748,7 @@ def main() -> int:
                     notice = (out.strip().splitlines() or [item["value"]])[:2]
                     checks = preflight_checks()
                     sub = None
-                    idx = index_for_action("api-key")
+                    idx = index_for_action("model")
                 elif sub["kind"] == "api-key":
                     row = row_by_action.get("__sub_selected__", row_by_action.get("api-key", 10))
                     key = inline_secret_prompt(None, f"API key for {item['value']}: ", row)
@@ -1864,6 +1864,10 @@ def main() -> int:
                         default = str(pcfg_now.get("request_timeout_ms", "300000"))
                         entered = inline_prompt(None, "timeout ms: ", row, default)
                         value = f"timeout={entered}" if entered else ""
+                    elif action_value == "__edit_rate_limit__":
+                        default = str(pcfg_now.get("rate_limit_rpm", "40"))
+                        entered = inline_prompt(None, "rate_limit_rpm (0 disables): ", row, default)
+                        value = f"rate_limit_rpm={entered}" if entered else ""
                     elif action_value == "__edit_native__":
                         default = "true" if pcfg_now.get("native_compat", True) else "false"
                         entered = inline_prompt(None, "native true/false: ", row, default)

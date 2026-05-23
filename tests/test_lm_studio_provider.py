@@ -51,6 +51,27 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertEqual(0.9, request["top_p"])
         self.assertTrue(any(message.get("role") == "user" for message in request["messages"]))
 
+    def test_lm_studio_options_are_provider_specific(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
+
+        status = claude_any.llm_options_status("lm-studio", pcfg)
+        self.assertIn("context_window=32768", status)
+        self.assertIn("reserve=1024", status)
+        self.assertIn("stream=on", status)
+        self.assertNotIn("native=", status)
+
+        rows, values = claude_any.llm_option_panel_rows("lm-studio", pcfg, "en")
+        self.assertIn("context_window", values)
+        self.assertIn("context_reserve_tokens", values)
+        self.assertIn("temperature", values)
+        self.assertIn("stream_enabled", values)
+        self.assertNotIn("native_compat", values)
+        self.assertTrue(any("Context window" in row for row in rows))
+
+        context_rows, context_values = claude_any.context_setup_panel_rows("lm-studio", pcfg, "en")
+        self.assertTrue(any(value.startswith("context-") for value in context_values))
+        self.assertFalse(any("managed by Claude Code" in row for row in context_rows))
+
     def test_lm_studio_routes_through_openai_compatible_forwarder(self):
         cfg = {
             "current_provider": "lm-studio",
