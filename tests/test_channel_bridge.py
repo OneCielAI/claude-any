@@ -372,6 +372,82 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
         self.assertTrue(any("channel_llm_inject_skipped" in item and "initialized" in item for item in log_messages))
 
+    def test_body_with_pending_channel_messages_skips_direct_router_requests(self):
+        body = {"metadata": {"claude_any_channel_direct": True}, "messages": []}
+        with mock.patch.object(claude_any, "load_config") as load_config:
+            out = claude_any.body_with_pending_channel_messages(body)
+        self.assertIs(out, body)
+        load_config.assert_not_called()
+
+    def test_body_with_pending_channel_messages_skips_direct_delivered_messages(self):
+        body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
+        messages = [{"id": 3, "channel": "room", "sender_id": "sarah", "message": "already sent", "meta": {"room_id": "room"}}]
+        claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+        claude_any._CHANNEL_LLM_DIRECT_DELIVERED.add(3)
+        try:
+            with (
+                mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+                mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
+                mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+                mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                out = claude_any.body_with_pending_channel_messages(body)
+        finally:
+            claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+        self.assertIs(out, body)
+        write_cursor.assert_called_with(3)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("llm_direct_delivered" in item for item in log_messages))
+
+    def test_channel_direct_llm_worker_posts_prompt_to_router(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self, limit=-1):
+                return json.dumps(
+                    {
+                        "content": [{"type": "text", "text": "분석 완료"}],
+                        "stop_reason": "end_turn",
+                    }
+                ).encode("utf-8")
+
+        message = {
+            "id": 9,
+            "channel": "room_4pyr8vvwm2cd",
+            "sender_id": "ai-net",
+            "message": "새 이벤트",
+            "meta": {"room_id": "room_4pyr8vvwm2cd"},
+        }
+        claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+        try:
+            with (
+                mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+                mock.patch.object(claude_any, "get_current_provider", return_value=("ollama-cloud", {"request_timeout_ms": 300000})),
+                mock.patch.object(claude_any, "current_alias", return_value="claude-any-ollama-cloud-test"),
+                mock.patch.object(claude_any.urllib.request, "urlopen", return_value=FakeResponse()) as urlopen,
+                mock.patch.object(claude_any, "append_chat_message") as append,
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                claude_any._channel_direct_llm_worker(message)
+        finally:
+            claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+
+        req = urlopen.call_args.args[0]
+        self.assertTrue(req.full_url.endswith("/v1/messages"))
+        body = json.loads(req.data.decode("utf-8"))
+        self.assertTrue(body["metadata"]["claude_any_channel_direct"])
+        self.assertEqual("9", body["metadata"]["channel_message_id"])
+        prompt = body["messages"][0]["content"][0]["text"]
+        self.assertIn("<< room_4pyr8vvwm2cd >> 에서 SSE 메시지가 도착", prompt)
+        self.assertIn("새 이벤트", prompt)
+        append.assert_called_once()
+        self.assertEqual("channel_llm_response", append.call_args.args[0]["kind"])
+
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(
             {

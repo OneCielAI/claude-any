@@ -154,6 +154,9 @@ _CHANNEL_MCP_CURSOR_LOCK = threading.Lock()
 _CHANNEL_MCP_CURSOR_LAST_ID: int | None = None
 _CHANNEL_LLM_CURSOR_LOCK = threading.Lock()
 _CHANNEL_LLM_CURSOR_LAST_ID: int | None = None
+_CHANNEL_LLM_DIRECT_LOCK = threading.Lock()
+_CHANNEL_LLM_DIRECT_INFLIGHT: set[int] = set()
+_CHANNEL_LLM_DIRECT_DELIVERED: set[int] = set()
 _NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
 BUILTIN_CHANNEL_SPEC = "server:claude-any-router"
 _MCP_NOTIFICATION_DEDUP_TTL_SECONDS = 3.0
@@ -5220,6 +5223,7 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], eve
     if not payload:
         return
     saved = append_chat_message(payload)
+    schedule_channel_direct_llm_delivery(saved)
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _CHANNEL_SSE_LOCK:
         state = _CHANNEL_SSE_CONNECTIONS.get(name)
@@ -16108,6 +16112,110 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
     )
 
 
+def _anthropic_message_text(message: dict[str, Any]) -> str:
+    parts: list[str] = []
+    for block in message.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "text":
+            parts.append(str(block.get("text") or ""))
+    return "".join(parts).strip()
+
+
+def schedule_channel_direct_llm_delivery(message: dict[str, Any]) -> bool:
+    try:
+        message_id = int(message.get("id") or 0)
+    except Exception:
+        message_id = 0
+    if message_id <= 0:
+        return False
+    try:
+        cfg = load_config()
+        if channel_delivery_mode(cfg) != "llm":
+            return False
+        skip_reason = _channel_llm_message_skip_reason(message)
+        if skip_reason:
+            router_log("INFO", f"channel_llm_direct_skipped message_id={message_id} channel={message.get('channel')} reason={skip_reason}")
+            return False
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_direct_skipped message_id={message_id} error={type(exc).__name__}: {exc}")
+        return False
+    with _CHANNEL_LLM_DIRECT_LOCK:
+        if message_id in _CHANNEL_LLM_DIRECT_INFLIGHT or message_id in _CHANNEL_LLM_DIRECT_DELIVERED:
+            return False
+        _CHANNEL_LLM_DIRECT_INFLIGHT.add(message_id)
+    thread = threading.Thread(target=_channel_direct_llm_worker, args=(message,), daemon=True, name=f"ca-channel-llm-{message_id}")
+    thread.start()
+    router_log("INFO", f"channel_llm_direct_queued message_id={message_id} channel={message.get('channel')}")
+    return True
+
+
+def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
+    try:
+        message_id = int(message.get("id") or 0)
+    except Exception:
+        message_id = 0
+    try:
+        cfg = load_config()
+        provider, pcfg = get_current_provider(cfg)
+        model = current_alias(cfg)
+        prompt = format_channel_llm_batch_prompt([message])
+        body = {
+            "model": model,
+            "max_tokens": 512,
+            "stream": False,
+            "metadata": {
+                "claude_any_channel_direct": True,
+                "channel_message_id": str(message_id),
+                "channel": str(message.get("channel") or "default"),
+            },
+            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+        }
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        headers = {
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "x-claude-any-channel-direct": "1",
+        }
+        timeout = max(30.0, min(provider_request_timeout_seconds(pcfg), 300.0))
+        router_log(
+            "INFO",
+            f"channel_llm_direct_request message_id={message_id} provider={provider} model={model} bytes={len(data)}",
+        )
+        req = urllib.request.Request(join_url(ROUTER_BASE, "/v1/messages"), data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read(2_000_000).decode("utf-8", errors="replace")
+        parsed = json.loads(raw)
+        text = _anthropic_message_text(parsed) if isinstance(parsed, dict) else ""
+        with _CHANNEL_LLM_DIRECT_LOCK:
+            _CHANNEL_LLM_DIRECT_DELIVERED.add(message_id)
+            if len(_CHANNEL_LLM_DIRECT_DELIVERED) > 1000:
+                for old_id in sorted(_CHANNEL_LLM_DIRECT_DELIVERED)[:500]:
+                    _CHANNEL_LLM_DIRECT_DELIVERED.discard(old_id)
+        if text:
+            append_chat_message(
+                {
+                    "channel": message.get("channel") or "default",
+                    "sender_id": "claude-any-llm",
+                    "recipients": "internal",
+                    "kind": "channel_llm_response",
+                    "message": text,
+                    "visibility": "internal",
+                    "delivery": [],
+                    "meta": {
+                        "source_message_id": message_id,
+                        "provider": provider,
+                        "model": model,
+                    },
+                }
+            )
+        stop_reason = parsed.get("stop_reason") if isinstance(parsed, dict) else ""
+        router_log("INFO", f"channel_llm_direct_response message_id={message_id} chars={len(text)} stop_reason={stop_reason}")
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_direct_failed message_id={message_id} error={type(exc).__name__}: {exc}")
+    finally:
+        with _CHANNEL_LLM_DIRECT_LOCK:
+            _CHANNEL_LLM_DIRECT_INFLIGHT.discard(message_id)
+
+
 def _channel_llm_write_cursor_locked(last_id: int) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp_path = CHANNEL_LLM_CURSOR_PATH.with_suffix(".json.tmp")
@@ -16147,6 +16255,9 @@ def reset_channel_llm_delivery_cursor(last_id: int | None = None) -> int:
 
 def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     global _CHANNEL_LLM_CURSOR_LAST_ID
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    if body.get("claude_any_channel_direct") or metadata.get("claude_any_channel_direct"):
+        return body
     cfg = load_config()
     if channel_delivery_mode(cfg) != "llm":
         return body
@@ -16164,6 +16275,18 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                 router_log(
                     "INFO",
                     f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
+                )
+                continue
+            try:
+                message_id = int(message.get("id") or 0)
+            except Exception:
+                message_id = 0
+            with _CHANNEL_LLM_DIRECT_LOCK:
+                direct_delivered = message_id in _CHANNEL_LLM_DIRECT_DELIVERED
+            if direct_delivered:
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_delivered",
                 )
                 continue
             pending.append(message)
