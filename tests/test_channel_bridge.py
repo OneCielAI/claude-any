@@ -487,6 +487,47 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(captured[0]["meta"]["llm_direct_pending"])
         schedule.assert_called_once()
 
+    def test_channel_sse_dispatch_ignores_native_router_self_echo(self):
+        original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
+        try:
+            claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+            claude_any._CHANNEL_SSE_CONNECTIONS["mcp-claude-any-router"] = {
+                "name": "mcp-claude-any-router",
+                "channel": "room_4pyr8vvwm2cd",
+            }
+            with (
+                mock.patch.object(claude_any, "_sse_payload_to_chat_payload") as parse_payload,
+                mock.patch.object(claude_any, "append_chat_message") as append,
+                mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery") as schedule,
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                claude_any._channel_sse_dispatch(
+                    "mcp-claude-any-router",
+                    "message",
+                    ['{"method":"notifications/claude/channel","params":{"recipients":["all"]}}'],
+                )
+        finally:
+            claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+            claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
+
+        parse_payload.assert_not_called()
+        append.assert_not_called()
+        schedule.assert_not_called()
+        self.assertTrue(any("native_router_self_echo" in str(call.args[1]) for call in router_log.call_args_list))
+
+    def test_channel_string_list_decodes_json_array_strings(self):
+        self.assertEqual(["all"], claude_any._as_string_list('["all"]'))
+        self.assertEqual(["Robert", "Sarah"], claude_any._as_string_list(['["Robert"]', "Sarah"]))
+
+    def test_channel_llm_skip_reason_rejects_internal_and_router_self_echo(self):
+        self.assertEqual("recipient_internal", claude_any._channel_llm_message_skip_reason({"message": "x", "recipients": "internal"}))
+        self.assertEqual(
+            "native_router_self_echo",
+            claude_any._channel_llm_message_skip_reason(
+                {"message": "x", "sender_id": "mcp-claude-any-router", "meta": {"sse_source": "mcp-claude-any-router"}}
+            ),
+        )
+
     def test_channel_direct_llm_worker_posts_prompt_to_router(self):
         class FakeResponse:
             def __enter__(self):
@@ -535,6 +576,7 @@ class ChannelBridgeTests(unittest.TestCase):
         append.assert_called_once()
         response_payload = append.call_args.args[0]
         self.assertEqual("channel_llm_response", response_payload["kind"])
+        self.assertEqual(["all"], response_payload["recipients"])
         self.assertEqual("user", response_payload["visibility"])
         self.assertEqual(["native"], response_payload["delivery"])
         self.assertTrue(response_payload["meta"]["llm_direct_delivered"])
@@ -560,6 +602,20 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual("robert", notification["params"]["sender_id"])
         self.assertEqual(["sarah"], notification["params"]["recipients"])
         self.assertEqual("7", notification["params"]["meta"]["claude_any_message_id"])
+        self.assertEqual('["sarah"]', notification["params"]["meta"]["recipients"])
+
+    def test_router_channel_mcp_notification_normalizes_json_string_recipients(self):
+        notification = claude_any._channel_mcp_notification(
+            {
+                "id": 9,
+                "channel": "room",
+                "sender_id": "robert",
+                "message": "hello",
+                "recipients": '["sarah"]',
+                "meta": {"room_id": "room"},
+            }
+        )
+        self.assertEqual(["sarah"], notification["params"]["recipients"])
         self.assertEqual('["sarah"]', notification["params"]["meta"]["recipients"])
 
     def test_router_channel_mcp_notification_stringifies_meta_for_native_schema(self):

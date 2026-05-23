@@ -159,6 +159,7 @@ _CHANNEL_LLM_DIRECT_INFLIGHT: set[int] = set()
 _CHANNEL_LLM_DIRECT_DELIVERED: set[int] = set()
 _NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
 BUILTIN_CHANNEL_SPEC = "server:claude-any-router"
+_NATIVE_ROUTER_CHANNEL_NAMES = {"claude-any-router", "mcp-claude-any-router"}
 _MCP_NOTIFICATION_DEDUP_TTL_SECONDS = 3.0
 _MCP_NOTIFICATION_DEDUP_LOCK = threading.Lock()
 _MCP_NOTIFICATION_DEDUP_RECENT: dict[str, tuple[str, float]] = {}
@@ -4814,11 +4815,24 @@ def _as_string_list(value: Any) -> list[str]:
     if value is None:
         return []
     if isinstance(value, str):
-        if value.strip().lower() in ("", "all", "*"):
-            return ["all"] if value.strip() else []
-        return [value.strip()]
-    if isinstance(value, list):
-        return [str(item).strip() for item in value if str(item).strip()]
+        text = value.strip()
+        if not text:
+            return []
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                parsed = json.loads(text)
+                if isinstance(parsed, list):
+                    return _as_string_list(parsed)
+            except Exception:
+                pass
+        if text.lower() in ("all", "*"):
+            return ["all"]
+        return [text]
+    if isinstance(value, (list, tuple, set)):
+        out: list[str] = []
+        for item in value:
+            out.extend(_as_string_list(item))
+        return out
     return [str(value).strip()] if str(value).strip() else []
 
 
@@ -5246,6 +5260,12 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], eve
     if (event_name or "").strip().lower() == "endpoint":
         _channel_sse_maybe_initialize_mcp(name, data_text)
         return
+    if str(name or "").strip().lower() in _NATIVE_ROUTER_CHANNEL_NAMES:
+        router_log(
+            "INFO",
+            f"channel_sse_message_ignored name={name} event={event_name or 'message'} reason=native_router_self_echo",
+        )
+        return
     with _CHANNEL_SSE_LOCK:
         state = _CHANNEL_SSE_CONNECTIONS.get(name)
         if not state:
@@ -5417,6 +5437,7 @@ def _native_channel_meta(message: dict[str, Any]) -> dict[str, str]:
         if not name:
             continue
         meta[name] = _native_channel_meta_value(value)
+    message_recipients = _as_string_list(message.get("recipients")) if message.get("recipients") is not None else None
     base = {
         "claude_any_message_id": message.get("id"),
         "channel": message.get("channel") or "default",
@@ -5424,7 +5445,7 @@ def _native_channel_meta(message: dict[str, Any]) -> dict[str, str]:
         "thread_id": message.get("thread_id"),
         "parent_id": message.get("parent_id"),
         "kind": message.get("kind"),
-        "recipients": message.get("recipients"),
+        "recipients": message_recipients,
     }
     for key, value in base.items():
         if value is not None:
@@ -5460,7 +5481,8 @@ def _channel_mcp_notification(message: dict[str, Any]) -> dict[str, Any]:
     }
     for key in ("id", "thread_id", "parent_id", "kind", "time", "recipients"):
         if message.get(key) is not None:
-            params[key] = _native_channel_param_value(message.get(key))
+            value = _as_string_list(message.get(key)) if key == "recipients" else message.get(key)
+            params[key] = _native_channel_param_value(value)
     for key in ("room_id", "room", "recipient_id", "recipient", "conversation_id", "dm_id"):
         value = raw_meta.get(key)
         if value is not None and key not in params:
@@ -16072,6 +16094,9 @@ def _channel_llm_message_skip_reason(message: dict[str, Any]) -> str | None:
     visibility = str(message.get("visibility") or "user").strip().lower()
     if visibility in {"hidden", "internal", "transport", "control", "system"}:
         return f"visibility_{visibility}"
+    recipients = {item.strip().lower() for item in _as_string_list(message.get("recipients"))}
+    if "internal" in recipients:
+        return "recipient_internal"
     delivery = _as_string_list(message.get("delivery"))
     if delivery:
         normalized_delivery = {item.strip().lower() for item in delivery}
@@ -16081,6 +16106,10 @@ def _channel_llm_message_skip_reason(message: dict[str, Any]) -> str | None:
     if wake_reason:
         return wake_reason
     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    sse_source = str(meta.get("sse_source") or meta.get("source") or "").strip().lower()
+    sender = str(message.get("sender_id") or meta.get("sender_id") or "").strip().lower()
+    if sse_source in _NATIVE_ROUTER_CHANNEL_NAMES or sender in _NATIVE_ROUTER_CHANNEL_NAMES:
+        return "native_router_self_echo"
     meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event") or meta.get("status") or "").strip().lower()
     if meta_kind in _CHANNEL_CONTROL_KINDS:
         return meta_kind
@@ -16250,7 +16279,7 @@ def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
                 {
                     "channel": message.get("channel") or "default",
                     "sender_id": "claude-any-llm",
-                    "recipients": "internal",
+                    "recipients": ["all"],
                     "kind": "channel_llm_response",
                     "message": text,
                     "visibility": "user",
