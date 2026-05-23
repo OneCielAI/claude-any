@@ -133,6 +133,9 @@ npm install -g @oneciel-ai/claude-any@latest
 ```
 
 Nightly version numbers follow `X.Y.Z-nightly.YYYYMMDD-HHmm` (UTC).
+Maintainers publish nightlies by pushing to the `nightly` branch; GitHub
+Actions handles npm publishing with the repository `NPM_TOKEN`. Do not run
+`npm publish` from a local checkout.
 
 ## Run Claude Code Headlessly
 
@@ -369,18 +372,21 @@ claude-any
 ### Releasing (maintainers)
 
 The npm registry version is published automatically by the
-[`Publish to npm`](.github/workflows/npm-publish.yml) workflow when a new
-GitHub Release is published. The workflow needs an `NPM_TOKEN` repository
-secret containing a granular access token for `@oneciel-ai/claude-any` with
+[`Publish to npm`](.github/workflows/npm-publish.yml) workflow when `main`
+or `nightly` is pushed. The workflow needs an `NPM_TOKEN` repository secret
+containing a granular access token for `@oneciel-ai/claude-any` with
 *Bypass 2FA for publishing* enabled.
+
+Do not run `npm publish` from a local checkout. Local npm auth can be
+different from the GitHub Actions token and may report `E401`/`E404` even
+when the branch-push workflow publishes successfully.
 
 Release flow:
 
-1. Bump `version` in `package.json` and `VERSION` in `claude_any.py`.
-2. Add a Changelog entry.
-3. `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
-4. `gh release create vX.Y.Z --title "..." --notes "..."` — this triggers
-   the publish workflow.
+1. Nightly work: commit to `nightly` and run `git push origin nightly`.
+2. Stable release: merge `nightly` to `main` and run `git push origin main`.
+3. Verify the `Publish to npm` workflow succeeded.
+4. For stable releases, create the matching GitHub Release after npm publish.
 
 
 ![Claude Any menu](docs/assets/claude-any-main.en.png)

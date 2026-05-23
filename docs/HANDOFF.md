@@ -421,9 +421,13 @@ Check:
 
 ## Release process
 
-Current release path uses GitHub Actions and two npm dist-tags.
+Current release path uses GitHub Actions and two npm dist-tags. The
+`Publish to npm` workflow is triggered automatically by branch pushes to
+`nightly` and `main`.
 
-Local npm auth may not work. Prefer:
+Do not run `npm publish` locally. Local npm auth can be missing or stale,
+which produces misleading `E401`/`E404` results even though the branch-push
+workflow publishes with the repository `NPM_TOKEN` secret.
 
 For ongoing work:
 
@@ -458,6 +462,13 @@ npm view @oneciel-ai/claude-any version gitHead dist.tarball
 npm view @oneciel-ai/claude-any@nightly version gitHead dist.tarball
 ```
 
+Troubleshooting note from 2026-05-23: local `npm whoami` returned `E401`,
+and local `npm publish --tag nightly` returned `E404`, while the
+branch-push workflow successfully published
+`@oneciel-ai/claude-any@0.1.100-nightly.20260523-2252` from commit
+`1ce64abcf6e96f1313a9bb6641d37a52d7bae368`. Treat GitHub Actions as the
+source of truth for npm publishing.
+
 ## Known local workspace notes
 
 The following local untracked directories have appeared during npm registry verification and should not be treated as source changes:
@@ -467,6 +478,10 @@ The following local untracked directories have appeared during npm registry veri
 .npm-view-cache-2/
 .npm-view-cache-3/
 .npm-view-cache-4/
+.npm-view-cache-5/
+.npm-view-cache-6/
+.npm-view-cache-7/
+.npm-view-cache-8/
 ```
 
 Leave them alone unless doing deliberate workspace cleanup.

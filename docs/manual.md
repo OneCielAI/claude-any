@@ -69,10 +69,15 @@ claude-any
 
 ### Releasing (maintainers)
 
-The `Publish to npm` workflow publishes to the registry on every push to
-either the `main` or the `nightly` branch. It reads the `NPM_TOKEN`
-repository secret, which must hold a granular npm access token for
-`@oneciel-ai/claude-any` with *Bypass 2FA for publishing* enabled.
+The `Publish to npm` workflow is the only supported publish path. It
+publishes to the registry on every push to either the `main` or the
+`nightly` branch. It reads the `NPM_TOKEN` repository secret, which must
+hold a granular npm access token for `@oneciel-ai/claude-any` with
+*Bypass 2FA for publishing* enabled.
+
+Do not run `npm publish` from a local checkout. Local npm auth can differ
+from the GitHub Actions token and can produce misleading `E401`/`E404`
+errors even when the branch-push workflow publishes successfully.
 
 Two channels exist:
 
@@ -88,7 +93,9 @@ Nightly flow (ongoing work):
 
 1. Commit to `nightly`. CI runs lint + tests and `Publish to npm`
    emits a fresh `X.Y.Z-nightly.YYYYMMDD-HHmm` artifact.
-2. Real users on `latest` are unaffected; only those who explicitly
+2. Push `nightly` with `git push origin nightly`; this is the publish
+   trigger.
+3. Real users on `latest` are unaffected; only those who explicitly
    installed `@nightly` will pull it.
 
 Stable release flow (promoting nightly into a real release):

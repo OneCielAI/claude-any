@@ -241,17 +241,21 @@ claude-any
 
 ### 发布（维护者）
 
-发布新 GitHub Release 时，
-[`Publish to npm`](../.github/workflows/npm-publish.yml) 工作流会自动
-将包发布到 npm 。该工作流读取仓库 secret `NPM_TOKEN`，token 需要对
-`@oneciel-ai/claude-any` 拥有写权限并启用 *Bypass 2FA for publishing*。
+[`Publish to npm`](../.github/workflows/npm-publish.yml) 工作流会在
+`main` 或 `nightly` 分支 push 时自动发布到 npm。该工作流读取仓库
+secret `NPM_TOKEN`，token 需要对 `@oneciel-ai/claude-any` 拥有写权限并启用
+*Bypass 2FA for publishing*。
+
+不要在本地 checkout 中直接运行 `npm publish`。本地 npm 认证可能不同于
+GitHub Actions 的 `NPM_TOKEN`，即使分支 push 发布已经成功，本地也可能显示
+`E401`/`E404`。
 
 发布流程:
 
-1. 升级 `package.json` 的 `version` 和 `claude_any.py` 的 `VERSION`。
-2. 增加 Changelog 条目。
-3. `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`。
-4. `gh release create vX.Y.Z --title "..." --notes "..."` —— 触发 publish 工作流。
+1. nightly 工作提交到 `nightly` 后运行 `git push origin nightly`。
+2. 稳定版将 `nightly` 合并到 `main` 后运行 `git push origin main`。
+3. 确认 `Publish to npm` 工作流成功。
+4. 稳定版在确认 npm 发布后创建 GitHub Release。
 
 
 ![Claude Any menu](assets/claude-any-main.zh.png)

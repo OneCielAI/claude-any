@@ -244,18 +244,21 @@ claude-any
 
 ### リリース (メンテナー向け)
 
-新しい GitHub Release が公開されると
-[`Publish to npm`](../.github/workflows/npm-publish.yml) ワークフローが
-自動的に npm へ公開します。ワークフローは `@oneciel-ai/claude-any` に対する
-*Bypass 2FA for publishing* を有効にした granular token を、リポジトリ
-secret `NPM_TOKEN` として受け取ります。
+[`Publish to npm`](../.github/workflows/npm-publish.yml) ワークフローは
+`main` または `nightly` ブランチへの push で自動的に npm へ公開します。
+ワークフローは `@oneciel-ai/claude-any` に対する *Bypass 2FA for publishing*
+を有効にした granular token を、リポジトリ secret `NPM_TOKEN` として受け取ります。
+
+ローカル checkout から `npm publish` を直接実行しないでください。ローカル npm
+認証は GitHub Actions の `NPM_TOKEN` と異なる場合があり、ブランチ push による
+公開が成功していてもローカルでは `E401`/`E404` に見えることがあります。
 
 リリース手順:
 
-1. `package.json` の `version` と `claude_any.py` の `VERSION` を上げる。
-2. Changelog 項目を追加。
-3. `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
-4. `gh release create vX.Y.Z --title "..." --notes "..."` — publish ワークフローを起動。
+1. nightly 作業は `nightly` に commit して `git push origin nightly`。
+2. 安定版は `nightly` を `main` に merge して `git push origin main`。
+3. `Publish to npm` ワークフローの成功を確認。
+4. 安定版は npm 公開確認後に GitHub Release を作成。
 
 
 ![Claude Any menu](assets/claude-any-main.ja.png)

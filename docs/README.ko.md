@@ -251,18 +251,21 @@ claude-any
 
 ### 릴리즈 (메인테이너용)
 
-새 GitHub Release 가 publish 되면
 [`Publish to npm`](../.github/workflows/npm-publish.yml) 워크플로가
-자동으로 npm 에 배포합니다. 워크플로는 `@oneciel-ai/claude-any` 에 대한
-*Bypass 2FA for publishing* 권한이 있는 granular token 을 저장소 secret
-`NPM_TOKEN` 으로 받습니다.
+`main` 또는 `nightly` 브랜치 push 때 자동으로 npm 에 배포합니다.
+워크플로는 `@oneciel-ai/claude-any` 에 대한 *Bypass 2FA for publishing*
+권한이 있는 granular token 을 저장소 secret `NPM_TOKEN` 으로 받습니다.
+
+로컬 체크아웃에서 `npm publish` 를 직접 실행하지 마세요. 로컬 npm 인증은
+GitHub Actions 의 `NPM_TOKEN` 과 다를 수 있고, 실제 브랜치 push 배포는
+성공했는데도 로컬에서는 `E401`/`E404` 로 보일 수 있습니다.
 
 릴리즈 절차:
 
-1. `package.json` 의 `version` 과 `claude_any.py` 의 `VERSION` 을 올림.
-2. Changelog 항목 추가.
-3. `git tag -a vX.Y.Z -m "..." && git push origin vX.Y.Z`.
-4. `gh release create vX.Y.Z --title "..." --notes "..."` — publish 워크플로 트리거.
+1. `nightly` 작업은 `nightly` 브랜치에 커밋하고 `git push origin nightly`.
+2. 안정 릴리즈는 `nightly` 를 `main` 으로 병합하고 `git push origin main`.
+3. `Publish to npm` 워크플로 성공 여부 확인.
+4. 안정 릴리즈는 npm 배포 확인 후 GitHub Release 를 생성.
 
 
 ![Claude Any 메뉴](assets/claude-any-main.ko.png)
