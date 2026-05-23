@@ -330,6 +330,13 @@ class ChannelBridgeTests(unittest.TestCase):
         messages = [
             {"id": 2, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.sse.connected", "meta": {}},
             {"id": 3, "channel": "room", "sender_id": "sarah", "message": "Robert, can you check this?", "meta": {"room_id": "room"}},
+            {
+                "id": 4,
+                "channel": "ai-net-sse",
+                "sender_id": "ai-net-sse",
+                "message": "SSE MCP initialized",
+                "meta": {"transport": "sse", "event": "initialized"},
+            },
         ]
         with (
             mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
@@ -344,12 +351,14 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(2, len(out["messages"]))
         injected = out["messages"][-1]["content"][0]["text"]
         self.assertIn("channel inbox", injected)
-        self.assertIn("First, briefly tell the local user", injected)
+        self.assertIn("You must visibly tell the local user", injected)
         self.assertIn("Robert, can you check this?", injected)
         self.assertNotIn("ai-net.sse.connected", injected)
-        write_cursor.assert_called_with(3)
+        self.assertNotIn("SSE MCP initialized", injected)
+        write_cursor.assert_called_with(4)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
+        self.assertTrue(any("channel_llm_inject_skipped_noise" in item and "transport_channel" in item for item in log_messages))
 
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(

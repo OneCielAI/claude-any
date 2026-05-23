@@ -15983,6 +15983,28 @@ def _channel_wake_message_noise_reason(message: dict[str, Any]) -> str | None:
     return None
 
 
+def _channel_llm_message_noise_reason(message: dict[str, Any]) -> str | None:
+    wake_reason = _channel_wake_message_noise_reason(message)
+    if wake_reason:
+        return wake_reason
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip().lower()
+    channel = str(message.get("channel") or "").strip().lower()
+    sender = str(message.get("sender_id") or "").strip().lower()
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event") or "").strip().lower()
+    source = str(meta.get("source") or meta.get("transport") or "").strip().lower()
+    if channel.endswith(("-sse", "-ws")) and sender in {"", channel, "channel", "system", "mcp"}:
+        if meta_kind in {"", "connection", "connected", "initialized", "init", "ready", "status", "heartbeat", "keepalive"}:
+            return "transport_channel"
+        if source in {"sse", "ws", "websocket", "mcp-sse"}:
+            return "transport_channel"
+        if re.search(r"\b(sse|ws|websocket|mcp)\b.*\b(connected|initialized|ready|started)\b", body):
+            return "transport_channel"
+    if meta_kind in {"connection", "connected", "heartbeat", "keepalive"}:
+        return meta_kind
+    return None
+
+
 def _channel_wake_message_is_noise(message: dict[str, Any]) -> bool:
     return _channel_wake_message_noise_reason(message) is not None
 
@@ -16028,10 +16050,11 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         parts.append("- " + " ".join(fields) + f" text={json.dumps(body, ensure_ascii=False)}" + meta_text)
     return (
         "[claude-any channel inbox]\n"
-        "External channel notifications arrived through claude-any while native Claude Code Channels were unavailable.\n"
-        "First, briefly tell the local user that these notifications arrived and summarize who sent what. "
-        "Then decide whether to respond, call an available reply/MCP tool, or continue the current task. "
-        "If no action is needed, say that clearly and keep the current work moving.\n"
+        "Active external notifications arrived through claude-any while native Claude Code Channels were unavailable.\n"
+        "You must visibly tell the local user about these notifications in your next response before continuing. "
+        "Summarize the sender, channel, and message text in 1-2 short sentences. "
+        "If a notification asks for a reply or action, respond using the available channel/AI-NET/MCP tool when possible. "
+        "Do not silently ignore these notifications or only continue the prior task.\n"
         + "\n".join(parts)
     )
 
@@ -16087,7 +16110,7 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                 max_seen = max(max_seen, int(message.get("id") or 0))
             except Exception:
                 continue
-            noise_reason = _channel_wake_message_noise_reason(message)
+            noise_reason = _channel_llm_message_noise_reason(message)
             if noise_reason:
                 router_log(
                     "INFO",
