@@ -2,9 +2,9 @@
 
 Date: 2026-05-22
 Stable release: `@oneciel-ai/claude-any@0.1.99`
-Nightly release: `@oneciel-ai/claude-any@0.1.99-nightly.20260522-1706`
+Nightly release: `@oneciel-ai/claude-any@0.1.99-nightly.20260522-2101`
 Current branch: `nightly`
-Current pushed commit: `0853688` (`Probe SSE MCP servers for the channel capability too`)
+Current pushed commit: `5a90a9a` (`Add Claude Native provider with router-kill guarantee`)
 
 ## Current state
 
@@ -19,7 +19,7 @@ The latest production path is:
 - Native clients receive channel messages through `notifications/claude/channel` with metadata preserved as much as the MCP schema allows.
 - `stdin` fallback injects a compact wake prompt into Claude Code when channel messages arrive.
 
-The published stable npm version `0.1.99` includes the automatic MCP channel capability probing work through timeout/error classification. The current `nightly` branch adds the MCP channel server guide cleanup and SSE MCP server probing refinements.
+The published stable npm version `0.1.99` includes the automatic MCP channel capability probing work through timeout/error classification. The current `nightly` branch adds the MCP channel server guide cleanup, SSE MCP server probing refinements, MCP-spec NDJSON probing defaults, and Claude Native isolation guarantees.
 
 ## Recent release sequence
 
@@ -138,6 +138,50 @@ The `nightly` branch currently contains additional unreleased/staged work:
 - Added and then simplified an MCP channel-capable server author guide.
 - Reframed the guide to point at Anthropic's MCP spec rather than maintaining a duplicated local protocol reference.
 - Extended channel probing so SSE MCP servers are probed for channel capability too.
+- Changed the stdio channel probe default to MCP-spec newline-delimited JSON (`jsonl`/NDJSON). Legacy `Content-Length` framed probing is still available through `claude_any_stdio: "framed"` or equivalent aliases.
+- Added Claude Native provider semantics: `anthropic` is now labeled `Claude Native`; aliases include `claude-native`, `native`, and `claude-code`; launches suppress claude-any routing/model/advisor env overrides and guarantee the router is stopped before Claude Code starts.
+
+## Provider modes
+
+### Claude Native
+
+`anthropic` is intentionally presented as `Claude Native`.
+
+Use this mode when the user wants Claude Code's own Anthropic/OAuth/default behavior, not claude-any routing.
+
+Aliases:
+
+- `anthropic`
+- `claude`
+- `claude-native`
+- `native`
+- `claude-code`
+
+Claude Native contract:
+
+- `env_vars()` only sets `CLAUDE_ANY_PROVIDER=anthropic` as an internal marker.
+- If the user has a stored Anthropic API key, `ANTHROPIC_API_KEY` is passed through.
+- If no stored key exists, no Anthropic auth env var is set; Claude Code's own OAuth/default credentials win.
+- claude-any does not set `ANTHROPIC_BASE_URL`, `ANTHROPIC_MODEL`, `ANTHROPIC_AUTH_TOKEN`, advisor model, max output token, auto-compact, attribution, or model alias variables.
+- Before launching Claude Code, claude-any must guarantee the local router is stopped so stale router state cannot intercept the native Claude Code session.
+
+Important logs:
+
+- `router_kill_guarantee reason=native_anthropic_launch state=already_down`
+- `router_kill_guarantee reason=native_anthropic_launch state=killed elapsed_ms=...`
+- `router_kill_guarantee reason=native_anthropic_launch state=still_up_after_...`
+
+If the router remains alive after the shutdown deadline, launch aborts with a `RuntimeError`. This is deliberate.
+
+### Routed Providers
+
+Non-native providers still use claude-any's routing env and model aliases as before:
+
+- `ollama`
+- `ollama-cloud`
+- `vllm`
+- `nvidia-hosted`
+- `self-hosted-nim`
 
 ## Channel delivery modes
 
@@ -176,6 +220,33 @@ Stdin channel flow:
 4. Router writes `Ctrl-U`, the compact wake prompt, and submit bytes to Claude Code's PTY.
 5. Submit bytes are selected by explicit env override, platform default, or observed user input.
 
+## MCP channel capability probing
+
+Channel probing detects whether configured MCP servers expose the experimental `claude/channel` capability.
+
+Current behavior:
+
+- Stdio probe default is `jsonl`/NDJSON, matching the MCP stdio wire format.
+- `Content-Length` framed probing is treated as legacy opt-in.
+- Configure framed probing per server with `claude_any_stdio: "framed"` or aliases such as `content-length` / `lsp`.
+- Unknown or empty probe strategy values fall back to `jsonl`.
+- SSE MCP servers are also probed for channel capability on `nightly`.
+- Probe results are cached in `channel-probe-cache.json` and surfaced in the menu.
+
+Relevant helpers:
+
+- `_channel_probe_strategy_for`
+- `_channel_probe_parse_jsonl_responses`
+- `_channel_probe_parse_framed_responses`
+- `probe_stdio_mcp_for_channel_capability_detailed`
+- `CHANNEL_PROBE_CACHE_PATH`
+
+Debug focus:
+
+- If a spec-correct stdio server is missed, check whether it emits exactly one JSON object per line and no embedded newlines.
+- If a legacy server is missed, add `claude_any_stdio: "framed"` to its MCP config entry.
+- If probing times out, distinguish startup failure from missing capability; timeout and stderr/exit code are now preserved where available.
+
 ## Configuration
 
 Main config path:
@@ -206,6 +277,12 @@ Native channel cursor:
 
 ```text
 ~/.config/claude-any/channel-mcp-cursor.json
+```
+
+Channel probe cache:
+
+```text
+~/.config/claude-any/channel-probe-cache.json
 ```
 
 Do not commit or paste real MCP API keys into docs or issues. Keep values such as `AINET_API_KEY` in local config or environment only.
@@ -318,6 +395,30 @@ Check:
 
 Repeated 30 second `ConnectionResetError` closes can be normal client reconnect behavior, but a persistent `failed` state in `/mcp` means the client did not complete MCP initialization.
 
+### Claude Native still routes through claude-any
+
+This should not happen on current `nightly`.
+
+Check:
+
+- Selected provider resolves to `anthropic`.
+- Provider label is `Claude Native`.
+- `claude-any env` does not print `ANTHROPIC_BASE_URL=http://127.0.0.1:8799`.
+- Router log has a `router_kill_guarantee` entry during launch.
+- `claude-any stop` fully stops the router if the guarantee reports `state=still_up...`.
+
+The intended failure mode is to abort launch rather than accidentally route a native Claude Code session through claude-any.
+
+### Channel-capable MCP server is not detected
+
+Check:
+
+- Server type is stdio/command or SSE and is reachable.
+- Stdio server uses MCP-spec NDJSON by default.
+- Legacy framed stdio servers explicitly set `claude_any_stdio: "framed"`.
+- Probe cache is not stale; re-probe from the menu or remove `channel-probe-cache.json`.
+- Probe detail records timeout vs missing capability vs process stderr/exit code.
+
 ## Release process
 
 Current release path uses GitHub Actions and two npm dist-tags.
@@ -365,6 +466,7 @@ The following local untracked directories have appeared during npm registry veri
 .npm-view-cache-1/
 .npm-view-cache-2/
 .npm-view-cache-3/
+.npm-view-cache-4/
 ```
 
 Leave them alone unless doing deliberate workspace cleanup.
@@ -376,3 +478,5 @@ Leave them alone unless doing deliberate workspace cleanup.
 3. Capture logs for one successful native notification and one successful stdin fallback notification.
 4. If native `/mcp` still reports `claude-any-router failed`, inspect the MCP initialize/request response pair around `/ca/mcp/sse` and `/ca/mcp/messages`.
 5. If stdin still parks text in the input area, test explicit `CLAUDE_ANY_CHANNEL_WAKE_ENTER=crlf` and compare logs with observed `channel_stdin_proxy_enter_observed`.
+6. Test `claude-any --ca-provider claude-native` from a shell with a stale router process running and confirm launch aborts or logs `router_kill_guarantee ... state=killed`.
+7. Test a spec-correct stdio MCP server that only speaks NDJSON and confirm default channel probing detects `claude/channel`.
