@@ -325,6 +325,32 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_stdin_proxy_skipped_noise" in item for item in log_messages))
         self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2,3" in item and "enter=crlf" in item for item in log_messages))
 
+    def test_body_with_pending_channel_messages_injects_llm_context(self):
+        body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
+        messages = [
+            {"id": 2, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.sse.connected", "meta": {}},
+            {"id": 3, "channel": "room", "sender_id": "sarah", "message": "Robert, can you check this?", "meta": {"room_id": "room"}},
+        ]
+        with (
+            mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+            mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            out = claude_any.body_with_pending_channel_messages(body)
+
+        self.assertIsNot(out, body)
+        self.assertEqual(2, len(out["messages"]))
+        injected = out["messages"][-1]["content"][0]["text"]
+        self.assertIn("channel inbox", injected)
+        self.assertIn("First, briefly tell the local user", injected)
+        self.assertIn("Robert, can you check this?", injected)
+        self.assertNotIn("ai-net.sse.connected", injected)
+        write_cursor.assert_called_with(3)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
+
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(
             {

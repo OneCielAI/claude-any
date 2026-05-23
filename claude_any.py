@@ -60,6 +60,7 @@ WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
 CHANNEL_MCP_CURSOR_PATH = CONFIG_DIR / "channel-mcp-cursor.json"
+CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
 CHANNEL_PROBE_CACHE_PATH = CONFIG_DIR / "channel-probe-cache.json"
 MCP_PROXY_CONFIG = CONFIG_DIR / "mcp-proxy.json"
 ROUTER_HOST = os.environ.get("CLAUDE_ANY_ROUTER_CLIENT_HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -136,6 +137,8 @@ _CHANNEL_MCP_LOCK = threading.Lock()
 _CHANNEL_MCP_SESSIONS: dict[str, dict[str, Any]] = {}
 _CHANNEL_MCP_CURSOR_LOCK = threading.Lock()
 _CHANNEL_MCP_CURSOR_LAST_ID: int | None = None
+_CHANNEL_LLM_CURSOR_LOCK = threading.Lock()
+_CHANNEL_LLM_CURSOR_LAST_ID: int | None = None
 _NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
 BUILTIN_CHANNEL_SPEC = "server:claude-any-router"
 _MCP_NOTIFICATION_DEDUP_TTL_SECONDS = 3.0
@@ -1336,7 +1339,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "compat_prompt_for_non_anthropic": True,
         "channels": [],
         "development_channels": False,
-        "channel_delivery": "native",
+        "channel_delivery": "llm",
     },
     "cleanup": {
         "managed_services_on_launch": True,
@@ -1561,6 +1564,16 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
             cfg["claude_code"] = ccfg
         if normalize_channel_delivery(ccfg.get("channel_delivery")) == "stdin":
             ccfg["channel_delivery"] = "native"
+        migrations[marker] = True
+
+    marker = "default_channel_delivery_llm_20260523"
+    if not migrations.get(marker):
+        ccfg = cfg.setdefault("claude_code", {})
+        if not isinstance(ccfg, dict):
+            ccfg = {}
+            cfg["claude_code"] = ccfg
+        if normalize_channel_delivery(ccfg.get("channel_delivery")) == "native":
+            ccfg["channel_delivery"] = "llm"
         migrations[marker] = True
 
 
@@ -8288,6 +8301,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
 
 def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
     _update_tool_schema_registry(body.get("tools"))
+    body = body_with_pending_channel_messages(body)
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     base = pcfg.get("base_url", "").rstrip("/")
     original_body = body
@@ -9001,6 +9015,7 @@ def open_openai_stream_with_rate_retry(
 
 def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
     _update_tool_schema_registry(body.get("tools"))
+    body = body_with_pending_channel_messages(body)
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     if provider == "nvidia-hosted":
         model = ncp_model_id_for_nvidia_hosted(model)
@@ -11046,11 +11061,13 @@ def normalize_channel_delivery(value: Any) -> str:
     text = str(value or "").strip().lower().replace("_", "-")
     if text in {"native", "native-channel", "native-channel-bridge", "claude-channel", "claude/native"}:
         return "native"
+    if text in {"llm", "model", "context", "router", "advisor", "inband", "in-band"}:
+        return "llm"
     if text in {"stdin", "pty", "terminal", "wake", "wake-proxy", "legacy"}:
         return "stdin"
     if text in {"auto", ""}:
-        return "native"
-    return "native"
+        return "llm"
+    return "llm"
 
 
 def channel_delivery_mode(cfg: dict[str, Any] | None = None) -> str:
@@ -11058,7 +11075,7 @@ def channel_delivery_mode(cfg: dict[str, Any] | None = None) -> str:
     if env_value is not None:
         return normalize_channel_delivery(env_value)
     cfg = cfg or load_config()
-    return normalize_channel_delivery(cfg.setdefault("claude_code", {}).get("channel_delivery", "native"))
+    return normalize_channel_delivery(cfg.setdefault("claude_code", {}).get("channel_delivery", "llm"))
 
 
 def set_channel_delivery_config(value: Any) -> list[str]:
@@ -11068,6 +11085,8 @@ def set_channel_delivery_config(value: Any) -> list[str]:
     save_config(cfg)
     if mode == "native":
         return ["Channel delivery set to native claude/channel bridge."]
+    if mode == "llm":
+        return ["Channel delivery set to LLM context injection."]
     return ["Channel delivery set to stdin wake proxy."]
 
 
@@ -14821,11 +14840,12 @@ def _channel_panel_step(values: list[str], start: int, delta: int) -> int:
 def channel_delivery_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     current = channel_delivery_mode(cfg)
     rows = [
-        f"{'*' if current == 'native' else ' '} native Claude Code claude/channel queue bridge",
-        f"{'*' if current == 'stdin' else ' '} stdin  PTY wake proxy; works broadly, uses terminal input",
+        f"{'*' if current == 'llm' else ' '} llm    inject channel messages into next model request",
+        f"{'*' if current == 'native' else ' '} native Claude Code claude/channel bridge; requires Channels",
+        f"{'*' if current == 'stdin' else ' '} stdin  PTY wake proxy; terminal input fallback",
         "Back",
     ]
-    return rows, ["native", "stdin", "back"]
+    return rows, ["llm", "native", "stdin", "back"]
 
 
 def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
@@ -15697,6 +15717,12 @@ def should_use_native_channel_bridge(use_router_mode: bool, cfg: dict[str, Any],
     return bool(channel_delivery_mode(cfg) == "native" and not native_channel_passthrough_requested(passthrough))
 
 
+def should_use_channel_llm_delivery(use_router_mode: bool, passthrough: list[str], cfg: dict[str, Any] | None = None) -> bool:
+    if not use_router_mode or native_channel_passthrough_requested(passthrough):
+        return False
+    return bool(cfg is not None and channel_delivery_mode(cfg) == "llm")
+
+
 def claude_code_channels_auth_available(claude: str) -> tuple[bool, str]:
     try:
         proc = subprocess.run(
@@ -15852,7 +15878,7 @@ def write_mcp_proxy_config(
 def should_use_channel_stdin_proxy(use_router_mode: bool, passthrough: list[str], cfg: dict[str, Any] | None = None) -> bool:
     if not use_router_mode or native_channel_passthrough_requested(passthrough):
         return False
-    if cfg is not None and channel_delivery_mode(cfg) == "native":
+    if cfg is not None and channel_delivery_mode(cfg) in {"native", "llm"}:
         return False
     return True
 
@@ -15919,6 +15945,108 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
         + " ; ".join(parts)
         + ". If relevant to current work, respond or act now; otherwise keep working."
     )
+
+
+def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
+    parts: list[str] = []
+    for message in messages:
+        channel = str(message.get("channel") or "default")
+        sender = str(message.get("sender_id") or "channel")
+        mid = str(message.get("id") or "")
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        room = str(meta.get("room_id") or meta.get("room") or channel)
+        thread = str(message.get("thread_id") or meta.get("thread_id") or "")
+        body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
+        fields = [f"id={mid}", f"channel={channel}", f"room={room}", f"from={sender}"]
+        if thread:
+            fields.append(f"thread={thread}")
+        meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
+        parts.append("- " + " ".join(fields) + f" text={json.dumps(body, ensure_ascii=False)}" + meta_text)
+    return (
+        "[claude-any channel inbox]\n"
+        "External channel notifications arrived through claude-any while native Claude Code Channels were unavailable.\n"
+        "First, briefly tell the local user that these notifications arrived and summarize who sent what. "
+        "Then decide whether to respond, call an available reply/MCP tool, or continue the current task. "
+        "If no action is needed, say that clearly and keep the current work moving.\n"
+        + "\n".join(parts)
+    )
+
+
+def _channel_llm_write_cursor_locked(last_id: int) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = CHANNEL_LLM_CURSOR_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps({"last_id": max(0, int(last_id))}, separators=(",", ":")) + "\n", encoding="utf-8")
+    tmp_path.replace(CHANNEL_LLM_CURSOR_PATH)
+
+
+def _channel_llm_read_cursor_locked() -> int:
+    global _CHANNEL_LLM_CURSOR_LAST_ID
+    if _CHANNEL_LLM_CURSOR_LAST_ID is not None:
+        return _CHANNEL_LLM_CURSOR_LAST_ID
+    if CHANNEL_LLM_CURSOR_PATH.exists():
+        try:
+            data = json.loads(CHANNEL_LLM_CURSOR_PATH.read_text(encoding="utf-8"))
+            _CHANNEL_LLM_CURSOR_LAST_ID = max(0, int(data.get("last_id") or 0))
+            return _CHANNEL_LLM_CURSOR_LAST_ID
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_cursor_read_failed error={type(exc).__name__}: {exc}")
+    _CHANNEL_LLM_CURSOR_LAST_ID = max(0, _chat_init_next_id() - 1)
+    try:
+        _channel_llm_write_cursor_locked(_CHANNEL_LLM_CURSOR_LAST_ID)
+    except Exception:
+        pass
+    return _CHANNEL_LLM_CURSOR_LAST_ID
+
+
+def reset_channel_llm_delivery_cursor(last_id: int | None = None) -> int:
+    global _CHANNEL_LLM_CURSOR_LAST_ID
+    with _CHANNEL_LLM_CURSOR_LOCK:
+        _CHANNEL_LLM_CURSOR_LAST_ID = max(0, int(last_id if last_id is not None else _chat_init_next_id() - 1))
+        try:
+            _channel_llm_write_cursor_locked(_CHANNEL_LLM_CURSOR_LAST_ID)
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_cursor_write_failed error={type(exc).__name__}: {exc}")
+        return _CHANNEL_LLM_CURSOR_LAST_ID
+
+
+def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
+    global _CHANNEL_LLM_CURSOR_LAST_ID
+    cfg = load_config()
+    if channel_delivery_mode(cfg) != "llm":
+        return body
+    with _CHANNEL_LLM_CURSOR_LOCK:
+        last_id = _channel_llm_read_cursor_locked()
+        pending: list[dict[str, Any]] = []
+        max_seen = last_id
+        for message in read_chat_messages(last_id, None, None, 100):
+            try:
+                max_seen = max(max_seen, int(message.get("id") or 0))
+            except Exception:
+                continue
+            noise_reason = _channel_wake_message_noise_reason(message)
+            if noise_reason:
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
+                )
+                continue
+            pending.append(message)
+        if max_seen != last_id:
+            _CHANNEL_LLM_CURSOR_LAST_ID = max_seen
+            try:
+                _channel_llm_write_cursor_locked(max_seen)
+            except Exception as exc:
+                router_log("WARN", f"channel_llm_cursor_write_failed error={type(exc).__name__}: {exc}")
+        if not pending:
+            return body
+    messages = [m for m in body.get("messages", []) if isinstance(m, dict)]
+    messages.append({"role": "user", "content": [{"type": "text", "text": format_channel_llm_batch_prompt(pending)}]})
+    out = dict(body)
+    out["messages"] = messages
+    ids = ",".join(str(message.get("id") or "") for message in pending)
+    channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
+    router_log("INFO", f"channel_llm_injected count={len(pending)} message_ids={ids} channels={channels}")
+    return out
 
 
 def _write_fd_all(fd: int, data: bytes) -> None:
@@ -16896,7 +17024,8 @@ def launch_claude(
     launch_passthrough = normalize_channel_passthrough(passthrough)
     native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
     stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg)
-    if use_router_mode or native_channel_bridge:
+    llm_channel_delivery = should_use_channel_llm_delivery(use_router_mode, launch_passthrough, cfg)
+    if use_router_mode or native_channel_bridge or llm_channel_delivery:
         start_router_if_needed()
     if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
@@ -16946,9 +17075,9 @@ def launch_claude(
     if native_channel_bridge:
         auth_ok, auth_reason = claude_code_channels_auth_available(claude)
         if not auth_ok:
-            router_log("WARN", f"channel_native_unavailable_fallback reason={auth_reason} delivery=stdin")
+            router_log("WARN", f"channel_native_unavailable_fallback reason={auth_reason} delivery=llm")
             native_channel_bridge = False
-            stdin_channel_proxy = True
+            llm_channel_delivery = True
     extra_args: list[str] = []
     mcp_config_paths: list[str] = []
     if should_attach_web_search(provider, cfg, web_search_override):
@@ -16980,7 +17109,9 @@ def launch_claude(
         except Exception as exc:
             router_log("WARN", f"channel_probe_cache_load_failed error={type(exc).__name__}: {exc}")
     claude_passthrough = list(launch_passthrough)
-    if stdin_channel_proxy or native_channel_bridge:
+    if stdin_channel_proxy or native_channel_bridge or llm_channel_delivery:
+        if llm_channel_delivery:
+            reset_channel_llm_delivery_cursor()
         auto_start_sse_channels_from_mcp_configs(launch_passthrough)
         proxy_config = write_mcp_proxy_config(
             launch_passthrough,
