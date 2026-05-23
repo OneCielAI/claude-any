@@ -291,6 +291,7 @@ class ChannelConfigTests(unittest.TestCase):
     def test_launch_without_external_channels_uses_llm_delivery_when_selected(self):
         cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False, "channel_delivery": "llm"}}
         with ExitStack() as stack:
+            channel_path = Path("channel-mcp.json")
             stack.enter_context(mock.patch.object(claude_any, "run_prelaunch_menu", return_value=0))
             stack.enter_context(mock.patch.object(claude_any, "load_config", return_value=cfg))
             stack.enter_context(mock.patch.object(claude_any, "get_current_provider", return_value=("ollama-cloud", {})))
@@ -302,7 +303,7 @@ class ChannelConfigTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(claude_any, "start_router_if_needed"))
             reset_cursor = stack.enter_context(mock.patch.object(claude_any, "reset_channel_llm_delivery_cursor"))
             auto_start = stack.enter_context(mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", return_value=[]))
-            stack.enter_context(mock.patch.object(claude_any, "env_vars", return_value={"CLAUDE_ANY_MODEL_ALIAS": "claude-any-test"}))
+            stack.enter_context(mock.patch.object(claude_any, "env_vars", return_value={"CLAUDE_ANY_MODEL_ALIAS": "claude-any-test", "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"}))
             stack.enter_context(mock.patch.object(claude_any, "install_claude_any_slash_commands"))
             stack.enter_context(mock.patch.object(claude_any, "install_tool_guard_hooks"))
             stack.enter_context(mock.patch.object(claude_any, "install_claude_any_statusline"))
@@ -314,6 +315,7 @@ class ChannelConfigTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(claude_any, "cached_channel_capable_server_names", return_value=["claude-any-router"]))
             stack.enter_context(mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[]))
             stack.enter_context(mock.patch.object(claude_any, "read_channel_probe_cache", return_value={"probed_at": 1700000000}))
+            write_channel = stack.enter_context(mock.patch.object(claude_any, "write_channel_mcp_config", return_value=channel_path))
             proxy_config = stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=None))
             proxy = stack.enter_context(mock.patch.object(claude_any, "subprocess_call_with_channel_wake_proxy", return_value=0))
             call = stack.enter_context(mock.patch.object(claude_any.subprocess, "call", return_value=0))
@@ -322,11 +324,16 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertEqual(0, rc)
         ensure_probe.assert_called_once_with(cfg, [])
         reset_cursor.assert_called_once()
-        auto_start.assert_called_once_with([], extra_config_paths=[])
+        write_channel.assert_called_once()
+        auto_start.assert_called_once_with([], extra_config_paths=[channel_path])
         proxy_config.assert_called_once()
+        self.assertEqual([channel_path], proxy_config.call_args.kwargs["extra_config_paths"])
         proxy.assert_not_called()
         launch_cmd = call.call_args.args[0]
-        self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
+        self.assertIn("--dangerously-load-development-channels", launch_cmd)
+        self.assertIn("server:claude-any-router", launch_cmd)
+        launch_env = call.call_args.kwargs["env"]
+        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
 
     def test_launch_llm_delivery_uses_cached_probe_source_paths(self):
         cfg = {
@@ -338,6 +345,7 @@ class ChannelConfigTests(unittest.TestCase):
             },
         }
         with tempfile.TemporaryDirectory() as td:
+            channel_path = Path(td) / "channel-mcp.json"
             source_path = Path(td) / "source.mcp.json"
             proxy_path = Path(td) / "proxy.mcp.json"
             with ExitStack() as stack:
@@ -364,16 +372,21 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "cached_channel_capable_server_names", return_value=["claude-any-router", "ai-net-sse"]))
                 stack.enter_context(mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[source_path]))
                 stack.enter_context(mock.patch.object(claude_any, "read_channel_probe_cache", return_value={"probed_at": 1700000000}))
+                write_channel = stack.enter_context(mock.patch.object(claude_any, "write_channel_mcp_config", return_value=channel_path))
                 write_proxy = stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=proxy_path))
                 call = stack.enter_context(mock.patch.object(claude_any.subprocess, "call", return_value=0))
                 rc = claude_any.launch_claude([])
 
         self.assertEqual(0, rc)
         ensure_probe.assert_called_once_with(cfg, [])
-        auto_start.assert_called_once_with([], extra_config_paths=[source_path])
-        self.assertEqual([source_path], write_proxy.call_args.kwargs["extra_config_paths"])
+        write_channel.assert_called_once()
+        auto_start.assert_called_once_with([], extra_config_paths=[channel_path, source_path])
+        self.assertEqual([channel_path, source_path], write_proxy.call_args.kwargs["extra_config_paths"])
         launch_cmd = call.call_args.args[0]
         self.assertIn(str(proxy_path), launch_cmd)
+        self.assertIn("--dangerously-load-development-channels", launch_cmd)
+        self.assertIn("server:claude-any-router", launch_cmd)
+        self.assertIn("server:ai-net-sse", launch_cmd)
 
     def test_launch_without_external_channels_uses_generated_mcp_proxy_config_for_stdin(self):
         cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False, "channel_delivery": "stdin"}}

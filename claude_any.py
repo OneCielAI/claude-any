@@ -17350,7 +17350,7 @@ def launch_claude(
     llm_channel_delivery = should_use_channel_llm_delivery(use_router_mode, launch_passthrough, cfg)
     if use_router_mode or native_channel_bridge or llm_channel_delivery:
         start_router_if_needed()
-    if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge:
+    if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge or llm_channel_delivery:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
     if use_native_anthropic:
@@ -17405,7 +17405,7 @@ def launch_claude(
     mcp_config_paths: list[str] = []
     if should_attach_web_search(provider, cfg, web_search_override):
         mcp_config_paths.append(str(write_duckduckgo_mcp_config(cfg)))
-    if native_channel_bridge:
+    if native_channel_bridge or llm_channel_delivery:
         mcp_config_paths.append(str(write_channel_mcp_config()))
     detected_channel_specs: list[str] = []
     channel_probe_source_paths: list[Path] = []
@@ -17455,7 +17455,7 @@ def launch_claude(
             cfg,
             launch_passthrough,
             extra_specs=detected_channel_specs,
-            native_channel_bridge=native_channel_bridge,
+            native_channel_bridge=native_channel_bridge or llm_channel_delivery,
         )
     )
     cmd = [
