@@ -50,6 +50,10 @@ class ChannelConfigTests(unittest.TestCase):
             self.assertTrue(claude_any.should_use_native_channel_bridge(True, cfg, []))
             self.assertFalse(claude_any.should_use_channel_stdin_proxy(True, [], cfg))
 
+    def test_channel_specs_always_include_builtin_router(self):
+        cfg = {"claude_code": {"channels": []}}
+        self.assertEqual(["server:claude-any-router"], claude_any.channel_specs(cfg))
+
     def test_channel_delivery_migration_moves_old_default_to_native(self):
         cfg = {"migrations": {}, "claude_code": {"channel_delivery": "stdin"}, "providers": {}}
         claude_any.apply_config_migrations(cfg)
@@ -588,6 +592,15 @@ class ChannelProbeCacheTests(unittest.TestCase):
             self.assertTrue(claude_any.ensure_channel_probe_cache_for_launch(cfg, []))
         refresh.assert_called_once_with([])
 
+    def test_launch_refresh_needed_when_probe_cache_absent_even_without_external_selection(self):
+        cfg = {"claude_code": {"channels": [], "channel_delivery": "native"}}
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            self._isolate_cache(stack, td)
+            self.assertTrue(claude_any.channel_probe_cache_needs_launch_refresh(cfg, []))
+            refresh = stack.enter_context(mock.patch.object(claude_any, "refresh_channel_probe_cache", return_value={"servers": []}))
+            self.assertTrue(claude_any.ensure_channel_probe_cache_for_launch(cfg, []))
+        refresh.assert_called_once_with([])
+
     def test_launch_refresh_not_needed_when_selected_channel_has_source(self):
         cfg = {"claude_code": {"channels": ["server:ai-net-sse"], "channel_delivery": "native"}}
         with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
@@ -726,6 +739,16 @@ class ChannelProbeCacheTests(unittest.TestCase):
         inconclusive_idx = rows.index("[Probe inconclusive / check server]")
         self.assertIn("plain", rows[non_capable_idx + 1])
         self.assertIn("boring", rows[inconclusive_idx + 1])
+
+    def test_panel_rows_show_builtin_router_selected_without_probe_cache(self):
+        cfg = {"claude_code": {"channels": []}}
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            self._isolate_cache(stack, td)
+            rows, values = claude_any.channel_panel_rows(cfg)
+        self.assertIn("server:claude-any-router", values)
+        router_row = rows[values.index("server:claude-any-router")]
+        self.assertTrue(router_row.startswith("*"))
+        self.assertIn("built-in", router_row)
 
     def test_probe_record_bucket_separates_inconclusive_from_non_capable(self):
         self.assertEqual("capable", claude_any.channel_probe_record_bucket({"capable": True}))

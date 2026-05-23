@@ -137,6 +137,7 @@ _CHANNEL_MCP_SESSIONS: dict[str, dict[str, Any]] = {}
 _CHANNEL_MCP_CURSOR_LOCK = threading.Lock()
 _CHANNEL_MCP_CURSOR_LAST_ID: int | None = None
 _NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
+BUILTIN_CHANNEL_SPEC = "server:claude-any-router"
 _MCP_NOTIFICATION_DEDUP_TTL_SECONDS = 3.0
 _MCP_NOTIFICATION_DEDUP_LOCK = threading.Lock()
 _MCP_NOTIFICATION_DEDUP_RECENT: dict[str, tuple[str, float]] = {}
@@ -9776,8 +9777,8 @@ def channel_specs(cfg: dict[str, Any] | None = None) -> list[str]:
         items = raw
     else:
         items = []
-    channels: list[str] = []
-    seen: set[str] = set()
+    channels: list[str] = [BUILTIN_CHANNEL_SPEC]
+    seen: set[str] = {BUILTIN_CHANNEL_SPEC}
     for item in items:
         spec = str(item).strip()
         if not spec or spec in seen:
@@ -10852,6 +10853,8 @@ def _server_names_from_channel_specs(specs: Iterable[str]) -> list[str]:
 def channel_probe_cache_needs_launch_refresh(cfg: dict[str, Any], passthrough: list[str]) -> bool:
     cache = read_channel_probe_cache()
     records = cached_channel_probe_servers()
+    if not cache.get("probed_at") or not records:
+        return True
     configured_names = [
         name for name in _server_names_from_channel_specs(channel_specs_for_launch(cfg, passthrough))
         if name != "claude-any-router"
@@ -10919,10 +10922,10 @@ def auto_import_passthrough_channels(passthrough: list[str]) -> list[str]:
     if all(spec in existing for spec in specs):
         return []
     cc = cfg.setdefault("claude_code", {})
-    merged = list(channel_specs(cfg))
+    merged = [spec for spec in channel_specs(cfg) if spec != BUILTIN_CHANNEL_SPEC]
     added: list[str] = []
     for spec in specs:
-        if spec in existing:
+        if spec in existing or spec == BUILTIN_CHANNEL_SPEC:
             continue
         merged.append(spec)
         existing.add(spec)
@@ -11074,9 +11077,11 @@ def add_channel_spec(spec: str, *, development: bool = False) -> list[str]:
         return ["Channel spec was empty."]
     if not is_channel_spec_tagged(spec):
         return ["Channel spec must start with plugin: or server:."]
+    if spec == BUILTIN_CHANNEL_SPEC:
+        return ["Claude Any router channel is always enabled."]
     cfg = load_config()
     cc = cfg.setdefault("claude_code", {})
-    channels = channel_specs(cfg)
+    channels = [item for item in channel_specs(cfg) if item != BUILTIN_CHANNEL_SPEC]
     if spec not in channels:
         channels.append(spec)
     cc["channels"] = channels
@@ -11085,9 +11090,11 @@ def add_channel_spec(spec: str, *, development: bool = False) -> list[str]:
 
 
 def remove_channel_spec(spec: str) -> list[str]:
+    if spec == BUILTIN_CHANNEL_SPEC:
+        return ["Claude Any router channel is always enabled and cannot be removed."]
     cfg = load_config()
     cc = cfg.setdefault("claude_code", {})
-    before = channel_specs(cfg)
+    before = [item for item in channel_specs(cfg) if item != BUILTIN_CHANNEL_SPEC]
     after = [item for item in before if item != spec]
     cc["channels"] = after
     save_config(cfg)
@@ -11098,7 +11105,7 @@ def clear_channel_specs() -> list[str]:
     cfg = load_config()
     cfg.setdefault("claude_code", {})["channels"] = []
     save_config(cfg)
-    return ["Claude Code channels cleared."]
+    return ["External Claude Code channels cleared. Claude Any router remains enabled."]
 
 
 def cmd_channels(args: argparse.Namespace) -> None:
@@ -14694,6 +14701,8 @@ def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     channels = set(channel_specs(cfg))
     cache = read_channel_probe_cache()
     records = cache.get("servers") or []
+    if not any(isinstance(r, dict) and r.get("name") == "claude-any-router" for r in records):
+        records = [_builtin_router_probe_record(), *records]
     probed_at = cache.get("probed_at") or 0
     capable_records = [r for r in records if channel_probe_record_bucket(r) == "capable"]
     non_capable_records = [r for r in records if channel_probe_record_bucket(r) == "non_capable"]
