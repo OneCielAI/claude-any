@@ -364,14 +364,21 @@ class LMStudioProviderTests(unittest.TestCase):
             mock.patch.object(claude_any, "write_context_usage"),
             mock.patch.object(claude_any, "maybe_handle_router_debug_request", return_value=False),
             mock.patch.object(claude_any, "maybe_handle_advisor_request", return_value=False),
+            mock.patch.object(
+                claude_any,
+                "body_with_pending_channel_messages",
+                side_effect=lambda b: {**b, "messages": [{"role": "user", "content": "channel notice"}]},
+            ) as inject_channels,
             mock.patch.object(claude_any, "dump_request_for_trace"),
             mock.patch.object(claude_any, "forward_openai_compatible_chat") as forward,
         ):
             handler.do_POST()
 
         forward.assert_called_once()
+        inject_channels.assert_called_once()
         self.assertIs(forward.call_args.args[0], handler)
         self.assertEqual("lm-studio", forward.call_args.args[1])
+        self.assertEqual([{"role": "user", "content": "channel notice"}], forward.call_args.args[3]["messages"])
 
 
 if __name__ == "__main__":

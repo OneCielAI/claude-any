@@ -42,12 +42,23 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(payload["sender_id"], "ai-net")
         self.assertEqual(payload["recipients"], "claude")
         self.assertEqual(payload["thread_id"], "root")
+        self.assertEqual(payload["visibility"], "user")
+        self.assertIn("llm", payload["delivery"])
         self.assertEqual(payload["meta"]["room_id"], "room_phase1sim")
         self.assertEqual(payload["meta"]["mcp_method"], "notifications/claude/channel")
         self.assertEqual(payload["meta"]["sse_json"]["params"]["meta"]["room_id"], "room_phase1sim")
 
     def test_sse_payload_ignores_done_marker(self):
         self.assertIsNone(claude_any._sse_payload_to_chat_payload("[DONE]", "message", {"name": "x"}))
+
+    def test_sse_payload_ignores_jsonrpc_control_messages(self):
+        self.assertIsNone(
+            claude_any._sse_payload_to_chat_payload(
+                '{"jsonrpc":"2.0","method":"notifications/initialized","params":{}}',
+                "message",
+                {"name": "x"},
+            )
+        )
 
     def test_sse_payload_ignores_mcp_endpoint_event(self):
         self.assertIsNone(claude_any._sse_payload_to_chat_payload("/messages?session=abc", "endpoint", {"name": "x"}))
@@ -351,14 +362,15 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(2, len(out["messages"]))
         injected = out["messages"][-1]["content"][0]["text"]
         self.assertIn("channel inbox", injected)
-        self.assertIn("You must visibly tell the local user", injected)
+        self.assertIn("<< room >> 에서 SSE 메시지가 도착", injected)
+        self.assertIn("<< 메시지 >>", injected)
         self.assertIn("Robert, can you check this?", injected)
         self.assertNotIn("ai-net.sse.connected", injected)
         self.assertNotIn("SSE MCP initialized", injected)
         write_cursor.assert_called_with(4)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
-        self.assertTrue(any("channel_llm_inject_skipped_noise" in item and "transport_channel" in item for item in log_messages))
+        self.assertTrue(any("channel_llm_inject_skipped" in item and "initialized" in item for item in log_messages))
 
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(

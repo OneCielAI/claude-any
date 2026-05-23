@@ -4873,6 +4873,10 @@ def append_chat_message(payload: dict[str, Any]) -> dict[str, Any]:
             "kind": str(payload.get("kind") or "message"),
             "meta": payload.get("meta") if isinstance(payload.get("meta"), dict) else {},
         }
+        if payload.get("visibility") is not None:
+            message["visibility"] = str(payload.get("visibility") or "user")
+        if payload.get("delivery") is not None:
+            message["delivery"] = _as_string_list(payload.get("delivery"))
         with CHAT_MESSAGES_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
         _CHAT_CONDITION.notify_all()
@@ -5031,6 +5035,39 @@ def _compact_json_for_prompt(value: Any, max_chars: int = 2400) -> str:
     return text[: max_chars - 16] + "...<truncated>"
 
 
+_CHANNEL_CONTROL_KINDS = {
+    "connection",
+    "connected",
+    "disconnect",
+    "disconnected",
+    "endpoint",
+    "heartbeat",
+    "initialized",
+    "init",
+    "keepalive",
+    "ping",
+    "pong",
+    "ready",
+    "status",
+}
+
+
+def _channel_event_is_user_visible(kind: str, method: str, event_name: str, content: str, meta: dict[str, Any]) -> bool:
+    normalized_kind = str(kind or "").strip().lower().replace("_", ".").replace("/", ".")
+    normalized_method = str(method or "").strip().lower()
+    normalized_event = str(event_name or "").strip().lower()
+    meta_type = str(meta.get("type") or meta.get("event_type") or meta.get("kind") or meta.get("status") or "").strip().lower()
+    if normalized_kind in _CHANNEL_CONTROL_KINDS or normalized_event in _CHANNEL_CONTROL_KINDS or meta_type in _CHANNEL_CONTROL_KINDS:
+        return False
+    if meta.get("jsonrpc") is not None:
+        if normalized_method.startswith("notifications/claude/"):
+            return True
+        if normalized_method in {"notifications/message", "notifications/chat", "notifications/event"}:
+            return True
+        return False
+    return bool(content.strip())
+
+
 def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict[str, Any], event_id: str | None = None) -> dict[str, Any] | None:
     text = (data_text or "").strip()
     if not text or text == "[DONE]":
@@ -5085,6 +5122,8 @@ def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict
             kind = str(meta.get("kind"))
     if allowed_events and method not in allowed_events and (event_name or "message") not in allowed_events:
         return None
+    if not _channel_event_is_user_visible(kind, method, event_name, content, meta):
+        return None
     channel = meta.get("channel") or meta.get("room_id") or meta.get("room") or defaults.get("channel") or "default"
     return {
         "channel": channel,
@@ -5095,6 +5134,8 @@ def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict
         "kind": kind,
         "message": content,
         "meta": meta,
+        "visibility": "user",
+        "delivery": ["native", "stdin", "llm"],
     }
 
 
@@ -8316,7 +8357,6 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
 
 def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
     _update_tool_schema_registry(body.get("tools"))
-    body = body_with_pending_channel_messages(body)
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     base = pcfg.get("base_url", "").rstrip("/")
     original_body = body
@@ -9030,7 +9070,6 @@ def open_openai_stream_with_rate_retry(
 
 def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
     _update_tool_schema_registry(body.get("tools"))
-    body = body_with_pending_channel_messages(body)
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     if provider == "nvidia-hosted":
         model = ncp_model_id_for_nvidia_hosted(model)
@@ -9242,6 +9281,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         if maybe_handle_advisor_request(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
+        body = body_with_pending_channel_messages(body)
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
         try:
             if provider in ("ollama", "ollama-cloud"):
@@ -15983,24 +16023,21 @@ def _channel_wake_message_noise_reason(message: dict[str, Any]) -> str | None:
     return None
 
 
-def _channel_llm_message_noise_reason(message: dict[str, Any]) -> str | None:
+def _channel_llm_message_skip_reason(message: dict[str, Any]) -> str | None:
+    visibility = str(message.get("visibility") or "user").strip().lower()
+    if visibility in {"hidden", "internal", "transport", "control", "system"}:
+        return f"visibility_{visibility}"
+    delivery = _as_string_list(message.get("delivery"))
+    if delivery:
+        normalized_delivery = {item.strip().lower() for item in delivery}
+        if not ({"all", "*", "llm"} & normalized_delivery):
+            return "delivery_not_llm"
     wake_reason = _channel_wake_message_noise_reason(message)
     if wake_reason:
         return wake_reason
-    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip().lower()
-    channel = str(message.get("channel") or "").strip().lower()
-    sender = str(message.get("sender_id") or "").strip().lower()
     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
-    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event") or "").strip().lower()
-    source = str(meta.get("source") or meta.get("transport") or "").strip().lower()
-    if channel.endswith(("-sse", "-ws")) and sender in {"", channel, "channel", "system", "mcp"}:
-        if meta_kind in {"", "connection", "connected", "initialized", "init", "ready", "status", "heartbeat", "keepalive"}:
-            return "transport_channel"
-        if source in {"sse", "ws", "websocket", "mcp-sse"}:
-            return "transport_channel"
-        if re.search(r"\b(sse|ws|websocket|mcp)\b.*\b(connected|initialized|ready|started)\b", body):
-            return "transport_channel"
-    if meta_kind in {"connection", "connected", "heartbeat", "keepalive"}:
+    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event") or meta.get("status") or "").strip().lower()
+    if meta_kind in _CHANNEL_CONTROL_KINDS:
         return meta_kind
     return None
 
@@ -16047,15 +16084,19 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         if thread:
             fields.append(f"thread={thread}")
         meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
-        parts.append("- " + " ".join(fields) + f" text={json.dumps(body, ensure_ascii=False)}" + meta_text)
+        parts.append(
+            f"<< {channel} >> 에서 SSE 메시지가 도착했으니 분석하고 자세한 내용을 사용자에게 알려주고 처리하세요.\n"
+            f"<< 메시지 >>\n"
+            + " ".join(fields)
+            + f"\ntext={json.dumps(body, ensure_ascii=False)}"
+            + meta_text
+        )
     return (
         "[claude-any channel inbox]\n"
-        "Active external notifications arrived through claude-any while native Claude Code Channels were unavailable.\n"
-        "You must visibly tell the local user about these notifications in your next response before continuing. "
-        "Summarize the sender, channel, and message text in 1-2 short sentences. "
-        "If a notification asks for a reply or action, respond using the available channel/AI-NET/MCP tool when possible. "
-        "Do not silently ignore these notifications or only continue the prior task.\n"
-        + "\n".join(parts)
+        "아래 항목은 claude-any가 수신한 사용자 표시 대상 SSE 채널 메시지입니다. "
+        "다음 응답에서 먼저 사용자에게 채널명, 발신자, 메시지 내용과 필요한 처리를 알려주세요. "
+        "응답이나 액션이 필요하면 사용 가능한 channel/AI-NET/MCP 도구로 처리하세요.\n\n"
+        + "\n\n".join(parts)
     )
 
 
@@ -16110,11 +16151,11 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                 max_seen = max(max_seen, int(message.get("id") or 0))
             except Exception:
                 continue
-            noise_reason = _channel_llm_message_noise_reason(message)
-            if noise_reason:
+            skip_reason = _channel_llm_message_skip_reason(message)
+            if skip_reason:
                 router_log(
                     "INFO",
-                    f"channel_llm_inject_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
                 )
                 continue
             pending.append(message)
