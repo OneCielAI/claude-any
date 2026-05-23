@@ -11689,15 +11689,46 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
     return messages
 
 
-def apply_lm_studio_loaded_context_guard(pcfg: dict[str, Any]) -> list[str]:
+def apply_lm_studio_loaded_context_guard(pcfg: dict[str, Any], load: bool = False) -> list[str]:
+    if load:
+        try:
+            return ensure_lm_studio_model_loaded_for_context(pcfg, timeout=1.5)
+        except Exception as exc:
+            pcfg["native_compat"] = False
+            return [
+                "LM Studio could not automatically load the selected model with the recommended context.",
+                f"LM Studio load error: {type(exc).__name__}: {exc}",
+            ]
+
     try:
-        return ensure_lm_studio_model_loaded_for_context(pcfg, timeout=1.5)
-    except Exception as exc:
+        info = lm_studio_runtime_info(pcfg, timeout=0.75)
+    except Exception:
+        info = None
+    target = lm_studio_target_context(pcfg, info)
+    loaded = positive_int((info or {}).get("loaded_context_len"))
+    state = str((info or {}).get("state") or "")
+    max_len = positive_int((info or {}).get("max_model_len"))
+    messages: list[str] = []
+    if max_len:
+        messages.append(f"LM Studio model max context: {max_len:,} tokens.")
+    if target:
+        messages.append(f"LM Studio target context: {target:,} tokens.")
+    if max_len and max_len < LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT:
         pcfg["native_compat"] = False
-        return [
-            "LM Studio could not automatically load the selected model with the recommended context.",
-            f"LM Studio load error: {type(exc).__name__}: {exc}",
-        ]
+        pcfg["context_window"] = max_len
+        messages.append(
+            "LM Studio selected model cannot provide enough context for Claude Code "
+            f"({max_len:,} < {LM_STUDIO_MIN_CLAUDE_CODE_CONTEXT:,})."
+        )
+        return messages
+    pcfg["native_compat"] = True
+    if loaded:
+        messages.append(f"LM Studio currently loaded context: {loaded:,} tokens.")
+        if target and loaded < target:
+            messages.append("LM Studio will reload this model with the target context when you launch or test.")
+    elif state and state != "loaded":
+        messages.append("LM Studio will load this model with the target context when you launch or test.")
+    return messages
 
 
 def required_context_for_preset(preset_id: str, provider: str | None = None) -> int | None:
@@ -12038,6 +12069,7 @@ def apply_llm_preset_to_provider(
     preset_id: str,
     lang: str | None = None,
     sync_ollama_context: bool = True,
+    load_lm_studio: bool = False,
 ) -> list[str]:
     if preset_id not in LLM_PRESETS:
         raise SystemExit(f"Unknown preset: {preset_id}")
@@ -12462,7 +12494,7 @@ def apply_llm_preset_to_provider(
                     pcfg["max_output_tokens"] = min(positive_int(pcfg.get("max_output_tokens")) or 4096, max(1024, server_limit // 8))
     context_msgs.extend(cap_context_settings_to_model_capacity(provider, pcfg))
     if provider == "lm-studio":
-        context_msgs.extend(apply_lm_studio_loaded_context_guard(pcfg))
+        context_msgs.extend(apply_lm_studio_loaded_context_guard(pcfg, load=load_lm_studio))
     context_msgs.extend(apply_recommended_timeout_for_model_context(provider, pcfg))
     pcfg["llm_preset"] = preset_id
     family = model_option_family(provider, pcfg)

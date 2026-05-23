@@ -111,7 +111,34 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertEqual(4096, info["loaded_context_len"])
         self.assertEqual("loaded", info["state"])
 
-    def test_lm_studio_loaded_context_guard_reloads_when_too_small(self):
+    def test_lm_studio_loaded_context_guard_defers_reload_during_menu_selection(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
+        pcfg["current_model"] = "qwen3.6-35b-a3b-mtp@bf16"
+        pcfg["native_compat"] = True
+        pcfg["context_window"] = 65536
+        payload = {
+            "data": [
+                {
+                    "id": "qwen3.6-35b-a3b-mtp@bf16",
+                    "state": "loaded",
+                    "max_context_length": 262144,
+                    "loaded_context_length": 4096,
+                }
+            ]
+        }
+
+        with (
+            mock.patch.object(claude_any, "http_json", return_value=payload),
+            mock.patch.object(claude_any, "post_json") as post_json,
+        ):
+            messages = claude_any.apply_lm_studio_loaded_context_guard(pcfg)
+
+        self.assertTrue(pcfg["native_compat"])
+        self.assertEqual(65536, pcfg["context_window"])
+        post_json.assert_not_called()
+        self.assertTrue(any("will reload" in message for message in messages))
+
+    def test_lm_studio_loaded_context_guard_can_reload_when_requested(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
         pcfg["current_model"] = "qwen3.6-35b-a3b-mtp@bf16"
         pcfg["native_compat"] = True
@@ -135,7 +162,7 @@ class LMStudioProviderTests(unittest.TestCase):
                 return_value={"status": "loaded", "load_config": {"context_length": 65536}},
             ) as post_json,
         ):
-            messages = claude_any.apply_lm_studio_loaded_context_guard(pcfg)
+            messages = claude_any.apply_lm_studio_loaded_context_guard(pcfg, load=True)
 
         self.assertTrue(pcfg["native_compat"])
         self.assertEqual(65536, pcfg["context_window"])
@@ -188,7 +215,7 @@ class LMStudioProviderTests(unittest.TestCase):
                 return_value={"status": "loaded", "load_config": {"context_length": 65536}},
             ) as post_json,
         ):
-            messages = claude_any.apply_lm_studio_loaded_context_guard(pcfg)
+            messages = claude_any.apply_lm_studio_loaded_context_guard(pcfg, load=True)
 
         self.assertTrue(pcfg["native_compat"])
         self.assertEqual(65536, pcfg["context_window"])
