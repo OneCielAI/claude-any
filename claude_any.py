@@ -10384,6 +10384,24 @@ def cached_channel_probe_servers() -> list[dict[str, Any]]:
     return []
 
 
+def channel_probe_record_bucket(record: dict[str, Any]) -> str:
+    """Classify a probe record for display.
+
+    `non-capable` is reserved for a server that answered initialize and did
+    not advertise claude/channel. Timeouts and transport failures are
+    inconclusive: the server may still be channel-capable, but the probe did
+    not complete.
+    """
+    if record.get("capable"):
+        return "capable"
+    reason = str(record.get("reason") or "").strip()
+    if reason == "no_experimental_claude_channel" and record.get("response_received"):
+        return "non_capable"
+    if reason in {"transport_not_probed", "no_url"}:
+        return "skipped"
+    return "inconclusive"
+
+
 def cached_channel_capable_server_names() -> list[str]:
     """Capable server names from cache, with claude-any-router always
     present (because the router's own MCP bridge is built into claude-any)."""
@@ -10657,12 +10675,14 @@ def cmd_channels(args: argparse.Namespace) -> None:
         except Exception as exc:
             raise SystemExit(f"Channel probe failed: {type(exc).__name__}: {exc}")
         servers = result.get("servers") or []
-        capable = [r for r in servers if r.get("capable")]
-        non_capable = [r for r in servers if not r.get("capable")]
+        capable = [r for r in servers if channel_probe_record_bucket(r) == "capable"]
+        non_capable = [r for r in servers if channel_probe_record_bucket(r) == "non_capable"]
+        inconclusive = [r for r in servers if channel_probe_record_bucket(r) == "inconclusive"]
+        skipped = [r for r in servers if channel_probe_record_bucket(r) == "skipped"]
         probed_at = result.get("probed_at") or 0
         ts_str = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(probed_at)) if probed_at else "-"
         timeout_s = channel_probe_default_timeout()
-        print(f"channel probe complete (cached at {ts_str}, timeout {timeout_s:.1f}s per server)")
+        print(f"channel probe complete (probed at {ts_str}, timeout {timeout_s:.1f}s per server)")
         print(f"  capable     : {len(capable)}")
         for r in capable:
             transport = r.get("transport") or "?"
@@ -10670,9 +10690,14 @@ def cmd_channels(args: argparse.Namespace) -> None:
             suffix = " built-in" if source == "<built-in>" else f" {source}"
             print(f"    * {r.get('name')} ({transport}){suffix}")
         print(f"  non-capable : {len(non_capable)}")
+        for r in non_capable:
+            transport = r.get("transport") or "?"
+            reason = r.get("reason") or "-"
+            print(f"      {r.get('name')} ({transport}) reason={reason}")
+        print(f"  inconclusive: {len(inconclusive)}")
         timeout_seen = False
         exited_seen = False
-        for r in non_capable:
+        for r in inconclusive:
             transport = r.get("transport") or "?"
             reason = r.get("reason") or "-"
             elapsed = r.get("elapsed_ms")
@@ -10696,14 +10721,20 @@ def cmd_channels(args: argparse.Namespace) -> None:
             stdout_preview = r.get("stdout_preview")
             if stdout_preview:
                 print(f"        stdout: {stdout_preview}")
-            if reason == "timeout":
+            if str(reason).startswith("timeout"):
                 timeout_seen = True
             if reason == "exited_without_response":
                 exited_seen = True
+        if skipped:
+            print(f"  skipped     : {len(skipped)}")
+            for r in skipped:
+                transport = r.get("transport") or "?"
+                reason = r.get("reason") or "-"
+                print(f"      {r.get('name')} ({transport}) reason={reason}")
         if timeout_seen:
-            print("  hint: timeout means the server stayed running but never sent an initialize response in time.")
+            print("  hint: inconclusive timeout means the probe could not finish; the server may still be capable.")
             print("        increase CLAUDE_ANY_CHANNEL_PROBE_TIMEOUT_SECONDS if cold start is the cause,")
-            print("        or check that the server speaks Content-Length-framed stdio (not bare JSONL).")
+            print("        or re-run with the latest claude-any if this was an SSE endpoint event race.")
         if exited_seen:
             print("  hint: exited_without_response means the child died before responding. Check stderr above.")
         return
@@ -14069,8 +14100,10 @@ def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     cache = read_channel_probe_cache()
     records = cache.get("servers") or []
     probed_at = cache.get("probed_at") or 0
-    capable_records = [r for r in records if r.get("capable")]
-    non_capable_records = [r for r in records if not r.get("capable")]
+    capable_records = [r for r in records if channel_probe_record_bucket(r) == "capable"]
+    non_capable_records = [r for r in records if channel_probe_record_bucket(r) == "non_capable"]
+    inconclusive_records = [r for r in records if channel_probe_record_bucket(r) == "inconclusive"]
+    skipped_records = [r for r in records if channel_probe_record_bucket(r) == "skipped"]
 
     rows: list[str] = []
     values: list[str] = []
@@ -14098,6 +14131,26 @@ def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
         rows.append("[Detected but not channel-capable]")
         values.append("__heading__")
         for r in non_capable_records:
+            name = str(r.get("name") or "")
+            transport = str(r.get("transport") or "?")
+            reason = str(r.get("reason") or "-")
+            rows.append(f"  {name:<14} ({transport}) {reason}")
+            values.append("__noop__")
+
+    if inconclusive_records:
+        rows.append("[Probe inconclusive / check server]")
+        values.append("__heading__")
+        for r in inconclusive_records:
+            name = str(r.get("name") or "")
+            transport = str(r.get("transport") or "?")
+            reason = str(r.get("reason") or "-")
+            rows.append(f"  {name:<14} ({transport}) {reason}")
+            values.append("__noop__")
+
+    if skipped_records:
+        rows.append("[Not probed]")
+        values.append("__heading__")
+        for r in skipped_records:
             name = str(r.get("name") or "")
             transport = str(r.get("transport") or "?")
             reason = str(r.get("reason") or "-")

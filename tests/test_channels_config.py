@@ -592,12 +592,20 @@ class ChannelProbeCacheTests(unittest.TestCase):
                 "servers": [
                     {"name": "ai-net", "capable": True, "transport": "stdio"},
                     {"name": "boring", "capable": False, "transport": "stdio", "reason": "timeout"},
+                    {
+                        "name": "plain",
+                        "capable": False,
+                        "transport": "stdio",
+                        "reason": "no_experimental_claude_channel",
+                        "response_received": True,
+                    },
                 ],
             })
             cfg = {"claude_code": {"channels": ["server:ai-net"]}}
             rows, values = claude_any.channel_panel_rows(cfg)
         self.assertIn("[Auto-detected channel-capable]", rows)
         self.assertIn("[Detected but not channel-capable]", rows)
+        self.assertIn("[Probe inconclusive / check server]", rows)
         # ai-net should appear as a selected spec (* mark).
         self.assertTrue(any("server:ai-net" == v for v in values))
         ai_row = rows[values.index("server:ai-net")]
@@ -608,8 +616,31 @@ class ChannelProbeCacheTests(unittest.TestCase):
         # The Re-probe action must be present.
         self.assertIn("__reprobe__", values)
         # The reason from the detailed probe must surface to the user
-        # (so they can see whether it was timeout vs missing capability).
+        # without presenting timeout as proof that the server is non-capable.
         self.assertTrue(any("timeout" in row for row in rows))
+        non_capable_idx = rows.index("[Detected but not channel-capable]")
+        inconclusive_idx = rows.index("[Probe inconclusive / check server]")
+        self.assertIn("plain", rows[non_capable_idx + 1])
+        self.assertIn("boring", rows[inconclusive_idx + 1])
+
+    def test_probe_record_bucket_separates_inconclusive_from_non_capable(self):
+        self.assertEqual("capable", claude_any.channel_probe_record_bucket({"capable": True}))
+        self.assertEqual(
+            "non_capable",
+            claude_any.channel_probe_record_bucket({
+                "capable": False,
+                "reason": "no_experimental_claude_channel",
+                "response_received": True,
+            }),
+        )
+        self.assertEqual(
+            "inconclusive",
+            claude_any.channel_probe_record_bucket({"capable": False, "reason": "timeout_no_endpoint_event"}),
+        )
+        self.assertEqual(
+            "skipped",
+            claude_any.channel_probe_record_bucket({"capable": False, "reason": "transport_not_probed"}),
+        )
 
 
 class ChannelProbeDetailedReasonTests(unittest.TestCase):
