@@ -5655,6 +5655,21 @@ def _channel_mcp_session_start_last_id(handler: BaseHTTPRequestHandler) -> int:
     return client_last_id
 
 
+def _channel_mcp_message_skip_reason(message: dict[str, Any]) -> str | None:
+    visibility = str(message.get("visibility") or "user").strip().lower()
+    if visibility in {"hidden", "internal", "transport", "control", "system"}:
+        return f"visibility_{visibility}"
+    recipients = {item.strip().lower() for item in _as_string_list(message.get("recipients"))}
+    if "internal" in recipients:
+        return "recipient_internal"
+    delivery = _as_string_list(message.get("delivery"))
+    if delivery:
+        normalized_delivery = {item.strip().lower() for item in delivery}
+        if not ({"all", "*", "native", "mcp"} & normalized_delivery):
+            return "delivery_not_native"
+    return _channel_wake_message_noise_reason(message)
+
+
 def _channel_mcp_notifications_for_messages(
     messages: list[dict[str, Any]],
     session: str = "",
@@ -5664,11 +5679,11 @@ def _channel_mcp_notifications_for_messages(
     for message in messages:
         message_id = int(message.get("id") or 0)
         last_id = max(last_id, message_id)
-        noise_reason = _channel_wake_message_noise_reason(message)
-        if noise_reason:
+        skip_reason = _channel_mcp_message_skip_reason(message)
+        if skip_reason:
             router_log(
                 "INFO",
-                f"channel_mcp_skipped_noise session={session or '-'} message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
+                f"channel_mcp_skipped_noise session={session or '-'} message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
             )
             continue
         notification = _channel_mcp_notification(message)
@@ -5726,8 +5741,7 @@ def handle_channel_mcp_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
                 for event_id, notification in events:
                     _write_sse_event(handler, "message", notification, event_id)
                     router_log("INFO", f"channel_mcp_notification_written session={session} message_id={event_id}")
-                if not events:
-                    _channel_mcp_update_cursor(last_id)
+                _channel_mcp_update_cursor(last_id)
                 with _CHANNEL_MCP_LOCK:
                     state = _CHANNEL_MCP_SESSIONS.get(session)
                     if state:

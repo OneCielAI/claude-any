@@ -705,6 +705,38 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_mcp_skipped_noise" in item and "transport_connected" in item for item in log_messages))
         self.assertTrue(any("channel_mcp_notification_prepared" in item and "message_id=2" in item for item in log_messages))
 
+    def test_channel_mcp_notifications_skip_internal_messages(self):
+        messages = [
+            {
+                "id": 15,
+                "channel": "room",
+                "sender_id": "claude-any-llm",
+                "recipients": ["internal"],
+                "message": "old internal response",
+                "visibility": "user",
+                "delivery": ["native"],
+                "meta": {"room_id": "room"},
+            },
+            {
+                "id": 16,
+                "channel": "room",
+                "sender_id": "ai-net",
+                "recipients": ["all"],
+                "message": "new external message",
+                "visibility": "user",
+                "delivery": ["native", "llm"],
+                "meta": {"room_id": "room"},
+            },
+        ]
+        with mock.patch.object(claude_any, "router_log") as router_log:
+            last_id, events = claude_any._channel_mcp_notifications_for_messages(messages, "session-1")
+        self.assertEqual(16, last_id)
+        self.assertEqual(1, len(events))
+        self.assertEqual(16, events[0][0])
+        self.assertEqual(["all"], events[0][1]["params"]["recipients"])
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("recipient_internal" in item and "message_id=15" in item for item in log_messages))
+
     def test_channel_mcp_session_start_prefers_client_last_event_id_for_replay(self):
         class Handler:
             path = "/ca/mcp/sse"
