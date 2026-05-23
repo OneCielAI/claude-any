@@ -11094,10 +11094,18 @@ def auto_start_sse_channels_from_mcp_configs(
     passthrough: list[str] | None = None,
     cwd: Path | None = None,
     home: Path | None = None,
+    extra_config_paths: list[Path | str] | None = None,
 ) -> list[dict[str, Any]]:
     cwd = cwd or Path.cwd()
     started: list[dict[str, Any]] = []
-    for path in claude_mcp_config_paths(passthrough, cwd, home):
+    paths = [Path(path).expanduser() for path in extra_config_paths or []]
+    paths.extend(claude_mcp_config_paths(passthrough, cwd, home))
+    seen: set[str] = set()
+    for path in paths:
+        key = _path_for_compare(path)
+        if key in seen:
+            continue
+        seen.add(key)
         if not path.exists() or not path.is_file():
             continue
         for server in _read_mcp_sse_servers_from_json(path, cwd):
@@ -17213,16 +17221,16 @@ def launch_claude(
     if native_channel_bridge:
         mcp_config_paths.append(str(write_channel_mcp_config()))
     detected_channel_specs: list[str] = []
-    native_channel_specs: list[str] = []
-    if native_channel_bridge:
+    channel_probe_source_paths: list[Path] = []
+    if stdin_channel_proxy or native_channel_bridge or llm_channel_delivery:
         try:
             ensure_channel_probe_cache_for_launch(cfg, launch_passthrough)
             capable_names = cached_channel_capable_server_names()
             detected_channel_specs = [f"server:{name}" for name in capable_names]
-            native_channel_specs = channel_specs_for_launch(cfg, launch_passthrough, detected_channel_specs)
-            source_paths = cached_channel_source_paths_for_specs(native_channel_specs)
-            if source_paths:
-                mcp_config_paths.extend(str(path) for path in source_paths)
+            channel_launch_specs = channel_specs_for_launch(cfg, launch_passthrough, detected_channel_specs)
+            channel_probe_source_paths = cached_channel_source_paths_for_specs(channel_launch_specs)
+            if channel_probe_source_paths:
+                mcp_config_paths.extend(str(path) for path in channel_probe_source_paths)
             cache_age = read_channel_probe_cache().get("probed_at") or 0
             router_log(
                 "INFO",
@@ -17231,7 +17239,7 @@ def launch_claude(
                     int(cache_age),
                     len(capable_names),
                     ",".join(capable_names) or "-",
-                    ",".join(str(path) for path in source_paths) or "-",
+                    ",".join(str(path) for path in channel_probe_source_paths) or "-",
                 ),
             )
         except Exception as exc:
@@ -17240,7 +17248,10 @@ def launch_claude(
     if stdin_channel_proxy or native_channel_bridge or llm_channel_delivery:
         if llm_channel_delivery:
             reset_channel_llm_delivery_cursor()
-        auto_start_sse_channels_from_mcp_configs(launch_passthrough)
+        auto_start_sse_channels_from_mcp_configs(
+            launch_passthrough,
+            extra_config_paths=[Path(path) for path in mcp_config_paths],
+        )
         proxy_config = write_mcp_proxy_config(
             launch_passthrough,
             extra_config_paths=[Path(path) for path in mcp_config_paths],
