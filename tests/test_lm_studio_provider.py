@@ -111,11 +111,11 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertEqual(4096, info["loaded_context_len"])
         self.assertEqual("loaded", info["state"])
 
-    def test_lm_studio_loaded_context_guard_disables_native_when_too_small(self):
+    def test_lm_studio_loaded_context_guard_reloads_when_too_small(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
         pcfg["current_model"] = "qwen3.6-35b-a3b-mtp@bf16"
         pcfg["native_compat"] = True
-        pcfg["context_window"] = 32768
+        pcfg["context_window"] = 65536
         payload = {
             "data": [
                 {
@@ -127,13 +127,21 @@ class LMStudioProviderTests(unittest.TestCase):
             ]
         }
 
-        with mock.patch.object(claude_any, "http_json", return_value=payload):
+        with (
+            mock.patch.object(claude_any, "http_json", return_value=payload),
+            mock.patch.object(
+                claude_any,
+                "post_json",
+                return_value={"status": "loaded", "load_config": {"context_length": 65536}},
+            ) as post_json,
+        ):
             messages = claude_any.apply_lm_studio_loaded_context_guard(pcfg)
 
-        self.assertFalse(pcfg["native_compat"])
-        self.assertEqual(4096, pcfg["context_window"])
-        self.assertLessEqual(pcfg["max_output_tokens"], 1024)
-        self.assertTrue(any("native disabled" in message for message in messages))
+        self.assertTrue(pcfg["native_compat"])
+        self.assertEqual(65536, pcfg["context_window"])
+        self.assertEqual("http://127.0.0.1:1234/api/v1/models/load", post_json.call_args.args[0])
+        self.assertEqual(65536, post_json.call_args.args[1]["context_length"])
+        self.assertTrue(any("auto-reloading" in message for message in messages))
 
     def test_lm_studio_loaded_context_guard_keeps_native_when_large_enough(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
@@ -157,10 +165,11 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertTrue(pcfg["native_compat"])
         self.assertEqual(65536, pcfg["context_window"])
 
-    def test_lm_studio_loaded_context_guard_disables_native_when_not_loaded(self):
+    def test_lm_studio_loaded_context_guard_loads_when_not_loaded(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])
         pcfg["current_model"] = "qwen3.6-27b-mtp"
         pcfg["native_compat"] = True
+        pcfg["context_window"] = 65536
         payload = {
             "data": [
                 {
@@ -171,19 +180,29 @@ class LMStudioProviderTests(unittest.TestCase):
             ]
         }
 
-        with mock.patch.object(claude_any, "http_json", return_value=payload):
+        with (
+            mock.patch.object(claude_any, "http_json", return_value=payload),
+            mock.patch.object(
+                claude_any,
+                "post_json",
+                return_value={"status": "loaded", "load_config": {"context_length": 65536}},
+            ) as post_json,
+        ):
             messages = claude_any.apply_lm_studio_loaded_context_guard(pcfg)
 
-        self.assertFalse(pcfg["native_compat"])
-        self.assertTrue(any("not loaded" in message for message in messages))
+        self.assertTrue(pcfg["native_compat"])
+        self.assertEqual(65536, pcfg["context_window"])
+        self.assertEqual("qwen3.6-27b-mtp", post_json.call_args.args[1]["model"])
+        self.assertTrue(any("auto-loading" in message for message in messages))
 
-    def test_lm_studio_launch_blocks_small_loaded_context(self):
+    def test_lm_studio_launch_self_heals_small_loaded_context(self):
         cfg = {
             "current_provider": "lm-studio",
             "providers": {"lm-studio": dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])},
         }
         cfg["providers"]["lm-studio"]["current_model"] = "qwen3.6-35b-a3b-mtp@bf16"
-        payload = {
+        cfg["providers"]["lm-studio"]["context_window"] = 65536
+        small_payload = {
             "data": [
                 {
                     "id": "qwen3.6-35b-a3b-mtp@bf16",
@@ -193,15 +212,31 @@ class LMStudioProviderTests(unittest.TestCase):
                 }
             ]
         }
+        healed_payload = {
+            "data": [
+                {
+                    "id": "qwen3.6-35b-a3b-mtp@bf16",
+                    "state": "loaded",
+                    "max_context_length": 262144,
+                    "loaded_context_length": 65536,
+                }
+            ]
+        }
 
         with (
             mock.patch.object(claude_any, "load_config", return_value=cfg),
             mock.patch.object(claude_any, "base_url_status_line", return_value="Base URL: model list reachable (/v1/models)"),
-            mock.patch.object(claude_any, "http_json", return_value=payload),
+            mock.patch.object(claude_any, "http_json", side_effect=[small_payload, healed_payload]),
+            mock.patch.object(
+                claude_any,
+                "post_json",
+                return_value={"status": "loaded", "load_config": {"context_length": 65536}},
+            ),
+            mock.patch.object(claude_any, "save_config"),
         ):
             errors = claude_any.launch_readiness_errors()
 
-        self.assertTrue(any("loaded context is 4,096" in error for error in errors))
+        self.assertEqual([], errors)
 
     def test_lm_studio_options_are_provider_specific(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])

@@ -259,10 +259,13 @@ works for LM Studio's OpenAI-compatible `/v1/chat/completions` fallback.
 Claude Any reads LM Studio's local `/api/v0/models` or `/api/v1/models`
 metadata when available. The model catalog tells Claude Any what the model can
 support, while `loaded_context_length` or `loaded_instances[].config.context_length`
-tells it what LM Studio actually loaded. If the selected model is not loaded, or
-is loaded below 32K context, Claude Any blocks launch/test and asks you to reload
-the model with a larger context instead of letting Claude Code fail with
-`n_keep >= n_ctx`.
+tells it what LM Studio actually loaded. When you choose an LM Studio model,
+Claude Any first applies its recommended Claude Code options, then asks LM
+Studio to load or reload that model through `/api/v1/models/load` with the
+recommended `context_length`. It only blocks launch/test if LM Studio rejects
+that automatic load or reports that the model cannot provide at least 32K
+context. This keeps normal users away from `n_keep`, `n_ctx`, and manual context
+setup details.
 
 ### NVIDIA Hosted NIM
 
