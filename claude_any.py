@@ -5317,6 +5317,7 @@ def _native_channel_meta(message: dict[str, Any]) -> dict[str, str]:
         "thread_id": message.get("thread_id"),
         "parent_id": message.get("parent_id"),
         "kind": message.get("kind"),
+        "recipients": message.get("recipients"),
     }
     for key, value in base.items():
         if value is not None:
@@ -5326,19 +5327,43 @@ def _native_channel_meta(message: dict[str, Any]) -> dict[str, str]:
     return meta
 
 
+def _native_channel_param_value(value: Any) -> Any:
+    if value is None:
+        return None
+    if isinstance(value, (str, bool, int, float)):
+        return value
+    return _json_safe_metadata(value)
+
+
 def _channel_mcp_notification(message: dict[str, Any]) -> dict[str, Any]:
     text = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
     channel = str(message.get("channel") or "default")
     sender = str(message.get("sender_id") or "channel")
     prefix = f"[{channel}] {sender}"
     content = f"{prefix}: {text}" if text else prefix
+    raw_meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    params: dict[str, Any] = {
+        "content": content,
+        "message": text,
+        "text": text,
+        "channel": channel,
+        "source": channel,
+        "sender_id": sender,
+        "meta": _native_channel_meta(message),
+    }
+    for key in ("id", "thread_id", "parent_id", "kind", "time", "recipients"):
+        if message.get(key) is not None:
+            params[key] = _native_channel_param_value(message.get(key))
+    for key in ("room_id", "room", "recipient_id", "recipient", "conversation_id", "dm_id"):
+        value = raw_meta.get(key)
+        if value is not None and key not in params:
+            params[key] = _native_channel_param_value(value)
+    if "room_id" not in params and channel:
+        params["room_id"] = channel
     return {
         "jsonrpc": "2.0",
-        "method": "notifications/claude/channel",
-        "params": {
-            "content": content,
-            "meta": _native_channel_meta(message),
-        },
+        "method": _NATIVE_CHANNEL_NOTIFICATION_METHOD,
+        "params": params,
     }
 
 
@@ -5517,10 +5542,14 @@ def _channel_mcp_notifications_for_messages(
                 f"channel_mcp_skipped_noise session={session or '-'} message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
             )
             continue
-        events.append((last_id, _channel_mcp_notification(message)))
+        notification = _channel_mcp_notification(message)
+        events.append((last_id, notification))
+        params = notification.get("params") if isinstance(notification, dict) else {}
+        room_id = params.get("room_id") if isinstance(params, dict) else None
+        recipients = params.get("recipients") if isinstance(params, dict) else None
         router_log(
             "INFO",
-            f"channel_mcp_notification_prepared session={session or '-'} message_id={message.get('id')} channel={message.get('channel')}",
+            f"channel_mcp_notification_prepared session={session or '-'} message_id={message.get('id')} channel={message.get('channel')} room_id={room_id or '-'} recipients={_native_channel_meta_value(recipients)[:120] if recipients is not None else '-'}",
         )
     return last_id, events
 

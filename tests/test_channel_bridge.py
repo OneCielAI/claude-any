@@ -333,12 +333,20 @@ class ChannelBridgeTests(unittest.TestCase):
                 "sender_id": "robert",
                 "thread_id": "root",
                 "message": "hello Sarah",
+                "recipients": ["sarah"],
                 "meta": {"room_id": "room_phase1sim"},
             }
         )
         self.assertEqual("notifications/claude/channel", notification["method"])
         self.assertIn("hello Sarah", notification["params"]["content"])
+        self.assertEqual("hello Sarah", notification["params"]["message"])
+        self.assertEqual("hello Sarah", notification["params"]["text"])
+        self.assertEqual("room_phase1sim", notification["params"]["channel"])
+        self.assertEqual("room_phase1sim", notification["params"]["room_id"])
+        self.assertEqual("robert", notification["params"]["sender_id"])
+        self.assertEqual(["sarah"], notification["params"]["recipients"])
         self.assertEqual("7", notification["params"]["meta"]["claude_any_message_id"])
+        self.assertEqual('["sarah"]', notification["params"]["meta"]["recipients"])
 
     def test_router_channel_mcp_notification_stringifies_meta_for_native_schema(self):
         notification = claude_any._channel_mcp_notification(
