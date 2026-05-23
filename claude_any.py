@@ -16879,6 +16879,15 @@ def launch_claude(
     if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
+        if use_router_mode:
+            # Claude Code Channels are tied to the user's claude.ai login
+            # session. In router mode the local gateway does not need the
+            # dummy Anthropic token, and leaving it set can make Claude Code
+            # treat the session as API-token auth where channels are gated off.
+            env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            env.pop("ANTHROPIC_API_KEY", None)
+            launch_env.pop("ANTHROPIC_AUTH_TOKEN", None)
+            launch_env.pop("ANTHROPIC_API_KEY", None)
     if use_native_anthropic:
         # Claude Native guarantee — strip every env var claude-any (or a
         # prior claude-any session) might have left behind that would change

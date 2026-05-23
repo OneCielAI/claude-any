@@ -207,6 +207,7 @@ class ChannelConfigTests(unittest.TestCase):
                 "env_vars",
                 return_value={
                     "CLAUDE_ANY_MODEL_ALIAS": "claude-any-test",
+                    "ANTHROPIC_AUTH_TOKEN": "not-used",
                     "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
                 },
             ),
@@ -230,6 +231,7 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertNotIn("--channels", launch_cmd)
         launch_env = call.call_args.kwargs["env"]
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", launch_env)
 
     def test_launch_without_external_channels_uses_stdin_proxy_when_selected(self):
         cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False, "channel_delivery": "stdin"}}
@@ -313,7 +315,7 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "cleanup_managed_services_for_provider"))
                 stack.enter_context(mock.patch.object(claude_any, "start_router_if_needed"))
                 stack.enter_context(mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", return_value=[]))
-                stack.enter_context(mock.patch.object(claude_any, "env_vars", return_value={"CLAUDE_ANY_MODEL_ALIAS": "claude-any-test", "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"}))
+                stack.enter_context(mock.patch.object(claude_any, "env_vars", return_value={"CLAUDE_ANY_MODEL_ALIAS": "claude-any-test", "ANTHROPIC_AUTH_TOKEN": "not-used", "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"}))
                 stack.enter_context(mock.patch.object(claude_any, "install_claude_any_slash_commands"))
                 stack.enter_context(mock.patch.object(claude_any, "install_tool_guard_hooks"))
                 stack.enter_context(mock.patch.object(claude_any, "install_claude_any_statusline"))
@@ -341,6 +343,7 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertNotIn("original.json", launch_cmd)
         launch_env = call.call_args.kwargs["env"]
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", launch_env)
 
     def test_native_channel_bridge_applies_to_native_provider_launches(self):
         cfg = {
