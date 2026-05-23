@@ -5659,6 +5659,9 @@ def _channel_mcp_message_skip_reason(message: dict[str, Any]) -> str | None:
     visibility = str(message.get("visibility") or "user").strip().lower()
     if visibility in {"hidden", "internal", "transport", "control", "system"}:
         return f"visibility_{visibility}"
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    if meta.get("llm_direct_pending"):
+        return "llm_direct_pending"
     recipients = {item.strip().lower() for item in _as_string_list(message.get("recipients"))}
     if "internal" in recipients:
         return "recipient_internal"

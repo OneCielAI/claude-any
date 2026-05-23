@@ -737,6 +737,39 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("recipient_internal" in item and "message_id=15" in item for item in log_messages))
 
+    def test_channel_mcp_notifications_skip_direct_llm_pending_originals(self):
+        messages = [
+            {
+                "id": 106,
+                "channel": "room",
+                "sender_id": "ai-net",
+                "recipients": ["all"],
+                "message": "inbound event",
+                "visibility": "user",
+                "delivery": ["native", "llm"],
+                "meta": {"room_id": "room", "llm_direct_pending": True},
+            },
+            {
+                "id": 107,
+                "channel": "room",
+                "sender_id": "claude-any-llm",
+                "recipients": ["all"],
+                "message": "direct response",
+                "visibility": "user",
+                "delivery": ["native"],
+                "kind": "channel_llm_response",
+                "meta": {"room_id": "room", "source_message_id": 106, "llm_direct_delivered": True},
+            },
+        ]
+        with mock.patch.object(claude_any, "router_log") as router_log:
+            last_id, events = claude_any._channel_mcp_notifications_for_messages(messages, "session-1")
+        self.assertEqual(107, last_id)
+        self.assertEqual(1, len(events))
+        self.assertEqual(107, events[0][0])
+        self.assertEqual("channel_llm_response", events[0][1]["params"]["kind"])
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("llm_direct_pending" in item and "message_id=106" in item for item in log_messages))
+
     def test_channel_mcp_session_start_prefers_client_last_event_id_for_replay(self):
         class Handler:
             path = "/ca/mcp/sse"
