@@ -16314,11 +16314,13 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
             except Exception:
                 message_id = 0
             with _CHANNEL_LLM_DIRECT_LOCK:
+                direct_inflight = message_id in _CHANNEL_LLM_DIRECT_INFLIGHT
                 direct_delivered = message_id in _CHANNEL_LLM_DIRECT_DELIVERED
-            if direct_delivered:
+            if direct_inflight or direct_delivered:
+                reason = "llm_direct_inflight" if direct_inflight else "llm_direct_delivered"
                 router_log(
                     "INFO",
-                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_delivered",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={reason}",
                 )
                 continue
             pending.append(message)

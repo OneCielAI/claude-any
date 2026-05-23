@@ -400,6 +400,27 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("llm_direct_delivered" in item for item in log_messages))
 
+    def test_body_with_pending_channel_messages_skips_direct_inflight_messages(self):
+        body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
+        messages = [{"id": 3, "channel": "room", "sender_id": "sarah", "message": "direct running", "meta": {"room_id": "room"}}]
+        claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.clear()
+        claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.add(3)
+        try:
+            with (
+                mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+                mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
+                mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+                mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                out = claude_any.body_with_pending_channel_messages(body)
+        finally:
+            claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.clear()
+        self.assertIs(out, body)
+        write_cursor.assert_called_with(3)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("llm_direct_inflight" in item for item in log_messages))
+
     def test_channel_direct_llm_worker_posts_prompt_to_router(self):
         class FakeResponse:
             def __enter__(self):
