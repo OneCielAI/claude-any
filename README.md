@@ -17,7 +17,7 @@
 >
 > - **Free** — [NVIDIA hosted NIM](https://build.nvidia.com/) (qwen3-coder-480b, gpt-oss, and friends) through the API Catalog.
 > - **Low-cost** — [Ollama Cloud](https://ollama.com/cloud) for GLM, Qwen, DeepSeek, and other open-weight models at a fraction of frontier-model pricing.
-> - **Free + local** — [Ollama](https://ollama.com/) or [vLLM](https://github.com/vllm-project/vllm) on your own GPU, fully offline.
+> - **Free + local** — [Ollama](https://ollama.com/), [LM Studio](https://lmstudio.ai/), or [vLLM](https://github.com/vllm-project/vllm) on your own GPU, fully offline.
 > - **Plan Mode + Advisor ready** — Claude Any preserves Claude Code Plan Mode on non-Anthropic providers and adds an optional long-context Advisor model for review.
 > - **Smooth free-model pacing** — Claude Code spends time reading files and running tools, and Claude Any uses that natural gap for RPM pacing so NVIDIA hosted free models feel usable even with strict per-minute limits.
 >
@@ -62,7 +62,7 @@ Ollama Cloud (glm-5.1) streamed through the claude-any router with SSE word-boun
 ---
 
 Claude Any is a provider selector and compatibility launcher for Claude Code.
-It lets you choose Anthropic, Ollama, Ollama Cloud, vLLM, NVIDIA hosted models,
+It lets you choose Anthropic, Ollama, Ollama Cloud, LM Studio, vLLM, NVIDIA hosted models,
 or self-hosted NIM before Claude Code starts, then passes normal Claude Code
 arguments through unchanged.
 
@@ -76,7 +76,7 @@ Claude Any started from a practical need: even on the highest Claude Code plan,
 long sessions can run out of available tokens or become blocked while waiting
 for the next quota window. The goal is not to replace Claude Code, but to keep
 work moving. Slower but usable providers such as NVIDIA NIM, Ollama Cloud,
-vLLM, and local Ollama can act as hybrid third-party agents for summaries,
+LM Studio, vLLM, and local Ollama can act as hybrid third-party agents for summaries,
 research, journaling, simple coding tasks, and delegated background work.
 
 Another design goal is to keep as much of Claude Code's native experience as

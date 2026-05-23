@@ -211,6 +211,7 @@ PROVIDERS = [
     ("ollama", "Ollama"),
     ("ollama-cloud", "Ollama Cloud"),
     ("vllm", "vLLM"),
+    ("lm-studio", "LM Studio"),
     ("nvidia-hosted", "Nvidia Hosted"),
     ("self-hosted-nim", "Self Hosted NIM"),
 ]
@@ -392,6 +393,10 @@ PROVIDER_NOTES = {
             "vLLM: enter the vLLM server root that implements the Anthropic Messages API.",
             "Do not enter an OpenAI-only chat completions endpoint; use a compatibility proxy for those servers.",
         ],
+        "lm-studio": [
+            "LM Studio: uses the local OpenAI-compatible server.",
+            "Start LM Studio's Local Server and use http://127.0.0.1:1234/v1 as the base URL.",
+        ],
         "self-hosted-nim": [
             "Self-hosted NIM: enter the NIM server root that exposes Anthropic-compatible /v1/messages.",
             "This native path does not use the NVIDIA hosted API Catalog proxy.",
@@ -417,6 +422,10 @@ PROVIDER_NOTES = {
         "vllm": [
             "vLLM: Anthropic Messages API를 구현한 vLLM 서버 root를 넣으세요.",
             "OpenAI 전용 chat completions endpoint를 넣지 마세요. 그런 서버는 호환 프록시가 필요합니다.",
+        ],
+        "lm-studio": [
+            "LM Studio: 로컬 OpenAI 호환 서버를 사용합니다.",
+            "LM Studio의 Local Server를 켜고 base URL은 http://127.0.0.1:1234/v1 을 사용하세요.",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: Anthropic 호환 /v1/messages를 노출하는 NIM 서버 root를 넣으세요.",
@@ -444,6 +453,10 @@ PROVIDER_NOTES = {
             "vLLM: Anthropic Messages APIを実装したvLLMサーバーrootを入力してください。",
             "OpenAI専用chat completions endpointは入力しないでください。その場合は互換プロキシが必要です。",
         ],
+        "lm-studio": [
+            "LM Studio: ローカルのOpenAI互換サーバーを使います。",
+            "LM StudioのLocal Serverを起動し、base URLは http://127.0.0.1:1234/v1 を使ってください。",
+        ],
         "self-hosted-nim": [
             "Self-hosted NIM: Anthropic互換/v1/messagesを公開するNIMサーバーrootを入力してください。",
             "このnative経路はNVIDIA hosted API Catalog proxyを使いません。",
@@ -469,6 +482,10 @@ PROVIDER_NOTES = {
         "vllm": [
             "vLLM: 请输入实现Anthropic Messages API的vLLM服务器root。",
             "不要输入仅OpenAI chat completions的端点；这类服务器需要兼容代理。",
+        ],
+        "lm-studio": [
+            "LM Studio: 使用本地 OpenAI-compatible 服务器。",
+            "启动 LM Studio 的 Local Server，并使用 http://127.0.0.1:1234/v1 作为 base URL。",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: 请输入暴露 Anthropic-compatible /v1/messages 的 NIM 服务器 root。",
@@ -743,7 +760,7 @@ def is_ollama_provider(provider: str) -> bool:
 
 
 def has_provider_options(provider: str) -> bool:
-    return provider in ("vllm", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud")
+    return provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud")
 
 
 def ollama_ctx_text(pcfg: dict) -> str:
@@ -780,15 +797,16 @@ def provider_options_summary(provider: str, pcfg: dict) -> str:
         f"max {pcfg.get('max_output_tokens', 'default')}",
         f"timeout {timeout_text}",
     ]
-    if provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+    if provider in ("lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
         parts.append(f"rpm {pcfg.get('rate_limit_rpm', 40)}")
         if bool(pcfg.get("rate_limit_status", True)):
             parts.append("rpm_status on")
-    if provider in ("vllm", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim"):
         parts.insert(0, f"ctx {pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve {pcfg.get('context_reserve_tokens', 'default')}")
-        parts.append(f"native {str(bool(pcfg.get('native_compat', True))).lower()}")
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+        if provider in ("vllm", "self-hosted-nim"):
+            parts.append(f"native {str(bool(pcfg.get('native_compat', True))).lower()}")
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         parts.append(f"stream {'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
         if bool(pcfg.get("stream_word_chunking", False)):
             parts.append("word_chunk on")
@@ -834,6 +852,7 @@ def default_base_url(provider: str) -> str:
         "ollama": "http://your-ollama:11434",
         "ollama-cloud": "https://ollama.com",
         "vllm": "http://your-vllm:8000",
+        "lm-studio": "http://127.0.0.1:1234/v1",
         "nvidia-hosted": "https://integrate.api.nvidia.com/v1",
         "self-hosted-nim": "http://your-nim:8000",
     }.get(provider, "http://localhost:8000")
@@ -1234,38 +1253,42 @@ def build_provider_options_submenu() -> dict:
         ("__edit_max_output__", f"Edit max_output_tokens [{max_output}]", False),
         ("__edit_timeout__", f"Edit timeout ms [{timeout}]", False),
     ]
-    if provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+    if provider in ("lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
         choices.append(("__edit_rate_limit__", f"Edit rate_limit_rpm [{pcfg.get('rate_limit_rpm', 40)}]", False))
         choices.append(("rate_limit_status=true", "rate_limit_status on", bool(pcfg.get("rate_limit_status", True))))
         choices.append(("rate_limit_status=false", "rate_limit_status off", not bool(pcfg.get("rate_limit_status", True))))
-    if provider in ("vllm", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim"):
         native = bool(pcfg.get("native_compat", True))
         choices = [
             ("__edit_context_window__", f"Edit context_window [{pcfg.get('context_window', 'default')}]", False),
             ("__edit_reserve__", f"Edit context reserve [{pcfg.get('context_reserve_tokens', 'default')}]", False),
             *choices,
-            ("__edit_native__", f"Edit native mode [{str(native).lower()}]", False),
         ]
+        if provider in ("vllm", "self-hosted-nim"):
+            choices.append(("__edit_native__", f"Edit native mode [{str(native).lower()}]", False))
     choices.extend([
         ("__custom__", "Custom KEY=VALUE or unset:KEY...", False),
         ("max_output_tokens=4096", f"max_output_tokens 4096 (current {max_output})", str(max_output) == "4096"),
         ("max_output_tokens=8192", f"max_output_tokens 8192 (current {max_output})", str(max_output) == "8192"),
         ("timeout=300000", f"timeout 300000ms (current {timeout})", str(timeout) == "300000"),
     ])
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         choices.extend([
             ("stream=true", "stream on", stream_on),
             ("stream=false", "stream off (buffer full response)", not stream_on),
             ("stream_word_chunking=true", "stream_word_chunking on (flush at word boundary)", word_chunk_on),
             ("stream_word_chunking=false", "stream_word_chunking off (raw upstream SSE)", not word_chunk_on),
         ])
-    if provider in ("vllm", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim"):
         choices.extend([
             ("context_window=32768", f"context_window 32768 (current {pcfg.get('context_window', 'default')})", pcfg.get("context_window") == 32768),
             ("context_window=65536", f"context_window 65536 (current {pcfg.get('context_window', 'default')})", pcfg.get("context_window") == 65536),
-            ("native=true", "native true", bool(pcfg.get("native_compat", True))),
-            ("native=false", "native false", not bool(pcfg.get("native_compat", True))),
         ])
+        if provider in ("vllm", "self-hosted-nim"):
+            choices.extend([
+                ("native=true", "native true", bool(pcfg.get("native_compat", True))),
+                ("native=false", "native false", not bool(pcfg.get("native_compat", True))),
+            ])
     items = [
         {"value": value, "label": label, "current": current, "description": provider_option_description(value)}
         for value, label, current in choices
@@ -1504,12 +1527,12 @@ def draw_intro_panel(stdscr) -> int:
         right = split + 3
         add(stdscr, 1, right, "Tips for getting started", _style(bold=True) + cp(4))
         add(stdscr, 2, right, "Choose provider, model, base URL, and API key before launch.", cp(5))
-        add(stdscr, 3, right, "Routes Claude Code to Anthropic, Ollama, vLLM, Nvidia, or NIM.", cp(5))
+        add(stdscr, 3, right, "Routes Claude Code to Anthropic, Ollama, LM Studio, vLLM, Nvidia, or NIM.", cp(5))
         add(stdscr, 4, right, "Adds DuckDuckGo web search tooling for non-native providers.", cp(5))
         add(stdscr, 5, right, "Use --ca-* flags for headless runs; Claude flags pass through.", cp(5))
     else:
         add(stdscr, 1, 3, f"{APP_NAME} routes Claude Code through selectable providers.", _style(bold=True) + cp(5))
-        add(stdscr, 2, 3, "Anthropic, Ollama, vLLM, Nvidia Hosted, and self-hosted NIM.", cp(5))
+        add(stdscr, 2, 3, "Anthropic, Ollama, LM Studio, vLLM, Nvidia Hosted, and self-hosted NIM.", cp(5))
         add(stdscr, 3, 3, "DuckDuckGo web search is attached for non-native providers.", cp(5))
         add(stdscr, 4, 3, "Headless setup uses --ca-* flags; Claude flags pass through.", cp(5))
         if panel_h > 6:

@@ -125,7 +125,7 @@ The menu appears before Claude Code starts. Use arrow keys to move and Enter to
 edit or select:
 
 - Language: English, Korean, Japanese, Chinese.
-- Provider: Anthropic, Ollama, Ollama Cloud, vLLM, NVIDIA hosted, self-hosted NIM.
+- Provider: Anthropic, Ollama, Ollama Cloud, LM Studio, vLLM, NVIDIA hosted, self-hosted NIM.
 - API key: enter only when the selected provider needs one.
 - Base URL: provider-aware default or custom endpoint.
 - Model: provider model picker when available, custom input otherwise.
@@ -241,6 +241,18 @@ Links:
 - vLLM tool calling: https://docs.vllm.ai/en/stable/features/tool_calling/
 - vLLM GitHub: https://github.com/vllm-project/vllm
 
+### LM Studio
+
+LM Studio uses its local OpenAI-compatible server through the Claude Any router.
+Start LM Studio's Local Server and use this base URL:
+
+```text
+http://127.0.0.1:1234/v1
+```
+
+Then choose a model loaded in LM Studio, or set it headlessly with
+`--ca-provider lm-studio --ca-model MODEL_ID`.
+
 ### NVIDIA Hosted NIM
 
 NVIDIA hosted models are available through NVIDIA API Catalog. Claude Any uses a
@@ -341,6 +353,13 @@ claude-any \
   --ca-model my-model \
   --ca-context-window 65536 \
   --ca-max-output-tokens 4096
+
+# LM Studio local OpenAI-compatible server
+claude-any \
+  --ca-provider lm-studio \
+  --ca-base-url http://127.0.0.1:1234/v1 \
+  --ca-model local-model \
+  --ca-context-window 32768
 
 # NVIDIA hosted API Catalog through the local Claude Any router
 export NVIDIA_API_KEY="..."

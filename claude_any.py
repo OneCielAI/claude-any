@@ -87,6 +87,9 @@ PROVIDER_ALIASES = {
     "cloud-ollama": "ollama-cloud",
     "vllm": "vllm",
     "vllm-local": "vllm",
+    "lm-studio": "lm-studio",
+    "lmstudio": "lm-studio",
+    "lm": "lm-studio",
     "nvidia": "nvidia-hosted",
     "nvidia-hosted": "nvidia-hosted",
     "hosted-nvidia": "nvidia-hosted",
@@ -100,6 +103,7 @@ PROVIDER_LABELS = {
     "ollama": "Ollama",
     "ollama-cloud": "Ollama Cloud",
     "vllm": "vLLM",
+    "lm-studio": "LM Studio",
     "nvidia-hosted": "Nvidia Hosted",
     "self-hosted-nim": "Self Hosted NIM",
 }
@@ -1173,6 +1177,10 @@ PROVIDER_NOTES = {
             "vLLM: enter the vLLM server root that implements the Anthropic Messages API.",
             "Do not enter an OpenAI-only chat completions endpoint; use a compatibility proxy for those servers.",
         ],
+        "lm-studio": [
+            "LM Studio: uses the local OpenAI-compatible server.",
+            "Start LM Studio's Local Server and use http://127.0.0.1:1234/v1 as the base URL.",
+        ],
         "self-hosted-nim": [
             "Self-hosted NIM: enter the NIM server root that exposes Anthropic-compatible /v1/messages.",
             "This native path does not use the NVIDIA hosted API Catalog proxy.",
@@ -1198,6 +1206,10 @@ PROVIDER_NOTES = {
         "vllm": [
             "vLLM: Anthropic Messages API를 구현한 vLLM 서버 root를 넣으세요.",
             "OpenAI 전용 chat completions endpoint를 넣지 마세요. 그런 서버는 호환 프록시가 필요합니다.",
+        ],
+        "lm-studio": [
+            "LM Studio: 로컬 OpenAI 호환 서버를 사용합니다.",
+            "LM Studio의 Local Server를 켜고 base URL은 http://127.0.0.1:1234/v1 을 사용하세요.",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: Anthropic 호환 /v1/messages를 노출하는 NIM 서버 root를 넣으세요.",
@@ -1225,6 +1237,10 @@ PROVIDER_NOTES = {
             "vLLM: Anthropic Messages APIを実装したvLLMサーバーrootを入力してください。",
             "OpenAI専用chat completions endpointは入力しないでください。その場合は互換プロキシが必要です。",
         ],
+        "lm-studio": [
+            "LM Studio: ローカルのOpenAI互換サーバーを使います。",
+            "LM StudioのLocal Serverを起動し、base URLは http://127.0.0.1:1234/v1 を使ってください。",
+        ],
         "self-hosted-nim": [
             "Self-hosted NIM: Anthropic互換/v1/messagesを公開するNIMサーバーrootを入力してください。",
             "このnative経路はNVIDIA hosted API Catalog proxyを使いません。",
@@ -1250,6 +1266,10 @@ PROVIDER_NOTES = {
         "vllm": [
             "vLLM: 请输入实现Anthropic Messages API的vLLM服务器root。",
             "不要输入仅OpenAI chat completions的端点；这类服务器需要兼容代理。",
+        ],
+        "lm-studio": [
+            "LM Studio: 使用本地 OpenAI-compatible 服务器。",
+            "启动 LM Studio 的 Local Server，并使用 http://127.0.0.1:1234/v1 作为 base URL。",
         ],
         "self-hosted-nim": [
             "Self-hosted NIM: 请输入暴露 Anthropic-compatible /v1/messages 的 NIM 服务器 root。",
@@ -1357,6 +1377,24 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "advisor_model": "",
             "custom_models": ["my-model"],
             "native_compat": True,
+            "context_window": 32768,
+            "max_output_tokens": 4096,
+            "temperature": 0.7,
+            "top_p": 0.8,
+            "context_reserve_tokens": 1024,
+            "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT_MS,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
+        },
+        "lm-studio": {
+            "base_url": "http://127.0.0.1:1234/v1",
+            "api_key": "",
+            "current_model": "local-model",
+            "advisor_model": "",
+            "custom_models": ["local-model"],
+            "native_compat": False,
+            "rate_limit_rpm": 0,
+            "rate_limit_status": True,
             "context_window": 32768,
             "max_output_tokens": 4096,
             "temperature": 0.7,
@@ -3668,6 +3706,10 @@ def provider_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
     elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim"):
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
+    elif provider == "lm-studio":
+        if meaningful_key(str(pcfg.get("api_key") or "")):
+            headers["x-api-key"] = str(pcfg["api_key"])
+            headers["authorization"] = f"Bearer {pcfg['api_key']}"
     elif provider == "nvidia-hosted":
         key = nvidia_api_key() or (str(pcfg.get("api_key") or "") if meaningful_key(pcfg.get("api_key")) else "")
         if key:
@@ -3749,7 +3791,7 @@ def model_context_field(item: dict[str, Any]) -> int | None:
 
 
 def upstream_model_runtime_info(provider: str, pcfg: dict[str, Any], timeout: float = 3.0) -> dict[str, Any] | None:
-    if provider not in ("vllm", "self-hosted-nim"):
+    if provider not in ("vllm", "lm-studio", "self-hosted-nim"):
         return None
     base = provider_upstream_request_base(provider, pcfg)
     if not base:
@@ -3963,7 +4005,7 @@ def write_router_activity(event: str, provider: str, model: str | None = None, *
 def context_limit_for_status(provider: str, pcfg: dict[str, Any]) -> int | None:
     if provider in ("ollama", "ollama-cloud"):
         return ollama_context_limit_for_budget(pcfg)
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         return openai_context_limit_for_budget(provider, pcfg)
     return positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
 
@@ -5645,7 +5687,7 @@ def advisor_model_enabled(pcfg: dict[str, Any]) -> str:
 def advisor_provider_kind(provider: str) -> str:
     if provider in ("ollama", "ollama-cloud"):
         return "ollama"
-    if provider == "nvidia-hosted":
+    if provider in ("lm-studio", "nvidia-hosted"):
         return "openai-compatible"
     return ""
 
@@ -6628,7 +6670,7 @@ def set_upstream_stream_read_timeout(resp: Any, timeout: float) -> None:
 
 def cap_anthropic_body_for_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     capped = dict(body)
-    if provider not in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    if provider not in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         return capped
     if provider == "vllm":
         context_limit = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len")) or 32768
@@ -6802,7 +6844,7 @@ def advisor_response_text(provider: str, data: Any) -> str:
 def advisor_endpoint(provider: str, pcfg: dict[str, Any]) -> str:
     base = pcfg.get("base_url", "").rstrip("/")
     if advisor_provider_kind(provider) == "openai-compatible":
-        return join_url(provider_upstream_request_base(provider, pcfg), "/chat/completions")
+        return join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions")
     return join_url(base, "/api/chat")
 
 
@@ -6901,12 +6943,12 @@ def call_provider_chat_once(provider: str, pcfg: dict[str, Any], body: dict[str,
             None,
         )
         return ollama_chat_to_anthropic(data, model, source_body=body)
-    if provider == "nvidia-hosted":
-        upstream_model = ncp_model_id_for_nvidia_hosted(model)
+    if provider in ("lm-studio", "nvidia-hosted"):
+        upstream_model = ncp_model_id_for_nvidia_hosted(model) if provider == "nvidia-hosted" else model
         req_body = openai_compatible_chat_request(provider, upstream_model, body, pcfg, stream=False)
         apply_router_rate_limit(provider, pcfg, upstream_model)
         data = post_json_with_rate_retry(
-            join_url(provider_upstream_request_base(provider, pcfg), "/chat/completions"),
+            join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions"),
             req_body,
             provider_headers(provider, pcfg),
             provider_request_timeout_seconds(pcfg),
@@ -8616,7 +8658,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
         model = ncp_model_id_for_nvidia_hosted(model)
     original_body = body
     upstream_body = body_with_advisor_tool(body, pcfg) if advisor_provider_supported(provider) else body
-    url = join_url(provider_upstream_request_base(provider, pcfg), "/chat/completions")
+    url = join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions")
     waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
     stream_enabled = bool(pcfg.get("stream_enabled", True))
     stream = True if provider == "nvidia-hosted" else bool(body.get("stream", stream_enabled)) and stream_enabled
@@ -8816,7 +8858,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to Ollama-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_ollama_api_chat(self, provider, pcfg, body)
                 return
-            if provider == "nvidia-hosted":
+            if provider in ("lm-studio", "nvidia-hosted"):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to OpenAI-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_openai_compatible_chat(self, provider, pcfg, body)
                 return
@@ -9258,11 +9300,11 @@ def status_lines() -> list[str]:
         *([f"think: {bool(pcfg.get('think', False))}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("ollama", "ollama-cloud") else []),
-        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
-        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "self-hosted-nim") else []),
-        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
-        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
-        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "nvidia-hosted", "self-hosted-nim") else []),
+        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim") else []),
+        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim") else []),
+        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim") else []),
+        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim") else []),
+        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim") else []),
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
         f"log_level: {log_level_status()}",
         f"channels: {channel_status_text(cfg)}",
@@ -10941,8 +10983,8 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print("  claude-any --ca-ollama-option temperature=0.7 --ca-ollama-num-ctx 65536")
 
 
-PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud")
-PROVIDER_SAMPLING_OPTION_PROVIDERS = ("vllm", "nvidia-hosted", "self-hosted-nim")
+PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud")
+PROVIDER_SAMPLING_OPTION_PROVIDERS = ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim")
 PROVIDER_SAMPLING_OPTIONS = ("temperature", "top_p", "top_k")
 
 
@@ -10992,22 +11034,22 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     ]
     if pcfg.get("stream_idle_timeout_ms") is not None:
         parts.append(f"stream_idle_timeout={pcfg.get('stream_idle_timeout_ms')}ms")
-    if provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+    if provider in ("lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
         parts.append(f"rate_limit_rpm={pcfg.get('rate_limit_rpm', 40)}")
         if bool(pcfg.get("rate_limit_status", True)):
             used, limit = router_rate_limit_usage(provider, pcfg)
             if limit is not None:
                 suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unmanaged)"
                 parts.append(f"rpm_used={suffix}")
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
     if provider in ("vllm", "self-hosted-nim"):
-        native_default = False if provider == "nvidia-hosted" else True
+        native_default = True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
         parts.append(f"stream={'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
         if bool(pcfg.get("stream_word_chunking", False)):
             parts.append("word_chunk=on")
@@ -11049,7 +11091,7 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
         return "million-context"
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
-    if provider in ("vllm", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim"):
         server_limit = upstream_model_context_limit(provider, pcfg, timeout=1.5) or 0
         ctx = server_limit or positive_int(pcfg.get("context_window")) or 0
         if ctx >= 524288:
@@ -11348,7 +11390,7 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
         if fixed_ctx and fixed_ctx > capacity:
             pcfg["num_ctx"] = capacity
         return messages
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         context_window = positive_int(pcfg.get("context_window"))
         if context_window and context_window > capacity:
             pcfg["context_window"] = capacity
@@ -11404,7 +11446,7 @@ def context_setting_status(provider: str, pcfg: dict[str, Any]) -> str:
     cap_text = format_context_tokens(capacity)
     if provider in ("ollama", "ollama-cloud"):
         return f"model max {cap_text}; {ollama_num_ctx_status(pcfg)}"
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         window = positive_int(pcfg.get("context_window"))
         reserve = positive_int(pcfg.get("context_reserve_tokens"))
         reserve_text = f"; reserve {format_context_tokens(reserve)}" if reserve else ""
@@ -11421,7 +11463,7 @@ def configured_context_window_for_timeout(provider: str, pcfg: dict[str, Any]) -
             or positive_int(pcfg.get("num_ctx"))
             or provider_model_context_capacity(provider, pcfg)
         )
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         return positive_int(pcfg.get("context_window")) or provider_model_context_capacity(provider, pcfg)
     if provider == "anthropic":
         return provider_model_context_capacity(provider, pcfg)
@@ -11556,7 +11598,7 @@ def apply_context_setup_to_provider(provider: str, pcfg: dict[str, Any], mode: s
         pcfg["num_ctx_max"] = window
         pcfg["num_ctx_min"] = min(window, 32768 if window <= 65536 else 65536)
         pcfg.setdefault("ollama_options", {})["num_predict"] = output
-    elif provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         pcfg["context_window"] = window
         pcfg["context_reserve_tokens"] = reserve
         pcfg["max_output_tokens"] = output
@@ -11639,7 +11681,7 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
         if num_ctx and num_ctx <= 32768 and num_predict and num_predict <= 2048:
             return "fast"
         return None
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim", "anthropic"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "anthropic"):
         max_output = positive_int(pcfg.get("max_output_tokens")) or 0
         context_window = positive_int(pcfg.get("context_window")) or 0
         if bool(pcfg.get("think", False)):
@@ -11868,8 +11910,8 @@ def apply_llm_preset_to_provider(
         for token in with_preset_timeout_tokens(tokens_by_preset[preset_id], preset_id):
             apply_provider_option(provider, pcfg, token)
     else:
-        native_default = "false" if provider == "nvidia-hosted" else "true"
-        server_limit = upstream_model_context_limit(provider, pcfg) if provider in ("vllm", "self-hosted-nim") else None
+        native_default = "false" if provider in ("lm-studio", "nvidia-hosted") else "true"
+        server_limit = upstream_model_context_limit(provider, pcfg) if provider in ("vllm", "lm-studio", "self-hosted-nim") else None
         if provider == "nvidia-hosted":
             tokens_by_preset = {
                 "balanced": [
@@ -12105,7 +12147,7 @@ def apply_llm_preset_to_provider(
             ],
             }
         for token in with_preset_timeout_tokens(tokens_by_preset[preset_id], preset_id):
-            if provider == "nvidia-hosted" and token.startswith("native="):
+            if provider in ("lm-studio", "nvidia-hosted") and token.startswith("native="):
                 continue
             apply_provider_option(provider, pcfg, token)
         if server_limit:
@@ -12125,7 +12167,7 @@ def apply_llm_preset_to_provider(
         f"Provider: {provider}; {ui_text('model_family', lang)}: {model_family_text(family, lang)}",
     ]
     lines.extend(context_msgs)
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         server_limit = upstream_model_context_limit(provider, pcfg)
         required_context = required_context_for_preset(preset_id, provider) or 65536
         if server_limit:
@@ -12135,7 +12177,7 @@ def apply_llm_preset_to_provider(
                 lines.append("Client settings were capped to the server-reported context length.")
         elif preset_id in CONTEXT_HEAVY_PRESETS:
             lines.append("Could not verify server max_model_len; vLLM/NIM must be started with a matching context limit.")
-    if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         lines.append(
             "Applied options: "
             f"context_window={pcfg.get('context_window', 'default')}, "
@@ -12413,7 +12455,7 @@ def llm_option_current_bool(provider: str, pcfg: dict[str, Any], key: str) -> bo
     if key == "stream_word_chunking":
         return bool(pcfg.get("stream_word_chunking", False))
     if key == "native_compat":
-        default = False if provider == "nvidia-hosted" else True
+        default = False if provider in ("lm-studio", "nvidia-hosted") else True
         return bool(pcfg.get("native_compat", default))
     if key == "think":
         return bool(pcfg.get("think", False))
@@ -12457,11 +12499,11 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 40))
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
     else:
-        if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
             add("Context reserve", "context_reserve_tokens", pcfg.get("context_reserve_tokens", "default"))
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
-        if provider in ("vllm", "nvidia-hosted", "self-hosted-nim"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
             add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", "default"))
             add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
@@ -12591,10 +12633,10 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         elif key in ("rate_limit_status", "rpm_status"):
             pcfg["rate_limit_status"] = True
         elif key in ("native", "native_compat"):
-            if provider == "nvidia-hosted":
+            if provider in ("lm-studio", "nvidia-hosted"):
                 raise SystemExit(
-                    "nvidia-hosted does not expose Anthropic /v1/messages; use router mode. "
-                    "Use self-hosted-nim for native NIM /v1/messages."
+                    f"{provider} does not expose Anthropic /v1/messages; use router mode. "
+                    "Use self-hosted-nim or vLLM for native /v1/messages."
                 )
             pcfg["native_compat"] = True
         elif key in ("stream", "stream_enabled"):
@@ -12651,10 +12693,10 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         pcfg["rate_limit_rpm"] = fixed
         return
     if key in ("native", "native_compat"):
-        if provider == "nvidia-hosted":
+        if provider in ("lm-studio", "nvidia-hosted"):
             raise SystemExit(
-                "nvidia-hosted does not expose Anthropic /v1/messages; use router mode. "
-                "Use self-hosted-nim for native NIM /v1/messages."
+                f"{provider} does not expose Anthropic /v1/messages; use router mode. "
+                "Use self-hosted-nim or vLLM for native /v1/messages."
             )
         pcfg["native_compat"] = bool(value)
         return
@@ -12690,7 +12732,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
         except SystemExit:
             pass
     if provider not in PROVIDER_OPTION_PROVIDERS:
-        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, vllm, nvidia-hosted, and self-hosted-nim.")
+        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, vllm, lm-studio, nvidia-hosted, and self-hosted-nim.")
     pcfg = cfg["providers"][provider]
     if values:
         context_changed = any(
@@ -12937,7 +12979,7 @@ def vllm_tool_parser_hint(model: str) -> str | None:
 
 
 def compatibility_runtime_lines(provider: str, pcfg: dict[str, Any], native: bool) -> list[str]:
-    if provider not in ("vllm", "self-hosted-nim"):
+    if provider not in ("vllm", "lm-studio", "self-hosted-nim"):
         return []
     lines: list[str] = []
     info = upstream_model_runtime_info(provider, pcfg, timeout=4.0)
@@ -13596,6 +13638,7 @@ def default_base_url(provider: str) -> str:
         "ollama": "http://your-ollama:11434",
         "ollama-cloud": "https://ollama.com",
         "vllm": "http://your-vllm:8000",
+        "lm-studio": "http://127.0.0.1:1234/v1",
         "nvidia-hosted": nvidia_upstream_base_url(),
         "self-hosted-nim": "http://your-nim:8000",
     }.get(provider, "http://localhost:8000")
@@ -13689,6 +13732,8 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
             errors.append("Start Ollama or set a reachable Base URL before launching Claude Code.")
         elif provider == "self-hosted-nim":
             errors.append("Start NIM or set a reachable Anthropic-compatible Base URL before launching Claude Code.")
+        elif provider == "lm-studio":
+            errors.append("Start LM Studio's Local Server or set a reachable OpenAI-compatible Base URL before launching Claude Code.")
         else:
             errors.append("Set a reachable Base URL before launching Claude Code.")
     if provider == "nvidia-hosted" and not (nvidia_api_key() or meaningful_key(pcfg.get("api_key"))):
@@ -16546,7 +16591,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-stop               Stop router/proxy
   claude-any --                      Pass all following args directly to Claude Code
 
-Provider names: anthropic, ollama, ollama-cloud, vllm, nvidia-hosted, self-hosted-nim
+Provider names: anthropic, ollama, ollama-cloud, vllm, lm-studio, nvidia-hosted, self-hosted-nim
 Any other arguments are passed through to claude. Use -- before Claude flags that
 collide with claude-any setup flags."""
 
