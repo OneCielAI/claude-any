@@ -10768,6 +10768,85 @@ def cached_channel_capable_server_names() -> list[str]:
     return _dedupe_strings(names)
 
 
+def cached_channel_source_paths_for_specs(specs: Iterable[str]) -> list[Path]:
+    """Return MCP config files that supplied the selected channel servers.
+
+    The channel picker is driven by the probe cache, so launch should also
+    honor the cache's source_path. This keeps a selected server available even
+    when it came from an explicit/probed config path rather than the default
+    discovery set for the current working directory.
+    """
+    wanted = {
+        str(spec).split(":", 1)[1]
+        for spec in specs
+        if str(spec).startswith("server:") and str(spec).split(":", 1)[1]
+    }
+    if not wanted:
+        return []
+    out: list[Path] = []
+    seen: set[str] = set()
+    for record in cached_channel_probe_servers():
+        name = str(record.get("name") or "")
+        if name not in wanted:
+            continue
+        source = str(record.get("source_path") or "")
+        if not source or source == "<built-in>":
+            continue
+        path = Path(source).expanduser()
+        key = _path_for_compare(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _server_names_from_channel_specs(specs: Iterable[str]) -> list[str]:
+    names: list[str] = []
+    for spec in specs:
+        text = str(spec or "").strip()
+        if not text.startswith("server:"):
+            continue
+        name = text.split(":", 1)[1].strip()
+        if name:
+            names.append(name)
+    return _dedupe_strings(names)
+
+
+def channel_probe_cache_needs_launch_refresh(cfg: dict[str, Any], passthrough: list[str]) -> bool:
+    cache = read_channel_probe_cache()
+    records = cached_channel_probe_servers()
+    configured_names = [
+        name for name in _server_names_from_channel_specs(channel_specs_for_launch(cfg, passthrough))
+        if name != "claude-any-router"
+    ]
+    if not configured_names:
+        return False
+    if not cache.get("probed_at"):
+        return True
+    by_name = {str(r.get("name") or ""): r for r in records if r.get("name")}
+    for name in configured_names:
+        record = by_name.get(name)
+        if not record or not record.get("capable"):
+            return True
+        source = str(record.get("source_path") or "")
+        if not source or source == "<built-in>":
+            return True
+    return False
+
+
+def ensure_channel_probe_cache_for_launch(cfg: dict[str, Any], passthrough: list[str]) -> bool:
+    if not channel_probe_cache_needs_launch_refresh(cfg, passthrough):
+        return False
+    try:
+        router_log("INFO", "channel_probe_launch_refresh reason=missing_cache_or_selected_server")
+        refresh_channel_probe_cache(passthrough)
+        return True
+    except Exception as exc:
+        router_log("WARN", f"channel_probe_launch_refresh_failed error={type(exc).__name__}: {exc}")
+        return False
+
+
 def parse_passthrough_channel_specs(passthrough: list[str]) -> list[str]:
     """Extract channel specs from passthrough args of either
     --channels or --dangerously-load-development-channels (and the
@@ -16803,6 +16882,30 @@ def launch_claude(
         mcp_config_paths.append(str(write_duckduckgo_mcp_config(cfg)))
     if native_channel_bridge:
         mcp_config_paths.append(str(write_channel_mcp_config()))
+    detected_channel_specs: list[str] = []
+    native_channel_specs: list[str] = []
+    if native_channel_bridge:
+        try:
+            ensure_channel_probe_cache_for_launch(cfg, launch_passthrough)
+            capable_names = cached_channel_capable_server_names()
+            detected_channel_specs = [f"server:{name}" for name in capable_names]
+            native_channel_specs = channel_specs_for_launch(cfg, launch_passthrough, detected_channel_specs)
+            source_paths = cached_channel_source_paths_for_specs(native_channel_specs)
+            if source_paths:
+                mcp_config_paths.extend(str(path) for path in source_paths)
+            cache_age = read_channel_probe_cache().get("probed_at") or 0
+            router_log(
+                "INFO",
+                "channel_probe_loaded source=cache cache_age_ts=%d count=%d servers=%s sources=%s"
+                % (
+                    int(cache_age),
+                    len(capable_names),
+                    ",".join(capable_names) or "-",
+                    ",".join(str(path) for path in source_paths) or "-",
+                ),
+            )
+        except Exception as exc:
+            router_log("WARN", f"channel_probe_cache_load_failed error={type(exc).__name__}: {exc}")
     claude_passthrough = list(launch_passthrough)
     if stdin_channel_proxy or native_channel_bridge:
         auto_start_sse_channels_from_mcp_configs(launch_passthrough)
@@ -16817,18 +16920,6 @@ def launch_claude(
         extra_args.extend(["--mcp-config", *mcp_config_paths])
     if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
         extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
-    detected_channel_specs: list[str] = []
-    if native_channel_bridge:
-        try:
-            capable_names = cached_channel_capable_server_names()
-            detected_channel_specs = [f"server:{name}" for name in capable_names]
-            cache_age = read_channel_probe_cache().get("probed_at") or 0
-            router_log(
-                "INFO",
-                f"channel_probe_loaded source=cache cache_age_ts={int(cache_age)} count={len(capable_names)} servers={','.join(capable_names) or '-'}",
-            )
-        except Exception as exc:
-            router_log("WARN", f"channel_probe_cache_load_failed error={type(exc).__name__}: {exc}")
     extra_args.extend(
         claude_channel_args(
             cfg,

@@ -317,6 +317,9 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
                 stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "cached_channel_capable_server_names", return_value=["claude-any-router"]))
+                stack.enter_context(mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[]))
                 write_channel = stack.enter_context(mock.patch.object(claude_any, "write_channel_mcp_config", return_value=channel_path))
                 write_proxy = stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=proxy_path))
                 proxy = stack.enter_context(mock.patch.object(claude_any, "subprocess_call_with_channel_wake_proxy", return_value=0))
@@ -366,6 +369,9 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
                 stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "cached_channel_capable_server_names", return_value=["claude-any-router"]))
+                stack.enter_context(mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[]))
                 write_channel = stack.enter_context(mock.patch.object(claude_any, "write_channel_mcp_config", return_value=channel_path))
                 write_proxy = stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=proxy_path))
                 proxy = stack.enter_context(mock.patch.object(claude_any, "subprocess_call_with_channel_wake_proxy", return_value=0))
@@ -553,6 +559,52 @@ class ChannelProbeCacheTests(unittest.TestCase):
         self.assertIn("claude-any-router", names)
         self.assertIn("ai-net", names)
         self.assertNotIn("boring", names)
+
+    def test_cached_source_paths_for_selected_sse_channel(self):
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            root = self._isolate_cache(stack, td)
+            mcp_config = root / ".mcp.json"
+            claude_any._write_channel_probe_cache({
+                "version": 1,
+                "probed_at": 1700000000.0,
+                "servers": [
+                    {
+                        "name": "ai-net-sse",
+                        "capable": True,
+                        "transport": "sse",
+                        "source_path": str(mcp_config),
+                    },
+                ],
+            })
+            paths = claude_any.cached_channel_source_paths_for_specs(["server:ai-net-sse"])
+        self.assertEqual([mcp_config], paths)
+
+    def test_launch_refresh_needed_when_selected_channel_cache_missing(self):
+        cfg = {"claude_code": {"channels": ["server:ai-net-sse"], "channel_delivery": "native"}}
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            self._isolate_cache(stack, td)
+            self.assertTrue(claude_any.channel_probe_cache_needs_launch_refresh(cfg, []))
+            refresh = stack.enter_context(mock.patch.object(claude_any, "refresh_channel_probe_cache", return_value={"servers": []}))
+            self.assertTrue(claude_any.ensure_channel_probe_cache_for_launch(cfg, []))
+        refresh.assert_called_once_with([])
+
+    def test_launch_refresh_not_needed_when_selected_channel_has_source(self):
+        cfg = {"claude_code": {"channels": ["server:ai-net-sse"], "channel_delivery": "native"}}
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            root = self._isolate_cache(stack, td)
+            claude_any._write_channel_probe_cache({
+                "version": 1,
+                "probed_at": 1700000000.0,
+                "servers": [
+                    {
+                        "name": "ai-net-sse",
+                        "capable": True,
+                        "transport": "sse",
+                        "source_path": str(root / ".mcp.json"),
+                    },
+                ],
+            })
+            self.assertFalse(claude_any.channel_probe_cache_needs_launch_refresh(cfg, []))
 
     def test_probe_records_include_router_self_and_skip_recursion(self):
         with tempfile.TemporaryDirectory() as td:
