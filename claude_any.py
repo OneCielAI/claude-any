@@ -14982,10 +14982,12 @@ def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
         values.append("__heading__")
         for r in inconclusive_records:
             name = str(r.get("name") or "")
+            spec = f"server:{name}"
+            mark = "*" if spec in channels else " "
             transport = str(r.get("transport") or "?")
             reason = str(r.get("reason") or "-")
-            rows.append(f"  {name:<14} ({transport}) {reason}")
-            values.append("__noop__")
+            rows.append(f"{mark} {name:<14} ({transport}) {reason}")
+            values.append(spec)
 
     if skipped_records:
         rows.append("[Not probed]")
@@ -15005,7 +15007,7 @@ def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
         values.append(spec)
 
     covered: set[str] = set(OFFICIAL_CHANNEL_PLUGINS.values())
-    for r in capable_records:
+    for r in records:
         covered.add(f"server:{r.get('name')}")
     custom_specs = [spec for spec in channel_specs(cfg) if spec not in covered]
     if custom_specs:

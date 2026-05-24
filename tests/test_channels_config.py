@@ -871,6 +871,9 @@ class ChannelProbeCacheTests(unittest.TestCase):
         inconclusive_idx = rows.index("[Probe inconclusive / check server]")
         self.assertIn("plain", rows[non_capable_idx + 1])
         self.assertIn("boring", rows[inconclusive_idx + 1])
+        self.assertIn("server:boring", values)
+        self.assertNotIn("__noop__", values[inconclusive_idx + 1 : inconclusive_idx + 2])
+        self.assertEqual(values.index("server:boring"), claude_any._channel_panel_step(values, non_capable_idx, 1))
 
     def test_panel_rows_show_builtin_router_selected_without_probe_cache(self):
         cfg = {"claude_code": {"channels": []}}
