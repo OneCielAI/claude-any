@@ -854,7 +854,7 @@ class ChannelProbeCacheTests(unittest.TestCase):
             rows, values = claude_any.channel_panel_rows(cfg)
         self.assertIn("[Auto-detected channel-capable]", rows)
         self.assertIn("[Detected but not channel-capable]", rows)
-        self.assertIn("[Probe inconclusive / check server]", rows)
+        self.assertIn("[Probe inconclusive / selectable anyway]", rows)
         # ai-net should appear as a selected spec (* mark).
         self.assertTrue(any("server:ai-net" == v for v in values))
         ai_row = rows[values.index("server:ai-net")]
@@ -868,9 +868,10 @@ class ChannelProbeCacheTests(unittest.TestCase):
         # without presenting timeout as proof that the server is non-capable.
         self.assertTrue(any("timeout" in row for row in rows))
         non_capable_idx = rows.index("[Detected but not channel-capable]")
-        inconclusive_idx = rows.index("[Probe inconclusive / check server]")
+        inconclusive_idx = rows.index("[Probe inconclusive / selectable anyway]")
         self.assertIn("plain", rows[non_capable_idx + 1])
         self.assertIn("boring", rows[inconclusive_idx + 1])
+        self.assertIn("select anyway", rows[inconclusive_idx + 1])
         self.assertIn("server:boring", values)
         self.assertNotIn("__noop__", values[inconclusive_idx + 1 : inconclusive_idx + 2])
         self.assertEqual(values.index("server:boring"), claude_any._channel_panel_step(values, non_capable_idx, 1))

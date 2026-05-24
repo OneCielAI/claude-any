@@ -14978,7 +14978,7 @@ def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
             values.append("__noop__")
 
     if inconclusive_records:
-        rows.append("[Probe inconclusive / check server]")
+        rows.append("[Probe inconclusive / selectable anyway]")
         values.append("__heading__")
         for r in inconclusive_records:
             name = str(r.get("name") or "")
@@ -14986,7 +14986,7 @@ def channel_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
             mark = "*" if spec in channels else " "
             transport = str(r.get("transport") or "?")
             reason = str(r.get("reason") or "-")
-            rows.append(f"{mark} {name:<14} ({transport}) {reason}")
+            rows.append(f"{mark} {name:<14} ({transport}) {reason}  [select anyway]")
             values.append(spec)
 
     if skipped_records:
