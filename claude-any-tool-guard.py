@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 
-NON_NATIVE_PROVIDERS = {"ollama", "ollama-cloud", "vllm", "nvidia-hosted", "self-hosted-nim"}
+NON_NATIVE_PROVIDERS = {"ollama", "ollama-cloud", "deepseek", "vllm", "nvidia-hosted", "self-hosted-nim"}
 TASK_STATUS = {"pending", "in_progress", "completed", "deleted"}
 TASK_STATUS_ALIASES = {
     "active": "in_progress",

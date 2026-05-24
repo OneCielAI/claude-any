@@ -210,6 +210,7 @@ PROVIDERS = [
     ("anthropic", "Anthropic"),
     ("ollama", "Ollama"),
     ("ollama-cloud", "Ollama Cloud"),
+    ("deepseek", "DeepSeek.com"),
     ("vllm", "vLLM"),
     ("lm-studio", "LM Studio"),
     ("nvidia-hosted", "Nvidia Hosted"),
@@ -404,6 +405,10 @@ PROVIDER_NOTES = {
             "Ollama Cloud: calls https://ollama.com/api directly; an Ollama API key is required.",
             "Use this when you want cloud models without relying on the local Ollama daemon's sign-in state.",
         ],
+        "deepseek": [
+            "DeepSeek.com: uses DeepSeek's Anthropic API endpoint for Claude Code.",
+            "Set a DeepSeek API key; claude-any maps pro[1m] as the main model and flash for Haiku/subagents.",
+        ],
         "vllm": [
             "vLLM: enter the vLLM server root that implements the Anthropic Messages API.",
             "Do not enter an OpenAI-only chat completions endpoint; use a compatibility proxy for those servers.",
@@ -433,6 +438,10 @@ PROVIDER_NOTES = {
         "ollama-cloud": [
             "Ollama Cloud: https://ollama.com/api를 직접 호출합니다. Ollama API key가 필요합니다.",
             "로컬 Ollama 데몬의 로그인 상태와 무관하게 클라우드 모델을 쓰고 싶을 때 사용합니다.",
+        ],
+        "deepseek": [
+            "DeepSeek.com: Claude Code용 DeepSeek Anthropic API endpoint를 직접 사용합니다.",
+            "DeepSeek API key가 필요하며, pro[1m]은 메인 모델로, flash는 Haiku/subagent 모델로 설정됩니다.",
         ],
         "vllm": [
             "vLLM: Anthropic Messages API를 구현한 vLLM 서버 root를 넣으세요.",
@@ -464,6 +473,10 @@ PROVIDER_NOTES = {
             "Ollama Cloud: https://ollama.com/api を直接呼び出します。Ollama API keyが必要です。",
             "ローカルOllama daemonのサインイン状態に依存せずクラウドモデルを使う場合に選びます。",
         ],
+        "deepseek": [
+            "DeepSeek.com: Claude Code向けDeepSeek Anthropic API endpointを直接使います。",
+            "DeepSeek API keyが必要です。pro[1m]をメイン、flashをHaiku/subagentに設定します。",
+        ],
         "vllm": [
             "vLLM: Anthropic Messages APIを実装したvLLMサーバーrootを入力してください。",
             "OpenAI専用chat completions endpointは入力しないでください。その場合は互換プロキシが必要です。",
@@ -493,6 +506,10 @@ PROVIDER_NOTES = {
         "ollama-cloud": [
             "Ollama Cloud: 直接调用 https://ollama.com/api；需要Ollama API key。",
             "当你想不依赖本地Ollama daemon登录状态使用云端模型时选择它。",
+        ],
+        "deepseek": [
+            "DeepSeek.com: 直接使用面向 Claude Code 的 DeepSeek Anthropic API endpoint。",
+            "需要 DeepSeek API key；pro[1m] 作为主模型，flash 用于 Haiku/subagent。",
         ],
         "vllm": [
             "vLLM: 请输入实现Anthropic Messages API的vLLM服务器root。",
@@ -666,6 +683,8 @@ def api_key_status(provider: str, pcfg: dict) -> str:
         return "API key: set (Anthropic)" if meaningful_key(pcfg.get("api_key")) else "API key: not set (use API key or Claude login)"
     if provider == "ollama-cloud":
         return "API key: set (Ollama Cloud)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (Ollama Cloud required)"
+    if provider == "deepseek":
+        return "API key: set (DeepSeek)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (DeepSeek required)"
     key = pcfg.get("api_key")
     if meaningful_key(key):
         return "API key: set"
@@ -689,6 +708,8 @@ def probe_base_url(provider: str, pcfg: dict) -> str:
         return f"Base URL: placeholder ({base})"
     if provider == "nvidia-hosted":
         return f"Base URL: NVIDIA hosted ({base}); local router http://127.0.0.1:8799 starts on launch"
+    if provider == "deepseek":
+        return f"Base URL: DeepSeek Anthropic API configured ({base})"
     path = "/api/tags" if provider in ("ollama", "ollama-cloud") else "/v1/models"
     url = join_url(base, path)
     headers = {}
@@ -775,7 +796,7 @@ def is_ollama_provider(provider: str) -> bool:
 
 
 def has_provider_options(provider: str) -> bool:
-    return provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud")
+    return provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek")
 
 
 def ollama_ctx_text(pcfg: dict) -> str:
@@ -816,12 +837,11 @@ def provider_options_summary(provider: str, pcfg: dict) -> str:
         parts.append(f"rpm {pcfg.get('rate_limit_rpm', 40)}")
         if bool(pcfg.get("rate_limit_status", True)):
             parts.append("rpm_status on")
-    if provider in ("vllm", "lm-studio", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
         parts.insert(0, f"ctx {pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve {pcfg.get('context_reserve_tokens', 'default')}")
-        if provider in ("vllm", "lm-studio", "self-hosted-nim"):
-            parts.append(f"native {str(bool(pcfg.get('native_compat', True))).lower()}")
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+        parts.append(f"native {str(bool(pcfg.get('native_compat', True))).lower()}")
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
         parts.append(f"stream {'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
         if bool(pcfg.get("stream_word_chunking", False)):
             parts.append("word_chunk on")
@@ -866,6 +886,7 @@ def default_base_url(provider: str) -> str:
         "anthropic": "https://api.anthropic.com",
         "ollama": "http://your-ollama:11434",
         "ollama-cloud": "https://ollama.com",
+        "deepseek": "https://api.deepseek.com/anthropic",
         "vllm": "http://your-vllm:8000",
         "lm-studio": "http://127.0.0.1:1234/v1",
         "nvidia-hosted": "https://integrate.api.nvidia.com/v1",
@@ -1272,38 +1293,37 @@ def build_provider_options_submenu() -> dict:
         choices.append(("__edit_rate_limit__", f"Edit rate_limit_rpm [{pcfg.get('rate_limit_rpm', 40)}]", False))
         choices.append(("rate_limit_status=true", "rate_limit_status on", bool(pcfg.get("rate_limit_status", True))))
         choices.append(("rate_limit_status=false", "rate_limit_status off", not bool(pcfg.get("rate_limit_status", True))))
-    if provider in ("vllm", "lm-studio", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
         native = bool(pcfg.get("native_compat", True))
         choices = [
             ("__edit_context_window__", f"Edit context_window [{pcfg.get('context_window', 'default')}]", False),
             ("__edit_reserve__", f"Edit context reserve [{pcfg.get('context_reserve_tokens', 'default')}]", False),
             *choices,
         ]
-        if provider in ("vllm", "lm-studio", "self-hosted-nim"):
-            choices.append(("__edit_native__", f"Edit native mode [{str(native).lower()}]", False))
+        choices.append(("__edit_native__", f"Edit native mode [{str(native).lower()}]", False))
     choices.extend([
         ("__custom__", "Custom KEY=VALUE or unset:KEY...", False),
         ("max_output_tokens=4096", f"max_output_tokens 4096 (current {max_output})", str(max_output) == "4096"),
         ("max_output_tokens=8192", f"max_output_tokens 8192 (current {max_output})", str(max_output) == "8192"),
         ("timeout=300000", f"timeout 300000ms (current {timeout})", str(timeout) == "300000"),
     ])
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
         choices.extend([
             ("stream=true", "stream on", stream_on),
             ("stream=false", "stream off (buffer full response)", not stream_on),
             ("stream_word_chunking=true", "stream_word_chunking on (flush at word boundary)", word_chunk_on),
             ("stream_word_chunking=false", "stream_word_chunking off (raw upstream SSE)", not word_chunk_on),
         ])
-    if provider in ("vllm", "lm-studio", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
         choices.extend([
             ("context_window=32768", f"context_window 32768 (current {pcfg.get('context_window', 'default')})", pcfg.get("context_window") == 32768),
             ("context_window=65536", f"context_window 65536 (current {pcfg.get('context_window', 'default')})", pcfg.get("context_window") == 65536),
+            ("context_window=1048576", f"context_window 1048576 (current {pcfg.get('context_window', 'default')})", pcfg.get("context_window") == 1048576),
         ])
-        if provider in ("vllm", "lm-studio", "self-hosted-nim"):
-            choices.extend([
-                ("native=true", "native true", bool(pcfg.get("native_compat", True))),
-                ("native=false", "native false", not bool(pcfg.get("native_compat", True))),
-            ])
+        choices.extend([
+            ("native=true", "native true", bool(pcfg.get("native_compat", True))),
+            ("native=false", "native false", not bool(pcfg.get("native_compat", True))),
+        ])
     items = [
         {"value": value, "label": label, "current": current, "description": provider_option_description(value)}
         for value, label, current in choices

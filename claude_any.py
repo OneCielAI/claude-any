@@ -87,6 +87,11 @@ PROVIDER_ALIASES = {
     "ollama": "ollama",
     "ollama-cloud": "ollama-cloud",
     "cloud-ollama": "ollama-cloud",
+    "deepseek": "deepseek",
+    "deepseek.com": "deepseek",
+    "deepseek-com": "deepseek",
+    "deepseek-api": "deepseek",
+    "ds": "deepseek",
     "vllm": "vllm",
     "vllm-local": "vllm",
     "lm-studio": "lm-studio",
@@ -104,6 +109,7 @@ PROVIDER_LABELS = {
     "anthropic": "Claude Native",
     "ollama": "Ollama",
     "ollama-cloud": "Ollama Cloud",
+    "deepseek": "DeepSeek.com",
     "vllm": "vLLM",
     "lm-studio": "LM Studio",
     "nvidia-hosted": "Nvidia Hosted",
@@ -1454,6 +1460,23 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "num_predict": 4096,
             },
         },
+        "deepseek": {
+            "base_url": "https://api.deepseek.com/anthropic",
+            "api_key": "",
+            "current_model": "deepseek-v4-pro[1m]",
+            "advisor_model": "",
+            "custom_models": ["deepseek-v4-pro[1m]", "deepseek-v4-flash"],
+            "native_compat": True,
+            "context_window": 1048576,
+            "max_output_tokens": 8192,
+            "context_reserve_tokens": 8192,
+            "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT_MS,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
+            "effort_level": "max",
+            "haiku_model": "deepseek-v4-flash",
+            "subagent_model": "deepseek-v4-flash",
+        },
         "vllm": {
             "base_url": "http://127.0.0.1:8000",
             "api_key": "dummy",
@@ -1726,7 +1749,7 @@ def unique_model_ids(provider: str, ids: list[str]) -> list[str]:
 
 
 def normalize_model_id(provider: str, model_id: str) -> str:
-    model_id = strip_claude_context_suffix(model_id).strip()
+    model_id = str(model_id or "").strip() if provider == "deepseek" else strip_claude_context_suffix(model_id).strip()
     if provider == "ollama-cloud" and model_id.endswith(":cloud"):
         return model_id[:-6]
     return model_id
@@ -3897,6 +3920,16 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
     cached = read_model_list_cache(provider, pcfg)
     if cached is not None:
         return cached
+    if provider == "deepseek":
+        ids = unique_model_ids(provider, [
+            "deepseek-v4-pro[1m]",
+            "deepseek-v4-flash",
+            *(pcfg.get("custom_models", []) or []),
+            pcfg.get("current_model") or "",
+        ])
+        sorted_ids = sorted_model_ids(ids)
+        write_model_list_cache(provider, pcfg, sorted_ids)
+        return sorted_ids
     if provider == "nvidia-hosted":
         base = (pcfg.get("base_url") or nvidia_upstream_base_url()).rstrip("/")
     else:
@@ -4296,12 +4329,17 @@ def nvidia_hosted_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> 
     return False
 
 
+def deepseek_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return provider == "deepseek" and bool(pcfg.get("native_compat", True))
+
+
 def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return (
         vllm_native_compat_enabled(provider, pcfg)
         or lm_studio_native_compat_enabled(provider, pcfg)
         or nim_native_compat_enabled(provider, pcfg)
         or nvidia_hosted_native_compat_enabled(provider, pcfg)
+        or deepseek_native_compat_enabled(provider, pcfg)
     )
 
 
@@ -9856,6 +9894,8 @@ def provider_mode_label(provider: str, pcfg: dict[str, Any]) -> str:
         return "nim-native"
     if nvidia_hosted_native_compat_enabled(provider, pcfg):
         return "nvidia-native"
+    if deepseek_native_compat_enabled(provider, pcfg):
+        return "deepseek-native"
     return "claude-any-router"
 
 
@@ -9876,11 +9916,11 @@ def status_lines() -> list[str]:
         *([f"think: {bool(pcfg.get('think', False))}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("ollama", "ollama-cloud") else []),
-        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim") else []),
-        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim") else []),
-        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim") else []),
-        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim") else []),
-        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim") else []),
+        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
+        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek") else []),
+        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
+        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
+        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
         f"log_level: {log_level_status()}",
         f"channels: {channel_status_text(cfg)}",
@@ -11680,7 +11720,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print("  claude-any --ca-ollama-option temperature=0.7 --ca-ollama-num-ctx 65536")
 
 
-PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud")
+PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek")
 PROVIDER_SAMPLING_OPTION_PROVIDERS = ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim")
 PROVIDER_SAMPLING_OPTIONS = ("temperature", "top_p", "top_k")
 
@@ -11738,15 +11778,15 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
             if limit is not None:
                 suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unmanaged)"
                 parts.append(f"rpm_used={suffix}")
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
-    if provider in ("vllm", "lm-studio", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
         native_default = True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek"):
         parts.append(f"stream={'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
         if bool(pcfg.get("stream_word_chunking", False)):
             parts.append("word_chunk=on")
@@ -11788,7 +11828,7 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
         return "million-context"
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
-    if provider in ("vllm", "lm-studio", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
         server_limit = (
             model_context_hint_from_model_id(model)
             if provider == "lm-studio"
@@ -12091,7 +12131,7 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
         if fixed_ctx and fixed_ctx > capacity:
             pcfg["num_ctx"] = capacity
         return messages
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
         context_window = positive_int(pcfg.get("context_window"))
         if context_window and context_window > capacity:
             pcfg["context_window"] = capacity
@@ -12188,7 +12228,7 @@ def context_setting_status(provider: str, pcfg: dict[str, Any]) -> str:
     cap_text = format_context_tokens(capacity)
     if provider in ("ollama", "ollama-cloud"):
         return f"model max {cap_text}; {ollama_num_ctx_status(pcfg)}"
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
         window = positive_int(pcfg.get("context_window"))
         reserve = positive_int(pcfg.get("context_reserve_tokens"))
         reserve_text = f"; reserve {format_context_tokens(reserve)}" if reserve else ""
@@ -12205,7 +12245,7 @@ def configured_context_window_for_timeout(provider: str, pcfg: dict[str, Any]) -
             or positive_int(pcfg.get("num_ctx"))
             or provider_model_context_capacity(provider, pcfg)
         )
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
         return positive_int(pcfg.get("context_window")) or provider_model_context_capacity(provider, pcfg)
     if provider == "anthropic":
         return provider_model_context_capacity(provider, pcfg)
@@ -12340,7 +12380,7 @@ def apply_context_setup_to_provider(provider: str, pcfg: dict[str, Any], mode: s
         pcfg["num_ctx_max"] = window
         pcfg["num_ctx_min"] = min(window, 32768 if window <= 65536 else 65536)
         pcfg.setdefault("ollama_options", {})["num_predict"] = output
-    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
         pcfg["context_window"] = window
         pcfg["context_reserve_tokens"] = reserve
         pcfg["max_output_tokens"] = output
@@ -12423,7 +12463,7 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
         if num_ctx and num_ctx <= 32768 and num_predict and num_predict <= 2048:
             return "fast"
         return None
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "anthropic"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "anthropic"):
         max_output = positive_int(pcfg.get("max_output_tokens")) or 0
         context_window = positive_int(pcfg.get("context_window")) or 0
         if bool(pcfg.get("think", False)):
@@ -13248,18 +13288,18 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 40))
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
     else:
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
             add("Context reserve", "context_reserve_tokens", pcfg.get("context_reserve_tokens", "default"))
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
             add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", "default"))
             add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
             add("Temperature", "temperature", pcfg.get("temperature", "default"))
             add("Top P", "top_p", pcfg.get("top_p", "default"))
             add("Top K", "top_k", pcfg.get("top_k", "default"))
-            if provider in ("vllm", "lm-studio", "self-hosted-nim"):
+            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
                 add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", True)))
             add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
             if bool(pcfg.get("stream_enabled", True)):
@@ -13481,7 +13521,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
         except SystemExit:
             pass
     if provider not in PROVIDER_OPTION_PROVIDERS:
-        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, vllm, lm-studio, nvidia-hosted, and self-hosted-nim.")
+        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, vllm, lm-studio, nvidia-hosted, and self-hosted-nim.")
     pcfg = cfg["providers"][provider]
     if values:
         context_changed = any(
@@ -13507,6 +13547,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
     print("  context_window is a claude-any/router cap; native mode still cannot raise the real server limit.")
     print("  temperature/top_p/top_k are injected by claude-any router mode when the provider supports them.")
     print("Examples:")
+    print("  claude-anyctl provider-options deepseek max_output_tokens=8192 context_window=1048576")
     print("  claude-anyctl provider-options nvidia-hosted max_output_tokens=4096 temperature=0.7 top_p=0.8 timeout=300000 rate_limit_rpm=40")
     print("  claude-anyctl provider-options vllm max_output_tokens=4096 context_window=65536 timeout=300000")
     print("  claude-anyctl provider-options self-hosted-nim native=true max_output_tokens=4096")
@@ -13995,6 +14036,9 @@ def claude_code_output_token_limit(provider: str, pcfg: dict[str, Any]) -> int |
 
 
 def claude_code_auto_compact_window(provider: str, pcfg: dict[str, Any]) -> int | None:
+    configured = positive_int(pcfg.get("auto_compact_window"))
+    if configured:
+        return configured
     limit = context_limit_for_status(provider, pcfg)
     if limit:
         return limit
@@ -14063,6 +14107,24 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         })
     if provider_native_compat_enabled(provider, pcfg):
         model = current_upstream_model_id(provider, pcfg)
+        if provider == "deepseek":
+            token = str(pcfg.get("api_key") or "").strip() or "not-used"
+            small_model = str(pcfg.get("haiku_model") or "deepseek-v4-flash").strip() or "deepseek-v4-flash"
+            subagent_model = str(pcfg.get("subagent_model") or small_model).strip() or small_model
+            return apply_common_claude_env(provider, pcfg, {
+                "CLAUDE_ANY_PROVIDER": provider,
+                "ANTHROPIC_BASE_URL": native_anthropic_base_url(provider, pcfg),
+                "ANTHROPIC_API_KEY": token,
+                "ANTHROPIC_AUTH_TOKEN": token,
+                "ANTHROPIC_MODEL": model,
+                "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
+                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
+                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL": small_model,
+                "CLAUDE_CODE_SUBAGENT_MODEL": subagent_model,
+                "CLAUDE_CODE_EFFORT_LEVEL": str(pcfg.get("effort_level") or "max"),
+                "CLAUDE_ANY_MODEL_ALIAS": model,
+            })
         token = nvidia_api_key() if provider == "nvidia-hosted" else str(pcfg.get("api_key") or "dummy")
         if not token:
             token = "not-used"
@@ -14117,6 +14179,7 @@ def cmd_env(_: argparse.Namespace) -> None:
         "CLAUDE_CODE_ATTRIBUTION_HEADER",
         "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
         "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+        "CLAUDE_CODE_EFFORT_LEVEL",
         "ANTHROPIC_MODEL",
         "ANTHROPIC_CUSTOM_MODEL_OPTION",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
@@ -14422,6 +14485,7 @@ def default_base_url(provider: str) -> str:
         "anthropic": "https://api.anthropic.com",
         "ollama": "http://your-ollama:11434",
         "ollama-cloud": "https://ollama.com",
+        "deepseek": "https://api.deepseek.com/anthropic",
         "vllm": "http://your-vllm:8000",
         "lm-studio": "http://127.0.0.1:1234/v1",
         "nvidia-hosted": nvidia_upstream_base_url(),
@@ -14441,6 +14505,8 @@ def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         return "API key: set (Anthropic)" if meaningful_key(pcfg.get("api_key")) else "API key: not set (use API key or Claude login)"
     if provider == "ollama-cloud":
         return "API key: set (Ollama Cloud)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (Ollama Cloud required)"
+    if provider == "deepseek":
+        return "API key: set (DeepSeek)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (DeepSeek required)"
     if meaningful_key(pcfg.get("api_key")):
         return "API key: set"
     if provider == "ollama":
@@ -14459,6 +14525,8 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
             return f"Base URL: NVIDIA hosted native ({native_anthropic_base_url(provider, pcfg)}/v1/messages)"
         state = "ready" if router_up() else "starts on launch"
         return f"Base URL: NVIDIA hosted ({base}); local router {ROUTER_BASE} {state}"
+    if provider == "deepseek":
+        return f"Base URL: DeepSeek Anthropic API configured ({base})"
     path = "/api/tags" if provider in ("ollama", "ollama-cloud") else "/v1/models"
     headers: dict[str, str] = {}
     key = pcfg.get("api_key")
@@ -14525,6 +14593,8 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
         errors.append("Launch blocked: NVIDIA hosted requires an NVIDIA API key.")
     if provider == "ollama-cloud" and not meaningful_key(pcfg.get("api_key")):
         errors.append("Launch blocked: Ollama Cloud requires an API key.")
+    if provider == "deepseek" and not meaningful_key(pcfg.get("api_key")):
+        errors.append("Launch blocked: DeepSeek.com requires a DeepSeek API key.")
     if provider == "lm-studio":
         try:
             ensure_lm_studio_model_loaded_for_context(pcfg, timeout=1.5)
@@ -17597,6 +17667,7 @@ def launch_claude(
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
             "CLAUDE_CODE_MAX_OUTPUT_TOKENS",
             "CLAUDE_CODE_AUTO_COMPACT_WINDOW",
+            "CLAUDE_CODE_EFFORT_LEVEL",
             "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
             "CLAUDE_CODE_ATTRIBUTION_HEADER",
             "CLAUDE_ANY_ADVISOR_MODEL",
@@ -17736,6 +17807,7 @@ def _log_claude_command_for_diagnostics(cmd: list[str], env: dict[str, str]) -> 
         "CLAUDE_ANY_PROVIDER",
         "CLAUDE_ANY_MODEL_ALIAS",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
+        "CLAUDE_CODE_EFFORT_LEVEL",
     )
     env_summary = []
     for key in relevant_env_keys:
@@ -17885,7 +17957,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-stop               Stop router/proxy
   claude-any --                      Pass all following args directly to Claude Code
 
-Provider names: anthropic, ollama, ollama-cloud, vllm, lm-studio, nvidia-hosted, self-hosted-nim
+Provider names: anthropic, ollama, ollama-cloud, deepseek, vllm, lm-studio, nvidia-hosted, self-hosted-nim
 Any other arguments are passed through to claude. Use -- before Claude flags that
 collide with claude-any setup flags."""
 
