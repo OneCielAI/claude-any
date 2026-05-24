@@ -733,6 +733,59 @@ class ChannelProbeCacheTests(unittest.TestCase):
             self.assertTrue(claude_any.ensure_channel_probe_cache_for_launch(cfg, []))
         refresh.assert_called_once_with([])
 
+    def test_menu_rows_refresh_missing_probe_cache_before_rendering(self):
+        cfg = {"claude_code": {"channels": [], "channel_delivery": "native"}}
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            self._isolate_cache(stack, td)
+
+            def refresh(_passthrough):
+                cache = {
+                    "version": 1,
+                    "probed_at": 1700000000.0,
+                    "servers": [
+                        {
+                            "name": "ai-net-sse",
+                            "capable": True,
+                            "transport": "sse",
+                            "source_path": str(Path(td) / ".mcp.json"),
+                        },
+                    ],
+                }
+                claude_any._write_channel_probe_cache(cache)
+                return cache
+
+            refresh_mock = stack.enter_context(mock.patch.object(claude_any, "refresh_channel_probe_cache", side_effect=refresh))
+            rows, values, messages = claude_any.channel_panel_rows_for_menu(cfg, [])
+
+        refresh_mock.assert_called_once_with([])
+        self.assertIn("server:ai-net-sse", values)
+        self.assertTrue(any("Probe complete" in message for message in messages))
+        self.assertTrue(any("ai-net-sse" in row for row in rows))
+
+    def test_menu_rows_do_not_refresh_when_probe_cache_is_present(self):
+        cfg = {"claude_code": {"channels": ["server:ai-net-sse"], "channel_delivery": "native"}}
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            root = self._isolate_cache(stack, td)
+            claude_any._write_channel_probe_cache({
+                "version": 1,
+                "probed_at": 1700000000.0,
+                "servers": [
+                    {
+                        "name": "ai-net-sse",
+                        "capable": True,
+                        "transport": "sse",
+                        "source_path": str(root / ".mcp.json"),
+                    },
+                ],
+            })
+            refresh_mock = stack.enter_context(mock.patch.object(claude_any, "refresh_channel_probe_cache"))
+            rows, values, messages = claude_any.channel_panel_rows_for_menu(cfg, [])
+
+        refresh_mock.assert_not_called()
+        self.assertEqual([], messages)
+        self.assertIn("server:ai-net-sse", values)
+        self.assertTrue(any("ai-net-sse" in row for row in rows))
+
     def test_launch_refresh_not_needed_when_selected_channel_has_source(self):
         cfg = {"claude_code": {"channels": ["server:ai-net-sse"], "channel_delivery": "native"}}
         with tempfile.TemporaryDirectory() as td, ExitStack() as stack:

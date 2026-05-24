@@ -10975,8 +10975,7 @@ def refresh_channel_probe_cache(
     timeout_per_server: float | None = None,
 ) -> dict[str, Any]:
     """Re-scan known MCP config files, probe each stdio entry for the
-    channel capability, write the result to disk and return it. Only called
-    on explicit user action (menu refresh or CLI subcommand)."""
+    channel capability, write the result to disk and return it."""
     cwd = cwd or Path.cwd()
     paths = [str(p) for p in claude_mcp_config_paths(passthrough or [], cwd, home)]
     records = _probe_mcp_servers_to_records(paths, cwd, timeout_per_server=timeout_per_server)
@@ -11108,6 +11107,31 @@ def ensure_channel_probe_cache_for_launch(cfg: dict[str, Any], passthrough: list
     except Exception as exc:
         router_log("WARN", f"channel_probe_launch_refresh_failed error={type(exc).__name__}: {exc}")
         return False
+
+
+def channel_probe_summary_message(prefix: str, cache: dict[str, Any]) -> str:
+    records = [r for r in cache.get("servers") or [] if isinstance(r, dict)]
+    capable = [r for r in records if channel_probe_record_bucket(r) == "capable"]
+    inconclusive = [r for r in records if channel_probe_record_bucket(r) == "inconclusive"]
+    non_capable = [r for r in records if channel_probe_record_bucket(r) == "non_capable"]
+    return (
+        f"{prefix}: {len(capable)} channel-capable, "
+        f"{len(inconclusive)} inconclusive, {len(non_capable)} non-capable server(s)."
+    )
+
+
+def channel_panel_rows_for_menu(cfg: dict[str, Any], passthrough: list[str]) -> tuple[list[str], list[str], list[str]]:
+    messages: list[str] = []
+    if channel_probe_cache_needs_launch_refresh(cfg, passthrough):
+        try:
+            router_log("INFO", "channel_probe_menu_refresh reason=missing_cache_or_selected_server")
+            result = refresh_channel_probe_cache(passthrough)
+            messages = [channel_probe_summary_message("Probe complete", result)]
+        except Exception as exc:
+            router_log("WARN", f"channel_probe_menu_refresh_failed error={type(exc).__name__}: {exc}")
+            messages = [f"Channel probe failed: {type(exc).__name__}: {exc}"]
+    rows, values = channel_panel_rows(cfg)
+    return rows, values, messages
 
 
 def parse_passthrough_channel_specs(passthrough: list[str]) -> list[str]:
@@ -15416,7 +15440,9 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
         elif name == "log-level":
             panel_rows, panel_values = log_level_panel_rows(cfg)
         elif name == "channels":
-            panel_rows, panel_values = channel_panel_rows(cfg)
+            panel_rows, panel_values, probe_messages = channel_panel_rows_for_menu(cfg, passthrough)
+            if probe_messages:
+                messages = probe_messages
             if panel_values:
                 panel_idx = _channel_panel_first_selectable(panel_values)
         elif name == "context":
@@ -15643,8 +15669,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         first_render = render_prelaunch_screen(main_idx, panel, 0, panel_rows, checks, messages, first_render)
                         try:
                             result = refresh_channel_probe_cache(passthrough)
-                            capable = [r for r in result.get("servers") or [] if r.get("capable")]
-                            messages = [f"Probe complete: {len(capable)} channel-capable server(s)."]
+                            messages = [channel_probe_summary_message("Probe complete", result)]
                         except Exception as exc:
                             messages = [f"Re-probe failed: {type(exc).__name__}: {exc}"]
                         cfg = load_config()
