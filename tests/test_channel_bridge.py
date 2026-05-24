@@ -446,7 +446,7 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("llm_direct_inflight" in item for item in log_messages))
 
-    def test_channel_sse_dispatch_marks_direct_llm_pending_before_append(self):
+    def test_channel_sse_dispatch_stores_llm_only_without_background_delivery(self):
         captured: list[dict[str, object]] = []
         original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
 
@@ -469,13 +469,12 @@ class ChannelBridgeTests(unittest.TestCase):
                 "kind": "message",
                 "meta": {"room_id": "room_4pyr8vvwm2cd"},
                 "visibility": "user",
-                "delivery": ["native", "stdin", "llm"],
+                "delivery": ["llm"],
             }
             with (
-                mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
                 mock.patch.object(claude_any, "_sse_payload_to_chat_payload", return_value=payload),
                 mock.patch.object(claude_any, "append_chat_message", side_effect=fake_append),
-                mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery", return_value=True) as schedule,
+                mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery") as schedule,
                 mock.patch.object(claude_any, "router_log"),
             ):
                 claude_any._channel_sse_dispatch("mcp-ai-net-sse", "message", ["{}"])
@@ -484,8 +483,9 @@ class ChannelBridgeTests(unittest.TestCase):
             claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
 
         self.assertEqual(1, len(captured))
-        self.assertTrue(captured[0]["meta"]["llm_direct_pending"])
-        schedule.assert_called_once()
+        self.assertNotIn("llm_direct_pending", captured[0]["meta"])
+        self.assertEqual(["llm"], captured[0]["delivery"])
+        schedule.assert_not_called()
 
     def test_channel_sse_dispatch_ignores_native_router_self_echo(self):
         original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
@@ -528,7 +528,7 @@ class ChannelBridgeTests(unittest.TestCase):
             ),
         )
 
-    def test_channel_direct_llm_worker_posts_prompt_to_router(self):
+    def test_channel_direct_llm_worker_does_not_append_synthetic_response(self):
         class FakeResponse:
             def __enter__(self):
                 return self
@@ -573,13 +573,7 @@ class ChannelBridgeTests(unittest.TestCase):
         prompt = body["messages"][0]["content"][0]["text"]
         self.assertIn("<< room_4pyr8vvwm2cd >> 에서 SSE 메시지가 도착", prompt)
         self.assertIn("새 이벤트", prompt)
-        append.assert_called_once()
-        response_payload = append.call_args.args[0]
-        self.assertEqual("channel_llm_response", response_payload["kind"])
-        self.assertEqual(["all"], response_payload["recipients"])
-        self.assertEqual("user", response_payload["visibility"])
-        self.assertEqual(["native"], response_payload["delivery"])
-        self.assertTrue(response_payload["meta"]["llm_direct_delivered"])
+        append.assert_not_called()
 
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(
@@ -737,7 +731,7 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("recipient_internal" in item and "message_id=15" in item for item in log_messages))
 
-    def test_channel_mcp_notifications_skip_direct_llm_pending_originals(self):
+    def test_channel_mcp_notifications_skip_llm_only_inputs(self):
         messages = [
             {
                 "id": 106,
@@ -746,8 +740,8 @@ class ChannelBridgeTests(unittest.TestCase):
                 "recipients": ["all"],
                 "message": "inbound event",
                 "visibility": "user",
-                "delivery": ["native", "llm"],
-                "meta": {"room_id": "room", "llm_direct_pending": True},
+                "delivery": ["llm"],
+                "meta": {"room_id": "room"},
             },
             {
                 "id": 107,
@@ -768,7 +762,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(107, events[0][0])
         self.assertEqual("channel_llm_response", events[0][1]["params"]["kind"])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
-        self.assertTrue(any("llm_direct_pending" in item and "message_id=106" in item for item in log_messages))
+        self.assertTrue(any("delivery_not_native" in item and "message_id=106" in item for item in log_messages))
 
     def test_channel_mcp_session_start_prefers_client_last_event_id_for_replay(self):
         class Handler:

@@ -5184,7 +5184,7 @@ def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict
         "message": content,
         "meta": meta,
         "visibility": "user",
-        "delivery": ["native", "stdin", "llm"],
+        "delivery": ["llm"],
     }
 
 
@@ -5274,9 +5274,7 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], eve
     payload = _sse_payload_to_chat_payload(data_text, event_name, defaults, event_id=event_id)
     if not payload:
         return
-    payload = _mark_channel_payload_direct_llm_pending(payload)
     saved = append_chat_message(payload)
-    schedule_channel_direct_llm_delivery(saved)
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _CHANNEL_SSE_LOCK:
         state = _CHANNEL_SSE_CONNECTIONS.get(name)
@@ -16291,24 +16289,6 @@ def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
             if len(_CHANNEL_LLM_DIRECT_DELIVERED) > 1000:
                 for old_id in sorted(_CHANNEL_LLM_DIRECT_DELIVERED)[:500]:
                     _CHANNEL_LLM_DIRECT_DELIVERED.discard(old_id)
-        if text:
-            append_chat_message(
-                {
-                    "channel": message.get("channel") or "default",
-                    "sender_id": "claude-any-llm",
-                    "recipients": ["all"],
-                    "kind": "channel_llm_response",
-                    "message": text,
-                    "visibility": "user",
-                    "delivery": ["native"],
-                    "meta": {
-                        "source_message_id": message_id,
-                        "provider": provider,
-                        "model": model,
-                        "llm_direct_delivered": True,
-                    },
-                }
-            )
         stop_reason = parsed.get("stop_reason") if isinstance(parsed, dict) else ""
         router_log("INFO", f"channel_llm_direct_response message_id={message_id} chars={len(text)} stop_reason={stop_reason}")
     except Exception as exc:
