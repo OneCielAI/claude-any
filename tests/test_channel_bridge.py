@@ -372,6 +372,45 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
         self.assertTrue(any("channel_llm_inject_skipped" in item and "initialized" in item for item in log_messages))
 
+    def test_body_with_pending_channel_messages_blocks_first_turn_ai_net_write_tools(self):
+        body = {
+            "messages": [{"role": "user", "content": "continue"}],
+            "stream": True,
+            "tools": [
+                {"name": "mcp__ai-net-sse__send_dm"},
+                {"name": "mcp__ai-net-sse__send_message"},
+                {"name": "mcp__ai-net-sse__get_messages"},
+                {"name": "mcp__duckduckgo__search"},
+            ],
+            "tool_choice": {"type": "tool", "name": "mcp__ai-net-sse__send_dm"},
+        }
+        messages = [
+            {"id": 3, "channel": "room", "sender_id": "sarah", "message": "Robert, please read this", "meta": {"room_id": "room"}}
+        ]
+        with (
+            mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+            mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked"),
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            out = claude_any.body_with_pending_channel_messages(body)
+
+        tool_names = [tool.get("name") for tool in out["tools"]]
+        self.assertNotIn("mcp__ai-net-sse__send_dm", tool_names)
+        self.assertNotIn("mcp__ai-net-sse__send_message", tool_names)
+        self.assertIn("mcp__ai-net-sse__get_messages", tool_names)
+        self.assertIn("mcp__duckduckgo__search", tool_names)
+        self.assertNotIn("tool_choice", out)
+        self.assertTrue(out["metadata"]["claude_any_channel_injected"])
+        self.assertEqual("3", out["metadata"]["claude_any_channel_message_ids"])
+        injected = out["messages"][-1]["content"][0]["text"]
+        self.assertIn("visible text", injected)
+        self.assertIn("AI-Net 쓰기/전송 도구", injected)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_guard_blocked_tools" in item and "send_dm" in item for item in log_messages))
+        self.assertTrue(any("channel_llm_guard_removed_tool_choice" in item and "send_dm" in item for item in log_messages))
+
     def test_body_with_pending_channel_messages_skips_direct_router_requests(self):
         body = {"metadata": {"claude_any_channel_direct": True}, "messages": []}
         with mock.patch.object(claude_any, "load_config") as load_config:

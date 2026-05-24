@@ -16183,10 +16183,62 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
     return (
         "[claude-any channel inbox]\n"
         "아래 항목은 claude-any가 수신한 사용자 표시 대상 SSE 채널 메시지입니다. "
-        "다음 응답에서 먼저 사용자에게 채널명, 발신자, 메시지 내용과 필요한 처리를 알려주세요. "
-        "응답이나 액션이 필요하면 사용 가능한 channel/AI-NET/MCP 도구로 처리하세요.\n\n"
+        "반드시 이번 assistant 응답의 visible text 첫 부분에서 사용자에게 채널명, 발신자, 메시지 내용과 필요한 처리를 먼저 알려주세요. "
+        "이 첫 턴에서는 AI-Net 쓰기/전송 도구(send_dm/send_message 등)를 호출하지 마세요. "
+        "사용자가 후속 승인하거나 명시적으로 요청한 뒤에만 AI-Net 쓰기 도구를 사용하세요.\n\n"
         + "\n\n".join(parts)
     )
+
+
+_CHANNEL_LLM_FIRST_TURN_BLOCKED_TOOL_NAMES = frozenset(
+    {
+        "mcp__ai-net-sse__send_dm",
+        "mcp__ai-net-sse__send_message",
+        "mcp__ai-net-sse__assign_task",
+        "mcp__ai-net-sse__submit_finding",
+        "mcp__ai-net-sse__record_prediction",
+        "mcp__ai-net-sse__evaluate_prediction",
+        "mcp__ai-net-sse__ack_notifications",
+    }
+)
+
+
+def _guard_channel_llm_first_turn_tools(body: dict[str, Any]) -> dict[str, Any]:
+    tools = body.get("tools")
+    tool_choice = body.get("tool_choice") if isinstance(body.get("tool_choice"), dict) else None
+    tool_choice_name = tool_choice.get("name") if tool_choice else None
+    must_drop_tool_choice = isinstance(tool_choice_name, str) and tool_choice_name in _CHANNEL_LLM_FIRST_TURN_BLOCKED_TOOL_NAMES
+    if not isinstance(tools, list) or not tools:
+        if not must_drop_tool_choice:
+            return body
+        out = dict(body)
+        out.pop("tool_choice", None)
+        router_log("WARN", f"channel_llm_guard_removed_tool_choice name={tool_choice_name}")
+        return out
+
+    kept: list[Any] = []
+    dropped: list[str] = []
+    for tool in tools:
+        name = tool.get("name") if isinstance(tool, dict) else None
+        if isinstance(name, str) and name in _CHANNEL_LLM_FIRST_TURN_BLOCKED_TOOL_NAMES:
+            dropped.append(name)
+            continue
+        kept.append(tool)
+    if not dropped:
+        if not must_drop_tool_choice:
+            return body
+        out = dict(body)
+        out.pop("tool_choice", None)
+        router_log("WARN", f"channel_llm_guard_removed_tool_choice name={tool_choice_name}")
+        return out
+
+    out = dict(body)
+    out["tools"] = kept
+    router_log("INFO", f"channel_llm_guard_blocked_tools names={', '.join(sorted(set(dropped)))}")
+    if must_drop_tool_choice:
+        out.pop("tool_choice", None)
+        router_log("WARN", f"channel_llm_guard_removed_tool_choice name={tool_choice_name}")
+    return out
 
 
 def _mark_channel_payload_direct_llm_pending(payload: dict[str, Any]) -> dict[str, Any]:
@@ -16394,6 +16446,11 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     out["messages"] = messages
     ids = ",".join(str(message.get("id") or "") for message in pending)
     channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
+    out_metadata = dict(out.get("metadata") if isinstance(out.get("metadata"), dict) else {})
+    out_metadata["claude_any_channel_injected"] = True
+    out_metadata["claude_any_channel_message_ids"] = ids
+    out["metadata"] = out_metadata
+    out = _guard_channel_llm_first_turn_tools(out)
     router_log("INFO", f"channel_llm_injected count={len(pending)} message_ids={ids} channels={channels}")
     return out
 
