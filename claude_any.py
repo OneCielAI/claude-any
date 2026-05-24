@@ -3083,9 +3083,60 @@ def filter_blocked_tools(provider: str, pcfg: dict[str, Any], body: dict[str, An
     return new_body
 
 
+def summarize_messages_for_trace(messages: Any, max_messages: int = 30) -> list[dict[str, Any]]:
+    if not isinstance(messages, list):
+        return []
+    selected = messages[-max_messages:]
+    offset = len(messages) - len(selected)
+    summary: list[dict[str, Any]] = []
+    for index, message in enumerate(selected, start=offset):
+        if not isinstance(message, dict):
+            continue
+        entry: dict[str, Any] = {"index": index, "role": message.get("role")}
+        blocks: list[dict[str, Any]] = []
+        content = message.get("content")
+        if isinstance(content, str):
+            blocks.append({"type": "text", "text": _truncate_for_dump(content, 1000)})
+        elif isinstance(content, list):
+            for block in content:
+                if isinstance(block, str):
+                    blocks.append({"type": "text", "text": _truncate_for_dump(block, 1000)})
+                    continue
+                if not isinstance(block, dict):
+                    continue
+                block_type = str(block.get("type") or "")
+                if block_type == "text":
+                    blocks.append({"type": "text", "text": _truncate_for_dump(block.get("text", ""), 1000)})
+                elif block_type == "tool_use":
+                    blocks.append(
+                        {
+                            "type": "tool_use",
+                            "id": block.get("id"),
+                            "name": block.get("name"),
+                            "input": _truncate_for_dump(block.get("input"), 1200),
+                        }
+                    )
+                elif block_type == "tool_result":
+                    blocks.append(
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": block.get("tool_use_id"),
+                            "is_error": block.get("is_error"),
+                            "content": _truncate_for_dump(anthropic_content_to_text(block.get("content", "")), 1200),
+                        }
+                    )
+                else:
+                    blocks.append({"type": block_type or "unknown"})
+        else:
+            blocks.append({"type": type(content).__name__, "text": _truncate_for_dump(content, 1000)})
+        entry["content"] = blocks
+        summary.append(entry)
+    return summary
+
+
 def dump_request_for_trace(provider: str, path: str, body: dict[str, Any]) -> None:
     """At TRACE level, append a redacted snapshot of an inbound /v1/messages body
-    (tools list, system prompt summary, message count) to requests.jsonl.
+    (tools list, system prompt summary, message/tool block summary) to requests.jsonl.
     Used to capture tool definitions Claude Code injects (e.g. EnterPlanMode)."""
     if current_log_level() < LOG_LEVELS["TRACE"]:
         return
@@ -3100,6 +3151,7 @@ def dump_request_for_trace(provider: str, path: str, body: dict[str, Any]) -> No
             "model": body.get("model"),
             "stream": body.get("stream"),
             "messages_count": len(body.get("messages") or []),
+            "messages": summarize_messages_for_trace(body.get("messages")),
             "system": _truncate_for_dump(body.get("system")),
             "tools": body.get("tools"),
         }
@@ -8225,6 +8277,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 tool_index = next_content_index
                 next_content_index += 1
                 tool_indices.append(tool_index)
+                _remember_channel_injected_tool_use(source_body, tool_id, matched_name, fixed_input)
                 append_tool_call_log(
                     "ollama_stream_tool_call",
                     {
@@ -8549,6 +8602,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                 data = {"message": {"content": ""}, "done": True, "done_reason": "end_turn"}
             message = ollama_chat_to_anthropic(data, model, source_body=original_body)
             message = refine_message_with_advisor(provider, pcfg, original_body, message, model)
+            remember_channel_injected_tool_uses(original_body, message)
             message = prepend_anthropic_text(message, rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
             write_json(handler, message)
         return
@@ -8624,6 +8678,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
         return
     message = ollama_chat_to_anthropic(data, model, source_body=original_body)
     message = refine_message_with_advisor(provider, pcfg, original_body, message, model)
+    remember_channel_injected_tool_uses(original_body, message)
     message = prepend_anthropic_text(message, rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
     write_json(handler, message)
 
@@ -8831,6 +8886,7 @@ def stream_openai_chat_to_anthropic_sse(
             tool_index = next_content_index
             next_content_index += 1
             tool_id = str(fragment.get("id") or f"toolu_openai_{int(time.time() * 1000)}_{tool_index}")
+            _remember_channel_injected_tool_use(source_body, tool_id, matched_name, fixed_input)
             append_tool_call_log(
                 "openai_stream_tool_call",
                 {
@@ -9226,6 +9282,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
         return
     message = openai_chat_to_anthropic(data, model, source_body=original_body)
     message = refine_message_with_advisor(provider, pcfg, original_body, message, model)
+    remember_channel_injected_tool_uses(original_body, message)
     message = prepend_anthropic_text(message, notice)
     write_anthropic_message_response(handler, message, stream)
 
@@ -9356,6 +9413,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
         body = body_with_pending_channel_messages(body)
+        body = body_with_channel_tool_result_context(body)
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
         try:
             if provider in ("ollama", "ollama-cloud"):
@@ -16183,61 +16241,121 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
     return (
         "[claude-any channel inbox]\n"
         "아래 항목은 claude-any가 수신한 사용자 표시 대상 SSE 채널 메시지입니다. "
-        "반드시 이번 assistant 응답의 visible text 첫 부분에서 사용자에게 채널명, 발신자, 메시지 내용과 필요한 처리를 먼저 알려주세요. "
-        "이 첫 턴에서는 AI-Net 쓰기/전송 도구(send_dm/send_message 등)를 호출하지 마세요. "
-        "사용자가 후속 승인하거나 명시적으로 요청한 뒤에만 AI-Net 쓰기 도구를 사용하세요.\n\n"
+        "다음 응답에서 먼저 사용자에게 채널명, 발신자, 메시지 내용과 필요한 처리를 알려주세요. "
+        "응답이나 액션이 필요하면 사용 가능한 channel/AI-NET/MCP 도구로 자동 처리하세요. "
+        "도구를 호출했다면 tool_result 후속 턴에서 그 결과를 사용자에게 요약하세요.\n\n"
         + "\n\n".join(parts)
     )
 
 
-_CHANNEL_LLM_FIRST_TURN_BLOCKED_TOOL_NAMES = frozenset(
-    {
-        "mcp__ai-net-sse__send_dm",
-        "mcp__ai-net-sse__send_message",
-        "mcp__ai-net-sse__assign_task",
-        "mcp__ai-net-sse__submit_finding",
-        "mcp__ai-net-sse__record_prediction",
-        "mcp__ai-net-sse__evaluate_prediction",
-        "mcp__ai-net-sse__ack_notifications",
-    }
-)
+_CHANNEL_LLM_TOOL_CONTEXT_LOCK = threading.Lock()
+_CHANNEL_LLM_TOOL_CONTEXT: dict[str, dict[str, Any]] = {}
+_CHANNEL_LLM_TOOL_CONTEXT_LIMIT = 200
+_CHANNEL_LLM_TOOL_CONTEXT_PROMPT_LIMIT = 4000
 
 
-def _guard_channel_llm_first_turn_tools(body: dict[str, Any]) -> dict[str, Any]:
-    tools = body.get("tools")
-    tool_choice = body.get("tool_choice") if isinstance(body.get("tool_choice"), dict) else None
-    tool_choice_name = tool_choice.get("name") if tool_choice else None
-    must_drop_tool_choice = isinstance(tool_choice_name, str) and tool_choice_name in _CHANNEL_LLM_FIRST_TURN_BLOCKED_TOOL_NAMES
-    if not isinstance(tools, list) or not tools:
-        if not must_drop_tool_choice:
-            return body
-        out = dict(body)
-        out.pop("tool_choice", None)
-        router_log("WARN", f"channel_llm_guard_removed_tool_choice name={tool_choice_name}")
-        return out
-
-    kept: list[Any] = []
-    dropped: list[str] = []
-    for tool in tools:
-        name = tool.get("name") if isinstance(tool, dict) else None
-        if isinstance(name, str) and name in _CHANNEL_LLM_FIRST_TURN_BLOCKED_TOOL_NAMES:
-            dropped.append(name)
+def _channel_injected_prompt_text(body: dict[str, Any]) -> str:
+    for message in reversed(body.get("messages") or []):
+        if not isinstance(message, dict) or message.get("role") != "user":
             continue
-        kept.append(tool)
-    if not dropped:
-        if not must_drop_tool_choice:
-            return body
-        out = dict(body)
-        out.pop("tool_choice", None)
-        router_log("WARN", f"channel_llm_guard_removed_tool_choice name={tool_choice_name}")
-        return out
+        text = anthropic_content_to_text(message.get("content", ""))
+        if "[claude-any channel inbox]" in text:
+            return truncate_for_prompt(text, _CHANNEL_LLM_TOOL_CONTEXT_PROMPT_LIMIT)
+    return ""
 
+
+def _remember_channel_injected_tool_use(source_body: dict[str, Any] | None, tool_use_id: str, tool_name: str, tool_input: Any) -> None:
+    if not isinstance(source_body, dict) or not tool_use_id:
+        return
+    metadata = source_body.get("metadata") if isinstance(source_body.get("metadata"), dict) else {}
+    if not metadata.get("claude_any_channel_injected"):
+        return
+    context = {
+        "created_at": time.time(),
+        "channel_message_ids": str(metadata.get("claude_any_channel_message_ids") or ""),
+        "prompt": _channel_injected_prompt_text(source_body),
+        "tool_name": tool_name,
+        "tool_input": tool_input if isinstance(tool_input, (dict, list, str, int, float, bool)) or tool_input is None else str(tool_input),
+    }
+    with _CHANNEL_LLM_TOOL_CONTEXT_LOCK:
+        _CHANNEL_LLM_TOOL_CONTEXT[tool_use_id] = context
+        if len(_CHANNEL_LLM_TOOL_CONTEXT) > _CHANNEL_LLM_TOOL_CONTEXT_LIMIT:
+            for old_id, _old in sorted(_CHANNEL_LLM_TOOL_CONTEXT.items(), key=lambda item: item[1].get("created_at", 0))[
+                : len(_CHANNEL_LLM_TOOL_CONTEXT) - _CHANNEL_LLM_TOOL_CONTEXT_LIMIT
+            ]:
+                _CHANNEL_LLM_TOOL_CONTEXT.pop(old_id, None)
+    router_log(
+        "INFO",
+        f"channel_llm_tool_context_stored tool_use_id={tool_use_id} tool={tool_name} message_ids={context['channel_message_ids']}",
+    )
+
+
+def remember_channel_injected_tool_uses(source_body: dict[str, Any] | None, message: dict[str, Any]) -> None:
+    if not isinstance(message, dict):
+        return
+    for block in message.get("content") or []:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        _remember_channel_injected_tool_use(
+            source_body,
+            str(block.get("id") or ""),
+            str(block.get("name") or "tool"),
+            block.get("input"),
+        )
+
+
+def _channel_tool_result_contexts_for_body(body: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+    found: list[tuple[str, dict[str, Any]]] = []
+    with _CHANNEL_LLM_TOOL_CONTEXT_LOCK:
+        for message in body.get("messages") or []:
+            if not isinstance(message, dict) or message.get("role") != "user":
+                continue
+            for block in message.get("content") or []:
+                if not isinstance(block, dict) or block.get("type") != "tool_result":
+                    continue
+                tool_use_id = str(block.get("tool_use_id") or "")
+                context = _CHANNEL_LLM_TOOL_CONTEXT.get(tool_use_id)
+                if context:
+                    found.append((tool_use_id, dict(context)))
+    return found
+
+
+def body_with_channel_tool_result_context(body: dict[str, Any]) -> dict[str, Any]:
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    if metadata.get("claude_any_channel_tool_result_followup"):
+        return body
+    contexts = _channel_tool_result_contexts_for_body(body)
+    if not contexts:
+        return body
+    parts = [
+        "[claude-any channel tool_result follow-up]",
+        "아래 tool_result는 이전 턴에서 claude-any가 SSE 알림을 LLM에 주입해 자동 처리한 도구 호출의 결과입니다.",
+        "이 결과를 LLM 컨텍스트로 사용해 사용자 화면에 처리 결과를 요약하세요. 필요한 추가 자동 처리는 계속 수행해도 됩니다.",
+    ]
+    for tool_use_id, context in contexts:
+        parts.append(
+            "\n".join(
+                [
+                    f"tool_use_id={tool_use_id}",
+                    f"tool={context.get('tool_name') or 'tool'}",
+                    f"channel_message_ids={context.get('channel_message_ids') or ''}",
+                    f"tool_input={json.dumps(context.get('tool_input'), ensure_ascii=False)}",
+                    f"original_channel_prompt:\n{context.get('prompt') or '(not captured)'}",
+                ]
+            )
+        )
     out = dict(body)
-    out["tools"] = kept
-    router_log("INFO", f"channel_llm_guard_blocked_tools names={', '.join(sorted(set(dropped)))}")
-    if must_drop_tool_choice:
-        out.pop("tool_choice", None)
-        router_log("WARN", f"channel_llm_guard_removed_tool_choice name={tool_choice_name}")
+    messages = [m for m in body.get("messages", []) if isinstance(m, dict)]
+    messages.append({"role": "user", "content": [{"type": "text", "text": "\n\n".join(parts)}]})
+    out["messages"] = messages
+    out_metadata = dict(metadata)
+    out_metadata["claude_any_channel_tool_result_followup"] = True
+    out["metadata"] = out_metadata
+    router_log(
+        "INFO",
+        "channel_llm_tool_result_context_injected tool_use_ids="
+        + ",".join(tool_use_id for tool_use_id, _context in contexts),
+    )
     return out
 
 
@@ -16450,7 +16568,6 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     out_metadata["claude_any_channel_injected"] = True
     out_metadata["claude_any_channel_message_ids"] = ids
     out["metadata"] = out_metadata
-    out = _guard_channel_llm_first_turn_tools(out)
     router_log("INFO", f"channel_llm_injected count={len(pending)} message_ids={ids} channels={channels}")
     return out
 

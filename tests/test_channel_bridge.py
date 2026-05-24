@@ -372,7 +372,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
         self.assertTrue(any("channel_llm_inject_skipped" in item and "initialized" in item for item in log_messages))
 
-    def test_body_with_pending_channel_messages_blocks_first_turn_ai_net_write_tools(self):
+    def test_body_with_pending_channel_messages_keeps_ai_net_write_tools(self):
         body = {
             "messages": [{"role": "user", "content": "continue"}],
             "stream": True,
@@ -397,19 +397,112 @@ class ChannelBridgeTests(unittest.TestCase):
             out = claude_any.body_with_pending_channel_messages(body)
 
         tool_names = [tool.get("name") for tool in out["tools"]]
-        self.assertNotIn("mcp__ai-net-sse__send_dm", tool_names)
-        self.assertNotIn("mcp__ai-net-sse__send_message", tool_names)
+        self.assertIn("mcp__ai-net-sse__send_dm", tool_names)
+        self.assertIn("mcp__ai-net-sse__send_message", tool_names)
         self.assertIn("mcp__ai-net-sse__get_messages", tool_names)
         self.assertIn("mcp__duckduckgo__search", tool_names)
-        self.assertNotIn("tool_choice", out)
+        self.assertEqual({"type": "tool", "name": "mcp__ai-net-sse__send_dm"}, out["tool_choice"])
         self.assertTrue(out["metadata"]["claude_any_channel_injected"])
         self.assertEqual("3", out["metadata"]["claude_any_channel_message_ids"])
         injected = out["messages"][-1]["content"][0]["text"]
-        self.assertIn("visible text", injected)
-        self.assertIn("AI-Net 쓰기/전송 도구", injected)
+        self.assertIn("자동 처리", injected)
+        self.assertIn("tool_result", injected)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
-        self.assertTrue(any("channel_llm_guard_blocked_tools" in item and "send_dm" in item for item in log_messages))
-        self.assertTrue(any("channel_llm_guard_removed_tool_choice" in item and "send_dm" in item for item in log_messages))
+        self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
+
+    def test_channel_tool_result_context_is_injected_for_remembered_tool_use(self):
+        claude_any._CHANNEL_LLM_TOOL_CONTEXT.clear()
+        source_body = {
+            "metadata": {
+                "claude_any_channel_injected": True,
+                "claude_any_channel_message_ids": "110",
+            },
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "[claude-any channel inbox]\n<< room >> 에서 SSE 메시지가 도착했습니다.\n<< 발신자 >> Sarah\n<< 메시지 >> Robert 리드님, 준비 완료입니다.",
+                        }
+                    ],
+                }
+            ],
+        }
+        assistant_message = {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "tool_use",
+                    "id": "toolu_channel_1",
+                    "name": "mcp__ai-net-sse__send_dm",
+                    "input": {"to_agent_id": "agent_sarah", "content": "확인했습니다."},
+                }
+            ],
+        }
+        with mock.patch.object(claude_any, "router_log") as router_log:
+            claude_any.remember_channel_injected_tool_uses(source_body, assistant_message)
+            followup_body = {
+                "messages": [
+                    assistant_message,
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "toolu_channel_1",
+                                "content": "DM sent",
+                            }
+                        ],
+                    },
+                ],
+            }
+            out = claude_any.body_with_channel_tool_result_context(followup_body)
+
+        self.assertIsNot(out, followup_body)
+        self.assertTrue(out["metadata"]["claude_any_channel_tool_result_followup"])
+        injected = out["messages"][-1]["content"][0]["text"]
+        self.assertIn("channel tool_result follow-up", injected)
+        self.assertIn("toolu_channel_1", injected)
+        self.assertIn("mcp__ai-net-sse__send_dm", injected)
+        self.assertIn("Sarah", injected)
+        self.assertIn("Robert 리드님, 준비 완료입니다.", injected)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_tool_context_stored" in item and "toolu_channel_1" in item for item in log_messages))
+        self.assertTrue(any("channel_llm_tool_result_context_injected" in item and "toolu_channel_1" in item for item in log_messages))
+
+    def test_summarize_messages_for_trace_includes_tool_result_blocks(self):
+        summary = claude_any.summarize_messages_for_trace(
+            [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_trace_1",
+                            "name": "mcp__ai-net-sse__send_dm",
+                            "input": {"content": "hello"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_trace_1",
+                            "content": "sent",
+                        }
+                    ],
+                },
+            ]
+        )
+
+        self.assertEqual("tool_use", summary[0]["content"][0]["type"])
+        self.assertEqual("toolu_trace_1", summary[0]["content"][0]["id"])
+        self.assertEqual("tool_result", summary[1]["content"][0]["type"])
+        self.assertEqual("toolu_trace_1", summary[1]["content"][0]["tool_use_id"])
+        self.assertEqual("sent", summary[1]["content"][0]["content"])
 
     def test_body_with_pending_channel_messages_skips_direct_router_requests(self):
         body = {"metadata": {"claude_any_channel_direct": True}, "messages": []}
