@@ -693,6 +693,10 @@ def api_key_status(provider: str, pcfg: dict) -> str:
     return "API key: optional or not configured"
 
 
+def launch_requires_api_key(provider: str, pcfg: dict) -> bool:
+    return provider in ("nvidia-hosted", "ollama-cloud", "deepseek") and "missing" in api_key_status(provider, pcfg).lower()
+
+
 def join_url(base: str, path: str) -> str:
     base = base.rstrip("/")
     if base.endswith("/v1") and path.startswith("/v1/"):
@@ -1730,6 +1734,16 @@ def main() -> int:
             if ch == "KEY_ENTER":
                 action = items[idx][0]
                 if action == "launch":
+                    provider, pcfg = current_provider_cfg()
+                    if launch_requires_api_key(provider, pcfg):
+                        label = dict(PROVIDERS).get(provider, provider)
+                        notice = [
+                            f"Launch blocked: {label} requires an API key.",
+                            "Opening API key setup.",
+                        ]
+                        idx = index_for_action("api-key")
+                        sub = None
+                        continue
                     return 0
                 if action == "test":
                     code, out = run_test_with_animation(idx, checks)
@@ -1936,6 +1950,15 @@ def main() -> int:
 
         action = items[idx][0]
         if action == "launch":
+            provider, pcfg = current_provider_cfg()
+            if launch_requires_api_key(provider, pcfg):
+                label = dict(PROVIDERS).get(provider, provider)
+                notice = [
+                    f"Launch blocked: {label} requires an API key.",
+                    "Opening API key setup.",
+                ]
+                idx = index_for_action("api-key")
+                continue
             return 0
         if action == "test":
             code, out = run_test_with_animation(idx, checks)

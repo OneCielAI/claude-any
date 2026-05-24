@@ -56,6 +56,11 @@ class DeepSeekProviderTests(unittest.TestCase):
     def test_launch_requires_deepseek_api_key(self):
         errors = claude_any.launch_readiness_errors(self.deepseek_cfg(api_key=""))
         self.assertTrue(any("DeepSeek.com requires" in err for err in errors))
+        self.assertTrue(claude_any.launch_blockers_require_api_key(errors))
+
+    def test_base_url_blocker_does_not_open_api_key_setup(self):
+        errors = ["Launch blocked: Base URL unreachable."]
+        self.assertFalse(claude_any.launch_blockers_require_api_key(errors))
 
     def test_model_list_uses_documented_deepseek_models_without_network(self):
         pcfg = copy.deepcopy(claude_any.DEFAULT_CONFIG["providers"]["deepseek"])

@@ -14622,6 +14622,10 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
     return errors
 
 
+def launch_blockers_require_api_key(blockers: list[str]) -> bool:
+    return any("requires" in line.lower() and "api key" in line.lower() for line in blockers)
+
+
 def settings_ready_except_api_key() -> bool:
     cfg = load_config()
     provider, pcfg = get_current_provider(cfg)
@@ -15662,6 +15666,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                     elif value == "env":
                         default_env = {
                             "anthropic": "ANTHROPIC_API_KEY",
+                            "deepseek": "DEEPSEEK_API_KEY",
                             "nvidia-hosted": "NVIDIA_API_KEY",
                             "ollama-cloud": "OLLAMA_API_KEY",
                         }.get(provider, "API_KEY")
@@ -15890,6 +15895,17 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                     blockers = launch_readiness_errors()
                     if blockers:
                         messages = blockers
+                        if launch_blockers_require_api_key(blockers):
+                            cfg = load_config()
+                            provider, _ = get_current_provider(cfg)
+                            main_idx = actions.index("api-key")
+                            open_panel("api-key")
+                            if "input" in panel_values:
+                                panel_idx = panel_values.index("input")
+                            messages = [
+                                *blockers,
+                                f"Opening API key setup for {PROVIDER_LABELS.get(provider, provider)}.",
+                            ]
                         refresh_checks()
                         continue
                     return 0
