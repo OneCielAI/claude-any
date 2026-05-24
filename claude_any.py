@@ -5248,14 +5248,11 @@ def _sse_payload_to_chat_payload(data_text: str, event_name: str, defaults: dict
             event.get("payload") if isinstance(event.get("payload"), dict) else {}
         )
         meta.update(_event_meta_from_sources(parsed, params, payload, data, event, nested_payload))
-        content = (
-            _event_payload_text(params)
-            or _event_payload_text(payload)
-            or _event_payload_text(data)
-            or _event_payload_text(event)
-            or _event_payload_text(parsed)
-            or content
-        )
+        nested_content = _event_payload_text(nested_payload) or _event_payload_text(payload)
+        for source in (data, event):
+            direct = _first_present_dict_value(source, keys=("content", "message", "text", "body", "summary"))
+            nested_content = nested_content or _event_payload_text(direct)
+        content = nested_content or _event_payload_text(params) or _event_payload_text(parsed) or content
         kind = method.replace("notifications/claude/", "").replace("/", ".") if method else "sse"
         if not parsed.get("method") and meta.get("kind"):
             kind = str(meta.get("kind"))
@@ -16335,17 +16332,20 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
     for message in messages:
         channel = str(message.get("channel") or "default")
         sender = str(message.get("sender_id") or "channel")
+        recipients = message.get("recipients")
         mid = str(message.get("id") or "")
         meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
         room = str(meta.get("room_id") or meta.get("room") or channel)
         thread = str(message.get("thread_id") or meta.get("thread_id") or "")
         body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
         fields = [f"id={mid}", f"channel={channel}", f"room={room}", f"from={sender}"]
+        if recipients:
+            fields.append(f"to={_compact_json_for_prompt(recipients, max_chars=400)}")
         if thread:
             fields.append(f"thread={thread}")
         meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
         parts.append(
-            f"<< {channel} >> 에서 SSE 메시지가 도착했으니 분석하고 자세한 내용을 사용자에게 알려주고 처리하세요.\n"
+            f"<< {channel} >> incoming channel message for the current agent.\n"
             f"<< 메시지 >>\n"
             + " ".join(fields)
             + f"\ntext={json.dumps(body, ensure_ascii=False)}"
@@ -16353,9 +16353,13 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         )
     return (
         "[claude-any channel inbox]\n"
-        "아래 항목은 claude-any가 수신한 사용자 표시 대상 SSE 채널 메시지입니다. "
-        "다음 응답에서 먼저 사용자에게 채널명, 발신자, 메시지 내용과 필요한 처리를 알려주세요. "
+        "아래 항목은 claude-any가 자동 수신한 외부 채널/AI-Net 메시지입니다. "
+        "이 메시지는 현재 Claude Code 세션의 에이전트에게 도착한 실제 업무 메시지입니다. "
+        "sender/from, recipients/to, room/channel, text를 기준으로 누가 누구에게 보낸 DM/그룹 메시지인지 먼저 판단하세요. "
+        "AI-Net DM/업무 지시라면 현재 에이전트로서 수신 메시지 내용에 직접 대응하고, "
         "응답이나 액션이 필요하면 사용 가능한 channel/AI-NET/MCP 도구로 자동 처리하세요. "
+        "단순 온보딩/인사/중복 테스트 메시지를 새로 만들지 말고, 받은 메시지의 요청에 맞게 답장하거나 작업하세요. "
+        "다음 응답에는 사용자가 화면에서 볼 수 있도록 수신 메시지 요약과 수행한 처리 또는 필요한 다음 조치를 간단히 보여주세요. "
         "도구를 호출했다면 tool_result 후속 턴에서 그 결과를 사용자에게 요약하세요.\n\n"
         + "\n\n".join(parts)
     )

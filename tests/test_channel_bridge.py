@@ -92,6 +92,34 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(payload["meta"]["mcp_method"], "notifications/message")
         self.assertEqual(payload["meta"]["sse_json"]["params"]["data"]["type"], "message.created")
 
+    def test_sse_payload_prefers_nested_message_over_generic_notification_content(self):
+        payload = claude_any._sse_payload_to_chat_payload(
+            json.dumps(
+                {
+                    "method": "notifications/message",
+                    "params": {
+                        "content": "New message from Sarah",
+                        "data": {
+                            "type": "message.created",
+                            "room_id": "room_4pyr8vvwm2cd",
+                            "payload": {
+                                "message": {"content": "Robert 리드님, 매크로 분석 보고서입니다."},
+                                "sender_id": "agent_n3wy9gfjmcil",
+                            },
+                        },
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            "message",
+            {"name": "mcp-ai-net-sse", "channel": "ai-net-sse", "event_filter": ["notifications/message"]},
+        )
+        self.assertIsNotNone(payload)
+        assert payload is not None
+        self.assertEqual("Robert 리드님, 매크로 분석 보고서입니다.", payload["message"])
+        self.assertEqual("agent_n3wy9gfjmcil", payload["sender_id"])
+        self.assertEqual("room_4pyr8vvwm2cd", payload["channel"])
+
     def test_sse_payload_maps_direct_ai_net_chat_object(self):
         payload = claude_any._sse_payload_to_chat_payload(
             json.dumps(
@@ -362,8 +390,9 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(2, len(out["messages"]))
         injected = out["messages"][-1]["content"][0]["text"]
         self.assertIn("channel inbox", injected)
-        self.assertIn("<< room >> 에서 SSE 메시지가 도착", injected)
+        self.assertIn("incoming channel message for the current agent", injected)
         self.assertIn("<< 메시지 >>", injected)
+        self.assertIn("실제 업무 메시지", injected)
         self.assertIn("Robert, can you check this?", injected)
         self.assertNotIn("ai-net.sse.connected", injected)
         self.assertNotIn("SSE MCP initialized", injected)
@@ -409,6 +438,26 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("tool_result", injected)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
+
+    def test_channel_llm_prompt_treats_ai_net_dm_as_agent_task(self):
+        prompt = claude_any.format_channel_llm_batch_prompt(
+            [
+                {
+                    "id": 110,
+                    "channel": "room_4pyr8vvwm2cd",
+                    "sender_id": "agent_2i7ibhkysdk1",
+                    "recipients": ["agent_n3wy9gfjmcil"],
+                    "message": "Sarah, 추가 매크로 분석 보고서를 보내주세요.",
+                    "meta": {"room_id": "room_4pyr8vvwm2cd", "sender": "Robert", "recipient": "Sarah"},
+                }
+            ]
+        )
+        self.assertIn("현재 Claude Code 세션의 에이전트에게 도착한 실제 업무 메시지", prompt)
+        self.assertIn("AI-Net DM/업무 지시", prompt)
+        self.assertIn("수신 메시지 내용에 직접 대응", prompt)
+        self.assertIn("단순 온보딩/인사/중복 테스트 메시지", prompt)
+        self.assertIn("Sarah, 추가 매크로 분석 보고서를 보내주세요.", prompt)
+        self.assertIn('to=["agent_n3wy9gfjmcil"]', prompt)
 
     def test_channel_tool_result_context_is_injected_for_remembered_tool_use(self):
         claude_any._CHANNEL_LLM_TOOL_CONTEXT.clear()
@@ -703,7 +752,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(body["metadata"]["claude_any_channel_direct"])
         self.assertEqual("9", body["metadata"]["channel_message_id"])
         prompt = body["messages"][0]["content"][0]["text"]
-        self.assertIn("<< room_4pyr8vvwm2cd >> 에서 SSE 메시지가 도착", prompt)
+        self.assertIn("<< room_4pyr8vvwm2cd >> incoming channel message for the current agent", prompt)
         self.assertIn("새 이벤트", prompt)
         append.assert_not_called()
 
