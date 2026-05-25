@@ -5,6 +5,27 @@ import claude_any
 
 
 class RouterDebugTests(unittest.TestCase):
+    def test_default_router_port_uses_env_override(self):
+        with patch.dict("os.environ", {"CLAUDE_ANY_ROUTER_PORT": "9876"}, clear=False):
+            self.assertEqual(9876, claude_any.default_router_port())
+
+    def test_default_router_port_is_stable_per_posix_uid(self):
+        with (
+            patch.dict("os.environ", {}, clear=True),
+            patch.object(claude_any.os, "getuid", return_value=42, create=True),
+        ):
+            self.assertEqual(8841, claude_any.default_router_port())
+
+    def test_router_health_match_requires_same_user_and_config_dir(self):
+        health = {
+            "version": claude_any.VERSION,
+            "source_fingerprint": claude_any.SOURCE_FINGERPRINT,
+            "user": "other-user",
+            "config_dir": str(claude_any.CONFIG_DIR),
+        }
+
+        self.assertFalse(claude_any.router_health_matches_current(health))
+
     def test_router_debug_defaults_to_local_bind(self):
         with patch.dict("os.environ", {}, clear=True):
             self.assertFalse(claude_any.router_debug_external_access_enabled({}))

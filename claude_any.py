@@ -40,6 +40,32 @@ except Exception:
     pass
 
 HOME = Path.home()
+
+
+def default_router_port() -> int:
+    configured = str(os.environ.get("CLAUDE_ANY_ROUTER_PORT") or "").strip()
+    if configured:
+        try:
+            port = int(configured)
+            if 1 <= port <= 65535:
+                return port
+        except ValueError:
+            pass
+    base = 8799
+    try:
+        getuid = getattr(os, "getuid")
+    except AttributeError:
+        getuid = None
+    if callable(getuid):
+        try:
+            return base + (int(getuid()) % 1000)
+        except Exception:
+            pass
+    seed = f"{getpass.getuser()}|{HOME}"
+    digest = hashlib.sha256(seed.encode("utf-8", errors="replace")).hexdigest()
+    return base + (int(digest[:8], 16) % 1000)
+
+
 CONFIG_DIR = Path(os.environ.get("CLAUDE_ANY_CONFIG_DIR") or (HOME / ".config" / "claude-any"))
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = CONFIG_DIR / "router.log"
@@ -65,7 +91,7 @@ CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
 CHANNEL_PROBE_CACHE_PATH = CONFIG_DIR / "channel-probe-cache.json"
 MCP_PROXY_CONFIG = CONFIG_DIR / "mcp-proxy.json"
 ROUTER_HOST = os.environ.get("CLAUDE_ANY_ROUTER_CLIENT_HOST", "127.0.0.1").strip() or "127.0.0.1"
-ROUTER_PORT = 8799
+ROUTER_PORT = default_router_port()
 ROUTER_BASE = f"http://{ROUTER_HOST}:{ROUTER_PORT}"
 CLAUDE_GATEWAY_CACHE = HOME / ".claude" / "cache" / "gateway-models.json"
 CLAUDE_SETTINGS_PATH = HOME / ".claude" / "settings.json"
@@ -9380,6 +9406,10 @@ class RouterHandler(BaseHTTPRequestHandler):
                     "version": VERSION,
                     "source_fingerprint": SOURCE_FINGERPRINT,
                     "pid": os.getpid(),
+                    "user": getpass.getuser(),
+                    "home": str(HOME),
+                    "config_dir": str(CONFIG_DIR),
+                    "router_port": ROUTER_PORT,
                     "provider": provider,
                     "model": current_alias(cfg),
                     "chat": "/ca/chat/health",
@@ -9559,7 +9589,15 @@ def router_up() -> bool:
 def router_health_matches_current(health: dict[str, Any] | None) -> bool:
     if health is None:
         return False
-    return str(health.get("version") or "") == VERSION and str(health.get("source_fingerprint") or "") == SOURCE_FINGERPRINT
+    if str(health.get("version") or "") != VERSION:
+        return False
+    if str(health.get("source_fingerprint") or "") != SOURCE_FINGERPRINT:
+        return False
+    if str(health.get("user") or "") != getpass.getuser():
+        return False
+    if str(health.get("config_dir") or "") != str(CONFIG_DIR):
+        return False
+    return True
 
 
 def invalid_nvidia_hosted_base_url(value: str | None) -> bool:
