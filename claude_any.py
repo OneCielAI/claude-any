@@ -16614,7 +16614,8 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         "승인이 필요한 경우는 실제 결제/투자 실행, credential/secret 공개, 파괴적 파일/시스템/관리자 작업, "
         "명시적으로 승인이 필요한 외부 부작용처럼 되돌리기 어려운 고위험 작업뿐입니다. "
         "단순 온보딩/인사/중복 테스트 메시지를 새로 만들지 말고, 받은 메시지의 요청에 맞게 답장하거나 작업하세요. "
-        "'진행하겠습니다', '착수합니다', '보고하겠습니다', '결과를 공유하겠습니다'처럼 미래 행동을 약속하는 말만 남기고 턴을 끝내지 마세요. "
+        "'진행하겠습니다', '착수합니다', '보고하겠습니다', '결과를 공유하겠습니다', "
+        "'Let me send...', 'I will reply...', 'I'll respond...'처럼 미래 행동을 약속하는 말만 남기고 턴을 끝내지 마세요. "
         "그런 말을 할 상황이면 같은 턴에서 필요한 조사/도구 호출/채널 보고까지 수행하고, 수행할 수 없으면 구체적 차단 사유를 보고하세요. "
         "다음 응답에는 사용자가 화면에서 볼 수 있도록 수신 메시지 요약과 수행한 처리 또는 필요한 다음 조치를 간단히 보여주세요. "
         "도구를 호출했다면 tool_result 후속 턴에서 그 결과를 LLM이 다시 검토한 뒤 사용자에게 요약하고, 필요한 경우 후속 답장/작업까지 완료하세요.\n\n"
@@ -16923,6 +16924,70 @@ def _channel_direct_tool_uses(message: dict[str, Any]) -> list[dict[str, Any]]:
     return found
 
 
+_CHANNEL_DIRECT_DEFERRED_ACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(
+        r"\b(?:let me|i(?:'|’)ll|i will|i need to|i should|now i(?:'| will)?|next,?\s*i(?:'| will)?)\b"
+        r".{0,220}\b(?:send|respond|reply|post|message|dm|report|share|follow\s*up|call|fetch|check|read|look\s*up)\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"\b(?:send|respond|reply|post|message|dm|report|share|follow\s*up)\b"
+        r".{0,120}\b(?:now|next)\b",
+        re.IGNORECASE | re.DOTALL,
+    ),
+    re.compile(
+        r"(?:진행|착수|보고|공유|전송|답장|회신|확인|조회|조사|처리)"
+        r".{0,80}(?:하겠습니다|하겠다|하겠어요|할게요|하겠습니다\.|하겠습니다!)",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"(?:보내겠습니다|답장하겠습니다|회신하겠습니다|보고하겠습니다|공유하겠습니다|처리하겠습니다)",
+        re.DOTALL,
+    ),
+    re.compile(
+        r"(?:이제|먼저|다음으로).{0,100}(?:보내|답장|회신|보고|공유|조회|확인|조사|처리)"
+        r".{0,80}(?:하겠습니다|하겠다|합니다)",
+        re.DOTALL,
+    ),
+)
+
+
+def _channel_direct_text_is_deferred_action(text: str) -> bool:
+    body = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not body:
+        return False
+    completed_markers = (
+        "sent",
+        "replied",
+        "responded",
+        "posted",
+        "completed",
+        "done",
+        "전송 완료",
+        "답장 완료",
+        "회신 완료",
+        "처리 완료",
+        "보고 완료",
+        "공유 완료",
+    )
+    lowered = body.lower()
+    if any(marker in lowered for marker in completed_markers[:6]) or any(marker in body for marker in completed_markers[6:]):
+        return False
+    return any(pattern.search(body) for pattern in _CHANNEL_DIRECT_DEFERRED_ACTION_PATTERNS)
+
+
+def _channel_direct_deferred_action_prompt(text: str) -> str:
+    return (
+        "[claude-any channel action required]\n"
+        "Your previous assistant message announced a future safe channel action instead of performing it. "
+        "Do not end this autonomous channel turn with 'Let me...', 'I will...', or '하겠습니다'. "
+        "If the action is safe and an MCP tool can perform it, call the appropriate tool now. "
+        "If no tool can perform it, give a concise blocker summary instead.\n\n"
+        "previous_assistant_text="
+        + json.dumps(truncate_for_prompt(str(text or ""), 2000), ensure_ascii=False)
+    )
+
+
 def _channel_direct_append_summary(message: dict[str, Any], text: str, stop_reason: str, tool_turns: int = 0) -> None:
     try:
         message_id = int(message.get("id") or 0)
@@ -16997,6 +17062,7 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
     last_text = ""
     stop_reason = ""
     tool_turns = 0
+    deferred_action_retried = False
     for _turn in range(6):
         body: dict[str, Any] = {
             "model": model,
@@ -17018,6 +17084,16 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
         tool_uses = _channel_direct_tool_uses(parsed)
         messages.append({"role": "assistant", "content": parsed.get("content") or []})
         if not tool_uses:
+            if tools and not deferred_action_retried and _channel_direct_text_is_deferred_action(text):
+                deferred_action_retried = True
+                router_log("INFO", f"channel_llm_deferred_action_retry message_id={message_id} turn={_turn + 1}")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": _channel_direct_deferred_action_prompt(text)}],
+                    }
+                )
+                continue
             return last_text, stop_reason or "end_turn", tool_turns
         tool_turns += 1
         results: list[dict[str, Any]] = []

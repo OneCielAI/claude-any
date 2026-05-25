@@ -916,9 +916,20 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("로컬 사용자 승인 없이 같은 채널/DM에 답장", prompt)
         self.assertIn("답장 여부를 묻고 멈추지 마세요", prompt)
         self.assertIn("미래 행동을 약속하는 말만 남기고 턴을 끝내지 마세요", prompt)
+        self.assertIn("Let me send", prompt)
         self.assertIn("새 이벤트", prompt)
         append_summary.assert_called_once_with(message, "분석 완료", "end_turn", tool_turns=1)
         append.assert_not_called()
+
+    def test_channel_direct_deferred_action_detector_matches_future_promises(self):
+        self.assertTrue(
+            claude_any._channel_direct_text_is_deferred_action(
+                "Now I have the full context. Let me send her a proper DM response now."
+            )
+        )
+        self.assertTrue(claude_any._channel_direct_text_is_deferred_action("Sarah에게 결과를 보고하겠습니다."))
+        self.assertFalse(claude_any._channel_direct_text_is_deferred_action("Sarah에게 답장 완료했습니다."))
+        self.assertFalse(claude_any._channel_direct_text_is_deferred_action("Sarah에게 회신했습니다."))
 
     def test_channel_direct_router_response_round_trips_mcp_tool_result_to_llm(self):
         calls: list[dict[str, object]] = []
@@ -965,6 +976,61 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual("tool_result", tool_result["type"])
         self.assertEqual("toolu_direct_1", tool_result["tool_use_id"])
         self.assertEqual("DM sent", tool_result["content"])
+
+    def test_channel_direct_router_response_retries_deferred_action_text(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) == 1:
+                return {
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Now I have the full context. Let me send her a proper DM response now.",
+                        }
+                    ],
+                    "stop_reason": "end_turn",
+                }
+            if len(calls) == 2:
+                return {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_direct_retry_1",
+                            "name": "mcp__ai-net-sse__send_dm",
+                            "input": {"to_agent_id": "agent_sarah", "content": "현재 상황입니다."},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            return {"content": [{"type": "text", "text": "Sarah에게 현재 상황을 DM으로 회신했습니다."}], "stop_reason": "end_turn"}
+
+        with (
+            mock.patch.object(claude_any, "_channel_direct_tool_schemas", return_value=[{"name": "mcp__ai-net-sse__send_dm"}]),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool", return_value=("DM sent", False)) as execute_tool,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                15,
+                "수신 메시지를 처리하세요",
+                {"id": 15, "meta": {"sse_source": "mcp-ai-net-sse"}},
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("Sarah에게 현재 상황을 DM으로 회신했습니다.", text)
+        self.assertEqual("end_turn", stop_reason)
+        self.assertEqual(1, tool_turns)
+        execute_tool.assert_called_once()
+        self.assertEqual(3, len(calls))
+        retry_prompt = calls[1]["messages"][-1]["content"][0]["text"]
+        self.assertIn("[claude-any channel action required]", retry_prompt)
+        self.assertIn("Let me send", retry_prompt)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_deferred_action_retry" in item for item in log_messages))
 
     def test_channel_direct_terminal_notice_prints_when_stdout_is_tty(self):
         class FakeStdout:
