@@ -806,6 +806,35 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn(str(proxy_config), cmd)
         self.assertNotIn("--dangerously-load-development-channels", cmd)
 
+    def test_channel_direct_terminal_notice_prints_when_stdout_is_tty(self):
+        class FakeStdout:
+            def __init__(self):
+                self.text = ""
+
+            def isatty(self):
+                return True
+
+            def write(self, text):
+                self.text += text
+
+            def flush(self):
+                pass
+
+        fake_stdout = FakeStdout()
+        message = {
+            "id": 12,
+            "channel": "room_dm",
+            "sender_id": "ai-net-sse",
+            "meta": {"author_name": "Sarah"},
+        }
+
+        with mock.patch.object(claude_any.sys, "stdout", fake_stdout):
+            claude_any._channel_direct_terminal_notice(message, "처리 요약", "cli")
+
+        self.assertIn("message_id=12", fake_stdout.text)
+        self.assertIn("from=Sarah", fake_stdout.text)
+        self.assertIn("처리 요약", fake_stdout.text)
+
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(
             {

@@ -16735,6 +16735,30 @@ def _channel_direct_llm_http_response(message_id: int, prompt: str, provider: st
     return text, stop_reason
 
 
+def _channel_direct_terminal_notice(message: dict[str, Any], text: str, stop_reason: str) -> None:
+    if not text.strip():
+        return
+    try:
+        if not sys.stdout.isatty():
+            return
+    except Exception:
+        return
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    author = str(meta.get("author_name") or message.get("sender_id") or "channel")
+    channel = str(message.get("channel") or meta.get("room_id") or "default")
+    message_id = str(message.get("id") or "-")
+    body = truncate_for_prompt(text.strip(), 3000)
+    try:
+        sys.stdout.write(
+            "\n\n"
+            f"[claude-any channel] handled message_id={message_id} channel={channel} from={author} stop_reason={stop_reason}\n"
+            f"{body}\n"
+        )
+        sys.stdout.flush()
+    except Exception:
+        pass
+
+
 def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
     global _CHANNEL_LLM_CURSOR_LAST_ID
     try:
@@ -16761,6 +16785,7 @@ def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
                 _CHANNEL_LLM_CURSOR_LAST_ID = message_id
                 _channel_llm_write_cursor_locked(message_id)
         router_log("INFO", f"channel_llm_direct_response message_id={message_id} chars={len(text)} stop_reason={stop_reason}")
+        _channel_direct_terminal_notice(message, text, stop_reason)
     except Exception as exc:
         router_log("WARN", f"channel_llm_direct_failed message_id={message_id} error={type(exc).__name__}: {exc}")
     finally:
