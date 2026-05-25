@@ -1,5 +1,6 @@
 import copy
 import unittest
+from contextlib import ExitStack
 from unittest import mock
 
 import claude_any
@@ -31,45 +32,59 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertEqual("max", pcfg["effort_level"])
         self.assertTrue(pcfg["native_compat"])
 
-    def test_env_vars_use_deepseek_anthropic_endpoint(self):
-        env = claude_any.env_vars(self.deepseek_cfg(api_key="sk-deepseek-test"))
+    def test_env_vars_route_deepseek_through_claude_any_router(self):
+        cfg = self.deepseek_cfg(api_key="sk-deepseek-test")
+        pcfg = cfg["providers"]["deepseek"]
+        env = claude_any.env_vars(cfg)
         self.assertEqual("deepseek", env["CLAUDE_ANY_PROVIDER"])
-        self.assertEqual("https://api.deepseek.com/anthropic", env["ANTHROPIC_BASE_URL"])
-        self.assertEqual("sk-deepseek-test", env["ANTHROPIC_AUTH_TOKEN"])
+        self.assertEqual(claude_any.ROUTER_BASE, env["ANTHROPIC_BASE_URL"])
+        self.assertEqual("not-used", env["ANTHROPIC_AUTH_TOKEN"])
         self.assertNotIn("ANTHROPIC_API_KEY", env)
-        self.assertEqual("deepseek-v4-pro[1m]", env["ANTHROPIC_MODEL"])
-        self.assertEqual("deepseek-v4-pro[1m]", env["ANTHROPIC_DEFAULT_OPUS_MODEL"])
-        self.assertEqual("deepseek-v4-pro[1m]", env["ANTHROPIC_DEFAULT_SONNET_MODEL"])
-        self.assertEqual("deepseek-v4-flash", env["ANTHROPIC_DEFAULT_HAIKU_MODEL"])
-        self.assertEqual("deepseek-v4-flash", env["CLAUDE_CODE_SUBAGENT_MODEL"])
-        self.assertEqual("max", env["CLAUDE_CODE_EFFORT_LEVEL"])
+        self.assertNotIn("sk-deepseek-test", env.values())
+        expected_model = claude_any.claude_code_context_model_alias("deepseek", pcfg, claude_any.current_alias(cfg))
+        self.assertEqual(expected_model, env["ANTHROPIC_MODEL"])
+        self.assertEqual(expected_model, env["ANTHROPIC_DEFAULT_OPUS_MODEL"])
+        self.assertEqual(expected_model, env["ANTHROPIC_DEFAULT_SONNET_MODEL"])
+        self.assertEqual(expected_model, env["ANTHROPIC_DEFAULT_HAIKU_MODEL"])
+        self.assertEqual(expected_model, env["CLAUDE_CODE_SUBAGENT_MODEL"])
         self.assertEqual("8192", env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"])
 
     def test_launch_removes_inherited_anthropic_api_key_for_deepseek(self):
         cfg = self.deepseek_cfg(api_key="sk-deepseek-test")
-        with (
-            mock.patch.dict(
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch.dict(
                 "os.environ",
                 {"PATH": "/usr/local/bin", "ANTHROPIC_API_KEY": "sk-ant-old"},
                 clear=True,
-            ),
-            mock.patch.object(claude_any, "run_prelaunch_menu", return_value=0),
-            mock.patch.object(claude_any, "load_config", return_value=cfg),
-            mock.patch.object(claude_any, "launch_readiness_errors", return_value=[]),
-            mock.patch.object(claude_any, "cleanup_managed_services_for_provider"),
-            mock.patch.object(claude_any, "find_executable", return_value="/usr/local/bin/claude"),
-            mock.patch.object(claude_any, "run_claude_update_check"),
-            mock.patch.object(claude_any, "install_claude_any_slash_commands"),
-            mock.patch.object(claude_any, "install_tool_guard_hooks"),
-            mock.patch.object(claude_any, "install_claude_any_statusline"),
-            mock.patch.object(claude_any, "should_attach_web_search", return_value=False),
-            mock.patch.object(claude_any.subprocess, "call", return_value=0) as call,
-        ):
+            ))
+            stack.enter_context(mock.patch.object(claude_any, "run_prelaunch_menu", return_value=0))
+            stack.enter_context(mock.patch.object(claude_any, "load_config", return_value=cfg))
+            stack.enter_context(mock.patch.object(claude_any, "launch_readiness_errors", return_value=[]))
+            stack.enter_context(mock.patch.object(claude_any, "start_router_if_needed"))
+            stack.enter_context(mock.patch.object(claude_any, "cleanup_managed_services_for_provider"))
+            stack.enter_context(mock.patch.object(claude_any, "find_executable", return_value="/usr/local/bin/claude"))
+            stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
+            stack.enter_context(mock.patch.object(claude_any, "install_claude_any_slash_commands"))
+            stack.enter_context(mock.patch.object(claude_any, "install_tool_guard_hooks"))
+            stack.enter_context(mock.patch.object(claude_any, "install_claude_any_statusline"))
+            stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
+            stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
+            stack.enter_context(mock.patch.object(claude_any, "reset_channel_llm_delivery_cursor"))
+            stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=False))
+            stack.enter_context(mock.patch.object(claude_any, "cached_channel_capable_server_names", return_value=["claude-any-router"]))
+            stack.enter_context(mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[]))
+            stack.enter_context(mock.patch.object(claude_any, "read_channel_probe_cache", return_value={"probed_at": 1700000000}))
+            stack.enter_context(mock.patch.object(claude_any, "write_channel_mcp_config", return_value="channel-mcp.json"))
+            stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=None))
+            stack.enter_context(mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", return_value=[]))
+            stack.enter_context(mock.patch.object(claude_any, "subprocess_call_with_channel_wake_proxy", return_value=0))
+            call = stack.enter_context(mock.patch.object(claude_any.subprocess, "call", return_value=0))
             rc = claude_any.launch_claude([], update_check=False, self_update_check=False)
 
         self.assertEqual(0, rc)
         launch_env = call.call_args.kwargs["env"]
-        self.assertEqual("sk-deepseek-test", launch_env["ANTHROPIC_AUTH_TOKEN"])
+        self.assertEqual(claude_any.ROUTER_BASE, launch_env["ANTHROPIC_BASE_URL"])
+        self.assertEqual("not-used", launch_env["ANTHROPIC_AUTH_TOKEN"])
         self.assertNotIn("ANTHROPIC_API_KEY", launch_env)
 
     def test_deepseek_base_status_does_not_probe_model_list(self):

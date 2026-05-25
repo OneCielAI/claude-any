@@ -42,6 +42,7 @@ class LogLevelTests(unittest.TestCase):
             with (
                 mock.patch.object(claude_any, "LOG_LEVEL_PATH", path),
                 mock.patch.object(claude_any, "CONFIG_DIR", Path(td)),
+                mock.patch.object(claude_any, "CONFIG_PATH", Path(td) / "config.json"),
                 mock.patch.object(claude_any, "launch_claude") as launch,
             ):
                 with redirect_stdout(io.StringIO()):

@@ -9881,18 +9881,6 @@ def cmd_ollama_catalog(args: argparse.Namespace) -> None:
 def provider_mode_label(provider: str, pcfg: dict[str, Any]) -> str:
     if native_anthropic_enabled(provider):
         return "anthropic-native"
-    if ollama_native_compat_enabled(provider, pcfg):
-        return "ollama-native"
-    if vllm_native_compat_enabled(provider, pcfg):
-        return "vllm-native"
-    if lm_studio_native_compat_enabled(provider, pcfg):
-        return "lm-studio-native"
-    if nim_native_compat_enabled(provider, pcfg):
-        return "nim-native"
-    if nvidia_hosted_native_compat_enabled(provider, pcfg):
-        return "nvidia-native"
-    if deepseek_native_compat_enabled(provider, pcfg):
-        return "deepseek-native"
     return "claude-any-router"
 
 
@@ -14086,63 +14074,6 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         if meaningful_key(pcfg.get("api_key")):
             env["ANTHROPIC_API_KEY"] = str(pcfg["api_key"])
         return env
-    if ollama_native_compat_enabled(provider, pcfg):
-        model = launch_model_id(provider, pcfg)
-        return apply_common_claude_env(provider, pcfg, {
-            "CLAUDE_ANY_PROVIDER": provider,
-            "ANTHROPIC_BASE_URL": pcfg.get("base_url", "http://127.0.0.1:11434").rstrip("/"),
-            "ANTHROPIC_AUTH_TOKEN": "ollama",
-            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-            "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-            "ANTHROPIC_MODEL": model,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-            "CLAUDE_CODE_SUBAGENT_MODEL": model,
-            "CLAUDE_ANY_MODEL_ALIAS": model,
-        })
-    if provider_native_compat_enabled(provider, pcfg):
-        model = current_upstream_model_id(provider, pcfg)
-        if provider == "deepseek":
-            token = str(pcfg.get("api_key") or "").strip() or "not-used"
-            small_model = str(pcfg.get("haiku_model") or "deepseek-v4-flash").strip() or "deepseek-v4-flash"
-            subagent_model = str(pcfg.get("subagent_model") or small_model).strip() or small_model
-            # DeepSeek's Claude Code integration documents ANTHROPIC_AUTH_TOKEN
-            # only. Setting ANTHROPIC_API_KEY alongside it makes Claude Code
-            # report an auth conflict before launch.
-            return apply_common_claude_env(provider, pcfg, {
-                "CLAUDE_ANY_PROVIDER": provider,
-                "ANTHROPIC_BASE_URL": native_anthropic_base_url(provider, pcfg),
-                "ANTHROPIC_AUTH_TOKEN": token,
-                "ANTHROPIC_MODEL": model,
-                "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
-                "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-                "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL": small_model,
-                "CLAUDE_CODE_SUBAGENT_MODEL": subagent_model,
-                "CLAUDE_CODE_EFFORT_LEVEL": str(pcfg.get("effort_level") or "max"),
-                "CLAUDE_ANY_MODEL_ALIAS": model,
-            })
-        token = nvidia_api_key() if provider == "nvidia-hosted" else str(pcfg.get("api_key") or "dummy")
-        if not token:
-            token = "not-used"
-        return apply_common_claude_env(provider, pcfg, {
-            "CLAUDE_ANY_PROVIDER": provider,
-            "ANTHROPIC_BASE_URL": native_anthropic_base_url(provider, pcfg),
-            "ANTHROPIC_API_KEY": token,
-            "ANTHROPIC_AUTH_TOKEN": token,
-            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
-            "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
-            "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-            "ANTHROPIC_MODEL": model,
-            "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
-            "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-            "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
-            "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
-            "CLAUDE_CODE_SUBAGENT_MODEL": model,
-            "CLAUDE_ANY_MODEL_ALIAS": model,
-        })
     alias = current_alias(cfg)
     claude_model = claude_code_context_model_alias(provider, pcfg, alias)
     return apply_common_claude_env(provider, pcfg, {
@@ -14473,8 +14404,6 @@ def cleanup_managed_services_for_provider(provider: str, pcfg: dict[str, Any], c
         return
     if not cfg.get("cleanup", {}).get("managed_services_on_launch", True):
         return
-    if ollama_native_compat_enabled(provider, pcfg) or provider_native_compat_enabled(provider, pcfg):
-        stop_router_processes(quiet=quiet)
     if provider != "nvidia-hosted" or provider_native_compat_enabled(provider, pcfg):
         stop_ncp_proxy(quiet=quiet)
 
@@ -16234,9 +16163,8 @@ def write_mcp_proxy_config(
 def should_use_channel_stdin_proxy(use_router_mode: bool, passthrough: list[str], cfg: dict[str, Any] | None = None) -> bool:
     if not use_router_mode or native_channel_passthrough_requested(passthrough):
         return False
-    if cfg is not None and channel_delivery_mode(cfg) in {"native", "llm"}:
-        return False
-    return True
+    mode = channel_delivery_mode(cfg) if cfg is not None else "stdin"
+    return mode not in {"native", "llm"}
 
 
 def format_channel_wake_prompt(message: dict[str, Any]) -> str:
@@ -17656,9 +17584,7 @@ def launch_claude(
             print(f"- {line}", flush=True)
         return 2
     use_native_anthropic = native_anthropic_enabled(provider)
-    use_ollama_native = ollama_native_compat_enabled(provider, pcfg)
-    use_provider_native = provider_native_compat_enabled(provider, pcfg)
-    use_router_mode = not (use_native_anthropic or use_ollama_native or use_provider_native)
+    use_router_mode = not use_native_anthropic
     cleanup_managed_services_for_provider(provider, pcfg, cfg, quiet=True)
     env = os.environ.copy()
     env["PATH"] = str(HOME / ".local" / "bin") + os.pathsep + env.get("PATH", "")

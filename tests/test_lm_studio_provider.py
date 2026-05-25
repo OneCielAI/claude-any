@@ -373,7 +373,8 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertIn("stream=on", status)
         self.assertIn("native=True", status)
 
-        rows, values = claude_any.llm_option_panel_rows("lm-studio", pcfg, "en")
+        with mock.patch.object(claude_any, "load_config", return_value={}):
+            rows, values = claude_any.llm_option_panel_rows("lm-studio", pcfg, "en")
         self.assertIn("context_window", values)
         self.assertIn("context_reserve_tokens", values)
         self.assertIn("temperature", values)
@@ -385,16 +386,19 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertTrue(any(value.startswith("context-") for value in context_values))
         self.assertFalse(any("managed by Claude Code" in row for row in context_rows))
 
-    def test_lm_studio_native_env_uses_anthropic_base_url(self):
+    def test_lm_studio_launch_env_routes_through_claude_any_router(self):
         cfg = {
             "current_provider": "lm-studio",
             "providers": {"lm-studio": dict(claude_any.DEFAULT_CONFIG["providers"]["lm-studio"])},
         }
+        pcfg = cfg["providers"]["lm-studio"]
 
         env = claude_any.env_vars(cfg)
 
-        self.assertEqual("http://127.0.0.1:1234", env["ANTHROPIC_BASE_URL"])
-        self.assertEqual("local-model", env["ANTHROPIC_MODEL"])
+        self.assertEqual(claude_any.ROUTER_BASE, env["ANTHROPIC_BASE_URL"])
+        self.assertEqual("not-used", env["ANTHROPIC_AUTH_TOKEN"])
+        self.assertEqual(claude_any.current_alias(cfg), env["ANTHROPIC_MODEL"])
+        self.assertNotEqual(claude_any.native_anthropic_base_url("lm-studio", pcfg), env["ANTHROPIC_BASE_URL"])
         self.assertEqual("lm-studio", env["CLAUDE_ANY_PROVIDER"])
 
     def test_lm_studio_routes_through_openai_compatible_forwarder_when_native_disabled(self):

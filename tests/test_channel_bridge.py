@@ -1243,6 +1243,7 @@ class ChannelBridgeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "channel-mcp.json"
             with (
+                mock.patch.object(claude_any, "CONFIG_DIR", Path(td)),
                 mock.patch.object(claude_any, "CHANNEL_MCP_CONFIG", path),
                 mock.patch.object(claude_any, "_channel_mcp_ensure_cursor_initialized", return_value=0),
             ):
