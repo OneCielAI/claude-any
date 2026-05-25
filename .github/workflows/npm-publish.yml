@@ -70,3 +70,36 @@ jobs:
         if: steps.publish-check.outputs.should_publish == 'true'
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Verify published tarball
+        if: steps.publish-check.outputs.should_publish == 'true'
+        shell: bash
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          pkg="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          tag="${{ steps.channel.outputs.tag }}"
+          echo "Verifying ${pkg}@${version} tarball..."
+          for attempt in {1..12}; do
+            if npm pack "${pkg}@${version}" --dry-run >/tmp/npm-pack-verify.log 2>&1; then
+              cat /tmp/npm-pack-verify.log
+              exit 0
+            fi
+            cat /tmp/npm-pack-verify.log
+            echo "Tarball is not available yet; retry ${attempt}/12..."
+            sleep 10
+          done
+          if [[ "${tag}" == "nightly" ]]; then
+            echo "Published nightly tarball is unavailable; rolling nightly tag back to the newest installable nightly."
+            mapfile -t versions < <(npm view "${pkg}" versions --json | node -e "const fs=require('fs');const cur=process.argv[1];const versions=JSON.parse(fs.readFileSync(0,'utf8')); for (const v of versions.filter(v => v !== cur && v.includes('-nightly.')).reverse()) console.log(v);" "${version}")
+            for previous in "${versions[@]}"; do
+              if npm pack "${pkg}@${previous}" --dry-run >/tmp/npm-pack-previous.log 2>&1; then
+                cat /tmp/npm-pack-previous.log
+                npm dist-tag add "${pkg}@${previous}" nightly
+                echo "Rolled nightly back to ${previous}."
+                break
+              fi
+            done
+          fi
+          exit 1
