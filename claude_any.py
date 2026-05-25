@@ -14348,6 +14348,12 @@ def terminate_posix_port(port: int, label: str, quiet: bool = False) -> bool:
     return stopped
 
 
+def router_port_listener_pids() -> list[int]:
+    if os.name == "nt":
+        return windows_pids_on_port(ROUTER_PORT)
+    return posix_pids_on_port(ROUTER_PORT)
+
+
 def terminate_router_health_pid(health: dict[str, Any] | None, quiet: bool = True) -> bool:
     if not isinstance(health, dict):
         return False
@@ -14358,6 +14364,43 @@ def terminate_router_health_pid(health: dict[str, Any] | None, quiet: bool = Tru
     if pid in (os.getpid(), os.getppid()):
         return False
     return terminate_pid(pid, "claude-any router", quiet=quiet)
+
+
+def ensure_router_port_available_for_spawn(
+    reason: str,
+    health: dict[str, Any] | None = None,
+    max_wait_seconds: float = 5.0,
+) -> None:
+    """Clear the local router/MCP port before spawning a replacement router."""
+    stopped = terminate_router_health_pid(health, quiet=True)
+    stopped = stop_router_processes(quiet=True) or stopped
+    deadline = time.time() + max(0.1, max_wait_seconds)
+    while time.time() < deadline:
+        current_health = router_health()
+        if current_health is None and not router_port_listener_pids():
+            router_log(
+                "INFO",
+                f"router_port_clear reason={reason} port={ROUTER_PORT} stopped={str(stopped).lower()}",
+            )
+            return
+        if current_health is not None:
+            terminate_router_health_pid(current_health, quiet=True)
+        stop_router_processes(quiet=True)
+        time.sleep(0.1)
+    pids = router_port_listener_pids()
+    current_health = router_health()
+    health_desc = ""
+    if isinstance(current_health, dict):
+        health_desc = (
+            f" version={current_health.get('version') or '-'}"
+            f" source={current_health.get('source_fingerprint') or '-'}"
+            f" pid={current_health.get('pid') or '-'}"
+        )
+    raise RuntimeError(
+        f"stale claude-any router is still serving on {ROUTER_BASE}; "
+        f"port {ROUTER_PORT} listener_pids={pids or '-'}{health_desc}; "
+        "run `claude-any stop` and launch again."
+    )
 
 
 def terminate_windows_port(port: int, label: str, quiet: bool = False) -> bool:
@@ -16030,42 +16073,9 @@ def start_router_if_needed() -> None:
             f"running_version={running_version or '-'} current_version={VERSION} "
             f"running_source={running_fingerprint or '-'} current_source={SOURCE_FINGERPRINT}",
         )
-        terminate_router_health_pid(health, quiet=True)
-        stop_router_processes(quiet=True)
-        deadline = time.time() + 5
-        while time.time() < deadline and router_up():
-            time.sleep(0.1)
-    health = router_health()
-    if router_health_matches_current(health):
-        router_log("INFO", f"router_check_state running=True spawn=False base={ROUTER_BASE}")
-        return
-    if health is not None:
-        terminate_router_health_pid(health, quiet=True)
-        stop_router_processes(quiet=True)
-        deadline = time.time() + 5
-        while time.time() < deadline and router_up():
-            time.sleep(0.1)
-        health = router_health()
-    if health is not None:
-        raise RuntimeError(
-            f"stale claude-any router is still serving on {ROUTER_BASE}; run `claude-any stop` and launch again."
-        )
-    stop_router_processes(quiet=True)
-    health = router_health()
-    if router_health_matches_current(health):
-        router_log("INFO", f"router_check_state running=True spawn=False after_stop=True base={ROUTER_BASE}")
-        return
-    if health is not None:
-        terminate_router_health_pid(health, quiet=True)
-        stop_router_processes(quiet=True)
-        deadline = time.time() + 5
-        while time.time() < deadline and router_up():
-            time.sleep(0.1)
-        health = router_health()
-    if health is not None:
-        raise RuntimeError(
-            f"stale claude-any router is still serving on {ROUTER_BASE}; run `claude-any stop` and launch again."
-        )
+        ensure_router_port_available_for_spawn("version_mismatch", health)
+    else:
+        ensure_router_port_available_for_spawn("pre_spawn", None)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     cmd = [sys.executable, str(Path(__file__).resolve()), "serve"]
     kwargs: dict[str, Any] = {}

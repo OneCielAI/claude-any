@@ -162,6 +162,31 @@ class StopRouterGuaranteeTests(unittest.TestCase):
         self.assertTrue(result)
         terminate.assert_called_once_with(2468, "claude-any router", quiet=True)
 
+    def test_ensure_router_port_available_for_spawn_clears_empty_port(self):
+        with (
+            mock.patch.object(claude_any, "terminate_router_health_pid", return_value=False),
+            mock.patch.object(claude_any, "stop_router_processes", return_value=False) as stop,
+            mock.patch.object(claude_any, "router_health", return_value=None),
+            mock.patch.object(claude_any, "router_port_listener_pids", return_value=[]),
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            claude_any.ensure_router_port_available_for_spawn("test", None, max_wait_seconds=0.2)
+
+        stop.assert_called()
+
+    def test_ensure_router_port_available_for_spawn_reports_remaining_pids(self):
+        with (
+            mock.patch.object(claude_any, "terminate_router_health_pid", return_value=False),
+            mock.patch.object(claude_any, "stop_router_processes", return_value=False),
+            mock.patch.object(claude_any, "router_health", return_value={"version": "old", "source_fingerprint": "abc", "pid": 777}),
+            mock.patch.object(claude_any, "router_port_listener_pids", return_value=[777]),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                claude_any.ensure_router_port_available_for_spawn("test", {"pid": 777}, max_wait_seconds=0.2)
+
+        self.assertIn("listener_pids=[777]", str(ctx.exception))
+        self.assertIn("version=old", str(ctx.exception))
+
 
 class CleanupNativeAlwaysKillsTests(unittest.TestCase):
     def test_native_bypasses_managed_services_toggle(self):
