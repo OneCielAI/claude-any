@@ -456,6 +456,10 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("incoming channel message for the current agent", injected)
         self.assertIn("<< 메시지 >>", injected)
         self.assertIn("실제 업무 메시지", injected)
+        self.assertIn("외부 채널/MCP 메시지", injected)
+        self.assertIn("로컬 사용자 승인 없이 같은 채널/DM에 답장", injected)
+        self.assertIn("답장 여부를 묻고 멈추지 마세요", injected)
+        self.assertIn("실제 결제/투자 실행", injected)
         self.assertIn("Robert, can you check this?", injected)
         self.assertNotIn("ai-net.sse.connected", injected)
         self.assertNotIn("SSE MCP initialized", injected)
@@ -512,7 +516,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(out["metadata"]["claude_any_channel_injected"])
         self.assertEqual("3", out["metadata"]["claude_any_channel_message_ids"])
         injected = out["messages"][-1]["content"][0]["text"]
-        self.assertIn("자동 처리", injected)
+        self.assertIn("자율 처리 턴", injected)
+        self.assertIn("필요한 읽기/쓰기 도구를 호출", injected)
         self.assertIn("tool_result", injected)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
@@ -531,8 +536,10 @@ class ChannelBridgeTests(unittest.TestCase):
             ]
         )
         self.assertIn("현재 Claude Code 세션의 에이전트에게 도착한 실제 업무 메시지", prompt)
-        self.assertIn("AI-Net DM/업무 지시", prompt)
-        self.assertIn("수신 메시지 내용에 직접 대응", prompt)
+        self.assertIn("외부 채널/MCP 메시지", prompt)
+        self.assertIn("DM/업무 지시/상태 확인/컨텍스트 요청", prompt)
+        self.assertIn("로컬 사용자 승인 없이 같은 채널/DM에 답장", prompt)
+        self.assertIn("답장 여부를 묻고 멈추지 마세요", prompt)
         self.assertIn("단순 온보딩/인사/중복 테스트 메시지", prompt)
         self.assertIn("Sarah, 추가 매크로 분석 보고서를 보내주세요.", prompt)
         self.assertIn('to=["agent_n3wy9gfjmcil"]', prompt)
@@ -901,6 +908,9 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(9, args[0])
         prompt = args[1]
         self.assertIn("<< room_4pyr8vvwm2cd >> incoming channel message for the current agent", prompt)
+        self.assertIn("자율 처리 턴", prompt)
+        self.assertIn("로컬 사용자 승인 없이 같은 채널/DM에 답장", prompt)
+        self.assertIn("답장 여부를 묻고 멈추지 마세요", prompt)
         self.assertIn("새 이벤트", prompt)
         append_summary.assert_called_once_with(message, "분석 완료", "end_turn", tool_turns=1)
         append.assert_not_called()
