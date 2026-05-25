@@ -14851,11 +14851,9 @@ def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lan
         f"4. {ui_text('model', lang)}  [{compact_text(pcfg.get('current_model', 'unset'), 62)}]",
         f"5. {ui_text('advisor_model', lang)}  [{compact_text(pcfg.get('advisor_model') or 'off', 62)}]",
         f"6. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
-        f"7. {ui_text('channel_delivery', lang)}  [{channel_delivery_mode(cfg)}]",
-        f"8. {ui_text('channels', lang)}  [{channel_status_text(cfg)}]",
-        f"9. {ui_text('log_level', lang)}  [{log_level_status()}]",
-        f"10. {ui_text('test', lang)}",
-        f"11. {ui_text('launch', lang)}",
+        f"7. {ui_text('log_level', lang)}  [{log_level_status()}]",
+        f"8. {ui_text('test', lang)}",
+        f"9. {ui_text('launch', lang)}",
         ui_text("quit", lang),
     ]
 
@@ -15397,7 +15395,7 @@ def portable_language_menu() -> int:
 def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
     passthrough = list(passthrough or [])
     enable_ansi()
-    main_idx = 11 if settings_ready_except_api_key() else 0
+    main_idx = 9 if settings_ready_except_api_key() else 0
     panel: str | None = None
     panel_idx = 0
     panel_rows: list[str] = []
@@ -15643,7 +15641,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         messages = lines[-8:] if lines else ["Test produced no output."]
                         panel_rows, panel_values = ["Run compatibility test again", "Back"], ["run", "back"]
                         refresh_checks()
-                        main_idx = 11 if "Compatibility: OK" in out else 4
+                        main_idx = 9 if "Compatibility: OK" in out else 4
                 elif panel == "log-level":
                     if value == "back":
                         close_panel()
@@ -15817,7 +15815,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
             elif key in ("esc", "q"):
                 return 10
             elif key == "enter":
-                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "channel-delivery", "channels", "log-level", "test", "launch", "quit"]
+                actions = ["language", "provider", "api-key", "base-url", "model", "advisor-model", "options", "log-level", "test", "launch", "quit"]
                 action = actions[main_idx]
                 if action == "launch":
                     blockers = launch_readiness_errors()
@@ -15999,13 +15997,17 @@ def claude_channels_requested(cfg: dict[str, Any], passthrough: list[str], extra
 
 
 def should_use_native_channel_bridge(use_router_mode: bool, cfg: dict[str, Any], passthrough: list[str]) -> bool:
-    return bool(channel_delivery_mode(cfg) == "native" and not native_channel_passthrough_requested(passthrough))
+    return bool(
+        not use_router_mode
+        and channel_delivery_mode(cfg) == "native"
+        and not native_channel_passthrough_requested(passthrough)
+    )
 
 
 def should_use_channel_llm_delivery(use_router_mode: bool, passthrough: list[str], cfg: dict[str, Any] | None = None) -> bool:
     if not use_router_mode or native_channel_passthrough_requested(passthrough):
         return False
-    return bool(cfg is not None and channel_delivery_mode(cfg) == "llm")
+    return True
 
 
 def claude_code_channels_auth_available(claude: str) -> tuple[bool, str]:
@@ -16161,10 +16163,7 @@ def write_mcp_proxy_config(
 
 
 def should_use_channel_stdin_proxy(use_router_mode: bool, passthrough: list[str], cfg: dict[str, Any] | None = None) -> bool:
-    if not use_router_mode or native_channel_passthrough_requested(passthrough):
-        return False
-    mode = channel_delivery_mode(cfg) if cfg is not None else "stdin"
-    return mode not in {"native", "llm"}
+    return False
 
 
 def format_channel_wake_prompt(message: dict[str, Any]) -> str:
@@ -17706,7 +17705,7 @@ def launch_claude(
             cfg,
             launch_passthrough,
             extra_specs=detected_channel_specs,
-            native_channel_bridge=native_channel_bridge or llm_channel_delivery,
+            native_channel_bridge=native_channel_bridge,
         )
     )
     cmd = [

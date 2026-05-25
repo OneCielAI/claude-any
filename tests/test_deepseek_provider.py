@@ -69,7 +69,7 @@ class DeepSeekProviderTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(claude_any, "install_claude_any_statusline"))
             stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
             stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
-            stack.enter_context(mock.patch.object(claude_any, "reset_channel_llm_delivery_cursor"))
+            stack.enter_context(mock.patch.object(claude_any, "ensure_channel_llm_delivery_cursor_initialized"))
             stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=False))
             stack.enter_context(mock.patch.object(claude_any, "cached_channel_capable_server_names", return_value=["claude-any-router"]))
             stack.enter_context(mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[]))
