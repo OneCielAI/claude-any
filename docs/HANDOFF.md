@@ -48,6 +48,11 @@ Research directions for the next branch:
 4. If immediate screen output is required, keep terminal notices as diagnostic-only; do not rely on raw TTY writes as the product surface.
 5. Keep user-initiated `claude-any ... -p` pass-through working. The ban is on internal automatic background `-p` launches for channel notifications.
 
+Detailed investigation notes are in `docs/no-p-channel-research.md`. The key
+finding is that Claude Code's own bridge and team-agent paths queue inbound
+messages into the active REPL; print mode has separate headless handling, so it
+should not be used as the product path for automatic channel notifications.
+
 ## Recent release sequence
 
 ### 0.1.91
