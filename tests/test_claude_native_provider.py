@@ -137,12 +137,30 @@ class StopRouterGuaranteeTests(unittest.TestCase):
 
         with (
             mock.patch.object(claude_any.os, "name", "posix"),
+            mock.patch.object(claude_any, "linux_procfs_pids_on_port", return_value=[]),
             mock.patch.object(claude_any.shutil, "which", side_effect=fake_which),
             mock.patch.object(claude_any.subprocess, "run", return_value=FakeProcess()),
             mock.patch.object(claude_any.os, "getpid", return_value=100),
             mock.patch.object(claude_any.os, "getppid", return_value=101),
         ):
             self.assertEqual([4321], claude_any.posix_pids_on_port(8799))
+
+    def test_posix_pids_on_port_uses_procfs_fallback_without_tools(self):
+        with (
+            mock.patch.object(claude_any.os, "name", "posix"),
+            mock.patch.object(claude_any, "linux_procfs_pids_on_port", return_value=[5555]),
+            mock.patch.object(claude_any.shutil, "which", return_value=None),
+            mock.patch.object(claude_any.os, "getpid", return_value=100),
+            mock.patch.object(claude_any.os, "getppid", return_value=101),
+        ):
+            self.assertEqual([5555], claude_any.posix_pids_on_port(8799))
+
+    def test_terminate_router_health_pid_uses_health_pid(self):
+        with mock.patch.object(claude_any, "terminate_pid", return_value=True) as terminate:
+            result = claude_any.terminate_router_health_pid({"pid": 2468}, quiet=True)
+
+        self.assertTrue(result)
+        terminate.assert_called_once_with(2468, "claude-any router", quiet=True)
 
 
 class CleanupNativeAlwaysKillsTests(unittest.TestCase):

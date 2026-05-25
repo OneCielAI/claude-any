@@ -14230,10 +14230,66 @@ def windows_pids_on_port(port: int) -> list[int]:
     return sorted(pids)
 
 
+def linux_procfs_pids_on_port(port: int) -> list[int]:
+    if os.name == "nt":
+        return []
+    wanted_port = f"{int(port):04X}"
+    inodes: set[str] = set()
+    for table in (Path("/proc/net/tcp"), Path("/proc/net/tcp6")):
+        try:
+            lines = table.read_text(encoding="utf-8", errors="replace").splitlines()[1:]
+        except Exception:
+            continue
+        for line in lines:
+            parts = line.split()
+            if len(parts) < 10:
+                continue
+            local_addr = parts[1]
+            state = parts[3]
+            inode = parts[9]
+            if state != "0A" or ":" not in local_addr:
+                continue
+            if local_addr.rsplit(":", 1)[1].upper() == wanted_port and inode and inode != "0":
+                inodes.add(inode)
+    if not inodes:
+        return []
+    pids: set[int] = set()
+    current = os.getpid()
+    parent = os.getppid()
+    try:
+        proc_entries = list(Path("/proc").iterdir())
+    except Exception:
+        return []
+    for entry in proc_entries:
+        if not entry.name.isdigit():
+            continue
+        try:
+            pid = int(entry.name)
+        except ValueError:
+            continue
+        if pid in (current, parent):
+            continue
+        fd_dir = entry / "fd"
+        try:
+            fds = list(fd_dir.iterdir())
+        except Exception:
+            continue
+        for fd in fds:
+            try:
+                target = os.readlink(fd)
+            except Exception:
+                continue
+            match = re.match(r"socket:\[(\d+)\]$", target)
+            if match and match.group(1) in inodes:
+                pids.add(pid)
+                break
+    return sorted(pids)
+
+
 def posix_pids_on_port(port: int) -> list[int]:
     if os.name == "nt":
         return []
-    pids: set[int] = set()
+    pids: set[int] = set(linux_procfs_pids_on_port(port))
 
     def add_ints(text: str, *, skip_port: bool = False) -> None:
         for value in re.findall(r"\b\d+\b", text or ""):
@@ -14290,6 +14346,18 @@ def terminate_posix_port(port: int, label: str, quiet: bool = False) -> bool:
     if stopped and not quiet:
         print(f"Stopped existing {label} listener(s): {', '.join(map(str, pids))}.")
     return stopped
+
+
+def terminate_router_health_pid(health: dict[str, Any] | None, quiet: bool = True) -> bool:
+    if not isinstance(health, dict):
+        return False
+    try:
+        pid = int(health.get("pid") or 0)
+    except Exception:
+        return False
+    if pid in (os.getpid(), os.getppid()):
+        return False
+    return terminate_pid(pid, "claude-any router", quiet=quiet)
 
 
 def terminate_windows_port(port: int, label: str, quiet: bool = False) -> bool:
@@ -15962,6 +16030,7 @@ def start_router_if_needed() -> None:
             f"running_version={running_version or '-'} current_version={VERSION} "
             f"running_source={running_fingerprint or '-'} current_source={SOURCE_FINGERPRINT}",
         )
+        terminate_router_health_pid(health, quiet=True)
         stop_router_processes(quiet=True)
         deadline = time.time() + 5
         while time.time() < deadline and router_up():
@@ -15971,6 +16040,13 @@ def start_router_if_needed() -> None:
         router_log("INFO", f"router_check_state running=True spawn=False base={ROUTER_BASE}")
         return
     if health is not None:
+        terminate_router_health_pid(health, quiet=True)
+        stop_router_processes(quiet=True)
+        deadline = time.time() + 5
+        while time.time() < deadline and router_up():
+            time.sleep(0.1)
+        health = router_health()
+    if health is not None:
         raise RuntimeError(
             f"stale claude-any router is still serving on {ROUTER_BASE}; run `claude-any stop` and launch again."
         )
@@ -15979,6 +16055,13 @@ def start_router_if_needed() -> None:
     if router_health_matches_current(health):
         router_log("INFO", f"router_check_state running=True spawn=False after_stop=True base={ROUTER_BASE}")
         return
+    if health is not None:
+        terminate_router_health_pid(health, quiet=True)
+        stop_router_processes(quiet=True)
+        deadline = time.time() + 5
+        while time.time() < deadline and router_up():
+            time.sleep(0.1)
+        health = router_health()
     if health is not None:
         raise RuntimeError(
             f"stale claude-any router is still serving on {ROUTER_BASE}; run `claude-any stop` and launch again."
