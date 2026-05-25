@@ -9379,6 +9379,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     "ok": True,
                     "version": VERSION,
                     "source_fingerprint": SOURCE_FINGERPRINT,
+                    "pid": os.getpid(),
                     "provider": provider,
                     "model": current_alias(cfg),
                     "chat": "/ca/chat/health",
@@ -14155,22 +14156,8 @@ def pid_is_running(pid: int) -> bool:
         return False
 
 
-def terminate_pid_file(path: Path, label: str, quiet: bool = False) -> bool:
-    if not path.exists():
-        return False
-    try:
-        pid = int(path.read_text().strip())
-    except Exception:
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
-        return False
+def terminate_pid(pid: int, label: str, quiet: bool = False) -> bool:
     if not pid_is_running(pid):
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
         return False
     try:
         if os.name == "nt":
@@ -14193,6 +14180,26 @@ def terminate_pid_file(path: Path, label: str, quiet: bool = False) -> bool:
         if not quiet:
             print(f"Could not stop existing {label} session ({type(exc).__name__}).")
         return False
+
+
+def terminate_pid_file(path: Path, label: str, quiet: bool = False) -> bool:
+    if not path.exists():
+        return False
+    try:
+        pid = int(path.read_text().strip())
+    except Exception:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        return False
+    stopped = terminate_pid(pid, label, quiet=quiet)
+    if stopped or not pid_is_running(pid):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+    return stopped
 
 
 def windows_pids_on_port(port: int) -> list[int]:
@@ -14221,6 +14228,68 @@ def windows_pids_on_port(port: int) -> list[int]:
         except ValueError:
             continue
     return sorted(pids)
+
+
+def posix_pids_on_port(port: int) -> list[int]:
+    if os.name == "nt":
+        return []
+    pids: set[int] = set()
+
+    def add_ints(text: str, *, skip_port: bool = False) -> None:
+        for value in re.findall(r"\b\d+\b", text or ""):
+            try:
+                pid = int(value)
+            except ValueError:
+                continue
+            if skip_port and pid == port:
+                continue
+            pids.add(pid)
+
+    commands: list[tuple[list[str], str]] = [
+        (["lsof", "-nP", f"-iTCP:{port}", "-sTCP:LISTEN", "-t"], "plain"),
+        (["fuser", "-n", "tcp", str(port)], "fuser"),
+        (["ss", "-ltnp", f"sport = :{port}"], "ss"),
+        (["netstat", "-ltnp"], "netstat"),
+    ]
+    for cmd, kind in commands:
+        if not shutil.which(cmd[0]):
+            continue
+        try:
+            proc = subprocess.run(
+                cmd,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=5,
+            )
+        except Exception:
+            continue
+        text = (proc.stdout or "") + "\n" + (proc.stderr or "")
+        if kind == "plain":
+            add_ints(text)
+        elif kind == "fuser":
+            add_ints(text.split(":", 1)[1] if ":" in text else text, skip_port=True)
+        elif kind == "ss":
+            for value in re.findall(r"pid=(\d+)", text):
+                add_ints(value)
+        else:
+            for line in text.splitlines():
+                if "LISTEN" not in line or f":{port}" not in line:
+                    continue
+                match = re.search(r"\s(\d+)/", line)
+                if match:
+                    add_ints(match.group(1))
+    return sorted(pid for pid in pids if pid not in (os.getpid(), os.getppid()))
+
+
+def terminate_posix_port(port: int, label: str, quiet: bool = False) -> bool:
+    stopped = False
+    pids = posix_pids_on_port(port)
+    for pid in pids:
+        stopped = terminate_pid(pid, label, quiet=True) or stopped
+    if stopped and not quiet:
+        print(f"Stopped existing {label} listener(s): {', '.join(map(str, pids))}.")
+    return stopped
 
 
 def terminate_windows_port(port: int, label: str, quiet: bool = False) -> bool:
@@ -14359,6 +14428,8 @@ def stop_router_processes(quiet: bool = False) -> bool:
         stopped = terminate_windows_port(ROUTER_PORT, "claude-any router", quiet=quiet) or stopped
         return stopped
     stopped = terminate_matching_processes(["claude_any.py", "serve"], "claude-any router", quiet=quiet) or stopped
+    stopped = terminate_matching_processes(["claude-any", "serve"], "claude-any router", quiet=True) or stopped
+    stopped = terminate_posix_port(ROUTER_PORT, "claude-any router", quiet=quiet) or stopped
     return stopped
 
 

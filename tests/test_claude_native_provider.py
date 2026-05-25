@@ -113,6 +113,37 @@ class StopRouterGuaranteeTests(unittest.TestCase):
         self.assertIn("native_anthropic_launch", str(ctx.exception))
         self.assertIn("router", str(ctx.exception).lower())
 
+    def test_stop_router_processes_uses_posix_port_fallback(self):
+        with (
+            mock.patch.object(claude_any.os, "name", "posix"),
+            mock.patch.object(claude_any, "terminate_pid_file", return_value=False) as pid_file,
+            mock.patch.object(claude_any, "terminate_matching_processes", return_value=False) as match,
+            mock.patch.object(claude_any, "terminate_posix_port", return_value=True) as port,
+        ):
+            result = claude_any.stop_router_processes(quiet=True)
+
+        self.assertTrue(result)
+        pid_file.assert_called_once()
+        self.assertEqual(2, match.call_count)
+        port.assert_called_once_with(claude_any.ROUTER_PORT, "claude-any router", quiet=True)
+
+    def test_posix_pids_on_port_parses_ss_listener_pid(self):
+        class FakeProcess:
+            stdout = 'LISTEN 0 4096 127.0.0.1:8799 0.0.0.0:* users:(("python",pid=4321,fd=4))'
+            stderr = ""
+
+        def fake_which(name):
+            return f"/usr/bin/{name}" if name == "ss" else None
+
+        with (
+            mock.patch.object(claude_any.os, "name", "posix"),
+            mock.patch.object(claude_any.shutil, "which", side_effect=fake_which),
+            mock.patch.object(claude_any.subprocess, "run", return_value=FakeProcess()),
+            mock.patch.object(claude_any.os, "getpid", return_value=100),
+            mock.patch.object(claude_any.os, "getppid", return_value=101),
+        ):
+            self.assertEqual([4321], claude_any.posix_pids_on_port(8799))
+
 
 class CleanupNativeAlwaysKillsTests(unittest.TestCase):
     def test_native_bypasses_managed_services_toggle(self):
