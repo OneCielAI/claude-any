@@ -36,7 +36,7 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertEqual("deepseek", env["CLAUDE_ANY_PROVIDER"])
         self.assertEqual("https://api.deepseek.com/anthropic", env["ANTHROPIC_BASE_URL"])
         self.assertEqual("sk-deepseek-test", env["ANTHROPIC_AUTH_TOKEN"])
-        self.assertEqual("sk-deepseek-test", env["ANTHROPIC_API_KEY"])
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
         self.assertEqual("deepseek-v4-pro[1m]", env["ANTHROPIC_MODEL"])
         self.assertEqual("deepseek-v4-pro[1m]", env["ANTHROPIC_DEFAULT_OPUS_MODEL"])
         self.assertEqual("deepseek-v4-pro[1m]", env["ANTHROPIC_DEFAULT_SONNET_MODEL"])
@@ -44,6 +44,33 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertEqual("deepseek-v4-flash", env["CLAUDE_CODE_SUBAGENT_MODEL"])
         self.assertEqual("max", env["CLAUDE_CODE_EFFORT_LEVEL"])
         self.assertEqual("8192", env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"])
+
+    def test_launch_removes_inherited_anthropic_api_key_for_deepseek(self):
+        cfg = self.deepseek_cfg(api_key="sk-deepseek-test")
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"PATH": "/usr/local/bin", "ANTHROPIC_API_KEY": "sk-ant-old"},
+                clear=True,
+            ),
+            mock.patch.object(claude_any, "run_prelaunch_menu", return_value=0),
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "launch_readiness_errors", return_value=[]),
+            mock.patch.object(claude_any, "cleanup_managed_services_for_provider"),
+            mock.patch.object(claude_any, "find_executable", return_value="/usr/local/bin/claude"),
+            mock.patch.object(claude_any, "run_claude_update_check"),
+            mock.patch.object(claude_any, "install_claude_any_slash_commands"),
+            mock.patch.object(claude_any, "install_tool_guard_hooks"),
+            mock.patch.object(claude_any, "install_claude_any_statusline"),
+            mock.patch.object(claude_any, "should_attach_web_search", return_value=False),
+            mock.patch.object(claude_any.subprocess, "call", return_value=0) as call,
+        ):
+            rc = claude_any.launch_claude([], update_check=False, self_update_check=False)
+
+        self.assertEqual(0, rc)
+        launch_env = call.call_args.kwargs["env"]
+        self.assertEqual("sk-deepseek-test", launch_env["ANTHROPIC_AUTH_TOKEN"])
+        self.assertNotIn("ANTHROPIC_API_KEY", launch_env)
 
     def test_deepseek_base_status_does_not_probe_model_list(self):
         cfg = self.deepseek_cfg(api_key="sk-deepseek-test")

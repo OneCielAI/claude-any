@@ -14108,10 +14108,12 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
             token = str(pcfg.get("api_key") or "").strip() or "not-used"
             small_model = str(pcfg.get("haiku_model") or "deepseek-v4-flash").strip() or "deepseek-v4-flash"
             subagent_model = str(pcfg.get("subagent_model") or small_model).strip() or small_model
+            # DeepSeek's Claude Code integration documents ANTHROPIC_AUTH_TOKEN
+            # only. Setting ANTHROPIC_API_KEY alongside it makes Claude Code
+            # report an auth conflict before launch.
             return apply_common_claude_env(provider, pcfg, {
                 "CLAUDE_ANY_PROVIDER": provider,
                 "ANTHROPIC_BASE_URL": native_anthropic_base_url(provider, pcfg),
-                "ANTHROPIC_API_KEY": token,
                 "ANTHROPIC_AUTH_TOKEN": token,
                 "ANTHROPIC_MODEL": model,
                 "ANTHROPIC_CUSTOM_MODEL_OPTION": model,
