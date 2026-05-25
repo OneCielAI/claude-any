@@ -23,14 +23,12 @@ automatic notification handling:
 User-invoked `claude-any ... -p` pass-through should remain supported. The
 restriction is only on claude-any launching hidden `-p` work for channel events.
 
-## Current claude-any path
+## Previous claude-any path
 
-The automatic direct-channel path currently lives in `claude_any.py`:
+The old automatic direct-channel path lived in `claude_any.py`:
 
-- `_channel_direct_llm_cli_response()` shells out to Claude Code and appends
-  `-p` to the command.
 - `_channel_direct_llm_http_response()` can call `/v1/messages`, but it does not
-  yet run a complete tool-use loop.
+  run a complete tool-use loop by itself.
 - `_channel_direct_terminal_notice()` writes a best-effort notice to the
   terminal, but this is diagnostic output, not a reliable transcript surface.
 - `body_with_pending_channel_messages()` injects pending channel messages into
@@ -155,11 +153,12 @@ user learns what happened.
 
 ## Recommended Next Implementation
 
-1. Disable hidden `claude -p` for automatic channel notifications.
-   Keep explicit user pass-through untouched.
+This branch implements the no-hidden-`-p` direction:
 
-2. Replace `_channel_direct_llm_cli_response()` in the automatic path with a
-   router-owned direct handler:
+1. Hidden `claude -p` is removed from automatic channel notification handling.
+   Explicit user pass-through remains untouched.
+
+2. Automatic handling now uses a router-owned direct handler:
 
    ```text
    channel notification
@@ -171,43 +170,47 @@ user learns what happened.
      -> persist final summary
    ```
 
-3. Add a minimal MCP tool-result loop for direct channel handling. At minimum,
-   it must support the AI-Net tools needed for DM workflows:
+3. Direct channel handling has a minimal MCP tool-result loop. It discovers
+   tools from the initialized source SSE MCP server, exposes them to the LLM as
+   Anthropic tools, executes selected tools with MCP `tools/call`, and sends
+   `tool_result` blocks back to the same LLM conversation before asking for the
+   final response.
 
-   - `get_messages`
-   - `send_dm`
-   - `send_message`
-   - `ack_notifications`
-   - `wait_for_notifications` only when explicitly bounded
+4. MCP JSON-RPC responses arriving on the SSE stream are stored as RPC results
+   and are not appended as chat/channel notifications. This prevents `tools/list`
+   and `tools/call` responses from being mistaken for Sarah/Robert messages.
 
-4. Add durable visibility state, for example:
+5. Durable visibility state is stored in:
 
    ```text
-   ~/.config/claude-any/channel-results.jsonl
-   ~/.config/claude-any/channel-visible-queue.jsonl
+   ~/.config/claude-any/channel-llm-summary-queue.jsonl
+   ~/.config/claude-any/channel-llm-summary-cursor.json
    ```
 
    Each entry should include channel, message id, source agent, prompt summary,
    tool calls, tool results, final response text, and whether it has been shown
    in the interactive session.
 
-5. Extend `body_with_pending_channel_messages()` so normal routed requests also
-   include completed direct-handling summaries that have not yet been shown.
+6. Normal routed requests now call `body_with_pending_channel_summaries()` after
+   pending channel-message injection, so completed direct-handling summaries that
+   have not yet been shown are injected into the visible session.
    This lets the active Claude Code session print a visible summary on the next
    user/model turn even though the autonomous work happened in claude-any.
 
-6. Add explicit logs so failures are diagnosable:
+7. Explicit logs make failures diagnosable:
 
    - `channel_llm_direct_router_request`
+   - `channel_sse_mcp_rpc_response`
    - `channel_llm_tool_call`
    - `channel_llm_tool_result_forwarded`
-   - `channel_llm_direct_router_response`
    - `channel_llm_summary_queued`
    - `channel_llm_summary_injected`
+   - `channel_llm_direct_response`
 
-7. Add tests that prove automatic channel notifications do not spawn `claude -p`.
-   The test should patch subprocess execution and fail if the internal automatic
-   path appends `-p`.
+8. Tests prove automatic channel notifications use the router-owned path, round
+   trip MCP `tool_result` blocks to the same LLM turn, store SSE JSON-RPC
+   responses without chat append, and inject durable summaries into the next
+   routed request.
 
 ## Open Question
 

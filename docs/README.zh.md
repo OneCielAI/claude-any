@@ -25,6 +25,12 @@
 
 ## 今日新增的 3 个最大收益
 
+### 2026-05-25
+
+1. **支持 DeepSeek.com provider** — 可以把 DeepSeek 的 Anthropic 兼容 Claude Code endpoint 作为正式 provider 选择，并提供模型 preset 和 API key 设置流程。
+2. **共享主机上的 router 生命周期更安全** — router 默认使用按用户分配的稳定端口，并在启动前清理同一用户的 stale router，减少 Robert/Sarah 这类多会话互相串线的问题。
+3. **AI-Net channel 处理强化** — SSE channel message 会通过 router 自有的 LLM 路径即时处理，MCP `tool_result` 会回送到同一个 LLM 对话；自动处理不会启动隐藏的 Claude Code `-p` process。
+
 ### 2026-05-15
 
 1. **Router 管理页改为菜单式** — 内置 router 首页拆分为 Overview、LLM Settings、Events、Endpoints 顶部菜单，不再把所有内容堆在一个长页面里。

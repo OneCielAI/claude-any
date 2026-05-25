@@ -20,14 +20,14 @@ The latest production path is:
 - Channel delivery choices are hidden from normal routed-provider launch flow; routed sessions use the `llm` channel delivery path.
 - MCP notification events are persisted into `chat-messages.jsonl`.
 - AI-Net/SSE notifications can trigger immediate direct LLM handling, use MCP tools, and receive tool-result follow-up context.
-- Direct channel handling currently captures background output and emits a best-effort terminal notice; this is the main known limitation for the next nightly.
+- Direct channel handling no longer spawns hidden Claude Code `-p`; it uses the routed `/v1/messages` path, executes MCP tools over the initialized SSE connection, forwards `tool_result` blocks back to the same LLM turn, queues summaries durably, and injects those summaries into the next visible routed request.
 
 The previous stable `0.1.99` included automatic MCP channel capability probing through timeout/error classification. `0.1.100` adds DeepSeek.com, shared-host router isolation, automatic API-key setup routing, unique nightly versions, router cleanup hardening, and LLM channel direct handling diagnostics.
 
-## Critical next-nightly research: remove internal `claude -p`
+## Current next-nightly work: remove internal `claude -p`
 
 Do not continue the automatic channel-notification path by spawning a hidden
-`claude -p` process. The current 0.1.100 direct handler can run:
+`claude -p` process. The previous 0.1.100 direct handler could run:
 
 ```text
 claude --dangerously-skip-permissions --model ... --mcp-config ... -p "[claude-any channel inbox] ..."
@@ -40,13 +40,23 @@ can use MCP tools, but it is the wrong long-term design:
 - Its stdout is captured by claude-any, so "show the user a summary" is not guaranteed to appear in the visible Claude Code UI.
 - Recent Anthropic billing/policy behavior can treat `-p` as a separate usage path, so automatic background channel handling must not create hidden `-p` calls.
 
-Research directions for the next branch:
+Implemented direction for the next branch:
 
 1. Reuse the existing routed `/v1/messages` path without invoking Claude Code `-p`.
-2. Preserve MCP/tool ability by moving the needed AI-Net reply operations into router-owned tools or a controlled MCP client path, not a second Claude Code CLI.
-3. Store direct handling summaries in a durable queue and inject them into the next interactive `/v1/messages` request so the visible Claude Code session summarizes what happened.
-4. If immediate screen output is required, keep terminal notices as diagnostic-only; do not rely on raw TTY writes as the product surface.
+2. Preserve MCP/tool ability with a controlled SSE MCP JSON-RPC client path and direct `tools/call` execution.
+3. Store direct handling summaries in `channel-llm-summary-queue.jsonl` and inject them into the next interactive `/v1/messages` request so the visible Claude Code session summarizes what happened.
+4. Keep terminal notices as diagnostic-only; do not rely on raw TTY writes as the product surface.
 5. Keep user-initiated `claude-any ... -p` pass-through working. The ban is on internal automatic background `-p` launches for channel notifications.
+
+Useful logs:
+
+- `channel_sse_mcp_rpc_response`
+- `channel_llm_direct_router_request`
+- `channel_llm_tool_call`
+- `channel_llm_tool_result_forwarded`
+- `channel_llm_summary_queued`
+- `channel_llm_summary_injected`
+- `channel_llm_direct_response`
 
 Detailed investigation notes are in `docs/no-p-channel-research.md`. The key
 finding is that Claude Code's own bridge and team-agent paths queue inbound
@@ -405,18 +415,19 @@ CLAUDE_ANY_CHANNEL_WAKE_ENTER=cr claude-any
 Check:
 
 - Router log has `channel_sse_message_received`.
-- Router log has `channel_llm_direct_cli_request` or `channel_llm_direct_request`.
-- If tools were needed, router log has `channel_llm_tool_context_stored`.
-- Router log has `channel_llm_tool_result_context_injected` after tool results.
-- Router log has `channel_llm_direct_response ... chars=N`.
+- Router log has `channel_llm_direct_router_request`.
+- If tools were needed, router log has `channel_llm_tool_call` and
+  `channel_llm_tool_result_forwarded`.
+- Router log has `channel_llm_summary_queued`.
+- On the next routed interactive request, router log has
+  `channel_llm_summary_injected`.
+- Router log has `channel_llm_direct_response ... chars=N tool_turns=N`.
 - The AI-Net room/DM contains the reply sent by the agent.
 
-If all of those are true, the agent handled the notification. The missing part
-is visibility in the interactive Claude Code UI. In 0.1.100, the direct handler
-captures a background response and writes a best-effort terminal notice; that
-is not a guaranteed transcript message. The next nightly must replace this
-with a no-`-p` route and a durable visible-summary queue injected into the
-interactive session.
+If the direct response exists but `channel_llm_summary_injected` does not, the
+agent handled the notification but the user has not yet made a routed
+interactive request where the queued summary can be shown. Terminal notices are
+diagnostic only; the durable visible path is the summary queue injection.
 
 ### Native channel message is not visible in Claude Code
 

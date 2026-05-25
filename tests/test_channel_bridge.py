@@ -575,6 +575,54 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIs(out, body)
         load_config.assert_not_called()
 
+    def test_body_with_pending_channel_summaries_injects_direct_processing_result(self):
+        original_cursor = claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+        cursor_payload = None
+        with tempfile.TemporaryDirectory() as td:
+            queue_path = Path(td) / "channel-llm-summary-queue.jsonl"
+            cursor_path = Path(td) / "channel-llm-summary-cursor.json"
+            queue_path.write_text(
+                json.dumps(
+                    {
+                        "message_id": 12,
+                        "channel": "room_4pyr8vvwm2cd",
+                        "sender": "Sarah",
+                        "stop_reason": "end_turn",
+                        "tool_turns": 1,
+                        "incoming": "Robert 리드님, 보고드립니다.",
+                        "summary": "Sarah에게 업무를 배정했고 DM 전송 결과를 확인했습니다.",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            try:
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = None
+                with (
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_QUEUE_PATH", queue_path),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_CURSOR_PATH", cursor_path),
+                    mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_DELIVERY": "llm"}),
+                    mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+                    mock.patch.object(claude_any, "router_log") as router_log,
+                ):
+                    out = claude_any.body_with_pending_channel_summaries(
+                        {"messages": [{"role": "user", "content": "continue"}]}
+                    )
+                    cursor_payload = json.loads(cursor_path.read_text(encoding="utf-8"))
+            finally:
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = original_cursor
+
+        self.assertEqual(2, len(out["messages"]))
+        injected = out["messages"][-1]["content"][0]["text"]
+        self.assertIn("channel direct handling summaries", injected)
+        self.assertIn("message_id=12", injected)
+        self.assertIn("Sarah에게 업무를 배정", injected)
+        self.assertTrue(out["metadata"]["claude_any_channel_summary_injected"])
+        self.assertEqual("12", out["metadata"]["claude_any_channel_summary_message_ids"])
+        self.assertEqual({"last_id": 12}, cursor_payload)
+        self.assertTrue(any("channel_llm_summary_injected" in str(call.args[1]) for call in router_log.call_args_list))
+
     def test_body_with_pending_channel_messages_skips_persisted_direct_pending_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
         messages = [
@@ -712,6 +760,37 @@ class ChannelBridgeTests(unittest.TestCase):
         schedule.assert_not_called()
         self.assertTrue(any("native_router_self_echo" in str(call.args[1]) for call in router_log.call_args_list))
 
+    def test_channel_sse_dispatch_stores_mcp_rpc_response_without_chat_append(self):
+        original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
+        try:
+            claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+            claude_any._CHANNEL_SSE_CONNECTIONS["mcp-ai-net-sse"] = {
+                "name": "mcp-ai-net-sse",
+                "mcp_rpc_results": {},
+            }
+            with (
+                mock.patch.object(claude_any, "_sse_payload_to_chat_payload") as parse_payload,
+                mock.patch.object(claude_any, "append_chat_message") as append,
+                mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery") as schedule,
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                claude_any._channel_sse_dispatch(
+                    "mcp-ai-net-sse",
+                    "message",
+                    [json.dumps({"jsonrpc": "2.0", "id": 123, "result": {"ok": True}})],
+                )
+                state = claude_any._CHANNEL_SSE_CONNECTIONS["mcp-ai-net-sse"]
+                stored = state["mcp_rpc_results"]["123"]
+        finally:
+            claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+            claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
+
+        self.assertEqual({"ok": True}, stored["result"])
+        parse_payload.assert_not_called()
+        append.assert_not_called()
+        schedule.assert_not_called()
+        self.assertTrue(any("channel_sse_mcp_rpc_response" in str(call.args[1]) for call in router_log.call_args_list))
+
     def test_channel_string_list_decodes_json_array_strings(self):
         self.assertEqual(["all"], claude_any._as_string_list('["all"]'))
         self.assertEqual(["Robert", "Sarah"], claude_any._as_string_list(['["Robert"]', "Sarah"]))
@@ -725,22 +804,7 @@ class ChannelBridgeTests(unittest.TestCase):
             ),
         )
 
-    def test_channel_direct_llm_worker_does_not_append_synthetic_response(self):
-        class FakeResponse:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, exc_type, exc, tb):
-                return False
-
-            def read(self, limit=-1):
-                return json.dumps(
-                    {
-                        "content": [{"type": "text", "text": "분석 완료"}],
-                        "stop_reason": "end_turn",
-                    }
-                ).encode("utf-8")
-
+    def test_channel_direct_llm_worker_uses_router_without_hidden_print_mode(self):
         message = {
             "id": 9,
             "channel": "room_4pyr8vvwm2cd",
@@ -754,8 +818,14 @@ class ChannelBridgeTests(unittest.TestCase):
                 mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
                 mock.patch.object(claude_any, "get_current_provider", return_value=("ollama-cloud", {"request_timeout_ms": 300000})),
                 mock.patch.object(claude_any, "current_alias", return_value="claude-any-ollama-cloud-test"),
-                mock.patch.object(claude_any, "find_executable", return_value=None),
-                mock.patch.object(claude_any.urllib.request, "urlopen", return_value=FakeResponse()) as urlopen,
+                mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=0),
+                mock.patch.object(claude_any, "_channel_llm_write_cursor_locked"),
+                mock.patch.object(
+                    claude_any,
+                    "_channel_direct_llm_router_response",
+                    return_value=("분석 완료", "end_turn", 1),
+                ) as router_response,
+                mock.patch.object(claude_any, "_channel_direct_append_summary") as append_summary,
                 mock.patch.object(claude_any, "append_chat_message") as append,
                 mock.patch.object(claude_any, "router_log"),
             ):
@@ -763,48 +833,60 @@ class ChannelBridgeTests(unittest.TestCase):
         finally:
             claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
 
-        req = urlopen.call_args.args[0]
-        self.assertTrue(req.full_url.endswith("/v1/messages"))
-        body = json.loads(req.data.decode("utf-8"))
-        self.assertTrue(body["metadata"]["claude_any_channel_direct"])
-        self.assertEqual("9", body["metadata"]["channel_message_id"])
-        prompt = body["messages"][0]["content"][0]["text"]
+        router_response.assert_called_once()
+        args = router_response.call_args.args
+        self.assertEqual(9, args[0])
+        prompt = args[1]
         self.assertIn("<< room_4pyr8vvwm2cd >> incoming channel message for the current agent", prompt)
         self.assertIn("새 이벤트", prompt)
+        append_summary.assert_called_once_with(message, "분석 완료", "end_turn", tool_turns=1)
         append.assert_not_called()
 
-    def test_channel_direct_llm_cli_uses_mcp_config_without_native_channels(self):
-        class FakeProcess:
-            returncode = 0
-            stdout = "처리 완료"
-            stderr = ""
+    def test_channel_direct_router_response_round_trips_mcp_tool_result_to_llm(self):
+        calls: list[dict[str, object]] = []
 
-        with tempfile.TemporaryDirectory() as tmp:
-            proxy_config = Path(tmp) / "mcp-proxy.json"
-            proxy_config.write_text('{"mcpServers":{}}', encoding="utf-8")
-            with (
-                mock.patch.object(claude_any, "find_executable", return_value="/usr/local/bin/claude"),
-                mock.patch.object(claude_any, "env_vars", return_value={"ANTHROPIC_BASE_URL": "http://127.0.0.1:8799"}),
-                mock.patch.object(claude_any, "current_alias", return_value="claude-any-deepseek-test"),
-                mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config),
-                mock.patch.object(claude_any.subprocess, "run", return_value=FakeProcess()) as run,
-                mock.patch.object(claude_any, "router_log"),
-            ):
-                out = claude_any._channel_direct_llm_cli_response(
-                    11,
-                    "수신 메시지를 처리하세요",
-                    {"providers": {"deepseek": {"request_timeout_ms": 300000}}},
-                    {"request_timeout_ms": 300000},
-                )
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) == 1:
+                return {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_direct_1",
+                            "name": "mcp__ai-net-sse__send_dm",
+                            "input": {"to_agent_id": "agent_sarah", "content": "확인했습니다."},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            return {"content": [{"type": "text", "text": "Sarah에게 회신했습니다."}], "stop_reason": "end_turn"}
 
-        self.assertEqual("처리 완료", out)
-        cmd = run.call_args.args[0]
-        self.assertIn("--dangerously-skip-permissions", cmd)
-        self.assertIn("--model", cmd)
-        self.assertIn("claude-any-deepseek-test", cmd)
-        self.assertIn("--mcp-config", cmd)
-        self.assertIn(str(proxy_config), cmd)
-        self.assertNotIn("--dangerously-load-development-channels", cmd)
+        with (
+            mock.patch.object(claude_any, "_channel_direct_tool_schemas", return_value=[{"name": "mcp__ai-net-sse__send_dm"}]),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool", return_value=("DM sent", False)) as execute_tool,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                14,
+                "수신 메시지를 처리하세요",
+                {"id": 14, "meta": {"sse_source": "mcp-ai-net-sse"}},
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("Sarah에게 회신했습니다.", text)
+        self.assertEqual("end_turn", stop_reason)
+        self.assertEqual(1, tool_turns)
+        execute_tool.assert_called_once()
+        self.assertEqual(2, len(calls))
+        second_messages = calls[1]["messages"]
+        self.assertEqual("assistant", second_messages[-2]["role"])
+        self.assertEqual("user", second_messages[-1]["role"])
+        tool_result = second_messages[-1]["content"][0]
+        self.assertEqual("tool_result", tool_result["type"])
+        self.assertEqual("toolu_direct_1", tool_result["tool_use_id"])
+        self.assertEqual("DM sent", tool_result["content"])
 
     def test_channel_direct_terminal_notice_prints_when_stdout_is_tty(self):
         class FakeStdout:

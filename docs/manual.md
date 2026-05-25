@@ -735,23 +735,28 @@ alive permanently.
 Routed, non-Claude-Native sessions use the LLM channel delivery path for
 external systems such as AI-Net. SSE/MCP notifications are stored in
 `chat-messages.jsonl`, delivered to the LLM context, and can use MCP tools when
-the response requires them. Logs to check:
+the response requires them. Automatic direct handling is router-owned and does
+not spawn a hidden Claude Code `-p` process. The direct handler calls the
+selected routed provider through `/v1/messages`, executes MCP `tools/call`
+requests over the initialized SSE connection, feeds `tool_result` blocks back
+to the same LLM conversation, then queues a visible summary for the next
+interactive routed request. Logs to check:
 
 ```text
 channel_sse_message_received
-channel_llm_direct_cli_request
-channel_llm_tool_context_stored
-channel_llm_tool_result_context_injected
+channel_sse_mcp_rpc_response
+channel_llm_direct_router_request
+channel_llm_tool_call
+channel_llm_tool_result_forwarded
+channel_llm_summary_queued
+channel_llm_summary_injected
 channel_llm_direct_response
 ```
 
-If those entries appear, the notification was processed. In 0.1.100, direct
-automatic handling can use a background Claude Code `-p` process and captures
-its output before writing a best-effort terminal notice. That notice is not an
-interactive Claude Code transcript message and may be visually hidden by the
-TUI. The next nightly line should remove this internal `-p` dependency for
-automatic channel notifications and route handled summaries through a visible
-interactive-session queue instead. User-initiated `claude-any ... -p` remains
+If those entries appear, the notification was processed. Terminal notices remain
+best-effort diagnostics; the durable transcript surface is the summary queue,
+which is injected into the next routed Claude Code request so the visible
+session can summarize what happened. User-initiated `claude-any ... -p` remains
 ordinary Claude Code pass-through usage.
 
 ## Development Story

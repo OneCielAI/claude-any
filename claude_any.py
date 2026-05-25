@@ -88,6 +88,8 @@ DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
 CHANNEL_MCP_CURSOR_PATH = CONFIG_DIR / "channel-mcp-cursor.json"
 CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
+CHANNEL_LLM_SUMMARY_QUEUE_PATH = CONFIG_DIR / "channel-llm-summary-queue.jsonl"
+CHANNEL_LLM_SUMMARY_CURSOR_PATH = CONFIG_DIR / "channel-llm-summary-cursor.json"
 CHANNEL_PROBE_CACHE_PATH = CONFIG_DIR / "channel-probe-cache.json"
 MCP_PROXY_CONFIG = CONFIG_DIR / "mcp-proxy.json"
 ROUTER_HOST = os.environ.get("CLAUDE_ANY_ROUTER_CLIENT_HOST", "127.0.0.1").strip() or "127.0.0.1"
@@ -180,12 +182,15 @@ _CHAT_CONDITION = threading.Condition()
 _CHAT_NEXT_ID: int | None = None
 _CHANNEL_SSE_LOCK = threading.Lock()
 _CHANNEL_SSE_CONNECTIONS: dict[str, dict[str, Any]] = {}
+_CHANNEL_SSE_RPC_CONDITION = threading.Condition()
 _CHANNEL_MCP_LOCK = threading.Lock()
 _CHANNEL_MCP_SESSIONS: dict[str, dict[str, Any]] = {}
 _CHANNEL_MCP_CURSOR_LOCK = threading.Lock()
 _CHANNEL_MCP_CURSOR_LAST_ID: int | None = None
 _CHANNEL_LLM_CURSOR_LOCK = threading.Lock()
 _CHANNEL_LLM_CURSOR_LAST_ID: int | None = None
+_CHANNEL_LLM_SUMMARY_LOCK = threading.Lock()
+_CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID: int | None = None
 _CHANNEL_LLM_DIRECT_LOCK = threading.Lock()
 _CHANNEL_LLM_DIRECT_INFLIGHT: set[int] = set()
 _CHANNEL_LLM_DIRECT_DELIVERED: set[int] = set()
@@ -5333,6 +5338,98 @@ def _mcp_sse_post_json(endpoint: str, headers: dict[str, str], payload: dict[str
             return data.decode("utf-8", errors="replace")
 
 
+def _channel_sse_store_rpc_response(name: str, data_text: str) -> bool:
+    try:
+        payload = json.loads((data_text or "").strip())
+    except Exception:
+        return False
+    if not isinstance(payload, dict) or payload.get("id") is None:
+        return False
+    if "result" not in payload and "error" not in payload:
+        return False
+    rpc_id = str(payload.get("id"))
+    with _CHANNEL_SSE_RPC_CONDITION:
+        with _CHANNEL_SSE_LOCK:
+            state = _CHANNEL_SSE_CONNECTIONS.get(name)
+            if not state:
+                return True
+            results = state.get("mcp_rpc_results")
+            if not isinstance(results, dict):
+                results = {}
+                state["mcp_rpc_results"] = results
+            results[rpc_id] = payload
+            if len(results) > 200:
+                for old_id in list(results)[: len(results) - 200]:
+                    results.pop(old_id, None)
+        _CHANNEL_SSE_RPC_CONDITION.notify_all()
+    router_log("INFO", f"channel_sse_mcp_rpc_response name={name} id={rpc_id}")
+    return True
+
+
+def _channel_sse_take_rpc_response(name: str, rpc_id: Any, timeout: float) -> dict[str, Any] | None:
+    key = str(rpc_id)
+    deadline = time.time() + max(0.1, timeout)
+    with _CHANNEL_SSE_RPC_CONDITION:
+        while True:
+            with _CHANNEL_SSE_LOCK:
+                state = _CHANNEL_SSE_CONNECTIONS.get(name)
+                results = state.get("mcp_rpc_results") if isinstance(state, dict) else None
+                if isinstance(results, dict) and key in results:
+                    found = results.pop(key)
+                    return found if isinstance(found, dict) else None
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            _CHANNEL_SSE_RPC_CONDITION.wait(min(remaining, 1.0))
+
+
+def _channel_sse_public_mcp_name(name: str) -> str:
+    text = str(name or "").strip()
+    return text[4:] if text.startswith("mcp-") else text
+
+
+def _channel_sse_state_name_for_mcp_server(server_name: str) -> str | None:
+    candidates = []
+    text = str(server_name or "").strip()
+    if text:
+        candidates.append(text)
+        if text.startswith("mcp-"):
+            candidates.append(text[4:])
+        else:
+            candidates.append(f"mcp-{text}")
+    with _CHANNEL_SSE_LOCK:
+        for candidate in candidates:
+            if candidate in _CHANNEL_SSE_CONNECTIONS:
+                return candidate
+        for name in _CHANNEL_SSE_CONNECTIONS:
+            if _channel_sse_public_mcp_name(name) == text:
+                return name
+    return None
+
+
+def _channel_sse_rpc_request(name: str, method: str, params: dict[str, Any] | None = None, timeout: float | None = None) -> dict[str, Any]:
+    with _CHANNEL_SSE_LOCK:
+        state = _CHANNEL_SSE_CONNECTIONS.get(name)
+        if not state:
+            raise RuntimeError(f"SSE channel {name} is not connected")
+        if not state.get("mcp_initialized"):
+            raise RuntimeError(f"SSE channel {name} is not MCP initialized")
+        endpoint = str(state.get("mcp_endpoint") or "")
+        headers = dict(state.get("headers") or {})
+        effective_timeout = float(timeout if timeout is not None else state.get("mcp_timeout_seconds") or 20.0)
+    if not endpoint:
+        raise RuntimeError(f"SSE channel {name} has no MCP endpoint")
+    request_id = int(time.time_ns() % 9_000_000_000_000_000)
+    payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
+    posted = _mcp_sse_post_json(endpoint, headers, payload, max(1.0, min(120.0, effective_timeout)))
+    if isinstance(posted, dict) and posted.get("id") == request_id and ("result" in posted or "error" in posted):
+        return posted
+    response = _channel_sse_take_rpc_response(name, request_id, max(1.0, min(120.0, effective_timeout)))
+    if response is None:
+        raise TimeoutError(f"timed out waiting for MCP SSE response id={request_id} method={method} channel={name}")
+    return response
+
+
 def _channel_sse_maybe_initialize_mcp(name: str, endpoint_text: str) -> None:
     with _CHANNEL_SSE_LOCK:
         state = _CHANNEL_SSE_CONNECTIONS.get(name)
@@ -5372,6 +5469,8 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], eve
     data_text = "\n".join(data_lines)
     if (event_name or "").strip().lower() == "endpoint":
         _channel_sse_maybe_initialize_mcp(name, data_text)
+        return
+    if _channel_sse_store_rpc_response(name, data_text):
         return
     if str(name or "").strip().lower() in _NATIVE_ROUTER_CHANNEL_NAMES:
         router_log(
@@ -5502,6 +5601,7 @@ def start_channel_sse_connection(config: dict[str, Any]) -> dict[str, Any]:
             "mcp_endpoint": None,
             "mcp_initialized": False,
             "mcp_last_error": None,
+            "mcp_rpc_results": {},
             "mcp_protocol_version": str(config.get("mcp_protocol_version") or "2024-11-05"),
             "mcp_timeout_seconds": float(config.get("mcp_timeout_seconds") or 20.0),
         }
@@ -9480,6 +9580,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
         body = body_with_pending_channel_messages(body)
+        body = body_with_pending_channel_summaries(body)
         body = body_with_channel_tool_result_context(body)
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
         try:
@@ -16567,6 +16668,8 @@ def _channel_tool_result_contexts_for_body(body: dict[str, Any]) -> list[tuple[s
 
 def body_with_channel_tool_result_context(body: dict[str, Any]) -> dict[str, Any]:
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    if body.get("claude_any_channel_direct") or metadata.get("claude_any_channel_direct"):
+        return body
     if metadata.get("claude_any_channel_tool_result_followup"):
         return body
     contexts = _channel_tool_result_contexts_for_body(body)
@@ -16662,46 +16765,185 @@ def schedule_channel_direct_llm_delivery(message: dict[str, Any]) -> bool:
     return True
 
 
-def _channel_direct_llm_cli_response(message_id: int, prompt: str, cfg: dict[str, Any], pcfg: dict[str, Any]) -> str | None:
-    claude = find_executable("claude")
-    if not claude:
-        return None
-    env = os.environ.copy()
-    env["PATH"] = str(HOME / ".local" / "bin") + os.pathsep + env.get("PATH", "")
-    env.update(env_vars(cfg))
-    env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
-    mcp_config = MCP_PROXY_CONFIG if MCP_PROXY_CONFIG.exists() else None
-    if mcp_config is None:
-        try:
-            mcp_config = write_mcp_proxy_config([], extra_config_paths=[write_channel_mcp_config()])
-        except Exception as exc:
-            router_log("WARN", f"channel_llm_direct_cli_mcp_config_failed message_id={message_id} error={type(exc).__name__}: {exc}")
-            mcp_config = None
-    cmd = [claude, "--dangerously-skip-permissions"]
-    model = current_alias(cfg)
-    if model:
-        cmd.extend(["--model", model])
-    if mcp_config:
-        cmd.extend(["--mcp-config", str(mcp_config)])
-    cmd.extend(["-p", prompt])
-    timeout = max(30.0, min(provider_request_timeout_seconds(pcfg), 300.0))
-    router_log("INFO", f"channel_llm_direct_cli_request message_id={message_id} argv_len={len(cmd)}")
-    proc = subprocess.run(
-        cmd,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        timeout=timeout,
-    )
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip()
-        router_log(
-            "WARN",
-            f"channel_llm_direct_cli_failed message_id={message_id} rc={proc.returncode} error={truncate_for_prompt(err, 500)}",
+def _channel_direct_source_state_name(message: dict[str, Any]) -> str | None:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    source = str(meta.get("sse_source") or meta.get("source") or "").strip()
+    if source:
+        found = _channel_sse_state_name_for_mcp_server(source)
+        if found:
+            return found
+    with _CHANNEL_SSE_LOCK:
+        for name, state in _CHANNEL_SSE_CONNECTIONS.items():
+            if str(name).strip().lower() in _NATIVE_ROUTER_CHANNEL_NAMES:
+                continue
+            if state.get("mcp_initialized"):
+                return name
+    return None
+
+
+def _channel_direct_tool_schemas(message: dict[str, Any]) -> list[dict[str, Any]]:
+    state_name = _channel_direct_source_state_name(message)
+    if not state_name:
+        return []
+    public_server = _channel_sse_public_mcp_name(state_name)
+    try:
+        response = _channel_sse_rpc_request(state_name, "tools/list", {}, timeout=20.0)
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_tools_list_failed server={state_name} error={type(exc).__name__}: {exc}")
+        return []
+    if response.get("error"):
+        router_log("WARN", f"channel_llm_tools_list_failed server={state_name} error={truncate_for_prompt(json.dumps(response.get('error'), ensure_ascii=False), 500)}")
+        return []
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    tools = result.get("tools") if isinstance(result.get("tools"), list) else []
+    converted: list[dict[str, Any]] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        raw_name = str(tool.get("name") or "").strip()
+        if not raw_name:
+            continue
+        schema = tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else None
+        if schema is None:
+            schema = tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else None
+        if schema is None:
+            schema = {"type": "object", "properties": {}}
+        converted.append(
+            {
+                "name": f"mcp__{public_server}__{raw_name}",
+                "description": str(tool.get("description") or f"MCP tool {raw_name} on {public_server}"),
+                "input_schema": schema,
+            }
         )
+    router_log("INFO", f"channel_llm_tools_list server={state_name} count={len(converted)}")
+    return converted
+
+
+def _channel_direct_tool_name_parts(name: str) -> tuple[str, str] | None:
+    text = str(name or "").strip()
+    if not text.startswith("mcp__"):
         return None
-    return (proc.stdout or "").strip()
+    rest = text[len("mcp__"):]
+    if "__" not in rest:
+        return None
+    server_name, tool_name = rest.split("__", 1)
+    server_name = server_name.strip()
+    tool_name = tool_name.strip()
+    if not server_name or not tool_name:
+        return None
+    return server_name, tool_name
+
+
+def _channel_direct_mcp_result_text(response: dict[str, Any]) -> tuple[str, bool]:
+    if response.get("error"):
+        return json.dumps(response.get("error"), ensure_ascii=False, indent=2), True
+    result = response.get("result") if isinstance(response.get("result"), dict) else {}
+    is_error = bool(result.get("isError") or result.get("is_error"))
+    content = result.get("content")
+    parts: list[str] = []
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                parts.append(str(block))
+                continue
+            if block.get("type") == "text":
+                parts.append(str(block.get("text") or ""))
+            else:
+                parts.append(json.dumps(block, ensure_ascii=False))
+    elif content is not None:
+        parts.append(anthropic_content_to_text(content))
+    if not parts:
+        parts.append(json.dumps(result, ensure_ascii=False, indent=2))
+    return "\n".join(part for part in parts if part).strip(), is_error
+
+
+def _channel_direct_execute_tool(tool_use: dict[str, Any]) -> tuple[str, bool]:
+    tool_id = str(tool_use.get("id") or "")
+    name = str(tool_use.get("name") or "")
+    parts = _channel_direct_tool_name_parts(name)
+    if parts is None:
+        return f"Unsupported automatic channel tool: {name}", True
+    server_name, tool_name = parts
+    state_name = _channel_sse_state_name_for_mcp_server(server_name)
+    if not state_name:
+        return f"MCP SSE server for tool {name} is not connected", True
+    arguments = tool_use.get("input") if isinstance(tool_use.get("input"), dict) else {}
+    router_log("INFO", f"channel_llm_tool_call tool_use_id={tool_id} server={state_name} tool={tool_name}")
+    try:
+        response = _channel_sse_rpc_request(
+            state_name,
+            "tools/call",
+            {"name": tool_name, "arguments": arguments},
+            timeout=120.0,
+        )
+        text, is_error = _channel_direct_mcp_result_text(response)
+        router_log(
+            "INFO",
+            f"channel_llm_tool_result_forwarded tool_use_id={tool_id} server={state_name} tool={tool_name} chars={len(text)} is_error={is_error}",
+        )
+        return text or "(empty MCP tool result)", is_error
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_tool_call_failed tool_use_id={tool_id} server={state_name} tool={tool_name} error={type(exc).__name__}: {exc}")
+        return f"{type(exc).__name__}: {exc}", True
+
+
+def _channel_direct_tool_uses(message: dict[str, Any]) -> list[dict[str, Any]]:
+    found: list[dict[str, Any]] = []
+    for block in message.get("content") or []:
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            found.append(block)
+    return found
+
+
+def _channel_direct_append_summary(message: dict[str, Any], text: str, stop_reason: str, tool_turns: int = 0) -> None:
+    try:
+        message_id = int(message.get("id") or 0)
+    except Exception:
+        message_id = 0
+    if message_id <= 0:
+        return
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    record = {
+        "message_id": message_id,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "channel": message.get("channel") or meta.get("room_id") or "default",
+        "source": meta.get("sse_source") or meta.get("source") or "",
+        "sender_id": message.get("sender_id") or meta.get("sender_id") or "",
+        "stop_reason": stop_reason,
+        "tool_turns": tool_turns,
+        "incoming": truncate_for_prompt(str(message.get("message") or ""), 4000),
+        "summary": truncate_for_prompt(text.strip(), 12000),
+    }
+    try:
+        CHANNEL_LLM_SUMMARY_QUEUE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        with _CHANNEL_LLM_SUMMARY_LOCK:
+            with CHANNEL_LLM_SUMMARY_QUEUE_PATH.open("a", encoding="utf-8") as fh:
+                fh.write(line)
+        router_log("INFO", f"channel_llm_summary_queued message_id={message_id} chars={len(record['summary'])} stop_reason={stop_reason}")
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_summary_queue_failed message_id={message_id} error={type(exc).__name__}: {exc}")
+
+
+def _channel_direct_llm_http_message(message_id: int, body: dict[str, Any], provider: str, pcfg: dict[str, Any], model: str) -> dict[str, Any]:
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "x-claude-any-channel-direct": "1",
+    }
+    timeout = max(30.0, min(provider_request_timeout_seconds(pcfg), 300.0))
+    router_log(
+        "INFO",
+        f"channel_llm_direct_router_request message_id={message_id} provider={provider} model={model} bytes={len(data)}",
+    )
+    req = urllib.request.Request(join_url(ROUTER_BASE, "/v1/messages"), data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(2_000_000).decode("utf-8", errors="replace")
+    parsed = json.loads(raw)
+    if not isinstance(parsed, dict):
+        raise RuntimeError("direct router response was not a JSON object")
+    return parsed
 
 
 def _channel_direct_llm_http_response(message_id: int, prompt: str, provider: str, pcfg: dict[str, Any], model: str) -> tuple[str, str]:
@@ -16715,24 +16957,54 @@ def _channel_direct_llm_http_response(message_id: int, prompt: str, provider: st
         },
         "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
     }
-    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    headers = {
-        "content-type": "application/json",
-        "anthropic-version": "2023-06-01",
-        "x-claude-any-channel-direct": "1",
-    }
-    timeout = max(30.0, min(provider_request_timeout_seconds(pcfg), 300.0))
-    router_log(
-        "INFO",
-        f"channel_llm_direct_request message_id={message_id} provider={provider} model={model} bytes={len(data)}",
-    )
-    req = urllib.request.Request(join_url(ROUTER_BASE, "/v1/messages"), data=data, headers=headers, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read(2_000_000).decode("utf-8", errors="replace")
-    parsed = json.loads(raw)
+    parsed = _channel_direct_llm_http_message(message_id, body, provider, pcfg, model)
     text = _anthropic_message_text(parsed) if isinstance(parsed, dict) else ""
     stop_reason = str(parsed.get("stop_reason") if isinstance(parsed, dict) else "")
     return text, stop_reason
+
+
+def _channel_direct_llm_router_response(message_id: int, prompt: str, message: dict[str, Any], provider: str, pcfg: dict[str, Any], model: str) -> tuple[str, str, int]:
+    tools = _channel_direct_tool_schemas(message)
+    messages: list[dict[str, Any]] = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    last_text = ""
+    stop_reason = ""
+    tool_turns = 0
+    for _turn in range(6):
+        body: dict[str, Any] = {
+            "model": model,
+            "max_tokens": 768,
+            "stream": False,
+            "metadata": {
+                "claude_any_channel_direct": True,
+                "channel_message_id": str(message_id),
+            },
+            "messages": messages,
+        }
+        if tools:
+            body["tools"] = tools
+        parsed = _channel_direct_llm_http_message(message_id, body, provider, pcfg, model)
+        stop_reason = str(parsed.get("stop_reason") or "")
+        text = _anthropic_message_text(parsed)
+        if text.strip():
+            last_text = text
+        tool_uses = _channel_direct_tool_uses(parsed)
+        messages.append({"role": "assistant", "content": parsed.get("content") or []})
+        if not tool_uses:
+            return last_text, stop_reason or "end_turn", tool_turns
+        tool_turns += 1
+        results: list[dict[str, Any]] = []
+        for tool_use in tool_uses:
+            result_text, is_error = _channel_direct_execute_tool(tool_use)
+            results.append(
+                {
+                    "type": "tool_result",
+                    "tool_use_id": str(tool_use.get("id") or ""),
+                    "content": result_text,
+                    "is_error": is_error,
+                }
+            )
+        messages.append({"role": "user", "content": results})
+    return last_text, "max_tool_turns", tool_turns
 
 
 def _channel_direct_terminal_notice(message: dict[str, Any], text: str, stop_reason: str) -> None:
@@ -16770,10 +17042,7 @@ def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
         provider, pcfg = get_current_provider(cfg)
         model = current_alias(cfg)
         prompt = format_channel_llm_batch_prompt([message])
-        text = _channel_direct_llm_cli_response(message_id, prompt, cfg, pcfg)
-        stop_reason = "cli"
-        if text is None:
-            text, stop_reason = _channel_direct_llm_http_response(message_id, prompt, provider, pcfg, model)
+        text, stop_reason, tool_turns = _channel_direct_llm_router_response(message_id, prompt, message, provider, pcfg, model)
         with _CHANNEL_LLM_DIRECT_LOCK:
             _CHANNEL_LLM_DIRECT_DELIVERED.add(message_id)
             if len(_CHANNEL_LLM_DIRECT_DELIVERED) > 1000:
@@ -16784,7 +17053,8 @@ def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
             if message_id > current:
                 _CHANNEL_LLM_CURSOR_LAST_ID = message_id
                 _channel_llm_write_cursor_locked(message_id)
-        router_log("INFO", f"channel_llm_direct_response message_id={message_id} chars={len(text)} stop_reason={stop_reason}")
+        _channel_direct_append_summary(message, text, stop_reason, tool_turns=tool_turns)
+        router_log("INFO", f"channel_llm_direct_response message_id={message_id} chars={len(text)} stop_reason={stop_reason} tool_turns={tool_turns}")
         _channel_direct_terminal_notice(message, text, stop_reason)
     except Exception as exc:
         router_log("WARN", f"channel_llm_direct_failed message_id={message_id} error={type(exc).__name__}: {exc}")
@@ -16833,6 +17103,119 @@ def reset_channel_llm_delivery_cursor(last_id: int | None = None) -> int:
 def ensure_channel_llm_delivery_cursor_initialized() -> int:
     with _CHANNEL_LLM_CURSOR_LOCK:
         return _channel_llm_read_cursor_locked()
+
+
+def _channel_llm_summary_write_cursor_locked(last_id: int) -> None:
+    CHANNEL_LLM_SUMMARY_CURSOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = CHANNEL_LLM_SUMMARY_CURSOR_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps({"last_id": max(0, int(last_id))}, separators=(",", ":")) + "\n", encoding="utf-8")
+    tmp_path.replace(CHANNEL_LLM_SUMMARY_CURSOR_PATH)
+
+
+def _channel_llm_summary_read_cursor_locked() -> int:
+    global _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+    if _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID is not None:
+        return _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+    if CHANNEL_LLM_SUMMARY_CURSOR_PATH.exists():
+        try:
+            data = json.loads(CHANNEL_LLM_SUMMARY_CURSOR_PATH.read_text(encoding="utf-8"))
+            _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = max(0, int(data.get("last_id") or 0))
+            return _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_summary_cursor_read_failed error={type(exc).__name__}: {exc}")
+    _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = 0
+    return 0
+
+
+def _read_channel_llm_summary_records(after_id: int, limit: int = 20) -> list[dict[str, Any]]:
+    if not CHANNEL_LLM_SUMMARY_QUEUE_PATH.exists():
+        return []
+    records: list[dict[str, Any]] = []
+    try:
+        with CHANNEL_LLM_SUMMARY_QUEUE_PATH.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                if len(records) >= limit:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    message_id = int(item.get("message_id") or 0)
+                except Exception:
+                    message_id = 0
+                if message_id > after_id:
+                    records.append(item)
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_summary_queue_read_failed error={type(exc).__name__}: {exc}")
+    return records
+
+
+def format_channel_llm_summary_prompt(records: list[dict[str, Any]]) -> str:
+    parts = [
+        "[claude-any channel direct handling summaries]",
+        "아래 항목은 claude-any가 외부 채널/AI-Net 메시지를 백그라운드에서 자동 처리한 결과입니다.",
+        "사용자가 화면에서 알 수 있도록 각 항목의 수신 메시지, 수행한 tool/action, 최종 응답 또는 남은 조치를 간단히 요약하세요.",
+    ]
+    for item in records:
+        parts.append(
+            "\n".join(
+                [
+                    f"message_id={item.get('message_id')}",
+                    f"channel={item.get('channel') or 'default'}",
+                    f"source={item.get('source') or ''}",
+                    f"sender={item.get('sender_id') or ''}",
+                    f"stop_reason={item.get('stop_reason') or ''}",
+                    f"tool_turns={item.get('tool_turns') or 0}",
+                    f"incoming={json.dumps(str(item.get('incoming') or ''), ensure_ascii=False)}",
+                    f"direct_handler_summary:\n{item.get('summary') or '(empty)'}",
+                ]
+            )
+        )
+    return "\n\n".join(parts)
+
+
+def body_with_pending_channel_summaries(body: dict[str, Any]) -> dict[str, Any]:
+    global _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    if body.get("claude_any_channel_direct") or metadata.get("claude_any_channel_direct"):
+        return body
+    if metadata.get("claude_any_channel_summary_injected"):
+        return body
+    cfg = load_config()
+    if channel_delivery_mode(cfg) != "llm":
+        return body
+    with _CHANNEL_LLM_SUMMARY_LOCK:
+        last_id = _channel_llm_summary_read_cursor_locked()
+        records = _read_channel_llm_summary_records(last_id, 20)
+        if not records:
+            return body
+        max_seen = last_id
+        for item in records:
+            try:
+                max_seen = max(max_seen, int(item.get("message_id") or 0))
+            except Exception:
+                pass
+        _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = max_seen
+        try:
+            _channel_llm_summary_write_cursor_locked(max_seen)
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
+    out = dict(body)
+    messages = [m for m in body.get("messages", []) if isinstance(m, dict)]
+    messages.append({"role": "user", "content": [{"type": "text", "text": format_channel_llm_summary_prompt(records)}]})
+    out["messages"] = messages
+    out_metadata = dict(metadata)
+    out_metadata["claude_any_channel_summary_injected"] = True
+    out_metadata["claude_any_channel_summary_message_ids"] = ",".join(str(item.get("message_id") or "") for item in records)
+    out["metadata"] = out_metadata
+    router_log("INFO", f"channel_llm_summary_injected count={len(records)} message_ids={out_metadata['claude_any_channel_summary_message_ids']}")
+    return out
 
 
 def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:

@@ -29,7 +29,7 @@
 
 1. **DeepSeek.com provider path** — DeepSeek's Anthropic-compatible Claude Code endpoint is available as a first-class provider with model presets and API-key launch checks.
 2. **Safer shared-host router lifecycle** — routed sessions now use a stable per-user router port by default and stale same-user routers are cleaned up before launch, avoiding cross-user session bleed on shared machines.
-3. **AI-Net channel processing hardening** — SSE channel messages can be processed through the LLM delivery path with MCP tool-result follow-up context, plus diagnostics for direct handling, cursors, and terminal notices.
+3. **AI-Net channel processing hardening** — SSE channel messages can be processed through the router-owned LLM delivery path with MCP `tool_result` round trips and queued visible summaries, without spawning a hidden Claude Code `-p` process for automatic handling.
 
 ### 2026-05-18
 
@@ -544,10 +544,11 @@ steps under that larger model's supervision.
 - **Channel delivery simplification**: non-native routed sessions use the LLM
   channel path instead of asking users to pick between native/SSE/stdio channel
   modes in the launch menu.
-- **AI-Net/SSE direct handling diagnostics**: channel notifications trigger
-  immediate LLM handling, preserve tool-result follow-up context, track direct
-  delivery cursors, and emit best-effort terminal notices for handled channel
-  messages.
+- **AI-Net/SSE direct handling without hidden `-p`**: channel notifications
+  trigger immediate router-owned LLM handling, execute MCP tools over the
+  initialized SSE connection, feed `tool_result` blocks back to the same LLM
+  conversation, queue visible summaries for the next routed request, and keep
+  best-effort terminal notices as diagnostics.
 
 ### 0.1.71
 

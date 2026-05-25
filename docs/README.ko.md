@@ -29,7 +29,7 @@
 
 1. **DeepSeek.com 프로바이더 지원** — DeepSeek의 Anthropic 호환 Claude Code 엔드포인트를 정식 프로바이더로 선택할 수 있고, 모델 프리셋과 API 키 설정 흐름을 제공합니다.
 2. **공유 서버에서 더 안전한 라우터 수명주기** — 라우터가 기본적으로 사용자별 안정 포트를 사용하고, 같은 사용자의 stale router를 실행 전에 정리해 Robert/Sarah 같은 다중 세션이 서로 섞이는 문제를 줄였습니다.
-3. **AI-Net 채널 처리 보강** — SSE 채널 메시지를 LLM 전달 경로에서 즉시 처리하고, MCP tool_result 후속 컨텍스트와 direct 처리 로그/터미널 notice 진단을 남깁니다.
+3. **AI-Net 채널 처리 보강** — SSE 채널 메시지를 라우터 소유 LLM 경로에서 즉시 처리하고, MCP `tool_result`를 같은 LLM 대화로 되돌리며, 자동 처리에는 숨은 Claude Code `-p` 프로세스를 띄우지 않습니다.
 
 ### 2026-05-18
 
