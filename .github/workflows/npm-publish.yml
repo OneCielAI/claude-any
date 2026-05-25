@@ -80,14 +80,15 @@ jobs:
           pkg="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
           tag="${{ steps.channel.outputs.tag }}"
+          max_attempts=30
           echo "Verifying ${pkg}@${version} tarball..."
-          for attempt in {1..12}; do
+          for attempt in $(seq 1 "${max_attempts}"); do
             if npm pack "${pkg}@${version}" --dry-run >/tmp/npm-pack-verify.log 2>&1; then
               cat /tmp/npm-pack-verify.log
               exit 0
             fi
             cat /tmp/npm-pack-verify.log
-            echo "Tarball is not available yet; retry ${attempt}/12..."
+            echo "Tarball is not available yet; retry ${attempt}/${max_attempts}..."
             sleep 10
           done
           if [[ "${tag}" == "nightly" ]]; then
