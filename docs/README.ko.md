@@ -25,6 +25,12 @@
 
 ## 오늘 추가된 최고의 3가지 베네핏
 
+### 2026-05-25
+
+1. **DeepSeek.com 프로바이더 지원** — DeepSeek의 Anthropic 호환 Claude Code 엔드포인트를 정식 프로바이더로 선택할 수 있고, 모델 프리셋과 API 키 설정 흐름을 제공합니다.
+2. **공유 서버에서 더 안전한 라우터 수명주기** — 라우터가 기본적으로 사용자별 안정 포트를 사용하고, 같은 사용자의 stale router를 실행 전에 정리해 Robert/Sarah 같은 다중 세션이 서로 섞이는 문제를 줄였습니다.
+3. **AI-Net 채널 처리 보강** — SSE 채널 메시지를 LLM 전달 경로에서 즉시 처리하고, MCP tool_result 후속 컨텍스트와 direct 처리 로그/터미널 notice 진단을 남깁니다.
+
 ### 2026-05-18
 
 1. **외부 에이전트용 실시간 채널 브리지** — Claude Any가 `/ca/channel/*` 엔드포인트와 SSE connector를 제공해 AI-Net 같은 시스템의 실시간 에이전트 메시지를 Claude Code 세션으로 밀어 넣을 수 있습니다.
@@ -61,13 +67,13 @@ Ollama Cloud (glm-5.1) 를 SSE 단어경계 청킹 활성화 상태에서 claude
 
 ---
 
-Claude Any는 Claude Code 실행 전에 Anthropic, Ollama, Ollama Cloud, vLLM,
-NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의 일반 인자는 그대로
-전달하는 프로바이더 선택 런처입니다.
+Claude Any는 Claude Code 실행 전에 Anthropic, Ollama, Ollama Cloud,
+DeepSeek.com, vLLM, NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의
+일반 인자는 그대로 전달하는 프로바이더 선택 런처입니다.
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.71`
+현재 버전: `0.1.100`
 
 ## 왜 만들었나
 

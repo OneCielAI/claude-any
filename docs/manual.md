@@ -10,7 +10,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.74`
+Current version: `0.1.100`
 
 ## Install
 
@@ -85,14 +85,14 @@ Two channels exist:
   `package.json` verbatim. This is what `npm install -g @oneciel-ai/claude-any`
   pulls.
 - `nightly` → published with npm dist-tag `nightly`. The workflow appends
-  `-nightly.YYYYMMDD-HHmm` (UTC) to the `package.json` version inside the
-  CI runner only — no commit is made. Each push produces a unique version.
-  Users opt in with `npm install -g @oneciel-ai/claude-any@nightly`.
+  `-nightly.YYYYMMDD-HHmmss.SHORTSHA` (UTC) to the `package.json` version
+  inside the CI runner only — no commit is made. Each push produces a unique
+  version. Users opt in with `npm install -g @oneciel-ai/claude-any@nightly`.
 
 Nightly flow (ongoing work):
 
 1. Commit to `nightly`. CI runs lint + tests and `Publish to npm`
-   emits a fresh `X.Y.Z-nightly.YYYYMMDD-HHmm` artifact.
+   emits a fresh `X.Y.Z-nightly.YYYYMMDD-HHmmss.SHORTSHA` artifact.
 2. Push `nightly` with `git push origin nightly`; this is the publish
    trigger.
 3. Real users on `latest` are unaffected; only those who explicitly
@@ -132,7 +132,7 @@ The menu appears before Claude Code starts. Use arrow keys to move and Enter to
 edit or select:
 
 - Language: English, Korean, Japanese, Chinese.
-- Provider: Anthropic, Ollama, Ollama Cloud, LM Studio, vLLM, NVIDIA hosted, self-hosted NIM.
+- Provider: Anthropic, Ollama, Ollama Cloud, DeepSeek.com, LM Studio, vLLM, NVIDIA hosted, self-hosted NIM.
 - API key: enter only when the selected provider needs one.
 - Base URL: provider-aware default or custom endpoint.
 - Model: provider model picker when available, custom input otherwise.
@@ -210,6 +210,35 @@ Links:
 - Ollama Cloud: https://ollama.com/cloud
 - Ollama API keys: https://ollama.com/settings/keys
 - Ollama sign in: https://ollama.com/signin
+
+### DeepSeek.com
+
+DeepSeek.com is available as a routed provider through DeepSeek's
+Anthropic-compatible Claude Code endpoint:
+
+```text
+https://api.deepseek.com/anthropic
+```
+
+Choose `DeepSeek.com` in the provider menu, or configure it headlessly:
+
+```sh
+claude-any --ca-provider deepseek --ca-model deepseek-v4-pro
+```
+
+DeepSeek requires a DeepSeek API key. If launch is blocked because no key is
+configured, Claude Any opens the API-key setup path so you can enter or select
+the environment variable without restarting the launcher.
+
+The DeepSeek provider is intentionally routed through Claude Any, which sets
+the Anthropic-compatible base URL and model alias for Claude Code. Avoid
+setting both `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` manually in your
+shell; let Claude Any prepare the auth environment for the selected provider.
+
+Links:
+
+- DeepSeek Claude Code integration: https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code
+- DeepSeek API keys: https://platform.deepseek.com/api_keys
 
 ### vLLM
 
@@ -615,6 +644,11 @@ it back as `after=N` to receive only new messages.
 
 Headless examples:
 
+Use the router base printed by `claude-any status` or the launch log. On POSIX
+systems the default is per-user (`8799 + uid % 1000`) unless
+`CLAUDE_ANY_ROUTER_PORT` is set. The examples below use `8799` only as a
+placeholder.
+
 ```sh
 # Send a direct message.
 curl -s http://127.0.0.1:8799/ca/chat/messages \
@@ -686,12 +720,39 @@ alive permanently.
 - `claude-any stop` stops managed Claude Any router processes.
 - When launching Claude Code, Claude Any starts only the services required by
   the selected provider.
-- Ollama and Ollama Cloud router mode use the Claude Any router on
-  `127.0.0.1:8799`.
-- NVIDIA hosted router mode uses the Claude Any router on `127.0.0.1:8799`;
-  hosted API Catalog models do not require a separate NVIDIA proxy.
+- Routed providers use the Claude Any router on a stable per-user local port.
+  `CLAUDE_ANY_ROUTER_PORT` wins when set; otherwise POSIX systems default to
+  `8799 + (uid % 1000)`. This avoids cross-user router reuse on shared hosts.
+- Ollama Cloud, DeepSeek.com, NVIDIA hosted, and other router-backed providers
+  use that local router. Hosted API Catalog models do not require a separate
+  NVIDIA proxy.
 - For clean provider-switch testing, run `claude-any stop`, select the provider,
-  then launch or test. This avoids stale router port ownership from old sessions.
+  then launch or test. Current launches also try to clear stale same-user router
+  processes before spawning.
+
+## External Channel Delivery
+
+Routed, non-Claude-Native sessions use the LLM channel delivery path for
+external systems such as AI-Net. SSE/MCP notifications are stored in
+`chat-messages.jsonl`, delivered to the LLM context, and can use MCP tools when
+the response requires them. Logs to check:
+
+```text
+channel_sse_message_received
+channel_llm_direct_cli_request
+channel_llm_tool_context_stored
+channel_llm_tool_result_context_injected
+channel_llm_direct_response
+```
+
+If those entries appear, the notification was processed. In 0.1.100, direct
+automatic handling can use a background Claude Code `-p` process and captures
+its output before writing a best-effort terminal notice. That notice is not an
+interactive Claude Code transcript message and may be visually hidden by the
+TUI. The next nightly line should remove this internal `-p` dependency for
+automatic channel notifications and route handled summaries through a visible
+interactive-session queue instead. User-initiated `claude-any ... -p` remains
+ordinary Claude Code pass-through usage.
 
 ## Development Story
 

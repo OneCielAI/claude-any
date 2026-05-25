@@ -25,6 +25,12 @@
 
 ## Today's Top 3 Benefits
 
+### 2026-05-25
+
+1. **DeepSeek.com provider path** — DeepSeek's Anthropic-compatible Claude Code endpoint is available as a first-class provider with model presets and API-key launch checks.
+2. **Safer shared-host router lifecycle** — routed sessions now use a stable per-user router port by default and stale same-user routers are cleaned up before launch, avoiding cross-user session bleed on shared machines.
+3. **AI-Net channel processing hardening** — SSE channel messages can be processed through the LLM delivery path with MCP tool-result follow-up context, plus diagnostics for direct handling, cursors, and terminal notices.
+
 ### 2026-05-18
 
 1. **Realtime channel bridge for external agents** — Claude Any now exposes `/ca/channel/*` endpoints and an SSE connector so systems like AI-Net can push live agent messages into Claude Code sessions.
@@ -62,13 +68,13 @@ Ollama Cloud (glm-5.1) streamed through the claude-any router with SSE word-boun
 ---
 
 Claude Any is a provider selector and compatibility launcher for Claude Code.
-It lets you choose Anthropic, Ollama, Ollama Cloud, LM Studio, vLLM, NVIDIA hosted models,
-or self-hosted NIM before Claude Code starts, then passes normal Claude Code
-arguments through unchanged.
+It lets you choose Anthropic, Ollama, Ollama Cloud, DeepSeek.com, LM Studio,
+vLLM, NVIDIA hosted models, or self-hosted NIM before Claude Code starts, then
+passes normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.74`
+Current version: `0.1.100`
 
 ## Why This Exists
 
@@ -132,7 +138,7 @@ To go back to stable:
 npm install -g @oneciel-ai/claude-any@latest
 ```
 
-Nightly version numbers follow `X.Y.Z-nightly.YYYYMMDD-HHmm` (UTC).
+Nightly version numbers follow `X.Y.Z-nightly.YYYYMMDD-HHmmss.SHORTSHA` (UTC).
 Maintainers publish nightlies by pushing to the `nightly` branch; GitHub
 Actions handles npm publishing with the repository `NPM_TOKEN`. Do not run
 `npm publish` from a local checkout.
@@ -384,7 +390,8 @@ when the branch-push workflow publishes successfully.
 Release flow:
 
 1. Nightly work: commit to `nightly` and run `git push origin nightly`.
-2. Stable release: merge `nightly` to `main` and run `git push origin main`.
+2. Stable release: bump `package.json` and `claude_any.py` to the target stable
+   version when needed, merge `nightly` to `main`, and run `git push origin main`.
 3. Verify the `Publish to npm` workflow succeeded.
 4. For stable releases, create the matching GitHub Release after npm publish.
 
@@ -518,6 +525,29 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.100
+
+- **DeepSeek.com provider**: added a first-class `deepseek` provider for
+  `https://api.deepseek.com/anthropic`, including aliases, defaults, model
+  presets, and launch-time API-key guidance.
+- **No API-key menu dead end**: when a provider launch is blocked by a missing
+  key, the launcher opens the API-key menu path instead of forcing the user to
+  restart navigation manually.
+- **Nightly publish reliability**: nightly versions now include seconds and
+  the short commit SHA so repeated same-minute pushes produce installable npm
+  artifacts.
+- **Router cleanup and shared-host isolation**: claude-any clears stale
+  same-user router processes before spawning, uses `/proc`/port fallbacks on
+  Linux, and defaults routed providers to a stable per-user port instead of a
+  single global `8799`.
+- **Channel delivery simplification**: non-native routed sessions use the LLM
+  channel path instead of asking users to pick between native/SSE/stdio channel
+  modes in the launch menu.
+- **AI-Net/SSE direct handling diagnostics**: channel notifications trigger
+  immediate LLM handling, preserve tool-result follow-up context, track direct
+  delivery cursors, and emit best-effort terminal notices for handled channel
+  messages.
 
 ### 0.1.71
 
@@ -940,6 +970,7 @@ steps under that larger model's supervision.
 | Anthropic | Native Claude Code | Uses Claude login or Anthropic API key. |
 | Ollama | Native when available, router otherwise | Local Ollama normally needs no API key. Cloud models through local Ollama require `ollama signin` on the Ollama host. |
 | Ollama Cloud | Router | Calls `https://ollama.com/api`; requires an Ollama API key. |
+| DeepSeek.com | Router | Calls `https://api.deepseek.com/anthropic`; requires a DeepSeek API key. |
 | vLLM | Native Anthropic-compatible endpoint | Use a vLLM endpoint that exposes Anthropic-compatible `/v1/messages`; match `--tool-call-parser` to the model family. |
 | NVIDIA hosted | Router | Uses the NVIDIA hosted API Catalog through the Claude Any local router. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | Use the self-hosted NIM Anthropic-compatible endpoint. |
@@ -953,12 +984,27 @@ normal lifecycle is:
   `claude-any stop`.
 - When `claude-any` starts Claude Code, it starts only the services required by
   the selected provider.
-- Ollama and Ollama Cloud router mode use the Claude Any router on
-  `127.0.0.1:8799`.
-- NVIDIA hosted router mode uses the Claude Any router on `127.0.0.1:8799`;
-  hosted API Catalog models do not require a separate NVIDIA proxy.
+- Routed providers use the Claude Any router on a stable per-user local port.
+  `CLAUDE_ANY_ROUTER_PORT` wins when set; otherwise POSIX systems default to
+  `8799 + (uid % 1000)`. This prevents users on the same host from accidentally
+  sharing one stale router.
+- Ollama Cloud, DeepSeek.com, NVIDIA hosted, and other router-backed providers
+  use that local router; hosted API Catalog models do not require a separate
+  NVIDIA proxy.
 - Run `claude-any stop` before a fresh provider-switch test if an old router is
-  still bound to the local port.
+  still bound to the local port. Current launches also try to clear stale
+  same-user router processes automatically.
+
+### Channel Automation Note
+
+Routed, non-Claude-Native sessions deliver external channel messages through
+the LLM channel path. The 0.1.100 implementation can process AI-Net/SSE
+notifications automatically and can call MCP tools while doing so. Direct
+channel handling currently surfaces summaries through best-effort terminal
+notices and follow-up context; a future nightly must avoid spawning an internal
+`claude -p` process for automatic channel handling so background notifications
+do not create a separate Claude Code billing path. User-initiated `-p`
+commands remain ordinary Claude Code pass-through arguments.
 
 This keeps Claude Code pointed at one stable Claude Any entry point while still
 letting provider-specific helpers start on demand.

@@ -1,10 +1,10 @@
 # claude-any handoff
 
-Date: 2026-05-22
-Stable release: `@oneciel-ai/claude-any@0.1.99`
-Nightly release: `@oneciel-ai/claude-any@0.1.99-nightly.20260522-2101`
+Date: 2026-05-25
+Stable release being promoted: `@oneciel-ai/claude-any@0.1.100`
+Latest tested nightly: `@oneciel-ai/claude-any@0.1.100-nightly.20260525-080725.2424094`
 Current branch: `nightly`
-Current pushed commit: `5a90a9a` (`Add Claude Native provider with router-kill guarantee`)
+Current pushed commit: `2424094` (`Show direct channel handling in terminal`)
 
 ## Current state
 
@@ -12,14 +12,41 @@ Current pushed commit: `5a90a9a` (`Add Claude Native provider with router-kill g
 
 The latest production path is:
 
-- Default channel delivery is `native`.
-- `stdin` delivery remains available as a fallback/manual option.
-- Native channel delivery exposes the router MCP bridge at `/ca/mcp/sse` and `/ca/mcp/messages`.
+- `0.1.100` promotes the current `nightly` line to stable.
+- DeepSeek.com is a first-class routed provider using `https://api.deepseek.com/anthropic`.
+- Non-Claude-Native providers route through claude-any; Claude Native suppresses routing env vars and stops the router before launch.
+- Routed sessions default to a stable per-user router port (`CLAUDE_ANY_ROUTER_PORT`, otherwise `8799 + uid % 1000` on POSIX).
+- Stale same-user routers are cleared by port/PID/procfs fallbacks before spawn.
+- Channel delivery choices are hidden from normal routed-provider launch flow; routed sessions use the `llm` channel delivery path.
 - MCP notification events are persisted into `chat-messages.jsonl`.
-- Native clients receive channel messages through `notifications/claude/channel` with metadata preserved as much as the MCP schema allows.
-- `stdin` fallback injects a compact wake prompt into Claude Code when channel messages arrive.
+- AI-Net/SSE notifications can trigger immediate direct LLM handling, use MCP tools, and receive tool-result follow-up context.
+- Direct channel handling currently captures background output and emits a best-effort terminal notice; this is the main known limitation for the next nightly.
 
-The published stable npm version `0.1.99` includes the automatic MCP channel capability probing work through timeout/error classification. The current `nightly` branch adds the MCP channel server guide cleanup, SSE MCP server probing refinements, MCP-spec NDJSON probing defaults, and Claude Native isolation guarantees.
+The previous stable `0.1.99` included automatic MCP channel capability probing through timeout/error classification. `0.1.100` adds DeepSeek.com, shared-host router isolation, automatic API-key setup routing, unique nightly versions, router cleanup hardening, and LLM channel direct handling diagnostics.
+
+## Critical next-nightly research: remove internal `claude -p`
+
+Do not continue the automatic channel-notification path by spawning a hidden
+`claude -p` process. The current 0.1.100 direct handler can run:
+
+```text
+claude --dangerously-skip-permissions --model ... --mcp-config ... -p "[claude-any channel inbox] ..."
+```
+
+That made AI-Net messages actionable because the headless Claude Code process
+can use MCP tools, but it is the wrong long-term design:
+
+- It is a separate Claude Code process from the user-visible interactive session.
+- Its stdout is captured by claude-any, so "show the user a summary" is not guaranteed to appear in the visible Claude Code UI.
+- Recent Anthropic billing/policy behavior can treat `-p` as a separate usage path, so automatic background channel handling must not create hidden `-p` calls.
+
+Research directions for the next branch:
+
+1. Reuse the existing routed `/v1/messages` path without invoking Claude Code `-p`.
+2. Preserve MCP/tool ability by moving the needed AI-Net reply operations into router-owned tools or a controlled MCP client path, not a second Claude Code CLI.
+3. Store direct handling summaries in a durable queue and inject them into the next interactive `/v1/messages` request so the visible Claude Code session summarizes what happened.
+4. If immediate screen output is required, keep terminal notices as diagnostic-only; do not rely on raw TTY writes as the product surface.
+5. Keep user-initiated `claude-any ... -p` pass-through working. The ban is on internal automatic background `-p` launches for channel notifications.
 
 ## Recent release sequence
 
@@ -130,16 +157,26 @@ Behavior:
 - Timeouts are reported differently from "server does not expose channel capability".
 - This reduces false negatives when a server is slow or fails during startup.
 
-### Nightly after 0.1.99
+### 0.1.100
 
-The `nightly` branch currently contains additional unreleased/staged work:
+The `nightly` branch currently contains the release candidate being promoted to stable:
 
 - Split npm publishing into stable `latest` and pre-release `nightly` channels.
+- Made nightly version numbers unique with UTC seconds and short SHA.
 - Added and then simplified an MCP channel-capable server author guide.
 - Reframed the guide to point at Anthropic's MCP spec rather than maintaining a duplicated local protocol reference.
 - Extended channel probing so SSE MCP servers are probed for channel capability too.
 - Changed the stdio channel probe default to MCP-spec newline-delimited JSON (`jsonl`/NDJSON). Legacy `Content-Length` framed probing is still available through `claude_any_stdio: "framed"` or equivalent aliases.
 - Added Claude Native provider semantics: `anthropic` is now labeled `Claude Native`; aliases include `claude-native`, `native`, and `claude-code`; launches suppress claude-any routing/model/advisor env overrides and guarantee the router is stopped before Claude Code starts.
+- Added DeepSeek.com routed provider semantics and defaults.
+- Opened the API-key setup path automatically when DeepSeek or another key-required provider blocks launch.
+- Routed non-native launches through claude-any instead of exposing native channel modes that cannot carry the planned `/llm` workflow.
+- Hid channel delivery choices from the normal options menu because routed sessions should use `llm`.
+- Fixed AI-Net DM channel handling and immediate SSE receipt processing.
+- Added direct channel tool-result context preservation.
+- Added best-effort terminal notice output for direct channel handling results.
+- Added stale router cleanup by listening port, PID, and procfs fallback.
+- Added per-user router MCP ports to avoid Robert/Sarah/worker sessions sharing one `127.0.0.1:8799` router on a shared host.
 
 ## Provider modes
 
@@ -185,9 +222,30 @@ Non-native providers still use claude-any's routing env and model aliases as bef
 
 ## Channel delivery modes
 
+### LLM
+
+LLM delivery is the default routed-provider channel path for 0.1.100.
+
+Use this when Claude Any, not Claude Native, is responsible for receiving
+external channel/SSE notifications and deciding how the current agent should
+respond.
+
+LLM channel flow:
+
+1. External MCP/SSE source sends `notifications/message` or `notifications/claude/channel`.
+2. Router stores a normalized message in `chat-messages.jsonl`.
+3. Router marks eligible messages for direct handling and records the channel cursor.
+4. The current 0.1.100 implementation may invoke a background `claude -p` process with the MCP proxy config so tool calls can be made.
+5. Tool calls from that background path store context with `channel_llm_tool_context_stored`; tool results are supplied through `channel_llm_tool_result_context_injected`.
+6. The final response is logged as `channel_llm_direct_response` and a best-effort terminal notice is written.
+
+Known limitation: step 4 must be removed in the next nightly. Do not rely on
+internal `claude -p` for automatic channel handling going forward.
+
 ### Native
 
-Native is the preferred delivery mode.
+Native is retained for Claude Code's experimental MCP channel behavior but is
+not the normal routed-provider path.
 
 Use this when Claude Code can connect to the built-in `claude-any-router` MCP server.
 
@@ -208,7 +266,7 @@ Native channel flow:
 
 ### Stdin
 
-Stdin is a fallback.
+Stdin is a fallback/manual test path.
 
 Use this when native MCP delivery is unavailable or when explicitly testing prompt injection behavior.
 
@@ -310,7 +368,7 @@ python -m unittest discover -s tests -p "test_channel_bridge.py"
 Watch recent router channel logs:
 
 ```bash
-grep -n "mcp_proxy_notification\|channel_mcp_\|channel_stdin_proxy\|web_fetch_disabled" ~/.config/claude-any/router.log | tail -120
+grep -n "channel_sse_message_received\|channel_llm_direct\|channel_llm_tool\|channel_mcp_\|channel_stdin_proxy\|web_fetch_disabled" ~/.config/claude-any/router.log | tail -160
 ```
 
 Check configured MCP proxy server files:
@@ -322,6 +380,7 @@ find ~/.config/claude-any/mcp-proxy-servers -maxdepth 1 -type f -print -exec sed
 Force channel delivery mode:
 
 ```bash
+claude-any channel-delivery llm
 claude-any channel-delivery native
 claude-any channel-delivery stdin
 ```
@@ -335,6 +394,24 @@ CLAUDE_ANY_CHANNEL_WAKE_ENTER=cr claude-any
 ```
 
 ## Debug checklist
+
+### LLM channel message is handled but not visible in Claude Code
+
+Check:
+
+- Router log has `channel_sse_message_received`.
+- Router log has `channel_llm_direct_cli_request` or `channel_llm_direct_request`.
+- If tools were needed, router log has `channel_llm_tool_context_stored`.
+- Router log has `channel_llm_tool_result_context_injected` after tool results.
+- Router log has `channel_llm_direct_response ... chars=N`.
+- The AI-Net room/DM contains the reply sent by the agent.
+
+If all of those are true, the agent handled the notification. The missing part
+is visibility in the interactive Claude Code UI. In 0.1.100, the direct handler
+captures a background response and writes a best-effort terminal notice; that
+is not a guaranteed transcript message. The next nightly must replace this
+with a no-`-p` route and a durable visible-summary queue injected into the
+interactive session.
 
 ### Native channel message is not visible in Claude Code
 
@@ -388,7 +465,8 @@ The desired behavior is that missing runners skip `web_fetch` cleanly rather tha
 
 Check:
 
-- Router is still listening on `127.0.0.1:8799`.
+- Router is listening on the expected local port. `CLAUDE_ANY_ROUTER_PORT`
+  overrides the port; otherwise POSIX defaults to `8799 + (uid % 1000)`.
 - `/ca/mcp/sse` returns `200`.
 - `/ca/mcp/messages?session=...` returns `200`.
 - Router log has `channel_mcp_session_started` followed by `channel_mcp_initialized`.
@@ -403,7 +481,7 @@ Check:
 
 - Selected provider resolves to `anthropic`.
 - Provider label is `Claude Native`.
-- `claude-any env` does not print `ANTHROPIC_BASE_URL=http://127.0.0.1:8799`.
+- `claude-any env` does not print `ANTHROPIC_BASE_URL=http://127.0.0.1:PORT` for the per-user router port.
 - Router log has a `router_kill_guarantee` entry during launch.
 - `claude-any stop` fully stops the router if the guarantee reports `state=still_up...`.
 

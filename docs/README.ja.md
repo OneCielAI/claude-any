@@ -61,7 +61,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.71`
+現在のバージョン: `0.1.100`
 
 ## 作られた理由
 

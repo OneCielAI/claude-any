@@ -61,7 +61,7 @@ NIM，并把普通 Claude Code 参数原样传递。
 
 Credits: One Ciel LLC
 
-当前版本: `0.1.71`
+当前版本: `0.1.100`
 
 ## 为什么存在
 
