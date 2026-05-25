@@ -14169,10 +14169,6 @@ def terminate_pid(pid: int, label: str, quiet: bool = False) -> bool:
                 time.sleep(0.1)
             if pid_is_running(pid):
                 os.kill(pid, signal.SIGKILL)
-        try:
-            path.unlink()
-        except FileNotFoundError:
-            pass
         if not quiet:
             print(f"Stopped existing {label} session (pid {pid}).")
         return True
