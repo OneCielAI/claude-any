@@ -261,6 +261,69 @@ class ChannelBridgeTests(unittest.TestCase):
                 claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
                 claude_any._CHAT_NEXT_ID = old_next
 
+    def test_sse_reconnect_sends_last_event_id(self):
+        seen_headers = []
+        second_seen = threading.Event()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_GET(self):
+                seen_headers.append(self.headers.get("Last-Event-ID"))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                if len(seen_headers) == 1:
+                    self.wfile.write(
+                        b'id: evt-1\n'
+                        b'event: message\n'
+                        b'data: {"method":"notifications/message","params":{"content":"first"}}\n\n'
+                    )
+                    self.wfile.flush()
+                    return
+                second_seen.set()
+                self.wfile.write(b': keepalive\n\n')
+                self.wfile.flush()
+                time.sleep(0.05)
+
+        original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
+        old_next = claude_any._CHAT_NEXT_ID
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chat_log = root / "chat-messages.jsonl"
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_address[1]}/events"
+                with (
+                    mock.patch.object(claude_any, "CONFIG_DIR", root),
+                    mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", chat_log),
+                    mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+                    mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery"),
+                ):
+                    claude_any.start_channel_sse_connection(
+                        {
+                            "name": "unit-sse-resume",
+                            "url": url,
+                            "channel": "unit",
+                            "retry_seconds": 1,
+                            "read_timeout_seconds": 5,
+                        }
+                    )
+                    self.assertTrue(second_seen.wait(3))
+                    self.assertGreaterEqual(len(seen_headers), 2)
+                    self.assertIsNone(seen_headers[0])
+                    self.assertEqual("evt-1", seen_headers[1])
+                    claude_any.stop_channel_sse_connection("unit-sse-resume")
+            finally:
+                server.shutdown()
+                server.server_close()
+                claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+                claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
+                claude_any._CHAT_NEXT_ID = old_next
+
     def test_channel_wake_prompt_contains_routing_context(self):
         prompt = claude_any.format_channel_wake_prompt(
             {

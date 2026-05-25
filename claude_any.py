@@ -5066,6 +5066,8 @@ def _channel_sse_status_public(name: str, state: dict[str, Any]) -> dict[str, An
         "messages_received": int(state.get("messages_received") or 0),
         "event_filter": state.get("event_filter") or [],
         "read_timeout_seconds": state.get("read_timeout_seconds"),
+        "last_sse_event_id": state.get("last_sse_event_id"),
+        "sse_reconnects": int(state.get("sse_reconnects") or 0),
         "mcp_endpoint": state.get("mcp_endpoint"),
         "mcp_initialized": bool(state.get("mcp_initialized")),
         "mcp_last_error": state.get("mcp_last_error"),
@@ -5467,6 +5469,11 @@ def _channel_sse_maybe_initialize_mcp(name: str, endpoint_text: str) -> None:
 
 def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], event_id: str | None = None) -> None:
     data_text = "\n".join(data_lines)
+    if event_id is not None:
+        with _CHANNEL_SSE_LOCK:
+            state = _CHANNEL_SSE_CONNECTIONS.get(name)
+            if state:
+                state["last_sse_event_id"] = str(event_id)
     if (event_name or "").strip().lower() == "endpoint":
         _channel_sse_maybe_initialize_mcp(name, data_text)
         return
@@ -5509,16 +5516,21 @@ def _channel_sse_worker(name: str) -> None:
                 return
             url = str(state.get("url") or "")
             headers = dict(state.get("headers") or {})
+            last_event_id = state.get("last_sse_event_id")
             read_timeout = max(5.0, min(3600.0, float(state.get("read_timeout_seconds") or 300.0)))
             retry_seconds = max(1.0, min(60.0, float(state.get("retry_seconds") or 5.0)))
         event_name = "message"
         event_id: str | None = None
         data_lines: list[str] = []
         try:
-            req = urllib.request.Request(url, headers={**headers, "Accept": "text/event-stream"})
+            request_headers = {**headers, "Accept": "text/event-stream"}
+            if last_event_id is not None and str(last_event_id) != "":
+                request_headers["Last-Event-ID"] = str(last_event_id)
+            req = urllib.request.Request(url, headers=request_headers)
             with urllib.request.urlopen(req, timeout=read_timeout) as response:
                 _channel_sse_set_state(name, last_error=None)
-                router_log("INFO", f"channel_sse_connected name={name} url={url}")
+                resumed = str(last_event_id) if last_event_id is not None and str(last_event_id) != "" else "-"
+                router_log("INFO", f"channel_sse_connected name={name} url={url} last_event_id={resumed}")
                 while True:
                     with _CHANNEL_SSE_LOCK:
                         current = _CHANNEL_SSE_CONNECTIONS.get(name)
@@ -5557,7 +5569,10 @@ def _channel_sse_worker(name: str) -> None:
                 if not state or not state.get("running"):
                     return
                 state["last_error"] = f"{type(exc).__name__}: {exc}"
-            router_log("WARN", f"channel_sse_reconnect name={name} error={type(exc).__name__}: {exc}")
+                state["sse_reconnects"] = int(state.get("sse_reconnects") or 0) + 1
+                last_event_id = state.get("last_sse_event_id")
+            resumed = str(last_event_id) if last_event_id is not None and str(last_event_id) != "" else "-"
+            router_log("WARN", f"channel_sse_reconnect name={name} last_event_id={resumed} error={type(exc).__name__}: {exc}")
             time.sleep(retry_seconds)
 
 
@@ -5595,6 +5610,13 @@ def start_channel_sse_connection(config: dict[str, Any]) -> dict[str, Any]:
             "messages_received": 0,
             "last_error": None,
             "event_filter": event_filter,
+            "last_sse_event_id": str(
+                config.get("last_sse_event_id")
+                or config.get("last_event_id")
+                or config.get("lastEventId")
+                or ""
+            ).strip(),
+            "sse_reconnects": 0,
             "read_timeout_seconds": float(config.get("read_timeout_seconds") or config.get("timeout") or 300.0),
             "retry_seconds": float(config.get("retry_seconds") or 5.0),
             "mcp_enabled": bool(config.get("mcp", config.get("mcp_enabled", True))),
