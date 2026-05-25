@@ -45,7 +45,8 @@ jobs:
         shell: bash
         run: |
           base="$(node -p "require('./package.json').version")"
-          stamp="$(date -u +%Y%m%d-%H%M)"
+          short_sha="${GITHUB_SHA::7}"
+          stamp="$(date -u +%Y%m%d-%H%M%S).${short_sha}"
           new="${base}-nightly.${stamp}"
           echo "Nightly version: ${new}"
           echo "version=${new}" >> "$GITHUB_OUTPUT"
