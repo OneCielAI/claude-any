@@ -80,7 +80,7 @@ jobs:
           pkg="$(node -p "require('./package.json').name")"
           version="$(node -p "require('./package.json').version")"
           tag="${{ steps.channel.outputs.tag }}"
-          max_attempts=30
+          max_attempts=90
           echo "Verifying ${pkg}@${version} tarball..."
           for attempt in $(seq 1 "${max_attempts}"); do
             if npm pack "${pkg}@${version}" --dry-run >/tmp/npm-pack-verify.log 2>&1; then
