@@ -30,6 +30,20 @@ function candidates() {
 
 let lastError = null;
 for (const [command, prefix] of candidates()) {
+  const probe = spawnSync(command, [...prefix, "--version"], { encoding: "utf8", stdio: "pipe" });
+  if (probe.error && probe.error.code === "ENOENT") {
+    lastError = probe.error;
+    continue;
+  }
+  if (probe.error) {
+    lastError = probe.error;
+    continue;
+  }
+  if ((probe.status ?? 1) !== 0) {
+    const detail = String(probe.stderr || probe.stdout || "").trim();
+    lastError = new Error(detail || `${command} ${prefix.join(" ")} --version failed`);
+    continue;
+  }
   const scriptArgs = mode ? [mode, ...extra] : extra;
   const args = [...prefix, script, ...scriptArgs];
   const result = spawnSync(command, args, { stdio: "inherit" });
