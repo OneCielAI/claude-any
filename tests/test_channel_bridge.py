@@ -401,6 +401,21 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
         self.assertTrue(any("channel_llm_inject_skipped" in item and "initialized" in item for item in log_messages))
 
+    def test_ensure_channel_llm_delivery_cursor_preserves_existing_cursor(self):
+        with tempfile.TemporaryDirectory() as td:
+            cursor_path = Path(td) / "channel-llm-cursor.json"
+            cursor_path.write_text('{"last_id":3}\n', encoding="utf-8")
+            original_cursor = claude_any._CHANNEL_LLM_CURSOR_LAST_ID
+            try:
+                claude_any._CHANNEL_LLM_CURSOR_LAST_ID = None
+                with (
+                    mock.patch.object(claude_any, "CHANNEL_LLM_CURSOR_PATH", cursor_path),
+                    mock.patch.object(claude_any, "_chat_init_next_id", return_value=10),
+                ):
+                    self.assertEqual(3, claude_any.ensure_channel_llm_delivery_cursor_initialized())
+            finally:
+                claude_any._CHANNEL_LLM_CURSOR_LAST_ID = original_cursor
+
     def test_body_with_pending_channel_messages_keeps_ai_net_write_tools(self):
         body = {
             "messages": [{"role": "user", "content": "continue"}],

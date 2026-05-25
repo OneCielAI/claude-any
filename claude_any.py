@@ -16552,6 +16552,11 @@ def reset_channel_llm_delivery_cursor(last_id: int | None = None) -> int:
         return _CHANNEL_LLM_CURSOR_LAST_ID
 
 
+def ensure_channel_llm_delivery_cursor_initialized() -> int:
+    with _CHANNEL_LLM_CURSOR_LOCK:
+        return _channel_llm_read_cursor_locked()
+
+
 def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     global _CHANNEL_LLM_CURSOR_LAST_ID
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
@@ -17680,7 +17685,7 @@ def launch_claude(
     claude_passthrough = list(launch_passthrough)
     if stdin_channel_proxy or native_channel_bridge or llm_channel_delivery:
         if llm_channel_delivery:
-            reset_channel_llm_delivery_cursor()
+            ensure_channel_llm_delivery_cursor_initialized()
         auto_start_sse_channels_from_mcp_configs(
             launch_passthrough,
             extra_config_paths=[Path(path) for path in mcp_config_paths],
