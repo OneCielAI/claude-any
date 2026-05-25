@@ -5373,6 +5373,7 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], eve
         "INFO",
         f"channel_sse_message_received name={name} event={event_name or 'message'} message_id={saved.get('id')} channel={saved.get('channel')}",
     )
+    schedule_channel_direct_llm_delivery(saved)
 
 
 def _channel_sse_worker(name: str) -> None:
@@ -16408,7 +16409,7 @@ def body_with_channel_tool_result_context(body: dict[str, Any]) -> dict[str, Any
 def _mark_channel_payload_direct_llm_pending(payload: dict[str, Any]) -> dict[str, Any]:
     try:
         cfg = load_config()
-        if channel_delivery_mode(cfg) != "llm":
+        if not should_use_channel_llm_delivery(True, [], cfg):
             return payload
         if _channel_llm_message_skip_reason(payload):
             return payload
@@ -16444,7 +16445,7 @@ def schedule_channel_direct_llm_delivery(message: dict[str, Any]) -> bool:
         return False
     try:
         cfg = load_config()
-        if channel_delivery_mode(cfg) != "llm":
+        if not should_use_channel_llm_delivery(True, [], cfg):
             return False
         skip_reason = _channel_llm_message_skip_reason(message)
         if skip_reason:
@@ -16463,7 +16464,81 @@ def schedule_channel_direct_llm_delivery(message: dict[str, Any]) -> bool:
     return True
 
 
+def _channel_direct_llm_cli_response(message_id: int, prompt: str, cfg: dict[str, Any], pcfg: dict[str, Any]) -> str | None:
+    claude = find_executable("claude")
+    if not claude:
+        return None
+    env = os.environ.copy()
+    env["PATH"] = str(HOME / ".local" / "bin") + os.pathsep + env.get("PATH", "")
+    env.update(env_vars(cfg))
+    env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
+    mcp_config = MCP_PROXY_CONFIG if MCP_PROXY_CONFIG.exists() else None
+    if mcp_config is None:
+        try:
+            mcp_config = write_mcp_proxy_config([], extra_config_paths=[write_channel_mcp_config()])
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_direct_cli_mcp_config_failed message_id={message_id} error={type(exc).__name__}: {exc}")
+            mcp_config = None
+    cmd = [claude, "--dangerously-skip-permissions"]
+    model = current_alias(cfg)
+    if model:
+        cmd.extend(["--model", model])
+    if mcp_config:
+        cmd.extend(["--mcp-config", str(mcp_config)])
+    cmd.extend(["-p", prompt])
+    timeout = max(30.0, min(provider_request_timeout_seconds(pcfg), 300.0))
+    router_log("INFO", f"channel_llm_direct_cli_request message_id={message_id} argv_len={len(cmd)}")
+    proc = subprocess.run(
+        cmd,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+    )
+    if proc.returncode != 0:
+        err = (proc.stderr or proc.stdout or "").strip()
+        router_log(
+            "WARN",
+            f"channel_llm_direct_cli_failed message_id={message_id} rc={proc.returncode} error={truncate_for_prompt(err, 500)}",
+        )
+        return None
+    return (proc.stdout or "").strip()
+
+
+def _channel_direct_llm_http_response(message_id: int, prompt: str, provider: str, pcfg: dict[str, Any], model: str) -> tuple[str, str]:
+    body = {
+        "model": model,
+        "max_tokens": 512,
+        "stream": False,
+        "metadata": {
+            "claude_any_channel_direct": True,
+            "channel_message_id": str(message_id),
+        },
+        "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
+    }
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "content-type": "application/json",
+        "anthropic-version": "2023-06-01",
+        "x-claude-any-channel-direct": "1",
+    }
+    timeout = max(30.0, min(provider_request_timeout_seconds(pcfg), 300.0))
+    router_log(
+        "INFO",
+        f"channel_llm_direct_request message_id={message_id} provider={provider} model={model} bytes={len(data)}",
+    )
+    req = urllib.request.Request(join_url(ROUTER_BASE, "/v1/messages"), data=data, headers=headers, method="POST")
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        raw = resp.read(2_000_000).decode("utf-8", errors="replace")
+    parsed = json.loads(raw)
+    text = _anthropic_message_text(parsed) if isinstance(parsed, dict) else ""
+    stop_reason = str(parsed.get("stop_reason") if isinstance(parsed, dict) else "")
+    return text, stop_reason
+
+
 def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
+    global _CHANNEL_LLM_CURSOR_LAST_ID
     try:
         message_id = int(message.get("id") or 0)
     except Exception:
@@ -16473,39 +16548,20 @@ def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
         provider, pcfg = get_current_provider(cfg)
         model = current_alias(cfg)
         prompt = format_channel_llm_batch_prompt([message])
-        body = {
-            "model": model,
-            "max_tokens": 512,
-            "stream": False,
-            "metadata": {
-                "claude_any_channel_direct": True,
-                "channel_message_id": str(message_id),
-                "channel": str(message.get("channel") or "default"),
-            },
-            "messages": [{"role": "user", "content": [{"type": "text", "text": prompt}]}],
-        }
-        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
-        headers = {
-            "content-type": "application/json",
-            "anthropic-version": "2023-06-01",
-            "x-claude-any-channel-direct": "1",
-        }
-        timeout = max(30.0, min(provider_request_timeout_seconds(pcfg), 300.0))
-        router_log(
-            "INFO",
-            f"channel_llm_direct_request message_id={message_id} provider={provider} model={model} bytes={len(data)}",
-        )
-        req = urllib.request.Request(join_url(ROUTER_BASE, "/v1/messages"), data=data, headers=headers, method="POST")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read(2_000_000).decode("utf-8", errors="replace")
-        parsed = json.loads(raw)
-        text = _anthropic_message_text(parsed) if isinstance(parsed, dict) else ""
+        text = _channel_direct_llm_cli_response(message_id, prompt, cfg, pcfg)
+        stop_reason = "cli"
+        if text is None:
+            text, stop_reason = _channel_direct_llm_http_response(message_id, prompt, provider, pcfg, model)
         with _CHANNEL_LLM_DIRECT_LOCK:
             _CHANNEL_LLM_DIRECT_DELIVERED.add(message_id)
             if len(_CHANNEL_LLM_DIRECT_DELIVERED) > 1000:
                 for old_id in sorted(_CHANNEL_LLM_DIRECT_DELIVERED)[:500]:
                     _CHANNEL_LLM_DIRECT_DELIVERED.discard(old_id)
-        stop_reason = parsed.get("stop_reason") if isinstance(parsed, dict) else ""
+        with _CHANNEL_LLM_CURSOR_LOCK:
+            current = _channel_llm_read_cursor_locked()
+            if message_id > current:
+                _CHANNEL_LLM_CURSOR_LAST_ID = message_id
+                _channel_llm_write_cursor_locked(message_id)
         router_log("INFO", f"channel_llm_direct_response message_id={message_id} chars={len(text)} stop_reason={stop_reason}")
     except Exception as exc:
         router_log("WARN", f"channel_llm_direct_failed message_id={message_id} error={type(exc).__name__}: {exc}")

@@ -642,7 +642,7 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("llm_direct_inflight" in item for item in log_messages))
 
-    def test_channel_sse_dispatch_stores_llm_only_without_background_delivery(self):
+    def test_channel_sse_dispatch_stores_llm_only_and_schedules_background_delivery(self):
         captured: list[dict[str, object]] = []
         original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
 
@@ -681,7 +681,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(1, len(captured))
         self.assertNotIn("llm_direct_pending", captured[0]["meta"])
         self.assertEqual(["llm"], captured[0]["delivery"])
-        schedule.assert_not_called()
+        schedule.assert_called_once()
+        self.assertEqual(7, schedule.call_args.args[0]["id"])
 
     def test_channel_sse_dispatch_ignores_native_router_self_echo(self):
         original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
@@ -753,6 +754,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
                 mock.patch.object(claude_any, "get_current_provider", return_value=("ollama-cloud", {"request_timeout_ms": 300000})),
                 mock.patch.object(claude_any, "current_alias", return_value="claude-any-ollama-cloud-test"),
+                mock.patch.object(claude_any, "find_executable", return_value=None),
                 mock.patch.object(claude_any.urllib.request, "urlopen", return_value=FakeResponse()) as urlopen,
                 mock.patch.object(claude_any, "append_chat_message") as append,
                 mock.patch.object(claude_any, "router_log"),
@@ -770,6 +772,39 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("<< room_4pyr8vvwm2cd >> incoming channel message for the current agent", prompt)
         self.assertIn("새 이벤트", prompt)
         append.assert_not_called()
+
+    def test_channel_direct_llm_cli_uses_mcp_config_without_native_channels(self):
+        class FakeProcess:
+            returncode = 0
+            stdout = "처리 완료"
+            stderr = ""
+
+        with tempfile.TemporaryDirectory() as tmp:
+            proxy_config = Path(tmp) / "mcp-proxy.json"
+            proxy_config.write_text('{"mcpServers":{}}', encoding="utf-8")
+            with (
+                mock.patch.object(claude_any, "find_executable", return_value="/usr/local/bin/claude"),
+                mock.patch.object(claude_any, "env_vars", return_value={"ANTHROPIC_BASE_URL": "http://127.0.0.1:8799"}),
+                mock.patch.object(claude_any, "current_alias", return_value="claude-any-deepseek-test"),
+                mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config),
+                mock.patch.object(claude_any.subprocess, "run", return_value=FakeProcess()) as run,
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                out = claude_any._channel_direct_llm_cli_response(
+                    11,
+                    "수신 메시지를 처리하세요",
+                    {"providers": {"deepseek": {"request_timeout_ms": 300000}}},
+                    {"request_timeout_ms": 300000},
+                )
+
+        self.assertEqual("처리 완료", out)
+        cmd = run.call_args.args[0]
+        self.assertIn("--dangerously-skip-permissions", cmd)
+        self.assertIn("--model", cmd)
+        self.assertIn("claude-any-deepseek-test", cmd)
+        self.assertIn("--mcp-config", cmd)
+        self.assertIn(str(proxy_config), cmd)
+        self.assertNotIn("--dangerously-load-development-channels", cmd)
 
     def test_router_channel_mcp_notification_wraps_chat_message(self):
         notification = claude_any._channel_mcp_notification(
