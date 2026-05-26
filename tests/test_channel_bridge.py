@@ -797,7 +797,7 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("llm_direct_inflight" in item for item in log_messages))
 
-    def test_channel_sse_dispatch_stores_llm_only_and_schedules_background_delivery(self):
+    def test_channel_sse_dispatch_marks_direct_pending_and_schedules_background_delivery(self):
         captured: list[dict[str, object]] = []
         original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
 
@@ -824,6 +824,7 @@ class ChannelBridgeTests(unittest.TestCase):
             }
             with (
                 mock.patch.object(claude_any, "_sse_payload_to_chat_payload", return_value=payload),
+                mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
                 mock.patch.object(claude_any, "append_chat_message", side_effect=fake_append),
                 mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery") as schedule,
                 mock.patch.object(claude_any, "router_log"),
@@ -834,10 +835,11 @@ class ChannelBridgeTests(unittest.TestCase):
             claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
 
         self.assertEqual(1, len(captured))
-        self.assertNotIn("llm_direct_pending", captured[0]["meta"])
+        self.assertTrue(captured[0]["meta"]["llm_direct_pending"])
         self.assertEqual(["llm"], captured[0]["delivery"])
         schedule.assert_called_once()
         self.assertEqual(7, schedule.call_args.args[0]["id"])
+        self.assertTrue(schedule.call_args.args[0]["meta"]["llm_direct_pending"])
 
     def test_channel_sse_dispatch_ignores_native_router_self_echo(self):
         original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)

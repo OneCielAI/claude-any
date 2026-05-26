@@ -5497,6 +5497,7 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], eve
     payload = _sse_payload_to_chat_payload(data_text, event_name, defaults, event_id=event_id)
     if not payload:
         return
+    payload = _mark_channel_payload_direct_llm_pending(payload)
     saved = append_chat_message(payload)
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _CHANNEL_SSE_LOCK:
