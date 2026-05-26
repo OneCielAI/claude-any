@@ -203,6 +203,39 @@ class ChannelBridgeTests(unittest.TestCase):
             claude_any._CHANNEL_SSE_CONNECTIONS.clear()
             claude_any._CHANNEL_SSE_CONNECTIONS.update(original)
 
+    def test_mcp_endpoint_event_reinitializes_changed_sse_session(self):
+        name = "unit-mcp"
+        original = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
+        try:
+            claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+            claude_any._CHANNEL_SSE_CONNECTIONS[name] = {
+                "name": name,
+                "url": "http://example.test/sse",
+                "headers": {"Authorization": "Bearer test"},
+                "running": True,
+                "mcp_enabled": True,
+                "mcp_initialized": True,
+                "mcp_endpoint": "http://example.test/messages?session=old",
+                "mcp_rpc_results": {"old": {"result": {}}},
+                "mcp_protocol_version": "2024-11-05",
+                "mcp_timeout_seconds": 20.0,
+            }
+            with (
+                mock.patch.object(claude_any, "_mcp_sse_post_json", return_value={"ok": True}) as post,
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                claude_any._channel_sse_dispatch(name, "endpoint", ["/messages?session=new"])
+            state = claude_any._CHANNEL_SSE_CONNECTIONS[name]
+            self.assertEqual("http://example.test/messages?session=new", state["mcp_endpoint"])
+            self.assertTrue(state["mcp_initialized"])
+            self.assertEqual({}, state["mcp_rpc_results"])
+            self.assertEqual(2, post.call_count)
+            log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+            self.assertTrue(any("channel_sse_mcp_reinitializing" in item for item in log_messages))
+        finally:
+            claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+            claude_any._CHANNEL_SSE_CONNECTIONS.update(original)
+
     def test_start_channel_sse_connection_receives_stream_message(self):
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_args):
@@ -1031,6 +1064,35 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("Let me send", retry_prompt)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_deferred_action_retry" in item for item in log_messages))
+
+    def test_channel_direct_router_response_without_tools_returns_blocker(self):
+        with (
+            mock.patch.object(claude_any, "_channel_direct_tool_schemas", return_value=[]),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message") as http_message,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                16,
+                "수신 메시지를 처리하세요",
+                {
+                    "id": 16,
+                    "channel": "room_dm_4wcekxw4yse",
+                    "message": "New message from Sarah",
+                    "meta": {"sse_source": "mcp-ai-net-sse", "room_id": "room_dm_4wcekxw4yse"},
+                },
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertIn("MCP 도구 목록을 가져오지 못했습니다", text)
+        self.assertIn("없는 도구를 가정한 텍스트 명령은 실행하지 않았습니다", text)
+        self.assertIn("room_dm_4wcekxw4yse", text)
+        self.assertEqual("no_tools", stop_reason)
+        self.assertEqual(0, tool_turns)
+        http_message.assert_not_called()
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_no_tools" in item for item in log_messages))
 
     def test_channel_direct_terminal_notice_prints_when_stdout_is_tty(self):
         class FakeStdout:

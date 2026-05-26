@@ -5439,14 +5439,18 @@ def _channel_sse_maybe_initialize_mcp(name: str, endpoint_text: str) -> None:
             return
         if not bool(state.get("mcp_enabled", True)):
             return
-        if state.get("mcp_initialized"):
-            return
         stream_url = str(state.get("url") or "")
+        endpoint = _channel_sse_absolute_endpoint(stream_url, endpoint_text)
+        current_endpoint = str(state.get("mcp_endpoint") or "")
+        was_initialized = bool(state.get("mcp_initialized"))
+        if was_initialized and current_endpoint == endpoint:
+            return
         headers = dict(state.get("headers") or {})
         timeout = max(5.0, min(120.0, float(state.get("mcp_timeout_seconds") or 20.0)))
         protocol_version = str(state.get("mcp_protocol_version") or "2024-11-05")
-    endpoint = _channel_sse_absolute_endpoint(stream_url, endpoint_text)
     try:
+        if was_initialized and current_endpoint:
+            router_log("INFO", f"channel_sse_mcp_reinitializing name={name} old_endpoint={current_endpoint} new_endpoint={endpoint}")
         initialize = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -5460,7 +5464,7 @@ def _channel_sse_maybe_initialize_mcp(name: str, endpoint_text: str) -> None:
         _mcp_sse_post_json(endpoint, headers, initialize, timeout)
         initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
         _mcp_sse_post_json(endpoint, headers, initialized, timeout)
-        _channel_sse_set_state(name, mcp_endpoint=endpoint, mcp_initialized=True, mcp_last_error=None)
+        _channel_sse_set_state(name, mcp_endpoint=endpoint, mcp_initialized=True, mcp_last_error=None, mcp_rpc_results={})
         router_log("INFO", f"channel_sse_mcp_initialized name={name} endpoint={endpoint}")
     except Exception as exc:
         _channel_sse_set_state(name, mcp_endpoint=endpoint, mcp_initialized=False, mcp_last_error=f"{type(exc).__name__}: {exc}")
@@ -16848,6 +16852,22 @@ def _channel_direct_tool_schemas(message: dict[str, Any]) -> list[dict[str, Any]
     return converted
 
 
+def _channel_direct_no_tools_summary(message: dict[str, Any]) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    source = str(meta.get("sse_source") or meta.get("source") or "channel")
+    channel = str(message.get("channel") or meta.get("room_id") or "default")
+    incoming = truncate_for_prompt(str(message.get("message") or ""), 1000)
+    return (
+        "채널 메시지는 수신됐지만 자동 처리에 필요한 MCP 도구 목록을 가져오지 못했습니다. "
+        "없는 도구를 가정한 텍스트 명령은 실행하지 않았습니다.\n\n"
+        f"- source: {source}\n"
+        f"- channel: {channel}\n"
+        f"- incoming: {incoming}\n\n"
+        "SSE/MCP endpoint가 재연결 중이거나 stale session일 수 있습니다. "
+        "다음 알림에서 endpoint가 재초기화되면 자동 처리가 재개됩니다."
+    )
+
+
 def _channel_direct_tool_name_parts(name: str) -> tuple[str, str] | None:
     text = str(name or "").strip()
     if not text.startswith("mcp__"):
@@ -17058,6 +17078,9 @@ def _channel_direct_llm_http_response(message_id: int, prompt: str, provider: st
 
 def _channel_direct_llm_router_response(message_id: int, prompt: str, message: dict[str, Any], provider: str, pcfg: dict[str, Any], model: str) -> tuple[str, str, int]:
     tools = _channel_direct_tool_schemas(message)
+    if not tools:
+        router_log("WARN", f"channel_llm_no_tools message_id={message_id}")
+        return _channel_direct_no_tools_summary(message), "no_tools", 0
     messages: list[dict[str, Any]] = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
     last_text = ""
     stop_reason = ""
