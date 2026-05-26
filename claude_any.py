@@ -1451,8 +1451,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "advisor_model": "",
             "custom_models": ["qwen3-coder"],
             "native_compat": True,
-            "rate_limit_rpm": 40,
-            "rate_limit_status": True,
+            "rate_limit_rpm": 0,
+            "rate_limit_status": False,
             "num_ctx": "auto",
             "num_ctx_min": 32768,
             "num_ctx_max": 131072,
@@ -1474,8 +1474,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "current_model": "glm-5.1",
             "advisor_model": "",
             "custom_models": ["glm-5.1"],
-            "rate_limit_rpm": 40,
-            "rate_limit_status": True,
+            "rate_limit_rpm": 0,
+            "rate_limit_status": False,
             "num_ctx": "auto",
             "num_ctx_min": 32768,
             "num_ctx_max": 131072,
@@ -1532,7 +1532,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "custom_models": ["local-model"],
             "native_compat": True,
             "rate_limit_rpm": 0,
-            "rate_limit_status": True,
+            "rate_limit_status": False,
             "context_window": 32768,
             "max_output_tokens": 4096,
             "temperature": 0.7,
@@ -1549,8 +1549,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "advisor_model": "",
             "custom_models": [],
             "native_compat": False,
-            "rate_limit_rpm": 40,
-            "rate_limit_status": True,
+            "rate_limit_rpm": 0,
+            "rate_limit_status": False,
             "context_window": 65536,
             "max_output_tokens": 4096,
             "temperature": 0.7,
@@ -1566,8 +1566,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "advisor_model": "",
             "custom_models": ["model"],
             "native_compat": True,
-            "rate_limit_rpm": 40,
-            "rate_limit_status": True,
+            "rate_limit_rpm": 0,
+            "rate_limit_status": False,
             "context_window": 32768,
             "max_output_tokens": 4096,
             "temperature": 0.7,
@@ -1674,6 +1674,27 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
             cfg["claude_code"] = ccfg
         if normalize_channel_delivery(ccfg.get("channel_delivery")) == "native":
             ccfg["channel_delivery"] = "llm"
+        migrations[marker] = True
+
+    marker = "rate_limit_defaults_off_20260526"
+    if not migrations.get(marker):
+        providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        for provider_name in ("ollama", "ollama-cloud", "nvidia-hosted", "self-hosted-nim"):
+            pcfg = providers.get(provider_name)
+            if not isinstance(pcfg, dict):
+                continue
+            old_default_rpm = str(pcfg.get("rate_limit_rpm", "")).strip() == "40"
+            old_default_status = bool(pcfg.get("rate_limit_status", True))
+            if old_default_rpm and old_default_status:
+                pcfg["rate_limit_rpm"] = 0
+                pcfg["rate_limit_status"] = False
+        pcfg = providers.get("lm-studio")
+        if (
+            isinstance(pcfg, dict)
+            and str(pcfg.get("rate_limit_rpm", "")).strip() == "0"
+            and bool(pcfg.get("rate_limit_status", True))
+        ):
+            pcfg["rate_limit_status"] = False
         migrations[marker] = True
 
 
@@ -2260,15 +2281,22 @@ def main():
     provider = str(cfg.get("current_provider") or "")
     pcfg = providers.get(provider) if isinstance(providers.get(provider), dict) else {}
     router_debug_external = bool(cfg.get("router_debug_external_access", False))
-    rpm_status = bool(pcfg.get("rate_limit_status", True))
+    rpm_status = bool(pcfg.get("rate_limit_status", False))
+    migrations = cfg.get("migrations") if isinstance(cfg.get("migrations"), dict) else {}
+    if not migrations.get("rate_limit_defaults_off_20260526"):
+        if (
+            provider in ("ollama", "ollama-cloud", "nvidia-hosted", "self-hosted-nim")
+            and str(pcfg.get("rate_limit_rpm", "")).strip() == "40"
+        ):
+            rpm_status = False
+        elif provider == "lm-studio" and str(pcfg.get("rate_limit_rpm", "")).strip() == "0":
+            rpm_status = False
     model = str(pcfg.get("current_model") or "")
-    raw_rpm = pcfg.get("rate_limit_rpm")
-    if raw_rpm is None and provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
-        raw_rpm = 40
+    raw_rpm = pcfg.get("rate_limit_rpm", 0)
     try:
         rpm = int(raw_rpm)
     except Exception:
-        rpm = 40
+        rpm = 0
     state = load_json(STATE_PATH, {})
     activity = load_json(ACTIVITY_PATH, {})
     context = load_json(CONTEXT_PATH, {})
@@ -3384,8 +3412,6 @@ def post_json(url: str, body: Any, headers: dict[str, str] | None = None, timeou
 
 def router_rate_limit_configured_rpm(provider: str, pcfg: dict[str, Any]) -> int | None:
     raw = pcfg.get("rate_limit_rpm")
-    if raw is None and provider in ("nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
-        raw = 40
     if raw is None:
         return None
     if isinstance(raw, str) and raw.strip().lower() in ("0", "false", "off", "disable", "disabled", "none", "unset"):
@@ -4665,7 +4691,7 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
     context = read_json_file(CONTEXT_USAGE_PATH)
     used, rpm_limit = router_rate_limit_usage(provider, pcfg)
     rpm_text = "off"
-    if bool(pcfg.get("rate_limit_status", True)):
+    if bool(pcfg.get("rate_limit_status", False)):
         rpm_text = f"{used}/min unmanaged" if rpm_limit == 0 else (f"{used}/{rpm_limit}" if rpm_limit else "unknown")
     timeout_ms = positive_int(pcfg.get("request_timeout_ms")) or DEFAULT_REQUEST_TIMEOUT_MS
     idle_ms = positive_int(pcfg.get("stream_idle_timeout_ms")) or timeout_profile_idle_ms(timeout_ms)
@@ -8692,7 +8718,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     headers = provider_headers(provider, pcfg)
     url = join_url(base, "/api/chat")
     waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
-    rpm_status = bool(pcfg.get("rate_limit_status", True))
+    rpm_status = bool(pcfg.get("rate_limit_status", False))
     if stream_requested:
         # Stream Ollama response through as Anthropic SSE
         data_bytes = json.dumps(req_body).encode("utf-8")
@@ -9405,7 +9431,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
         gate_reason = advisor_gate_reason_for_body(provider, pcfg, body)
         stream = False
         router_log("INFO", f"advisor gate enabled for {provider} reason={gate_reason}; collecting this turn before returning it to Claude Code")
-    notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", True)))
+    notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", False)))
     if stream:
         req_body = openai_compatible_chat_request(provider, model, upstream_body, pcfg, stream=True)
         req_tokens = estimate_tokens(req_body)
@@ -9657,7 +9683,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     self.send_header("content-type", ctype)
                     self.end_headers()
                     raw_resp = resp.read()
-                    notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", True)))
+                    notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", False)))
                     if notice and "application/json" in ctype:
                         try:
                             payload = json.loads(raw_resp.decode("utf-8", errors="replace"))
@@ -11791,7 +11817,7 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
         elif key in ("rate_limit", "rate_limit_rpm", "rpm"):
             pcfg.pop("rate_limit_rpm", None)
         elif key in ("rate_limit_status", "rpm_status"):
-            pcfg["rate_limit_status"] = True
+            pcfg["rate_limit_status"] = False
         else:
             pcfg.setdefault("ollama_options", {}).pop(key, None)
         return
@@ -11864,7 +11890,7 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
         pcfg["rate_limit_rpm"] = fixed
         return
     if key in ("rate_limit_status", "rpm_status"):
-        pcfg["rate_limit_status"] = parse_bool(value, default=True)
+        pcfg["rate_limit_status"] = parse_bool(value, default=False)
         return
     opts = pcfg.setdefault("ollama_options", {})
     if value is None:
@@ -11913,7 +11939,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     used, limit = router_rate_limit_usage(provider, pcfg)
     if limit is not None:
         print(f"rate_limit_rpm: {limit}")
-        if bool(pcfg.get("rate_limit_status", True)):
+        if bool(pcfg.get("rate_limit_status", False)):
             suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min (unmanaged)"
             print(f"rpm_used: {suffix}")
     print(f"ollama_options: {ollama_options_status(pcfg)}")
@@ -11975,8 +12001,8 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     if pcfg.get("stream_idle_timeout_ms") is not None:
         parts.append(f"stream_idle_timeout={pcfg.get('stream_idle_timeout_ms')}ms")
     if provider in ("lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud"):
-        parts.append(f"rate_limit_rpm={pcfg.get('rate_limit_rpm', 40)}")
-        if bool(pcfg.get("rate_limit_status", True)):
+        parts.append(f"rate_limit_rpm={pcfg.get('rate_limit_rpm', 0)}")
+        if bool(pcfg.get("rate_limit_status", False)):
             used, limit = router_rate_limit_usage(provider, pcfg)
             if limit is not None:
                 suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unmanaged)"
@@ -13310,16 +13336,16 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "zh": "流式连接打开后允许无字节到达的最长时间；超过后重试或作为 timeout 处理。",
     },
     "rate_limit_rpm": {
-        "en": "Router-side upstream request limit per minute. NIM hosted defaults to 40 RPM; unset/0 disables waiting.",
-        "ko": "라우터가 업스트림 요청 수를 분당 제한합니다. NIM hosted 기본값은 40 RPM입니다. unset/0이면 대기하지 않습니다.",
-        "ja": "ルーター側の上流リクエスト数/分の制限。NIM hosted は既定で 40 RPM。unset/0 で待機なし。",
-        "zh": "路由器侧上游每分钟请求限制。NIM hosted 默认 40 RPM；unset/0 表示不等待。",
+        "en": "Router-side upstream request limit per minute. Default is off; set a positive RPM to enable waiting.",
+        "ko": "라우터가 업스트림 요청 수를 분당 제한합니다. 기본값은 off입니다. 양수 RPM을 설정하면 대기 제한을 켭니다.",
+        "ja": "ルーター側の上流リクエスト数/分の制限。既定は off。正の RPM を設定すると待機制限を有効化します。",
+        "zh": "路由器侧上游每分钟请求限制。默认关闭；设置正数 RPM 后启用等待限制。",
     },
     "rate_limit_status": {
-        "en": "Show optional colored RPM usage status in Claude responses.",
-        "ko": "Claude 응답에 RPM 사용량 상태를 색상 텍스트로 표시합니다.",
-        "ja": "Claude応答にRPM使用量状態を色付きテキストで表示します。",
-        "zh": "在 Claude 响应中显示彩色 RPM 使用量状态。",
+        "en": "Show optional colored RPM usage status in Claude responses. Default is off.",
+        "ko": "Claude 응답에 RPM 사용량 상태를 색상 텍스트로 표시합니다. 기본값은 off입니다.",
+        "ja": "Claude応答にRPM使用量状態を色付きテキストで表示します。既定は off。",
+        "zh": "在 Claude 响应中显示彩色 RPM 使用量状态。默认关闭。",
     },
     "temperature": {
         "en": "Sampling temperature (0..2). Higher is more varied; lower is more deterministic.",
@@ -13452,7 +13478,7 @@ def llm_option_current_bool(provider: str, pcfg: dict[str, Any], key: str) -> bo
     if key == "think":
         return bool(pcfg.get("think", False))
     if key == "rate_limit_status":
-        return bool(pcfg.get("rate_limit_status", True))
+        return bool(pcfg.get("rate_limit_status", False))
     if key == "router_debug_external_access":
         return router_debug_external_access_enabled()
     return bool(pcfg.get(key, False))
@@ -13488,8 +13514,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         if bool(pcfg.get("stream_enabled", True)):
             add("Stream idle timeout ms", "stream_idle_timeout_ms", pcfg.get("stream_idle_timeout_ms", "auto"))
             add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
-        add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 40))
-        add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
+        add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 0))
+        add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", False)) else "off")
     else:
         if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
@@ -13497,8 +13523,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
         if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
-            add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", "default"))
-            add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", True)) else "off")
+            add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 0))
+            add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", False)) else "off")
             add("Temperature", "temperature", pcfg.get("temperature", "default"))
             add("Top P", "top_p", pcfg.get("top_p", "default"))
             add("Top K", "top_k", pcfg.get("top_k", "default"))
@@ -13526,7 +13552,7 @@ def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> 
     if key == "stream_word_chunking":
         return "true" if bool(pcfg.get("stream_word_chunking", False)) else "false"
     if key == "rate_limit_status":
-        return "true" if bool(pcfg.get("rate_limit_status", True)) else "false"
+        return "true" if bool(pcfg.get("rate_limit_status", False)) else "false"
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         if key == "num_ctx":
@@ -13623,7 +13649,7 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         elif key in ("rate_limit", "rate_limit_rpm", "rpm"):
             pcfg.pop("rate_limit_rpm", None)
         elif key in ("rate_limit_status", "rpm_status"):
-            pcfg["rate_limit_status"] = True
+            pcfg["rate_limit_status"] = False
         elif key in ("native", "native_compat"):
             if provider == "nvidia-hosted":
                 raise SystemExit(

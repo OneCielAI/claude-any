@@ -204,19 +204,19 @@ CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-forma
 Configure every launch option with flags:
 
 ```sh
-claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 120000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 120000 --ca-rate-limit-rpm 0 --ca-rate-limit-status off --ca-no-update-check -p "Reply with OK only." --output-format text
 ```
 
 Full Ollama Cloud 1M-context setup with flags:
 
 ```sh
-claude-any --ca-provider ollama-cloud --ca-base-url https://ollama.com --ca-model deepseek-v4-flash --ca-advisor-model deepseek-v4-pro --ca-api-key-env OLLAMA_API_KEY --ca-context-window 1048576 --ca-max-output-tokens 8192 --ca-request-timeout-ms 300000 --ca-stream on --ca-stream-word-chunking off --ca-rate-limit-rpm 0 --ca-rate-limit-status on -p "Create an implementation plan." --output-format text
+claude-any --ca-provider ollama-cloud --ca-base-url https://ollama.com --ca-model deepseek-v4-flash --ca-advisor-model deepseek-v4-pro --ca-api-key-env OLLAMA_API_KEY --ca-context-window 1048576 --ca-max-output-tokens 8192 --ca-request-timeout-ms 300000 --ca-stream on --ca-stream-word-chunking off --ca-rate-limit-rpm 0 --ca-rate-limit-status off -p "Create an implementation plan." --output-format text
 ```
 
 The same setup can let Claude Any choose the model's recommended LLM options:
 
 ```sh
-claude-any --ca-provider ollama-cloud --ca-base-url https://ollama.com --ca-auto-llm-options deepseek-v4-flash --ca-advisor-model deepseek-v4-pro --ca-api-key-env OLLAMA_API_KEY --ca-stream on --ca-rate-limit-status on -p "Create an implementation plan." --output-format text
+claude-any --ca-provider ollama-cloud --ca-base-url https://ollama.com --ca-auto-llm-options deepseek-v4-flash --ca-advisor-model deepseek-v4-pro --ca-api-key-env OLLAMA_API_KEY --ca-stream on --ca-rate-limit-status off -p "Create an implementation plan." --output-format text
 ```
 
 Full local Ollama setup with flags:
@@ -228,7 +228,7 @@ claude-any --ca-provider ollama --ca-base-url http://127.0.0.1:11434 --ca-model 
 Full NVIDIA hosted setup with rate-limit management:
 
 ```sh
-claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-context-window 65536 --ca-max-output-tokens 4096 --ca-request-timeout-ms 180000 --ca-stream on --ca-rate-limit-rpm 40 --ca-rate-limit-status on -p "Review this repository and list next actions." --output-format text
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-context-window 65536 --ca-max-output-tokens 4096 --ca-request-timeout-ms 180000 --ca-stream on --ca-rate-limit-rpm 0 --ca-rate-limit-status off -p "Review this repository and list next actions." --output-format text
 ```
 
 Or put the same values in environment variables:
@@ -243,8 +243,8 @@ export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
 export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
 export CLAUDE_ANY_CONTEXT_WINDOW=65536
 export CLAUDE_ANY_REQUEST_TIMEOUT_MS=120000
-export CLAUDE_ANY_RATE_LIMIT_RPM=40
-export CLAUDE_ANY_RATE_LIMIT_STATUS=on
+export CLAUDE_ANY_RATE_LIMIT_RPM=0
+export CLAUDE_ANY_RATE_LIMIT_STATUS=off
 claude-any -p "Reply with OK only." --output-format text
 ```
 
@@ -263,7 +263,7 @@ CLAUDE_ANY_REQUEST_TIMEOUT_MS=300000
 CLAUDE_ANY_STREAM=on
 CLAUDE_ANY_STREAM_WORD_CHUNKING=off
 CLAUDE_ANY_RATE_LIMIT_RPM=0
-CLAUDE_ANY_RATE_LIMIT_STATUS=on
+CLAUDE_ANY_RATE_LIMIT_STATUS=off
 CLAUDE_ANY_WEB_SEARCH=on
 CLAUDE_ANY_WEB_FETCH=on
 CLAUDE_ANY_SELF_UPDATE_CHECK=off
@@ -495,11 +495,12 @@ steps under that larger model's supervision.
   including local handling for `EnterPlanMode` and plan artifacts.
 - Optional `/advisor` slash command that routes the current task state to a
   selected Advisor Model, useful for long-context review and next-step checks.
-- Claude Code `statusLine` integration showing router RPM usage and wait time
-  in the bottom status area instead of polluting the chat transcript.
+- Optional Claude Code `statusLine` integration for router RPM usage and wait
+  time in the bottom status area instead of polluting the chat transcript.
 - Router-side RPM control for NVIDIA hosted, self-hosted NIM, Ollama, and
-  Ollama Cloud. `rate_limit_rpm=0` disables throttling while still showing the
-  last-60-seconds usage rate.
+  Ollama Cloud. The default is off (`rate_limit_rpm=0` and
+  `rate_limit_status=off`); set a positive RPM and enable status display when
+  you want router pacing telemetry.
 - Soft pacing subtracts time already spent reading files, running commands, and
   waiting for tool results. In real coding sessions, those tool-call gaps absorb
   much of the RPM spacing naturally, so providers such as NVIDIA hosted NIM can
@@ -549,6 +550,9 @@ steps under that larger model's supervision.
   initialized SSE connection, feed `tool_result` blocks back to the same LLM
   conversation, queue visible summaries for the next routed request, and keep
   best-effort terminal notices as diagnostics.
+- **RPM limits default off**: hosted/local router providers now default to
+  `rate_limit_rpm=0` and `rate_limit_status=off`; existing old default 40 RPM
+  configs are migrated to off unless the user selected a non-default value.
 
 ### 0.1.71
 
@@ -819,15 +823,15 @@ steps under that larger model's supervision.
 - **Plan Mode + Advisor headline**: document Claude Any's Plan Mode support for
   router-backed non-Anthropic providers and the `/advisor` slash command backed
   by a selected long-context Advisor Model.
-- **Status-line RPM telemetry**: Claude Any installs a Claude Code `statusLine`
-  command that shows router RPM usage and the latest wait time in the bottom
-  status area, keeping rate-limit telemetry out of the chat transcript.
+- **Status-line RPM telemetry**: Claude Any can show router RPM usage and the
+  latest wait time in the bottom status area when `rate_limit_status=on`,
+  keeping rate-limit telemetry out of the chat transcript.
 - **Soft RPM pacing for free hosted models**: NVIDIA hosted, self-hosted NIM,
   Ollama, and Ollama Cloud can use router-side RPM pacing. The pacing subtracts
   time already spent in file reads, command execution, and tool-result waits, so
   normal coding tool-call gaps naturally absorb much of the RPM spacing.
-- **Unlimited usage display**: `rate_limit_rpm=0` disables throttling while
-  still displaying the last-60-seconds request rate.
+- **Unlimited usage display**: `rate_limit_rpm=0` disables throttling; enable
+  `rate_limit_status=on` only when you want the last-60-seconds request rate.
 
 ### 0.1.27
 

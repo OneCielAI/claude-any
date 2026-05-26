@@ -440,8 +440,8 @@ claude-any \
   --ca-max-output-tokens 4096 \
   --ca-context-window 65536 \
   --ca-request-timeout-ms 120000 \
-  --ca-rate-limit-rpm 40 \
-  --ca-rate-limit-status on \
+  --ca-rate-limit-rpm 0 \
+  --ca-rate-limit-status off \
   --ca-stream on \
   --ca-stream-word-chunking off \
   --ca-web-search \
@@ -464,8 +464,8 @@ export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
 export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
 export CLAUDE_ANY_CONTEXT_WINDOW=65536
 export CLAUDE_ANY_REQUEST_TIMEOUT_MS=120000
-export CLAUDE_ANY_RATE_LIMIT_RPM=40
-export CLAUDE_ANY_RATE_LIMIT_STATUS=on
+export CLAUDE_ANY_RATE_LIMIT_RPM=0
+export CLAUDE_ANY_RATE_LIMIT_STATUS=off
 export CLAUDE_ANY_STREAM=on
 export CLAUDE_ANY_STREAM_WORD_CHUNKING=off
 export CLAUDE_ANY_WEB_SEARCH=on
@@ -488,8 +488,8 @@ CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
 CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
 CLAUDE_ANY_CONTEXT_WINDOW=65536
 CLAUDE_ANY_REQUEST_TIMEOUT_MS=120000
-CLAUDE_ANY_RATE_LIMIT_RPM=40
-CLAUDE_ANY_RATE_LIMIT_STATUS=on
+CLAUDE_ANY_RATE_LIMIT_RPM=0
+CLAUDE_ANY_RATE_LIMIT_STATUS=off
 CLAUDE_ANY_STREAM=on
 CLAUDE_ANY_STREAM_WORD_CHUNKING=off
 CLAUDE_ANY_WEB_SEARCH=on
@@ -558,8 +558,8 @@ Common Claude Any setup flags:
 | `--ca-context-window VALUE` | Set provider/router context-window cap where supported. |
 | `--ca-request-timeout-ms VALUE` | Set upstream request timeout in milliseconds. |
 | `--ca-stream-idle-timeout-ms VALUE` | Set stream idle timeout in milliseconds; if no bytes arrive for this long, the router can retry or fail instead of hanging forever. |
-| `--ca-rate-limit-rpm VALUE` | Set provider RPM limit; `0` disables throttling but keeps usage display. |
-| `--ca-rate-limit-status on|off` | Show or hide RPM/rate-limit status in the Claude Code statusline. |
+| `--ca-rate-limit-rpm VALUE` | Set provider RPM limit; default `0` disables router throttling. |
+| `--ca-rate-limit-status on|off` | Show or hide RPM/rate-limit status in the Claude Code statusline; default is `off`. |
 | `--ca-stream on|off` | Enable or disable streaming through the router. |
 | `--ca-stream-word-chunking on|off` | Split streamed text into smaller word-like chunks when enabled. |
 | `--ca-ollama-num-ctx VALUE` | Set Ollama `num_ctx`. |

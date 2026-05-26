@@ -145,7 +145,7 @@ CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-forma
 すべての起動オプションをフラグで渡す例:
 
 ```sh
-claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 120000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 120000 --ca-rate-limit-rpm 0 --ca-rate-limit-status off --ca-no-update-check -p "Reply with OK only." --output-format text
 ```
 
 同じ値を環境変数で指定:
@@ -160,8 +160,8 @@ export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
 export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
 export CLAUDE_ANY_CONTEXT_WINDOW=65536
 export CLAUDE_ANY_REQUEST_TIMEOUT_MS=120000
-export CLAUDE_ANY_RATE_LIMIT_RPM=40
-export CLAUDE_ANY_RATE_LIMIT_STATUS=on
+export CLAUDE_ANY_RATE_LIMIT_RPM=0
+export CLAUDE_ANY_RATE_LIMIT_STATUS=off
 claude-any -p "Reply with OK only." --output-format text
 ```
 
@@ -349,10 +349,11 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
   `EnterPlanMode` のローカル処理と plan artifact の流れを含みます。
 - 選択した Advisor Model に現在の作業状態を送り、レビューを受ける `/advisor`
   slash command。長コンテキストの確認や次の一手の検証に便利です。
-- Claude Code `statusLine` 連携により、router の RPM 使用量と待機時間を
-  チャット本文ではなく下部ステータス領域に表示します。
+- 任意の Claude Code `statusLine` 連携により、router の RPM 使用量と待機時間を
+  チャット本文ではなく下部ステータス領域に表示できます。
 - NVIDIA hosted、self-hosted NIM、Ollama、Ollama Cloud の router-side RPM 制御。
-  `rate_limit_rpm=0` では throttling を無効化し、直近 60 秒の使用量だけを表示します。
+  既定は `rate_limit_rpm=0` と `rate_limit_status=off` です。正の RPM と status 表示を
+  有効化すると router pacing telemetry を使えます。
 - soft pacing はファイル読み取り、コマンド実行、tool 結果待ちにすでに使われた
   時間を待機計算から差し引きます。実際のコーディングセッションでは、こうした
   tool-call の間隔が RPM 間隔を自然に吸収するため、NVIDIA hosted NIM のような
@@ -628,16 +629,16 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 - **Plan Mode + Advisor ヘッドライン**: router 経由の non-Anthropic provider での
   Plan Mode 対応と、選択した長コンテキスト Advisor Model で動作する `/advisor`
   slash command を文書化しました。
-- **statusLine RPM 表示**: Claude Any が Claude Code `statusLine` command を
-  インストールし、router の RPM 使用量と直近の待機時間を下部ステータス領域に表示します。
+- **statusLine RPM 表示**: `rate_limit_status=on` のとき、Claude Any が Claude Code
+  `statusLine` command で router の RPM 使用量と直近の待機時間を下部ステータス領域に表示します。
   rate-limit 情報でチャット本文を汚しません。
 - **無料 hosted モデル向け soft RPM pacing**: NVIDIA hosted、self-hosted NIM、
   Ollama、Ollama Cloud で router-side RPM pacing を使えます。ファイル読み取り、
   コマンド実行、tool 結果待ちにすでに使われた時間を待機計算から差し引くため、
   実際のコーディング中の tool-call 間隔が RPM 間隔を自然に吸収します。
 - **未管理 RPM の使用量表示**: `rate_limit_rpm=0` は router-side throttling を
-  無効化しますが、直近 60 秒のリクエスト使用量は引き続き表示します。provider 側に
-  制限がないという意味ではありません。
+  無効化します。直近 60 秒のリクエスト使用量は `rate_limit_status=on` のときだけ表示します。
+  provider 側に制限がないという意味ではありません。
 
 ### 0.1.27
 

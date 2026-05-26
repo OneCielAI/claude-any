@@ -151,7 +151,7 @@ CLAUDE_ANY_SKIP_MENU=1 claude-any -p "Summarize this repository." --output-forma
 모든 실행 옵션을 플래그로 전달:
 
 ```sh
-claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 120000 --ca-rate-limit-rpm 40 --ca-rate-limit-status on --ca-no-update-check -p "Reply with OK only." --output-format text
+claude-any --ca-provider nvidia-hosted --ca-base-url https://integrate.api.nvidia.com/v1 --ca-model z-ai/glm-4.7 --ca-advisor-model deepseek-ai/deepseek-v4-pro --ca-api-key-env NVIDIA_API_KEY --ca-max-output-tokens 4096 --ca-context-window 65536 --ca-request-timeout-ms 120000 --ca-rate-limit-rpm 0 --ca-rate-limit-status off --ca-no-update-check -p "Reply with OK only." --output-format text
 ```
 
 같은 값을 환경변수로 설정:
@@ -166,8 +166,8 @@ export CLAUDE_ANY_API_KEY_ENV=NVIDIA_API_KEY
 export CLAUDE_ANY_MAX_OUTPUT_TOKENS=4096
 export CLAUDE_ANY_CONTEXT_WINDOW=65536
 export CLAUDE_ANY_REQUEST_TIMEOUT_MS=120000
-export CLAUDE_ANY_RATE_LIMIT_RPM=40
-export CLAUDE_ANY_RATE_LIMIT_STATUS=on
+export CLAUDE_ANY_RATE_LIMIT_RPM=0
+export CLAUDE_ANY_RATE_LIMIT_STATUS=off
 claude-any -p "Reply with OK only." --output-format text
 ```
 
@@ -355,10 +355,11 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
   `EnterPlanMode` 로컬 처리와 plan artifact 흐름을 포함합니다.
 - 선택한 Advisor Model 로 현재 작업 상태를 보내 검토받는 `/advisor` slash command.
   긴 컨텍스트 리뷰와 다음 단계 확인에 유용합니다.
-- Claude Code `statusLine` 연동으로 router RPM 사용량과 wait 시간을 채팅 본문이
-  아니라 하단 상태 영역에 표시합니다.
+- 선택적으로 Claude Code `statusLine` 연동으로 router RPM 사용량과 wait 시간을 채팅 본문이
+  아니라 하단 상태 영역에 표시할 수 있습니다.
 - NVIDIA hosted, self-hosted NIM, Ollama, Ollama Cloud 에 대한 router-side RPM 제어.
-  `rate_limit_rpm=0`이면 throttling 은 끄고 최근 60초 사용량만 표시합니다.
+  기본값은 `rate_limit_rpm=0`, `rate_limit_status=off`이며, 양수 RPM과 status 표시를 켜면
+  router pacing telemetry를 사용할 수 있습니다.
 - soft pacing 은 파일 읽기, 명령 실행, tool 결과 대기에 이미 소비된 시간을 지연
   계산에서 뺍니다. 실제 코딩 세션에서는 이런 tool-call 간격이 RPM 간격을 자연스럽게
   흡수하므로, NVIDIA hosted NIM 같은 무료 모델의 RPM 제한 안에서 동작하면서도 매
@@ -634,15 +635,15 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 - **Plan Mode + Advisor 헤드라인**: router 기반 non-Anthropic provider 의
   Plan Mode 지원과, 선택한 긴 컨텍스트 Advisor Model 로 동작하는 `/advisor`
   slash command 를 문서화했습니다.
-- **statusLine RPM 표시**: Claude Any 가 Claude Code `statusLine` command 를
-  설치해 router RPM 사용량과 최근 wait 시간을 하단 상태 영역에 표시합니다. rate-limit
-  정보가 채팅 본문을 오염시키지 않습니다.
+- **statusLine RPM 표시**: `rate_limit_status=on`일 때 Claude Any 가 Claude Code
+  `statusLine` command 로 router RPM 사용량과 최근 wait 시간을 하단 상태 영역에 표시합니다.
+  rate-limit 정보가 채팅 본문을 오염시키지 않습니다.
 - **무료 hosted 모델을 위한 soft RPM pacing**: NVIDIA hosted, self-hosted NIM,
   Ollama, Ollama Cloud 에 router-side RPM pacing 을 사용할 수 있습니다. 파일 읽기,
   명령 실행, tool 결과 대기에 이미 쓰인 시간을 지연 계산에서 빼므로 실제 코딩 중
   tool-call 간격이 RPM 간격을 자연스럽게 흡수합니다.
-- **미관리 RPM 사용량 표시**: `rate_limit_rpm=0`은 router-side throttling 을 끄지만
-  최근 60초 요청 사용량은 계속 표시합니다. provider 제한이 없다는 뜻은 아닙니다.
+- **미관리 RPM 사용량 표시**: `rate_limit_rpm=0`은 router-side throttling 을 끕니다.
+  최근 60초 요청 사용량은 `rate_limit_status=on`일 때만 표시합니다. provider 제한이 없다는 뜻은 아닙니다.
 
 ### 0.1.27
 
