@@ -949,6 +949,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("로컬 사용자 승인 없이 같은 채널/DM에 답장", prompt)
         self.assertIn("답장 여부를 묻고 멈추지 마세요", prompt)
         self.assertIn("미래 행동을 약속하는 말만 남기고 턴을 끝내지 마세요", prompt)
+        self.assertIn("범위를 작게 유지", prompt)
+        self.assertIn("새 방 생성", prompt)
         self.assertIn("Let me send", prompt)
         self.assertIn("새 이벤트", prompt)
         append_summary.assert_called_once_with(message, "분석 완료", "end_turn", tool_turns=1)
@@ -1064,6 +1066,102 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("Let me send", retry_prompt)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_deferred_action_retry" in item for item in log_messages))
+
+    def test_channel_direct_router_response_retries_deferred_action_after_sixth_turn(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) <= 5:
+                return {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": f"toolu_many_{len(calls)}",
+                            "name": "mcp__ai-net-sse__get_messages",
+                            "input": {"room_id": "room_dm_4wcekxw4yse", "limit": 5},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            if len(calls) == 6:
+                return {
+                    "content": [{"type": "text", "text": "All members invited. Now let me reply to Sarah's DM."}],
+                    "stop_reason": "end_turn",
+                }
+            if len(calls) == 7:
+                return {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_after_retry",
+                            "name": "mcp__ai-net-sse__send_dm",
+                            "input": {"to_agent_id": "agent_sarah", "content": "현재 상황입니다."},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            return {"content": [{"type": "text", "text": "Sarah에게 현재 상황을 DM으로 회신했습니다."}], "stop_reason": "end_turn"}
+
+        with (
+            mock.patch.object(
+                claude_any,
+                "_channel_direct_tool_schemas",
+                return_value=[{"name": "mcp__ai-net-sse__get_messages"}, {"name": "mcp__ai-net-sse__send_dm"}],
+            ),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool", return_value=("ok", False)) as execute_tool,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                18,
+                "수신 메시지를 처리하세요",
+                {"id": 18, "channel": "room_dm_4wcekxw4yse", "meta": {"sse_source": "mcp-ai-net-sse"}},
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("Sarah에게 현재 상황을 DM으로 회신했습니다.", text)
+        self.assertEqual("end_turn", stop_reason)
+        self.assertEqual(6, tool_turns)
+        self.assertEqual(6, execute_tool.call_count)
+        self.assertEqual(8, len(calls))
+        retry_prompt = calls[6]["messages"][-1]["content"][0]["text"]
+        self.assertIn("[claude-any channel action required]", retry_prompt)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_deferred_action_retry" in item for item in log_messages))
+
+    def test_channel_direct_router_response_replaces_deferred_text_at_max_turns(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            return {
+                "content": [{"type": "text", "text": "All three members invited. Now let me send the group room announcement."}],
+                "stop_reason": "end_turn",
+            }
+
+        with (
+            mock.patch.object(claude_any, "_CHANNEL_DIRECT_MAX_ROUTER_TURNS", 1),
+            mock.patch.object(claude_any, "_channel_direct_tool_schemas", return_value=[{"name": "mcp__ai-net-sse__send_dm"}]),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                19,
+                "수신 메시지를 처리하세요",
+                {"id": 19, "channel": "room_dm_4wcekxw4yse", "message": "New message from Sarah"},
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("max_tool_turns", stop_reason)
+        self.assertEqual(0, tool_turns)
+        self.assertIn("도구 호출 한도", text)
+        self.assertIn("실제 처리 완료로 표시하지 않았습니다", text)
+        self.assertIn("Now let me send", text)
 
     def test_channel_direct_router_response_without_tools_returns_blocker(self):
         with (

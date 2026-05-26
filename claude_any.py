@@ -16615,6 +16615,8 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         "알림 본문이 'New message...' 같은 짧은 통지이고 room/message id가 있으면 먼저 사용 가능한 read/get_messages 계열 도구로 실제 메시지를 조회하세요. "
         "DM/업무 지시/상태 확인/컨텍스트 요청처럼 안전한 협업 응답은 로컬 사용자 승인 없이 같은 채널/DM에 답장하거나 필요한 읽기/쓰기 도구를 호출하세요. "
         "로컬 사용자에게 '답장할까요?'처럼 답장 여부를 묻고 멈추지 마세요. "
+        "짧은 DM/상태 확인/컨텍스트 요청은 범위를 작게 유지하세요. 실제 메시지를 읽은 뒤 같은 DM/채널에 직접 답장하는 것을 우선하세요. "
+        "수신 메시지가 명시적으로 요구하지 않았는데 새 방 생성, 멤버 초대, 태스크 배정, 새 워크플로 시작처럼 범위를 넓히는 작업을 하지 마세요. "
         "승인이 필요한 경우는 실제 결제/투자 실행, credential/secret 공개, 파괴적 파일/시스템/관리자 작업, "
         "명시적으로 승인이 필요한 외부 부작용처럼 되돌리기 어려운 고위험 작업뿐입니다. "
         "단순 온보딩/인사/중복 테스트 메시지를 새로 만들지 말고, 받은 메시지의 요청에 맞게 답장하거나 작업하세요. "
@@ -16972,6 +16974,9 @@ _CHANNEL_DIRECT_DEFERRED_ACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 
 
+_CHANNEL_DIRECT_MAX_ROUTER_TURNS = 10
+
+
 def _channel_direct_text_is_deferred_action(text: str) -> bool:
     body = re.sub(r"\s+", " ", str(text or "")).strip()
     if not body:
@@ -17005,6 +17010,21 @@ def _channel_direct_deferred_action_prompt(text: str) -> str:
         "If no tool can perform it, give a concise blocker summary instead.\n\n"
         "previous_assistant_text="
         + json.dumps(truncate_for_prompt(str(text or ""), 2000), ensure_ascii=False)
+    )
+
+
+def _channel_direct_max_turns_summary(message: dict[str, Any], last_text: str, tool_turns: int) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    channel = str(message.get("channel") or meta.get("room_id") or "default")
+    incoming = truncate_for_prompt(str(message.get("message") or ""), 1000)
+    previous = truncate_for_prompt(str(last_text or ""), 1200)
+    return (
+        "채널 메시지 자동 처리가 도구 호출 한도에 도달해 완료되지 않았습니다. "
+        "마지막 응답이 미래 행동 약속이어서 실제 처리 완료로 표시하지 않았습니다.\n\n"
+        f"- channel: {channel}\n"
+        f"- incoming: {incoming}\n"
+        f"- tool_turns: {tool_turns}\n"
+        f"- last_assistant_text: {previous}"
     )
 
 
@@ -17086,7 +17106,7 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
     stop_reason = ""
     tool_turns = 0
     deferred_action_retried = False
-    for _turn in range(6):
+    for _turn in range(_CHANNEL_DIRECT_MAX_ROUTER_TURNS):
         body: dict[str, Any] = {
             "model": model,
             "max_tokens": 768,
@@ -17131,6 +17151,8 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
                 }
             )
         messages.append({"role": "user", "content": results})
+    if _channel_direct_text_is_deferred_action(last_text):
+        return _channel_direct_max_turns_summary(message, last_text, tool_turns), "max_tool_turns", tool_turns
     return last_text, "max_tool_turns", tool_turns
 
 
