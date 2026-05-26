@@ -460,6 +460,71 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_stdin_proxy_skipped_noise" in item for item in log_messages))
         self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2,3" in item and "enter=crlf" in item for item in log_messages))
 
+    def test_inject_pending_channel_messages_skips_direct_llm_owned_messages(self):
+        messages = [
+            {
+                "id": 4,
+                "channel": "room_dm_generic",
+                "sender_id": "ai-net-sse",
+                "message": "New message from Sarah",
+                "meta": {"llm_direct_pending": True},
+            }
+        ]
+        with (
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_write_fd_all") as write_all,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            last_id = claude_any._inject_pending_channel_messages(99, 0)
+        self.assertEqual(4, last_id)
+        write_all.assert_not_called()
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("reason=llm_direct_pending" in item for item in log_messages))
+
+    def test_inject_pending_channel_summaries_writes_prompt_to_child_stdin(self):
+        original_cursor = claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+        with tempfile.TemporaryDirectory() as td:
+            queue_path = Path(td) / "channel-llm-summary-queue.jsonl"
+            cursor_path = Path(td) / "channel-llm-summary-cursor.json"
+            queue_path.write_text(
+                json.dumps(
+                    {
+                        "message_id": 12,
+                        "channel": "room_dm_generic",
+                        "sender_id": "Sarah",
+                        "stop_reason": "end_turn",
+                        "tool_turns": 2,
+                        "incoming": "New message from Sarah",
+                        "summary": "Sarah에게 현재 상황을 DM으로 회신했습니다.",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            try:
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = None
+                with (
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_QUEUE_PATH", queue_path),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_CURSOR_PATH", cursor_path),
+                    mock.patch.object(claude_any, "_write_fd_all") as write_all,
+                    mock.patch.object(claude_any, "router_log") as router_log,
+                ):
+                    last_id = claude_any._inject_pending_channel_summaries(99, b"\r\n")
+                    cursor_payload = json.loads(cursor_path.read_text(encoding="utf-8"))
+            finally:
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = original_cursor
+
+        self.assertEqual(12, last_id)
+        self.assertEqual({"last_id": 12}, cursor_payload)
+        payload = write_all.call_args.args[1]
+        self.assertIn("channel direct handling summaries".encode("utf-8"), payload)
+        self.assertIn("Sarah".encode("utf-8"), payload)
+        self.assertTrue(payload.startswith(b"\x15"))
+        self.assertTrue(payload.endswith(b"\r\n"))
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_stdin_summary_injected" in item and "message_ids=12" in item for item in log_messages))
+
     def test_body_with_pending_channel_messages_injects_llm_context(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
         messages = [
@@ -1208,8 +1273,69 @@ class ChannelBridgeTests(unittest.TestCase):
         retry_prompt = calls[2]["messages"][-1]["content"][0]["text"]
         self.assertIn("[claude-any channel reply required]", retry_prompt)
         self.assertIn("NO_REPLY:", retry_prompt)
+        self.assertEqual(["mcp__ai-net-sse__send_dm"], [tool["name"] for tool in calls[2]["tools"]])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_reply_action_retry" in item for item in log_messages))
+
+    def test_channel_direct_router_response_marks_reply_required_unfulfilled(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) == 1:
+                return {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read",
+                            "name": "mcp__ai-net-sse__get_messages",
+                            "input": {"room_id": "room_dm_generic", "limit": 5},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            if len(calls) == 2:
+                return {
+                    "content": [{"type": "text", "text": "I have enough context. Let me reply to Sarah now."}],
+                    "stop_reason": "end_turn",
+                }
+            return {
+                "content": [{"type": "text", "text": "I should send Sarah a reply with the current status."}],
+                "stop_reason": "end_turn",
+            }
+
+        with (
+            mock.patch.object(
+                claude_any,
+                "_channel_direct_tool_schemas",
+                return_value=[{"name": "mcp__ai-net-sse__get_messages"}, {"name": "mcp__ai-net-sse__send_dm"}],
+            ),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool", return_value=("ok", False)) as execute_tool,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                23,
+                "수신 메시지를 처리하세요",
+                {
+                    "id": 23,
+                    "channel": "room_dm_generic",
+                    "message": "New message from Sarah",
+                    "meta": {"sse_source": "mcp-ai-net-sse", "message_id": "msg_sarah"},
+                },
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("reply_required_unfulfilled", stop_reason)
+        self.assertEqual(1, tool_turns)
+        self.assertIn("실제 회신하지 않았습니다", text)
+        execute_tool.assert_called_once()
+        self.assertEqual(3, len(calls))
+        self.assertEqual(["mcp__ai-net-sse__send_dm"], [tool["name"] for tool in calls[2]["tools"]])
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_reply_required_unfulfilled" in item for item in log_messages))
 
     def test_channel_direct_router_response_allows_explicit_no_reply_marker(self):
         calls: list[dict[str, object]] = []

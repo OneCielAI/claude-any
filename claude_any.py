@@ -16337,6 +16337,17 @@ def should_use_channel_llm_delivery(use_router_mode: bool, passthrough: list[str
     return True
 
 
+def channel_specs_include_external_server(specs: list[str]) -> bool:
+    for spec in specs:
+        text = str(spec or "").strip()
+        if not text:
+            continue
+        name = text.split(":", 1)[1] if ":" in text else text
+        if name.strip().lower() not in _NATIVE_ROUTER_CHANNEL_NAMES:
+            return True
+    return False
+
+
 def claude_code_channels_auth_available(claude: str) -> tuple[bool, str]:
     try:
         proc = subprocess.run(
@@ -16851,6 +16862,17 @@ def _channel_direct_tool_is_reply_action(tool_name: str) -> bool:
     return normalized in _CHANNEL_DIRECT_REPLY_TOOL_NAMES
 
 
+def _channel_direct_tool_schema_short_name(tool: dict[str, Any]) -> str:
+    parts = _channel_direct_tool_name_parts(str(tool.get("name") or ""))
+    if parts is None:
+        return str(tool.get("name") or "")
+    return parts[1]
+
+
+def _channel_direct_reply_tool_schemas(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [tool for tool in tools if _channel_direct_tool_is_reply_action(_channel_direct_tool_schema_short_name(tool))]
+
+
 def _channel_direct_tool_schemas(message: dict[str, Any]) -> list[dict[str, Any]]:
     state_name = _channel_direct_source_state_name(message)
     if not state_name:
@@ -17115,6 +17137,21 @@ def _channel_direct_max_turns_summary(message: dict[str, Any], last_text: str, t
     )
 
 
+def _channel_direct_reply_required_summary(message: dict[str, Any], last_text: str, tool_turns: int) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    channel = str(message.get("channel") or meta.get("room_id") or "default")
+    incoming = truncate_for_prompt(str(message.get("message") or ""), 1000)
+    previous = truncate_for_prompt(str(last_text or ""), 1200)
+    return (
+        "채널 DM/멘션은 수신됐지만 reply/send 도구 호출 없이 자동 처리가 종료되어 실제 회신하지 않았습니다. "
+        "이 결과는 완료가 아니라 미처리 상태입니다.\n\n"
+        f"- channel: {channel}\n"
+        f"- incoming: {incoming}\n"
+        f"- tool_turns: {tool_turns}\n"
+        f"- last_assistant_text: {previous}"
+    )
+
+
 def _channel_direct_append_summary(message: dict[str, Any], text: str, stop_reason: str, tool_turns: int = 0) -> None:
     try:
         message_id = int(message.get("id") or 0)
@@ -17197,6 +17234,14 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
     reply_required = _channel_direct_message_requires_reply(message)
     executed_tool_names: list[str] = []
     for _turn in range(_CHANNEL_DIRECT_MAX_ROUTER_TURNS):
+        reply_already_attempted = any(_channel_direct_tool_is_reply_action(name) for name in executed_tool_names)
+        active_tools = tools
+        if reply_required and reply_action_retried and not reply_already_attempted:
+            reply_tools = _channel_direct_reply_tool_schemas(tools)
+            if not reply_tools:
+                router_log("WARN", f"channel_llm_reply_required_no_tool message_id={message_id} turn={_turn + 1}")
+                return _channel_direct_reply_required_summary(message, last_text, tool_turns), "reply_required_no_tool", tool_turns
+            active_tools = reply_tools
         body: dict[str, Any] = {
             "model": model,
             "max_tokens": 768,
@@ -17207,8 +17252,8 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
             },
             "messages": messages,
         }
-        if tools:
-            body["tools"] = tools
+        if active_tools:
+            body["tools"] = active_tools
         parsed = _channel_direct_llm_http_message(message_id, body, provider, pcfg, model)
         stop_reason = str(parsed.get("stop_reason") or "")
         text = _anthropic_message_text(parsed)
@@ -17217,6 +17262,24 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
         tool_uses = _channel_direct_tool_uses(parsed)
         messages.append({"role": "assistant", "content": parsed.get("content") or []})
         if not tool_uses:
+            if (
+                tools
+                and reply_required
+                and not any(_channel_direct_tool_is_reply_action(name) for name in executed_tool_names)
+                and not _channel_direct_text_declines_reply(text)
+            ):
+                if not reply_action_retried:
+                    reply_action_retried = True
+                    router_log("INFO", f"channel_llm_reply_action_retry message_id={message_id} turn={_turn + 1}")
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": _channel_direct_reply_action_prompt(text)}],
+                        }
+                    )
+                    continue
+                router_log("WARN", f"channel_llm_reply_required_unfulfilled message_id={message_id} turn={_turn + 1}")
+                return _channel_direct_reply_required_summary(message, text, tool_turns), "reply_required_unfulfilled", tool_turns
             if tools and not deferred_action_retried and _channel_direct_text_is_deferred_action(text):
                 deferred_action_retried = True
                 router_log("INFO", f"channel_llm_deferred_action_retry message_id={message_id} turn={_turn + 1}")
@@ -17227,27 +17290,24 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
                     }
                 )
                 continue
-            if (
-                tools
-                and reply_required
-                and not reply_action_retried
-                and not any(_channel_direct_tool_is_reply_action(name) for name in executed_tool_names)
-                and not _channel_direct_text_declines_reply(text)
-            ):
-                reply_action_retried = True
-                router_log("INFO", f"channel_llm_reply_action_retry message_id={message_id} turn={_turn + 1}")
-                messages.append(
-                    {
-                        "role": "user",
-                        "content": [{"type": "text", "text": _channel_direct_reply_action_prompt(text)}],
-                    }
-                )
-                continue
             return last_text, stop_reason or "end_turn", tool_turns
         tool_turns += 1
         results: list[dict[str, Any]] = []
+        allowed_tool_names = {str(tool.get("name") or "") for tool in active_tools}
         for tool_use in tool_uses:
+            requested_name = str(tool_use.get("name") or "")
             parts = _channel_direct_tool_name_parts(str(tool_use.get("name") or ""))
+            if requested_name not in allowed_tool_names:
+                router_log("WARN", f"channel_llm_tool_not_in_turn_schema tool_use_id={tool_use.get('id')} tool={requested_name}")
+                results.append(
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": str(tool_use.get("id") or ""),
+                        "content": f"Tool {requested_name} is not available for this reply-required turn. Use an available reply/send tool or end with NO_REPLY: if no reply is appropriate.",
+                        "is_error": True,
+                    }
+                )
+                continue
             if parts is not None:
                 executed_tool_names.append(parts[1])
             result_text, is_error = _channel_direct_execute_tool(tool_use)
@@ -17262,6 +17322,8 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
         messages.append({"role": "user", "content": results})
     if _channel_direct_text_is_deferred_action(last_text):
         return _channel_direct_max_turns_summary(message, last_text, tool_turns), "max_tool_turns", tool_turns
+    if reply_required and not any(_channel_direct_tool_is_reply_action(name) for name in executed_tool_names):
+        return _channel_direct_reply_required_summary(message, last_text, tool_turns), "reply_required_unfulfilled", tool_turns
     return last_text, "max_tool_turns", tool_turns
 
 
@@ -17637,6 +17699,12 @@ def _inject_pending_channel_messages(master_fd: int, last_id: int, enter_bytes: 
             last_id = max(last_id, int(message.get("id") or 0))
         except Exception:
             continue
+        if _channel_message_is_direct_llm_owned(message):
+            router_log(
+                "INFO",
+                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
+            )
+            continue
         noise_reason = _channel_wake_message_noise_reason(message)
         if noise_reason:
             router_log(
@@ -17658,9 +17726,46 @@ def _inject_pending_channel_messages(master_fd: int, last_id: int, enter_bytes: 
     return last_id
 
 
+def _inject_pending_channel_summaries(master_fd: int, enter_bytes: bytes | None = None) -> int:
+    global _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+    with _CHANNEL_LLM_SUMMARY_LOCK:
+        last_id = _channel_llm_summary_read_cursor_locked()
+        records = _read_channel_llm_summary_records(last_id, 20)
+        if not records:
+            return last_id
+        max_seen = last_id
+        for item in records:
+            try:
+                max_seen = max(max_seen, int(item.get("message_id") or 0))
+            except Exception:
+                pass
+        _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = max_seen
+        try:
+            _channel_llm_summary_write_cursor_locked(max_seen)
+        except Exception as exc:
+            router_log("WARN", f"channel_stdin_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
+    prompt = format_channel_llm_summary_prompt(records)
+    submit_bytes = _channel_wake_enter_bytes(enter_bytes)
+    _write_fd_all(master_fd, _channel_wake_input_bytes(prompt, submit_bytes))
+    ids = ",".join(str(item.get("message_id") or "") for item in records)
+    router_log(
+        "INFO",
+        f"channel_stdin_summary_injected count={len(records)} message_ids={ids} enter={_channel_enter_label(submit_bytes)}",
+    )
+    return max_seen
+
+
 def _chat_messages_file_marker() -> tuple[float, int]:
     try:
         stat = CHAT_MESSAGES_PATH.stat()
+        return (stat.st_mtime, stat.st_size)
+    except Exception:
+        return (0.0, 0)
+
+
+def _channel_llm_summary_file_marker() -> tuple[float, int]:
+    try:
+        stat = CHANNEL_LLM_SUMMARY_QUEUE_PATH.stat()
         return (stat.st_mtime, stat.st_size)
     except Exception:
         return (0.0, 0)
@@ -17677,6 +17782,7 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
 
     last_id = _chat_init_next_id() - 1
     last_channel_marker = _chat_messages_file_marker()
+    last_summary_marker = _channel_llm_summary_file_marker()
     master_fd, slave_fd = pty.openpty()
     proc = subprocess.Popen(cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, env=env, close_fds=True)
     os.close(slave_fd)
@@ -17722,6 +17828,10 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
                 if marker != last_channel_marker:
                     last_channel_marker = marker
                     last_id = _inject_pending_channel_messages(master_fd, last_id, channel_enter_bytes)
+                summary_marker = _channel_llm_summary_file_marker()
+                if summary_marker != last_summary_marker:
+                    last_summary_marker = summary_marker
+                    _inject_pending_channel_summaries(master_fd, channel_enter_bytes)
         while True:
             try:
                 readable, _, _ = select.select([master_fd], [], [], 0)
@@ -18644,7 +18754,13 @@ def launch_claude(
     cmd.extend(claude_passthrough)
     _log_claude_command_for_diagnostics(cmd, env)
     capture_stderr = env_bool(os.environ.get("CLAUDE_ANY_CAPTURE_CC_STDERR"), False)
-    if stdin_channel_proxy:
+    screen_summary_proxy = (
+        llm_channel_delivery
+        and channel_specs_include_external_server(detected_channel_specs)
+        and not has_passthrough_option(claude_passthrough, "-p", "--print")
+        and env_bool(os.environ.get("CLAUDE_ANY_CHANNEL_SCREEN_SUMMARY"), True)
+    )
+    if stdin_channel_proxy or screen_summary_proxy:
         return subprocess_call_with_channel_wake_proxy(cmd, env)
     if capture_stderr:
         return _subprocess_call_capturing_stderr(cmd, env)
