@@ -357,6 +357,82 @@ class ChannelBridgeTests(unittest.TestCase):
                 claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
                 claude_any._CHAT_NEXT_ID = old_next
 
+    def test_auto_start_sse_channels_filters_allowed_server_names(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp = root / ".mcp.json"
+            mcp.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ai-net-sse": {"type": "sse", "url": "http://example.test/ai/sse"},
+                            "other-sse": {"type": "sse", "url": "http://example.test/other/sse"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            seen: list[str] = []
+
+            def fake_start(server):
+                seen.append(server["name"])
+                return {"name": server["name"], "url": server["url"]}
+
+            with mock.patch.object(claude_any, "start_channel_sse_connection", side_effect=fake_start):
+                started = claude_any.auto_start_sse_channels_from_mcp_configs(
+                    [],
+                    cwd=root,
+                    home=root,
+                    allowed_server_names=["ai-net-sse"],
+                )
+            self.assertEqual(["mcp-ai-net-sse"], seen)
+            self.assertEqual(["mcp-ai-net-sse"], [item["name"] for item in started])
+
+    def test_start_router_managed_channel_sse_uses_enabled_external_channels(self):
+        cfg = {"claude_code": {"channels": ["server:claude-any-router", "server:ai-net-sse"]}}
+        with (
+            mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=False) as ensure_probe,
+            mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[]) as source_paths,
+            mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", return_value=[{"name": "mcp-ai-net-sse"}]) as auto_start,
+        ):
+            started = claude_any.start_router_managed_channel_sse(cfg)
+        self.assertEqual([{"name": "mcp-ai-net-sse"}], started)
+        ensure_probe.assert_called_once_with(cfg, [])
+        source_paths.assert_called_once_with(["server:ai-net-sse"])
+        auto_start.assert_called_once()
+        self.assertEqual(["ai-net-sse"], auto_start.call_args.kwargs["allowed_server_names"])
+
+    def test_start_router_managed_channel_sse_autodetects_without_external_channels(self):
+        cfg = {"claude_code": {"channels": ["server:claude-any-router"]}}
+        with mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", return_value=[{"name": "mcp-ai-net-sse"}]) as auto_start:
+            self.assertEqual([{"name": "mcp-ai-net-sse"}], claude_any.start_router_managed_channel_sse(cfg))
+        auto_start.assert_called_once()
+        self.assertIsNone(auto_start.call_args.kwargs["allowed_server_names"])
+
+    def test_channel_llm_prompt_warns_against_dm_label_recipient_misread(self):
+        prompt = claude_any.format_channel_llm_batch_prompt(
+            [
+                {
+                    "id": 1,
+                    "channel": "room_dm_abc",
+                    "sender_id": "ai-net-sse",
+                    "recipients": ["all"],
+                    "message": "New message from Robert",
+                    "meta": {"kind": "activity", "room_name": "DM-Robert", "message_id": "msg_1"},
+                }
+            ]
+        )
+        self.assertIn("MCP/channel 자격", prompt)
+        self.assertIn("DM label", prompt)
+        self.assertIn("현재 에이전트가 수신자가 아니라고 결론내리지 마세요", prompt)
+        self.assertIn("자동 회신 루프", prompt)
+
+    def test_reply_action_prompt_warns_against_dm_label_recipient_misread(self):
+        prompt = claude_any._channel_direct_reply_action_prompt("I am not the recipient.")
+        self.assertIn("configured MCP/channel credentials", prompt)
+        self.assertIn("DM label", prompt)
+        self.assertIn("automatic reply loop", prompt)
+
     def test_channel_wake_prompt_contains_routing_context(self):
         prompt = claude_any.format_channel_wake_prompt(
             {

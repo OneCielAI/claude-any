@@ -9693,9 +9693,16 @@ def serve(_: argparse.Namespace) -> None:
     )
     sys.stderr.flush()
     server = ThreadingHTTPServer((bind_host, ROUTER_PORT), RouterHandler)
+    channel_start_thread = threading.Thread(
+        target=lambda: start_router_managed_channel_sse(cfg),
+        daemon=True,
+        name="ca-router-channel-sse-start",
+    )
+    channel_start_thread.start()
     try:
         server.serve_forever()
     finally:
+        stop_channel_sse_connection(None)
         try:
             PID_PATH.unlink()
         except FileNotFoundError:
@@ -11444,9 +11451,17 @@ def auto_start_sse_channels_from_mcp_configs(
     cwd: Path | None = None,
     home: Path | None = None,
     extra_config_paths: list[Path | str] | None = None,
+    allowed_server_names: Iterable[str] | None = None,
 ) -> list[dict[str, Any]]:
     cwd = cwd or Path.cwd()
     started: list[dict[str, Any]] = []
+    allowed: set[str] | None = None
+    if allowed_server_names is not None:
+        allowed = {
+            _channel_sse_public_mcp_name(str(name or "").strip())
+            for name in allowed_server_names
+            if str(name or "").strip()
+        }
     paths = [Path(path).expanduser() for path in extra_config_paths or []]
     paths.extend(claude_mcp_config_paths(passthrough, cwd, home))
     seen: set[str] = set()
@@ -11458,12 +11473,47 @@ def auto_start_sse_channels_from_mcp_configs(
         if not path.exists() or not path.is_file():
             continue
         for server in _read_mcp_sse_servers_from_json(path, cwd):
+            public_name = _channel_sse_public_mcp_name(str(server.get("name") or ""))
+            if allowed is not None and public_name not in allowed:
+                continue
             try:
                 status = start_channel_sse_connection(server)
                 started.append(status)
                 router_log("INFO", f"channel_sse_auto_started name={status.get('name')} url={status.get('url')}")
             except Exception as exc:
                 router_log("WARN", f"channel_sse_auto_start_failed path={path} error={type(exc).__name__}: {exc}")
+    return started
+
+
+def router_managed_channel_server_names(cfg: dict[str, Any]) -> list[str]:
+    names = _server_names_from_channel_specs(channel_specs_for_launch(cfg, []))
+    return [name for name in names if name.strip().lower() not in _NATIVE_ROUTER_CHANNEL_NAMES]
+
+
+def start_router_managed_channel_sse(cfg: dict[str, Any]) -> list[dict[str, Any]]:
+    if not should_use_channel_llm_delivery(True, [], cfg):
+        return []
+    names = router_managed_channel_server_names(cfg)
+    source_paths: list[Path] = []
+    allowed_names: list[str] | None = names or None
+    if names:
+        try:
+            ensure_channel_probe_cache_for_launch(cfg, [])
+            source_paths = cached_channel_source_paths_for_specs([f"server:{name}" for name in names])
+        except Exception as exc:
+            router_log("WARN", f"router_channel_probe_cache_failed error={type(exc).__name__}: {exc}")
+    else:
+        router_log("INFO", "router_channel_sse_autodetect reason=no_external_channel_specs")
+    started = auto_start_sse_channels_from_mcp_configs(
+        [],
+        extra_config_paths=source_paths,
+        allowed_server_names=allowed_names,
+    )
+    router_log(
+        "INFO",
+        "router_channel_sse_started count=%d servers=%s"
+        % (len(started), ",".join(str(item.get("name") or "") for item in started) or "-"),
+    )
     return started
 
 
@@ -16622,7 +16672,12 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         "[claude-any channel inbox]\n"
         "아래 항목은 claude-any가 자동 수신한 외부 채널/MCP 메시지입니다. "
         "이 메시지는 현재 Claude Code 세션의 에이전트에게 도착한 실제 업무 메시지입니다. "
+        "이 inbox는 현재 에이전트의 MCP/channel 자격으로 구독된 수신함입니다. "
+        "room name, DM label, 또는 'New message from ...' 같은 짧은 알림만 보고 현재 에이전트가 수신자가 아니라고 결론내리지 마세요. "
+        "수신자 정체성이 애매하면 안전한 read/profile 도구로 실제 메시지와 현재 에이전트 정보를 확인한 뒤 판단하세요. "
         "이 턴은 외부 채널 수신함을 처리하는 자율 처리 턴입니다. "
+        "자동 회신 루프를 만들지 마세요. 단순 수신 확인, 감사, 준비 완료/대기 중, 진행상황 공유처럼 새 질문이나 새 업무 지시가 없는 메시지는 같은 내용으로 다시 예의상 답장하지 말고 NO_REPLY로 끝내세요. "
+        "이전 자동 답장에서 이미 차단 사유나 대기 요청을 전달했다면, 반복 업데이트를 보내지 말고 로컬 요약만 남기세요. "
         "sender/from, recipients/to, room/channel, text를 기준으로 누가 누구에게 보낸 DM/그룹 메시지인지 먼저 판단하세요. "
         "알림 본문이 'New message...' 같은 짧은 통지이고 room/message id가 있으면 먼저 사용 가능한 read/get_messages 계열 도구로 실제 메시지를 조회하세요. "
         "DM/업무 지시/상태 확인/컨텍스트 요청처럼 안전한 협업 응답은 로컬 사용자 승인 없이 같은 채널/DM에 답장하거나 필요한 읽기/쓰기 도구를 호출하세요. "
@@ -17113,6 +17168,9 @@ def _channel_direct_reply_action_prompt(text: str) -> str:
     return (
         "[claude-any channel reply required]\n"
         "You handled an incoming channel notification but ended without calling any reply/send tool. "
+        "This inbox is attached to the current agent's configured MCP/channel credentials; do not conclude you are not the recipient merely from a room name, DM label, or terse 'New message from ...' notification. "
+        "If recipient identity is uncertain, use safe read/profile tools before choosing not to reply. "
+        "Do not create an automatic reply loop: acknowledgements, thanks, readiness/waiting confirmations, or progress updates that ask no new question and assign no new task should end with NO_REPLY: instead of sending another courtesy reply. "
         "If the incoming message is addressed to this agent, asks for status/context, or expects a normal collaboration response, "
         "call the appropriate safe channel reply tool now. "
         "Do not only summarize. Do not ask the local user whether to reply. "
