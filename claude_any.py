@@ -16826,6 +16826,14 @@ _CHANNEL_DIRECT_EXACT_TOOL_ALLOWLIST = {
     "post_message",
     "post_dm",
 }
+_CHANNEL_DIRECT_REPLY_TOOL_NAMES = {
+    "send_dm",
+    "send_message",
+    "reply",
+    "send_reply",
+    "post_message",
+    "post_dm",
+}
 _CHANNEL_DIRECT_READ_TOOL_PREFIXES = ("get_", "list_", "read_", "search_")
 
 
@@ -16836,6 +16844,11 @@ def _channel_direct_tool_is_allowed(tool_name: str) -> bool:
     if normalized in _CHANNEL_DIRECT_EXACT_TOOL_ALLOWLIST:
         return True
     return any(normalized.startswith(prefix) for prefix in _CHANNEL_DIRECT_READ_TOOL_PREFIXES)
+
+
+def _channel_direct_tool_is_reply_action(tool_name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(tool_name or "").strip().lower()).strip("_")
+    return normalized in _CHANNEL_DIRECT_REPLY_TOOL_NAMES
 
 
 def _channel_direct_tool_schemas(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -17043,6 +17056,50 @@ def _channel_direct_deferred_action_prompt(text: str) -> str:
     )
 
 
+def _channel_direct_message_requires_reply(message: dict[str, Any]) -> bool:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    kind = str(meta.get("kind") or meta.get("event") or meta.get("type") or "").strip().lower()
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip().lower()
+    has_message_reference = bool(meta.get("message_id") or meta.get("source_message_id"))
+    if kind in {"activity", "message", "messages", "mention", "mentioned", "dm", "direct", "direct_message"}:
+        return True
+    if has_message_reference and any(marker in body for marker in ("new message", "mentioned", "mention", "dm", "direct message")):
+        return True
+    if body.startswith("new message from ") or "new message from " in body:
+        return True
+    if "mentioned you" in body or "멘션" in body:
+        return True
+    return False
+
+
+def _channel_direct_text_declines_reply(text: str) -> bool:
+    body = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not body:
+        return False
+    lowered = body.lower()
+    return (
+        lowered.startswith("no_reply:")
+        or lowered.startswith("no reply:")
+        or lowered.startswith("no response needed")
+        or lowered.startswith("no reply needed")
+        or body.startswith("응답 불필요:")
+        or body.startswith("회신 불필요:")
+    )
+
+
+def _channel_direct_reply_action_prompt(text: str) -> str:
+    return (
+        "[claude-any channel reply required]\n"
+        "You handled an incoming channel notification but ended without calling any reply/send tool. "
+        "If the incoming message is addressed to this agent, asks for status/context, or expects a normal collaboration response, "
+        "call the appropriate safe channel reply tool now. "
+        "Do not only summarize. Do not ask the local user whether to reply. "
+        "If and only if no channel reply is appropriate, end with a concise final answer that starts exactly with NO_REPLY:.\n\n"
+        "previous_assistant_text="
+        + json.dumps(truncate_for_prompt(str(text or ""), 2000), ensure_ascii=False)
+    )
+
+
 def _channel_direct_max_turns_summary(message: dict[str, Any], last_text: str, tool_turns: int) -> str:
     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
     channel = str(message.get("channel") or meta.get("room_id") or "default")
@@ -17136,6 +17193,9 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
     stop_reason = ""
     tool_turns = 0
     deferred_action_retried = False
+    reply_action_retried = False
+    reply_required = _channel_direct_message_requires_reply(message)
+    executed_tool_names: list[str] = []
     for _turn in range(_CHANNEL_DIRECT_MAX_ROUTER_TURNS):
         body: dict[str, Any] = {
             "model": model,
@@ -17167,10 +17227,29 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
                     }
                 )
                 continue
+            if (
+                tools
+                and reply_required
+                and not reply_action_retried
+                and not any(_channel_direct_tool_is_reply_action(name) for name in executed_tool_names)
+                and not _channel_direct_text_declines_reply(text)
+            ):
+                reply_action_retried = True
+                router_log("INFO", f"channel_llm_reply_action_retry message_id={message_id} turn={_turn + 1}")
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": _channel_direct_reply_action_prompt(text)}],
+                    }
+                )
+                continue
             return last_text, stop_reason or "end_turn", tool_turns
         tool_turns += 1
         results: list[dict[str, Any]] = []
         for tool_use in tool_uses:
+            parts = _channel_direct_tool_name_parts(str(tool_use.get("name") or ""))
+            if parts is not None:
+                executed_tool_names.append(parts[1])
             result_text, is_error = _channel_direct_execute_tool(tool_use)
             results.append(
                 {
