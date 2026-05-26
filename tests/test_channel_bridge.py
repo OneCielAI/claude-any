@@ -1094,6 +1094,39 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_no_tools" in item for item in log_messages))
 
+    def test_channel_direct_worker_does_not_enqueue_no_tools_summary(self):
+        message = {
+            "id": 17,
+            "channel": "room_dm_4wcekxw4yse",
+            "sender_id": "ai-net",
+            "message": "New message from Sarah",
+            "meta": {"room_id": "room_dm_4wcekxw4yse"},
+        }
+        claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+        try:
+            with (
+                mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+                mock.patch.object(claude_any, "get_current_provider", return_value=("ollama-cloud", {"request_timeout_ms": 300000})),
+                mock.patch.object(claude_any, "current_alias", return_value="claude-any-ollama-cloud-test"),
+                mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=0),
+                mock.patch.object(claude_any, "_channel_llm_write_cursor_locked"),
+                mock.patch.object(
+                    claude_any,
+                    "_channel_direct_llm_router_response",
+                    return_value=("MCP tools unavailable", "no_tools", 0),
+                ),
+                mock.patch.object(claude_any, "_channel_direct_append_summary") as append_summary,
+                mock.patch.object(claude_any, "_channel_direct_terminal_notice"),
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                claude_any._channel_direct_llm_worker(message)
+        finally:
+            claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+
+        append_summary.assert_not_called()
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_summary_skipped" in item and "reason=no_tools" in item for item in log_messages))
+
     def test_channel_direct_terminal_notice_prints_when_stdout_is_tty(self):
         class FakeStdout:
             def __init__(self):

@@ -17180,7 +17180,10 @@ def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
             if message_id > current:
                 _CHANNEL_LLM_CURSOR_LAST_ID = message_id
                 _channel_llm_write_cursor_locked(message_id)
-        _channel_direct_append_summary(message, text, stop_reason, tool_turns=tool_turns)
+        if stop_reason == "no_tools":
+            router_log("INFO", f"channel_llm_summary_skipped message_id={message_id} reason=no_tools")
+        else:
+            _channel_direct_append_summary(message, text, stop_reason, tool_turns=tool_turns)
         router_log("INFO", f"channel_llm_direct_response message_id={message_id} chars={len(text)} stop_reason={stop_reason} tool_turns={tool_turns}")
         _channel_direct_terminal_notice(message, text, stop_reason)
     except Exception as exc:
