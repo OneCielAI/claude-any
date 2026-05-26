@@ -16562,6 +16562,19 @@ def should_launch_process_start_channel_sse(
     return bool((stdin_channel_proxy or native_channel_bridge) and not llm_channel_delivery)
 
 
+def should_use_channel_screen_summary_proxy(
+    llm_channel_delivery: bool,
+    detected_channel_specs: list[str],
+    claude_passthrough: list[str],
+) -> bool:
+    return bool(
+        llm_channel_delivery
+        and channel_specs_include_external_server(detected_channel_specs)
+        and not has_passthrough_option(claude_passthrough, "-p", "--print")
+        and env_bool(os.environ.get("CLAUDE_ANY_CHANNEL_SCREEN_SUMMARY"), False)
+    )
+
+
 def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     channel = str(message.get("channel") or "default")
     sender = str(message.get("sender_id") or "channel")
@@ -19257,11 +19270,10 @@ def launch_claude(
     cmd.extend(claude_passthrough)
     _log_claude_command_for_diagnostics(cmd, env)
     capture_stderr = env_bool(os.environ.get("CLAUDE_ANY_CAPTURE_CC_STDERR"), False)
-    screen_summary_proxy = (
-        llm_channel_delivery
-        and channel_specs_include_external_server(detected_channel_specs)
-        and not has_passthrough_option(claude_passthrough, "-p", "--print")
-        and env_bool(os.environ.get("CLAUDE_ANY_CHANNEL_SCREEN_SUMMARY"), True)
+    screen_summary_proxy = should_use_channel_screen_summary_proxy(
+        llm_channel_delivery,
+        detected_channel_specs,
+        claude_passthrough,
     )
     if stdin_channel_proxy or screen_summary_proxy:
         if screen_summary_proxy and not stdin_channel_proxy:

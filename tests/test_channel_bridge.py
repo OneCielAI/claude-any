@@ -430,6 +430,33 @@ class ChannelBridgeTests(unittest.TestCase):
             print_channel_summaries=True,
         )
 
+    def test_screen_summary_proxy_is_off_by_default(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertFalse(
+                claude_any.should_use_channel_screen_summary_proxy(
+                    True,
+                    ["server:claude-any-router", "server:ai-net-sse"],
+                    [],
+                )
+            )
+
+    def test_screen_summary_proxy_requires_explicit_env(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_SCREEN_SUMMARY": "1"}, clear=True):
+            self.assertTrue(
+                claude_any.should_use_channel_screen_summary_proxy(
+                    True,
+                    ["server:claude-any-router", "server:ai-net-sse"],
+                    [],
+                )
+            )
+            self.assertFalse(
+                claude_any.should_use_channel_screen_summary_proxy(
+                    True,
+                    ["server:claude-any-router", "server:ai-net-sse"],
+                    ["-p", "hello"],
+                )
+            )
+
     def test_channel_summary_notice_is_compact_and_hides_no_reply(self):
         records = [
             {
