@@ -17334,6 +17334,16 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
                 and not any(_channel_direct_tool_is_reply_action(name) for name in executed_tool_names)
                 and not _channel_direct_text_declines_reply(text)
             ):
+                if reply_action_retried and not deferred_action_retried and _channel_direct_text_is_deferred_action(text):
+                    deferred_action_retried = True
+                    router_log("INFO", f"channel_llm_deferred_action_retry message_id={message_id} turn={_turn + 1} reason=reply_required")
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": [{"type": "text", "text": _channel_direct_deferred_action_prompt(text)}],
+                        }
+                    )
+                    continue
                 if not reply_action_retried:
                     reply_action_retried = True
                     router_log("INFO", f"channel_llm_reply_action_retry message_id={message_id} turn={_turn + 1}")

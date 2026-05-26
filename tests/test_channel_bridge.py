@@ -1429,10 +1429,89 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(1, tool_turns)
         self.assertIn("실제 회신하지 않았습니다", text)
         execute_tool.assert_called_once()
-        self.assertEqual(3, len(calls))
+        self.assertEqual(4, len(calls))
         self.assertEqual(["mcp__ai-net-sse__send_dm"], [tool["name"] for tool in calls[2]["tools"]])
+        self.assertEqual(["mcp__ai-net-sse__send_dm"], [tool["name"] for tool in calls[3]["tools"]])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_reply_required_unfulfilled" in item for item in log_messages))
+        self.assertTrue(any("channel_llm_deferred_action_retry" in item and "reason=reply_required" in item for item in log_messages))
+
+    def test_channel_direct_router_response_retries_deferred_reply_required_text(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) == 1:
+                return {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read",
+                            "name": "mcp__ai-net-sse__get_messages",
+                            "input": {"room_id": "room_dm_generic", "limit": 5},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            if len(calls) == 2:
+                return {
+                    "content": [{"type": "text", "text": "I read Sarah's DM. Let me send the reply now."}],
+                    "stop_reason": "end_turn",
+                }
+            if len(calls) == 3:
+                return {
+                    "content": [{"type": "text", "text": "Right, I need to actually send the reply to Sarah now."}],
+                    "stop_reason": "end_turn",
+                }
+            if len(calls) == 4:
+                return {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_reply",
+                            "name": "mcp__ai-net-sse__send_dm",
+                            "input": {"to_agent_id": "agent_sarah", "content": "현재 상황을 공유합니다."},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            return {"content": [{"type": "text", "text": "Sarah에게 DM으로 답장했습니다."}], "stop_reason": "end_turn"}
+
+        with (
+            mock.patch.object(
+                claude_any,
+                "_channel_direct_tool_schemas",
+                return_value=[{"name": "mcp__ai-net-sse__get_messages"}, {"name": "mcp__ai-net-sse__send_dm"}],
+            ),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool", return_value=("ok", False)) as execute_tool,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                24,
+                "수신 메시지를 처리하세요",
+                {
+                    "id": 24,
+                    "channel": "room_dm_generic",
+                    "message": "New message from Sarah",
+                    "meta": {"sse_source": "mcp-ai-net-sse", "message_id": "msg_sarah"},
+                },
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("Sarah에게 DM으로 답장했습니다.", text)
+        self.assertEqual("end_turn", stop_reason)
+        self.assertEqual(2, tool_turns)
+        self.assertEqual(
+            ["mcp__ai-net-sse__get_messages", "mcp__ai-net-sse__send_dm"],
+            [call.args[0]["name"] for call in execute_tool.call_args_list],
+        )
+        self.assertEqual(["mcp__ai-net-sse__send_dm"], [tool["name"] for tool in calls[2]["tools"]])
+        self.assertEqual(["mcp__ai-net-sse__send_dm"], [tool["name"] for tool in calls[3]["tools"]])
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_deferred_action_retry" in item and "reason=reply_required" in item for item in log_messages))
 
     def test_channel_direct_router_response_allows_explicit_no_reply_marker(self):
         calls: list[dict[str, object]] = []
