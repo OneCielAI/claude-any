@@ -1282,7 +1282,7 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_summary_skipped" in item and "reason=no_tools" in item for item in log_messages))
 
-    def test_channel_direct_terminal_notice_prints_when_stdout_is_tty(self):
+    def test_channel_direct_terminal_notice_is_quiet_by_default(self):
         class FakeStdout:
             def __init__(self):
                 self.text = ""
@@ -1304,7 +1304,40 @@ class ChannelBridgeTests(unittest.TestCase):
             "meta": {"author_name": "Sarah"},
         }
 
-        with mock.patch.object(claude_any.sys, "stdout", fake_stdout):
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(claude_any.sys, "stdout", fake_stdout),
+        ):
+            claude_any._channel_direct_terminal_notice(message, "처리 요약", "cli")
+
+        self.assertEqual("", fake_stdout.text)
+
+    def test_channel_direct_terminal_notice_prints_when_enabled_and_stdout_is_tty(self):
+        class FakeStdout:
+            def __init__(self):
+                self.text = ""
+
+            def isatty(self):
+                return True
+
+            def write(self, text):
+                self.text += text
+
+            def flush(self):
+                pass
+
+        fake_stdout = FakeStdout()
+        message = {
+            "id": 12,
+            "channel": "room_dm",
+            "sender_id": "ai-net-sse",
+            "meta": {"author_name": "Sarah"},
+        }
+
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_TERMINAL_NOTICE": "1"}),
+            mock.patch.object(claude_any.sys, "stdout", fake_stdout),
+        ):
             claude_any._channel_direct_terminal_notice(message, "처리 요약", "cli")
 
         self.assertIn("message_id=12", fake_stdout.text)

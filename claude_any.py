@@ -17187,6 +17187,8 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
 
 
 def _channel_direct_terminal_notice(message: dict[str, Any], text: str, stop_reason: str) -> None:
+    if not env_bool(os.environ.get("CLAUDE_ANY_CHANNEL_TERMINAL_NOTICE"), False):
+        return
     if not text.strip():
         return
     try:
