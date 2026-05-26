@@ -16817,6 +16817,27 @@ def _channel_direct_source_state_name(message: dict[str, Any]) -> str | None:
     return None
 
 
+_CHANNEL_DIRECT_EXACT_TOOL_ALLOWLIST = {
+    "echo",
+    "send_dm",
+    "send_message",
+    "reply",
+    "send_reply",
+    "post_message",
+    "post_dm",
+}
+_CHANNEL_DIRECT_READ_TOOL_PREFIXES = ("get_", "list_", "read_", "search_")
+
+
+def _channel_direct_tool_is_allowed(tool_name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(tool_name or "").strip().lower()).strip("_")
+    if not normalized:
+        return False
+    if normalized in _CHANNEL_DIRECT_EXACT_TOOL_ALLOWLIST:
+        return True
+    return any(normalized.startswith(prefix) for prefix in _CHANNEL_DIRECT_READ_TOOL_PREFIXES)
+
+
 def _channel_direct_tool_schemas(message: dict[str, Any]) -> list[dict[str, Any]]:
     state_name = _channel_direct_source_state_name(message)
     if not state_name:
@@ -16833,11 +16854,15 @@ def _channel_direct_tool_schemas(message: dict[str, Any]) -> list[dict[str, Any]
     result = response.get("result") if isinstance(response.get("result"), dict) else {}
     tools = result.get("tools") if isinstance(result.get("tools"), list) else []
     converted: list[dict[str, Any]] = []
+    filtered = 0
     for tool in tools:
         if not isinstance(tool, dict):
             continue
         raw_name = str(tool.get("name") or "").strip()
         if not raw_name:
+            continue
+        if not _channel_direct_tool_is_allowed(raw_name):
+            filtered += 1
             continue
         schema = tool.get("inputSchema") if isinstance(tool.get("inputSchema"), dict) else None
         if schema is None:
@@ -16851,7 +16876,8 @@ def _channel_direct_tool_schemas(message: dict[str, Any]) -> list[dict[str, Any]
                 "input_schema": schema,
             }
         )
-    router_log("INFO", f"channel_llm_tools_list server={state_name} count={len(converted)}")
+    suffix = f" filtered={filtered}" if filtered else ""
+    router_log("INFO", f"channel_llm_tools_list server={state_name} count={len(converted)}{suffix}")
     return converted
 
 
@@ -16916,6 +16942,9 @@ def _channel_direct_execute_tool(tool_use: dict[str, Any]) -> tuple[str, bool]:
     if parts is None:
         return f"Unsupported automatic channel tool: {name}", True
     server_name, tool_name = parts
+    if not _channel_direct_tool_is_allowed(tool_name):
+        router_log("WARN", f"channel_llm_tool_blocked tool_use_id={tool_id} tool={tool_name}")
+        return f"Automatic channel handling is not allowed to call tool {tool_name}", True
     state_name = _channel_sse_state_name_for_mcp_server(server_name)
     if not state_name:
         return f"MCP SSE server for tool {name} is not connected", True

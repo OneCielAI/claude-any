@@ -1165,6 +1165,61 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("실제 처리 완료로 표시하지 않았습니다", text)
         self.assertIn("Now let me send", text)
 
+    def test_channel_direct_tool_schemas_filters_workflow_tools(self):
+        response = {
+            "result": {
+                "tools": [
+                    {"name": "get_messages", "inputSchema": {"type": "object"}},
+                    {"name": "send_dm", "inputSchema": {"type": "object"}},
+                    {"name": "send_message", "inputSchema": {"type": "object"}},
+                    {"name": "list_rooms", "inputSchema": {"type": "object"}},
+                    {"name": "create_room", "inputSchema": {"type": "object"}},
+                    {"name": "add_room_member", "inputSchema": {"type": "object"}},
+                    {"name": "assign_task", "inputSchema": {"type": "object"}},
+                    {"name": "wait_for_notifications", "inputSchema": {"type": "object"}},
+                ]
+            }
+        }
+        with (
+            mock.patch.object(claude_any, "_channel_direct_source_state_name", return_value="mcp-ai-net-sse"),
+            mock.patch.object(claude_any, "_channel_sse_public_mcp_name", return_value="ai-net-sse"),
+            mock.patch.object(claude_any, "_channel_sse_rpc_request", return_value=response),
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            tools = claude_any._channel_direct_tool_schemas({"id": 20})
+
+        names = {tool["name"] for tool in tools}
+        self.assertIn("mcp__ai-net-sse__get_messages", names)
+        self.assertIn("mcp__ai-net-sse__send_dm", names)
+        self.assertIn("mcp__ai-net-sse__send_message", names)
+        self.assertIn("mcp__ai-net-sse__list_rooms", names)
+        self.assertNotIn("mcp__ai-net-sse__create_room", names)
+        self.assertNotIn("mcp__ai-net-sse__add_room_member", names)
+        self.assertNotIn("mcp__ai-net-sse__assign_task", names)
+        self.assertNotIn("mcp__ai-net-sse__wait_for_notifications", names)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("filtered=4" in item for item in log_messages))
+
+    def test_channel_direct_execute_tool_blocks_workflow_tools(self):
+        with (
+            mock.patch.object(claude_any, "_channel_sse_state_name_for_mcp_server", return_value="mcp-ai-net-sse"),
+            mock.patch.object(claude_any, "_channel_sse_rpc_request") as rpc_request,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, is_error = claude_any._channel_direct_execute_tool(
+                {
+                    "id": "toolu_blocked",
+                    "name": "mcp__ai-net-sse__create_room",
+                    "input": {"name": "new room"},
+                }
+            )
+
+        self.assertTrue(is_error)
+        self.assertIn("not allowed", text)
+        rpc_request.assert_not_called()
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_tool_blocked" in item for item in log_messages))
+
     def test_channel_direct_router_response_without_tools_returns_blocker(self):
         with (
             mock.patch.object(claude_any, "_channel_direct_tool_schemas", return_value=[]),
