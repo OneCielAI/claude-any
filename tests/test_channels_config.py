@@ -290,7 +290,7 @@ class ChannelConfigTests(unittest.TestCase):
 
         self.assertEqual(0, rc)
         write_channel.assert_called_once()
-        auto_start.assert_called_once_with([], extra_config_paths=[channel_path])
+        auto_start.assert_not_called()
         proxy_config.assert_called_once()
         proxy.assert_not_called()
         launch_cmd = call.call_args.args[0]
@@ -334,7 +334,7 @@ class ChannelConfigTests(unittest.TestCase):
         ensure_probe.assert_called_once_with(cfg, [])
         ensure_cursor.assert_called_once()
         write_channel.assert_called_once()
-        auto_start.assert_called_once_with([], extra_config_paths=[channel_path])
+        auto_start.assert_not_called()
         proxy_config.assert_called_once()
         self.assertEqual([channel_path], proxy_config.call_args.kwargs["extra_config_paths"])
         proxy.assert_not_called()
@@ -389,7 +389,7 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertEqual(0, rc)
         ensure_probe.assert_called_once_with(cfg, [])
         write_channel.assert_called_once()
-        auto_start.assert_called_once_with([], extra_config_paths=[channel_path, source_path])
+        auto_start.assert_not_called()
         self.assertEqual([channel_path, source_path], write_proxy.call_args.kwargs["extra_config_paths"])
         launch_cmd = call.call_args.args[0]
         self.assertIn(str(proxy_path), launch_cmd)

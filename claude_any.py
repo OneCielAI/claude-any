@@ -16554,6 +16554,14 @@ def should_use_channel_stdin_proxy(use_router_mode: bool, passthrough: list[str]
     return False
 
 
+def should_launch_process_start_channel_sse(
+    stdin_channel_proxy: bool,
+    native_channel_bridge: bool,
+    llm_channel_delivery: bool,
+) -> bool:
+    return bool((stdin_channel_proxy or native_channel_bridge) and not llm_channel_delivery)
+
+
 def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     channel = str(message.get("channel") or "default")
     sender = str(message.get("sender_id") or "channel")
@@ -17563,6 +17571,25 @@ def format_channel_llm_summary_prompt(records: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
+def format_channel_llm_summary_notice(records: list[dict[str, Any]]) -> str:
+    lines = [
+        "",
+        "[claude-any channel] background message handling summary",
+    ]
+    for item in records:
+        summary = re.sub(r"\s+", " ", str(item.get("summary") or "")).strip()
+        incoming = re.sub(r"\s+", " ", str(item.get("incoming") or "")).strip()
+        lines.extend(
+            [
+                f"- message_id={item.get('message_id')} channel={item.get('channel') or 'default'} sender={item.get('sender_id') or ''} stop_reason={item.get('stop_reason') or ''} tool_turns={item.get('tool_turns') or 0}",
+                f"  incoming: {truncate_for_prompt(incoming, 500)}",
+                f"  result: {truncate_for_prompt(summary, 1200)}",
+            ]
+        )
+    lines.append("")
+    return "\r\n".join(lines)
+
+
 def body_with_pending_channel_summaries(body: dict[str, Any]) -> dict[str, Any]:
     global _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
@@ -17813,6 +17840,31 @@ def _inject_pending_channel_summaries(master_fd: int, enter_bytes: bytes | None 
     return max_seen
 
 
+def _print_pending_channel_summaries(stdout_fd: int) -> int:
+    global _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+    with _CHANNEL_LLM_SUMMARY_LOCK:
+        last_id = _channel_llm_summary_read_cursor_locked()
+        records = _read_channel_llm_summary_records(last_id, 20)
+        if not records:
+            return last_id
+        max_seen = last_id
+        for item in records:
+            try:
+                max_seen = max(max_seen, int(item.get("message_id") or 0))
+            except Exception:
+                pass
+        _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = max_seen
+        try:
+            _channel_llm_summary_write_cursor_locked(max_seen)
+        except Exception as exc:
+            router_log("WARN", f"channel_screen_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
+    notice = format_channel_llm_summary_notice(records)
+    _write_fd_all(stdout_fd, notice.encode("utf-8", errors="replace"))
+    ids = ",".join(str(item.get("message_id") or "") for item in records)
+    router_log("INFO", f"channel_screen_summary_printed count={len(records)} message_ids={ids}")
+    return max_seen
+
+
 def _chat_messages_file_marker() -> tuple[float, int]:
     try:
         stat = CHAT_MESSAGES_PATH.stat()
@@ -17829,7 +17881,14 @@ def _channel_llm_summary_file_marker() -> tuple[float, int]:
         return (0.0, 0)
 
 
-def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str]) -> int:
+def subprocess_call_with_channel_wake_proxy(
+    cmd: list[str],
+    env: dict[str, str],
+    *,
+    inject_channel_messages: bool = True,
+    inject_channel_summaries: bool = True,
+    print_channel_summaries: bool = False,
+) -> int:
     if os.name != "posix" or not sys.stdin.isatty() or not sys.stdout.isatty():
         router_log("INFO", "channel_stdin_proxy_unavailable; using direct subprocess call")
         return subprocess.call(cmd, env=env)
@@ -17855,6 +17914,8 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
     )
     try:
         tty.setraw(stdin_fd)
+        if print_channel_summaries:
+            _print_pending_channel_summaries(stdout_fd)
         while proc.poll() is None:
             try:
                 readable, _, _ = select.select([stdin_fd, master_fd], [], [], 0.2)
@@ -17883,13 +17944,16 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
             if now - last_channel_poll >= 0.5:
                 last_channel_poll = now
                 marker = _chat_messages_file_marker()
-                if marker != last_channel_marker:
+                if inject_channel_messages and marker != last_channel_marker:
                     last_channel_marker = marker
                     last_id = _inject_pending_channel_messages(master_fd, last_id, channel_enter_bytes)
                 summary_marker = _channel_llm_summary_file_marker()
-                if summary_marker != last_summary_marker:
+                if inject_channel_summaries and summary_marker != last_summary_marker:
                     last_summary_marker = summary_marker
-                    _inject_pending_channel_summaries(master_fd, channel_enter_bytes)
+                    if print_channel_summaries:
+                        _print_pending_channel_summaries(stdout_fd)
+                    else:
+                        _inject_pending_channel_summaries(master_fd, channel_enter_bytes)
         while True:
             try:
                 readable, _, _ = select.select([master_fd], [], [], 0)
@@ -17916,6 +17980,16 @@ def subprocess_call_with_channel_wake_proxy(cmd: list[str], env: dict[str, str])
                 proc.terminate()
             except Exception:
                 pass
+
+
+def subprocess_call_with_channel_screen_summary_proxy(cmd: list[str], env: dict[str, str]) -> int:
+    return subprocess_call_with_channel_wake_proxy(
+        cmd,
+        env,
+        inject_channel_messages=False,
+        inject_channel_summaries=True,
+        print_channel_summaries=True,
+    )
 
 
 def _mcp_proxy_notification_payload(server_name: str, message: dict[str, Any]) -> dict[str, Any] | None:
@@ -18778,10 +18852,13 @@ def launch_claude(
     if stdin_channel_proxy or native_channel_bridge or llm_channel_delivery:
         if llm_channel_delivery:
             ensure_channel_llm_delivery_cursor_initialized()
-        auto_start_sse_channels_from_mcp_configs(
-            launch_passthrough,
-            extra_config_paths=[Path(path) for path in mcp_config_paths],
-        )
+        if should_launch_process_start_channel_sse(stdin_channel_proxy, native_channel_bridge, llm_channel_delivery):
+            auto_start_sse_channels_from_mcp_configs(
+                launch_passthrough,
+                extra_config_paths=[Path(path) for path in mcp_config_paths],
+            )
+        else:
+            router_log("INFO", "channel_sse_auto_start_skipped reason=router_managed_llm_delivery")
         proxy_config = write_mcp_proxy_config(
             launch_passthrough,
             extra_config_paths=[Path(path) for path in mcp_config_paths],
@@ -18819,6 +18896,8 @@ def launch_claude(
         and env_bool(os.environ.get("CLAUDE_ANY_CHANNEL_SCREEN_SUMMARY"), True)
     )
     if stdin_channel_proxy or screen_summary_proxy:
+        if screen_summary_proxy and not stdin_channel_proxy:
+            return subprocess_call_with_channel_screen_summary_proxy(cmd, env)
         return subprocess_call_with_channel_wake_proxy(cmd, env)
     if capture_stderr:
         return _subprocess_call_capturing_stderr(cmd, env)

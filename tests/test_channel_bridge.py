@@ -409,6 +409,27 @@ class ChannelBridgeTests(unittest.TestCase):
         auto_start.assert_called_once()
         self.assertIsNone(auto_start.call_args.kwargs["allowed_server_names"])
 
+    def test_launch_process_does_not_start_sse_for_llm_delivery(self):
+        self.assertFalse(claude_any.should_launch_process_start_channel_sse(False, False, True))
+        self.assertFalse(claude_any.should_launch_process_start_channel_sse(True, False, True))
+        self.assertFalse(claude_any.should_launch_process_start_channel_sse(False, True, True))
+        self.assertTrue(claude_any.should_launch_process_start_channel_sse(True, False, False))
+        self.assertTrue(claude_any.should_launch_process_start_channel_sse(False, True, False))
+        self.assertFalse(claude_any.should_launch_process_start_channel_sse(False, False, False))
+
+    def test_screen_summary_proxy_prints_not_input_injects(self):
+        with mock.patch.object(claude_any, "subprocess_call_with_channel_wake_proxy", return_value=0) as wake_proxy:
+            rc = claude_any.subprocess_call_with_channel_screen_summary_proxy(["claude"], {"A": "B"})
+
+        self.assertEqual(0, rc)
+        wake_proxy.assert_called_once_with(
+            ["claude"],
+            {"A": "B"},
+            inject_channel_messages=False,
+            inject_channel_summaries=True,
+            print_channel_summaries=True,
+        )
+
     def test_channel_llm_prompt_warns_against_dm_label_recipient_misread(self):
         prompt = claude_any.format_channel_llm_batch_prompt(
             [
