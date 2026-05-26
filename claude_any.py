@@ -17277,6 +17277,151 @@ def _channel_direct_reply_required_summary(message: dict[str, Any], last_text: s
     )
 
 
+def _channel_direct_schema_properties(tool: dict[str, Any]) -> dict[str, Any]:
+    schema = tool.get("input_schema") if isinstance(tool.get("input_schema"), dict) else {}
+    props = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    return props
+
+
+def _channel_direct_pick_schema_key(props: dict[str, Any], candidates: tuple[str, ...], default: str) -> str:
+    for key in candidates:
+        if key in props:
+            return key
+    return default
+
+
+def _channel_direct_same_channel_reply_tool(tools: list[dict[str, Any]]) -> dict[str, Any] | None:
+    preferred = (
+        "send_message",
+        "post_message",
+        "reply_message",
+        "send_channel_message",
+        "post_channel_message",
+    )
+    for wanted in preferred:
+        for tool in tools:
+            if _channel_direct_tool_schema_short_name(tool) == wanted:
+                return tool
+    return None
+
+
+def _channel_direct_fallback_reply_prompt(message: dict[str, Any], last_text: str) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    author = str(meta.get("author_name") or message.get("sender_id") or "the sender")
+    channel = str(message.get("channel") or meta.get("room_id") or "default")
+    incoming = truncate_for_prompt(str(message.get("message") or ""), 2000)
+    previous = truncate_for_prompt(str(last_text or ""), 2000)
+    return (
+        "[claude-any channel fallback reply]\n"
+        "The incoming channel DM/mention still needs a practical reply, but previous assistant turns did not call a reply/send tool. "
+        "Write only the exact message body that should be sent now to the same channel. "
+        "Do not mention internal routing, fallback handling, tool failures, or this instruction. "
+        "If tool results in this conversation show that a room was created or an action succeeded, include the useful public details. "
+        "If and only if the sender's latest message truly requires no response, output exactly 'NO_REPLY:' followed by one concise reason. "
+        "Otherwise produce a concise collaboration reply in the agent's voice.\n\n"
+        f"sender={author}\n"
+        f"channel={channel}\n"
+        f"incoming_notification={incoming}\n"
+        "previous_assistant_text="
+        + json.dumps(previous, ensure_ascii=False)
+    )
+
+
+def _channel_direct_generate_fallback_reply_text(
+    message_id: int,
+    messages: list[dict[str, Any]],
+    message: dict[str, Any],
+    last_text: str,
+    provider: str,
+    pcfg: dict[str, Any],
+    model: str,
+) -> str:
+    body: dict[str, Any] = {
+        "model": model,
+        "max_tokens": 512,
+        "stream": False,
+        "metadata": {
+            "claude_any_channel_direct": True,
+            "channel_message_id": str(message_id),
+            "channel_fallback_reply": True,
+        },
+        "messages": messages
+        + [
+            {
+                "role": "user",
+                "content": [{"type": "text", "text": _channel_direct_fallback_reply_prompt(message, last_text)}],
+            }
+        ],
+    }
+    try:
+        parsed = _channel_direct_llm_http_message(message_id, body, provider, pcfg, model)
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_fallback_reply_generation_failed message_id={message_id} error={type(exc).__name__}: {exc}")
+        return ""
+    return _anthropic_message_text(parsed).strip()
+
+
+def _channel_direct_fallback_reply_text(message: dict[str, Any], last_text: str) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    author = str(meta.get("author_name") or "there").strip() or "there"
+    prior = re.sub(r"\s+", " ", str(last_text or "")).strip()
+    if prior and not _channel_direct_text_is_deferred_action(prior):
+        return truncate_for_prompt(prior, 1200)
+    return (
+        f"{author}, 메시지 확인했습니다. 현재 채널 컨텍스트를 확인했고 필요한 조치를 이어서 진행하겠습니다. "
+        "세부 상태를 정리해서 다시 공유하겠습니다."
+    )
+
+
+def _channel_direct_send_same_channel_fallback_reply(
+    message_id: int,
+    message: dict[str, Any],
+    tools: list[dict[str, Any]],
+    reply_text: str,
+) -> tuple[str, bool]:
+    text = str(reply_text or "").strip()
+    if not text or _channel_direct_text_declines_reply(text):
+        return text, False
+    tool = _channel_direct_same_channel_reply_tool(tools)
+    if not tool:
+        return "No same-channel reply tool is available", False
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    channel = str(message.get("channel") or meta.get("room_id") or "").strip()
+    if not channel:
+        return "No channel/room id is available for fallback reply", False
+    props = _channel_direct_schema_properties(tool)
+    room_key = _channel_direct_pick_schema_key(
+        props,
+        ("room_id", "channel_id", "channel", "room", "conversation_id", "thread_id"),
+        "room_id",
+    )
+    content_key = _channel_direct_pick_schema_key(
+        props,
+        ("content", "message", "text", "body"),
+        "content",
+    )
+    tool_use = {
+        "id": f"channel_fallback_reply_{message_id}",
+        "name": str(tool.get("name") or ""),
+        "input": {room_key: channel, content_key: text},
+    }
+    result_text, is_error = _channel_direct_execute_tool(tool_use)
+    return result_text, not is_error
+
+
+def _channel_direct_fallback_reply_summary(reply_text: str, tool_result: str) -> str:
+    sent = truncate_for_prompt(str(reply_text or "").strip(), 4000)
+    result = truncate_for_prompt(str(tool_result or "").strip(), 2000)
+    return (
+        "reply-required 채널 메시지가 일반 재시도에서는 reply/send 호출 없이 끝나서, "
+        "라우터가 같은 채널에 안전 fallback 회신을 직접 전송했습니다.\n\n"
+        "## 보낸 메시지\n"
+        f"{sent}\n\n"
+        "## tool_result\n"
+        f"{result}"
+    )
+
+
 def _channel_direct_append_summary(message: dict[str, Any], text: str, stop_reason: str, tool_turns: int = 0) -> None:
     try:
         message_id = int(message.get("id") or 0)
@@ -17414,6 +17559,34 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
                     )
                     continue
                 router_log("WARN", f"channel_llm_reply_required_unfulfilled message_id={message_id} turn={_turn + 1}")
+                if _channel_direct_same_channel_reply_tool(tools):
+                    fallback_text = _channel_direct_generate_fallback_reply_text(
+                        message_id,
+                        messages,
+                        message,
+                        text or last_text,
+                        provider,
+                        pcfg,
+                        model,
+                    )
+                    if _channel_direct_text_declines_reply(fallback_text):
+                        return fallback_text, "end_turn", tool_turns
+                    if not fallback_text.strip():
+                        fallback_text = _channel_direct_fallback_reply_text(message, text or last_text)
+                    fallback_result, fallback_sent = _channel_direct_send_same_channel_fallback_reply(
+                        message_id,
+                        message,
+                        tools,
+                        fallback_text,
+                    )
+                    if fallback_sent:
+                        router_log("INFO", f"channel_llm_fallback_reply_sent message_id={message_id} chars={len(fallback_text)}")
+                        return (
+                            _channel_direct_fallback_reply_summary(fallback_text, fallback_result),
+                            "fallback_reply_sent",
+                            tool_turns + 1,
+                        )
+                    router_log("WARN", f"channel_llm_fallback_reply_failed message_id={message_id} result={truncate_for_prompt(fallback_result, 300)}")
                 return _channel_direct_reply_required_summary(message, text, tool_turns), "reply_required_unfulfilled", tool_turns
             if tools and not deferred_action_retried and _channel_direct_text_is_deferred_action(text):
                 deferred_action_retried = True
@@ -17458,6 +17631,34 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
     if _channel_direct_text_is_deferred_action(last_text):
         return _channel_direct_max_turns_summary(message, last_text, tool_turns), "max_tool_turns", tool_turns
     if reply_required and not any(_channel_direct_tool_is_reply_action(name) for name in executed_tool_names):
+        if _channel_direct_same_channel_reply_tool(tools):
+            fallback_text = _channel_direct_generate_fallback_reply_text(
+                message_id,
+                messages,
+                message,
+                last_text,
+                provider,
+                pcfg,
+                model,
+            )
+            if _channel_direct_text_declines_reply(fallback_text):
+                return fallback_text, "end_turn", tool_turns
+            if not fallback_text.strip():
+                fallback_text = _channel_direct_fallback_reply_text(message, last_text)
+            fallback_result, fallback_sent = _channel_direct_send_same_channel_fallback_reply(
+                message_id,
+                message,
+                tools,
+                fallback_text,
+            )
+            if fallback_sent:
+                router_log("INFO", f"channel_llm_fallback_reply_sent message_id={message_id} chars={len(fallback_text)} reason=max_turns")
+                return (
+                    _channel_direct_fallback_reply_summary(fallback_text, fallback_result),
+                    "fallback_reply_sent",
+                    tool_turns + 1,
+                )
+            router_log("WARN", f"channel_llm_fallback_reply_failed message_id={message_id} result={truncate_for_prompt(fallback_result, 300)} reason=max_turns")
         return _channel_direct_reply_required_summary(message, last_text, tool_turns), "reply_required_unfulfilled", tool_turns
     return last_text, "max_tool_turns", tool_turns
 

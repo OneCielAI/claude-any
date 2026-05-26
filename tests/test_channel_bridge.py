@@ -1447,6 +1447,85 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_llm_reply_required_unfulfilled" in item for item in log_messages))
         self.assertTrue(any("channel_llm_deferred_action_retry" in item and "reason=reply_required" in item for item in log_messages))
 
+    def test_channel_direct_router_response_fallback_sends_same_channel_reply(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) == 1:
+                return {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read",
+                            "name": "mcp__ai-net-sse__get_messages",
+                            "input": {"room_id": "room_dm_generic", "limit": 5},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            if len(calls) == 2:
+                return {
+                    "content": [{"type": "text", "text": "I have enough context. Let me reply to Sarah now."}],
+                    "stop_reason": "end_turn",
+                }
+            if len(calls) == 3:
+                return {
+                    "content": [{"type": "text", "text": "I should send Sarah a reply with the current status."}],
+                    "stop_reason": "end_turn",
+                }
+            return {
+                "content": [{"type": "text", "text": "Sarah, 메시지 확인했습니다. 현재 방을 만들었고 이어서 초대와 업무 배정을 진행하겠습니다."}],
+                "stop_reason": "end_turn",
+            }
+
+        with (
+            mock.patch.object(
+                claude_any,
+                "_channel_direct_tool_schemas",
+                return_value=[
+                    {"name": "mcp__ai-net-sse__get_messages"},
+                    {
+                        "name": "mcp__ai-net-sse__send_message",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"room_id": {"type": "string"}, "content": {"type": "string"}},
+                        },
+                    },
+                ],
+            ),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool", return_value=("message sent", False)) as execute_tool,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                24,
+                "수신 메시지를 처리하세요",
+                {
+                    "id": 24,
+                    "channel": "room_dm_generic",
+                    "message": "New message from Sarah",
+                    "meta": {"sse_source": "mcp-ai-net-sse", "message_id": "msg_sarah"},
+                },
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("fallback_reply_sent", stop_reason)
+        self.assertEqual(2, tool_turns)
+        self.assertIn("fallback 회신", text)
+        self.assertIn("Sarah, 메시지 확인했습니다", text)
+        self.assertEqual(
+            ["mcp__ai-net-sse__get_messages", "mcp__ai-net-sse__send_message"],
+            [call.args[0]["name"] for call in execute_tool.call_args_list],
+        )
+        self.assertEqual({"room_id": "room_dm_generic", "content": "Sarah, 메시지 확인했습니다. 현재 방을 만들었고 이어서 초대와 업무 배정을 진행하겠습니다."}, execute_tool.call_args_list[-1].args[0]["input"])
+        self.assertEqual(5, len(calls))
+        self.assertNotIn("tools", calls[-1])
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_fallback_reply_sent" in item for item in log_messages))
+
     def test_channel_direct_router_response_retries_deferred_reply_required_text(self):
         calls: list[dict[str, object]] = []
 
