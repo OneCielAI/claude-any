@@ -16909,20 +16909,68 @@ _CHANNEL_DIRECT_REPLY_TOOL_NAMES = {
     "post_dm",
 }
 _CHANNEL_DIRECT_READ_TOOL_PREFIXES = ("get_", "list_", "read_", "search_")
+_CHANNEL_DIRECT_COLLAB_WRITE_TOOL_PREFIXES = (
+    "ack_",
+    "add_",
+    "assign_",
+    "create_",
+    "evaluate_",
+    "record_",
+    "submit_",
+)
+_CHANNEL_DIRECT_BLOCKED_TOOL_PREFIXES = (
+    "clear_",
+    "delete_",
+    "destroy_",
+    "disable_",
+    "drop_",
+    "kill_",
+    "purge_",
+    "remove_",
+    "reset_",
+    "revoke_",
+    "shutdown_",
+    "stop_",
+    "truncate_",
+    "wait_",
+    "watch_",
+)
+_CHANNEL_DIRECT_BLOCKED_TOOL_TERMS = (
+    "credential",
+    "payment",
+    "purchase",
+    "secret",
+    "trade",
+    "transfer",
+    "withdraw",
+)
 
 
 def _channel_direct_tool_is_allowed(tool_name: str) -> bool:
     normalized = re.sub(r"[^a-z0-9_]+", "_", str(tool_name or "").strip().lower()).strip("_")
     if not normalized:
         return False
+    if any(normalized.startswith(prefix) for prefix in _CHANNEL_DIRECT_BLOCKED_TOOL_PREFIXES):
+        return False
+    if any(term in normalized for term in _CHANNEL_DIRECT_BLOCKED_TOOL_TERMS):
+        return False
     if normalized in _CHANNEL_DIRECT_EXACT_TOOL_ALLOWLIST:
         return True
-    return any(normalized.startswith(prefix) for prefix in _CHANNEL_DIRECT_READ_TOOL_PREFIXES)
+    if any(normalized.startswith(prefix) for prefix in _CHANNEL_DIRECT_READ_TOOL_PREFIXES):
+        return True
+    return any(normalized.startswith(prefix) for prefix in _CHANNEL_DIRECT_COLLAB_WRITE_TOOL_PREFIXES)
 
 
 def _channel_direct_tool_is_reply_action(tool_name: str) -> bool:
     normalized = re.sub(r"[^a-z0-9_]+", "_", str(tool_name or "").strip().lower()).strip("_")
     return normalized in _CHANNEL_DIRECT_REPLY_TOOL_NAMES
+
+
+def _channel_direct_tool_is_collab_write_action(tool_name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(tool_name or "").strip().lower()).strip("_")
+    return _channel_direct_tool_is_allowed(normalized) and any(
+        normalized.startswith(prefix) for prefix in _CHANNEL_DIRECT_COLLAB_WRITE_TOOL_PREFIXES
+    )
 
 
 def _channel_direct_tool_schema_short_name(tool: dict[str, Any]) -> str:
@@ -16934,6 +16982,17 @@ def _channel_direct_tool_schema_short_name(tool: dict[str, Any]) -> str:
 
 def _channel_direct_reply_tool_schemas(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [tool for tool in tools if _channel_direct_tool_is_reply_action(_channel_direct_tool_schema_short_name(tool))]
+
+
+def _channel_direct_reply_followup_tool_schemas(tools: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [
+        tool
+        for tool in tools
+        if (
+            _channel_direct_tool_is_reply_action(_channel_direct_tool_schema_short_name(tool))
+            or _channel_direct_tool_is_collab_write_action(_channel_direct_tool_schema_short_name(tool))
+        )
+    ]
 
 
 def _channel_direct_tool_schemas(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -17307,7 +17366,7 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
             if not reply_tools:
                 router_log("WARN", f"channel_llm_reply_required_no_tool message_id={message_id} turn={_turn + 1}")
                 return _channel_direct_reply_required_summary(message, last_text, tool_turns), "reply_required_no_tool", tool_turns
-            active_tools = reply_tools
+            active_tools = _channel_direct_reply_followup_tool_schemas(tools)
         body: dict[str, Any] = {
             "model": model,
             "max_tokens": 768,
