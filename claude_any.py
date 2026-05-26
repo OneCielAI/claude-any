@@ -17327,6 +17327,24 @@ def _channel_direct_fallback_reply_prompt(message: dict[str, Any], last_text: st
     )
 
 
+def _channel_direct_message_actor(message: dict[str, Any]) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    author = str(meta.get("author_name") or "").strip()
+    if author:
+        return author
+    incoming = str(message.get("message") or "")
+    for pattern in (
+        r"\bNew message from\s+([A-Za-z0-9_.@ -]{1,80})",
+        r"\b([A-Za-z0-9_.@ -]{1,80})\s+@mentioned you\b",
+    ):
+        match = re.search(pattern, incoming, re.IGNORECASE)
+        if match:
+            actor = re.sub(r"\s+", " ", match.group(1)).strip(" -")
+            if actor:
+                return actor
+    return "there"
+
+
 def _channel_direct_generate_fallback_reply_text(
     message_id: int,
     messages: list[dict[str, Any]],
@@ -17362,8 +17380,7 @@ def _channel_direct_generate_fallback_reply_text(
 
 
 def _channel_direct_fallback_reply_text(message: dict[str, Any], last_text: str) -> str:
-    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
-    author = str(meta.get("author_name") or "there").strip() or "there"
+    author = _channel_direct_message_actor(message)
     prior = re.sub(r"\s+", " ", str(last_text or "")).strip()
     if prior and not _channel_direct_text_is_deferred_action(prior):
         return truncate_for_prompt(prior, 1200)
@@ -17371,6 +17388,16 @@ def _channel_direct_fallback_reply_text(message: dict[str, Any], last_text: str)
         f"{author}, 메시지 확인했습니다. 현재 채널 컨텍스트를 확인했고 필요한 조치를 이어서 진행하겠습니다. "
         "세부 상태를 정리해서 다시 공유하겠습니다."
     )
+
+
+def _channel_direct_fallback_text_is_internal_action(text: str) -> bool:
+    body = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not body:
+        return False
+    lowered = body.lower()
+    if re.match(r"^(?:right[,. ]*)?(?:let me|i should|i need to|i will|i'll|now let me)\b", lowered):
+        return True
+    return bool(re.match(r"^(?:이제|먼저|다음으로)\b.{0,120}(?:보내|답장|회신|조회|확인|조사|처리).{0,80}(?:하겠습니다|하겠다|합니다)", body))
 
 
 def _channel_direct_send_same_channel_fallback_reply(
@@ -17571,7 +17598,7 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
                     )
                     if _channel_direct_text_declines_reply(fallback_text):
                         return fallback_text, "end_turn", tool_turns
-                    if not fallback_text.strip():
+                    if not fallback_text.strip() or _channel_direct_fallback_text_is_internal_action(fallback_text):
                         fallback_text = _channel_direct_fallback_reply_text(message, text or last_text)
                     fallback_result, fallback_sent = _channel_direct_send_same_channel_fallback_reply(
                         message_id,
@@ -17643,7 +17670,7 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
             )
             if _channel_direct_text_declines_reply(fallback_text):
                 return fallback_text, "end_turn", tool_turns
-            if not fallback_text.strip():
+            if not fallback_text.strip() or _channel_direct_fallback_text_is_internal_action(fallback_text):
                 fallback_text = _channel_direct_fallback_reply_text(message, last_text)
             fallback_result, fallback_sent = _channel_direct_send_same_channel_fallback_reply(
                 message_id,
@@ -17841,7 +17868,42 @@ def format_channel_llm_summary_prompt(records: list[dict[str, Any]]) -> str:
     return "\n\n".join(parts)
 
 
-def format_channel_llm_summary_notice(records: list[dict[str, Any]]) -> str:
+def _channel_llm_summary_notice_actor(item: dict[str, Any]) -> str:
+    meta_sender = str(item.get("sender_id") or "").strip()
+    incoming = str(item.get("incoming") or "")
+    for pattern in (
+        r"\bNew message from\s+([A-Za-z0-9_.@ -]{1,80})",
+        r"\b([A-Za-z0-9_.@ -]{1,80})\s+@mentioned you\b",
+        r"\bFrom:\*\*\s*([^*\n]{1,80})",
+        r"\*\*발신[:：]\*\*\s*([^(\n]{1,80})",
+    ):
+        match = re.search(pattern, incoming, re.IGNORECASE)
+        if match:
+            actor = re.sub(r"\s+", " ", match.group(1)).strip(" -")
+            if actor:
+                return actor
+    if meta_sender and meta_sender != "ai-net-sse":
+        return meta_sender
+    return "channel"
+
+
+def _channel_llm_summary_notice_is_quiet(item: dict[str, Any]) -> bool:
+    summary = re.sub(r"\s+", " ", str(item.get("summary") or "")).strip()
+    stop_reason = str(item.get("stop_reason") or "").strip().lower()
+    if summary.lower().startswith("no_reply:"):
+        return True
+    if summary.startswith("NO_REPLY:") or summary.startswith("응답 불필요:") or summary.startswith("회신 불필요:"):
+        return True
+    return stop_reason in {"no_reply", "no-reply"}
+
+
+def _channel_llm_summary_notice_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if env_bool(os.environ.get("CLAUDE_ANY_CHANNEL_SCREEN_SUMMARY_SHOW_NO_REPLY"), False):
+        return records
+    return [item for item in records if not _channel_llm_summary_notice_is_quiet(item)]
+
+
+def _format_channel_llm_summary_notice_verbose(records: list[dict[str, Any]]) -> str:
     lines = [
         "",
         "[claude-any channel] background message handling summary",
@@ -17858,6 +17920,39 @@ def format_channel_llm_summary_notice(records: list[dict[str, Any]]) -> str:
         )
     lines.append("")
     return "\r\n".join(lines)
+
+
+def _format_channel_llm_summary_notice_compact(records: list[dict[str, Any]]) -> str:
+    visible = _channel_llm_summary_notice_records(records)
+    if not visible:
+        return ""
+    actor_counts: dict[str, int] = {}
+    stop_counts: dict[str, int] = {}
+    for item in visible:
+        actor = _channel_llm_summary_notice_actor(item)
+        actor_counts[actor] = actor_counts.get(actor, 0) + 1
+        stop_reason = str(item.get("stop_reason") or "end_turn")
+        stop_counts[stop_reason] = stop_counts.get(stop_reason, 0) + 1
+    actors = ", ".join(f"{name} x{count}" for name, count in sorted(actor_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:4])
+    stops = ", ".join(f"{name} x{count}" for name, count in sorted(stop_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:4])
+    latest = visible[-1]
+    latest_actor = _channel_llm_summary_notice_actor(latest)
+    latest_summary = re.sub(r"\s+", " ", str(latest.get("summary") or "")).strip()
+    latest_line = truncate_for_prompt(latest_summary, 220)
+    return (
+        "\r\n"
+        f"[claude-any channel] handled {len(visible)} background update(s); actors: {actors}; outcomes: {stops}; "
+        f"latest=#{latest.get('message_id')} {latest_actor} {latest.get('channel') or 'default'} -> {latest.get('stop_reason') or 'end_turn'}"
+        + (f" | {latest_line}" if latest_line else "")
+        + "\r\n"
+    )
+
+
+def format_channel_llm_summary_notice(records: list[dict[str, Any]]) -> str:
+    style = str(os.environ.get("CLAUDE_ANY_CHANNEL_SCREEN_SUMMARY_STYLE") or "compact").strip().lower()
+    if style in {"verbose", "full", "long"}:
+        return _format_channel_llm_summary_notice_verbose(records)
+    return _format_channel_llm_summary_notice_compact(records)
 
 
 def body_with_pending_channel_summaries(body: dict[str, Any]) -> dict[str, Any]:
@@ -18128,9 +18223,12 @@ def _print_pending_channel_summaries(stdout_fd: int) -> int:
             _channel_llm_summary_write_cursor_locked(max_seen)
         except Exception as exc:
             router_log("WARN", f"channel_screen_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
-    notice = format_channel_llm_summary_notice(records)
-    _write_fd_all(stdout_fd, notice.encode("utf-8", errors="replace"))
     ids = ",".join(str(item.get("message_id") or "") for item in records)
+    notice = format_channel_llm_summary_notice(records)
+    if not notice.strip():
+        router_log("INFO", f"channel_screen_summary_skipped_quiet count={len(records)} message_ids={ids}")
+        return max_seen
+    _write_fd_all(stdout_fd, notice.encode("utf-8", errors="replace"))
     router_log("INFO", f"channel_screen_summary_printed count={len(records)} message_ids={ids}")
     return max_seen
 

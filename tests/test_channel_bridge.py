@@ -430,6 +430,59 @@ class ChannelBridgeTests(unittest.TestCase):
             print_channel_summaries=True,
         )
 
+    def test_channel_summary_notice_is_compact_and_hides_no_reply(self):
+        records = [
+            {
+                "message_id": 10,
+                "channel": "room_dm_a",
+                "incoming": "New message from Sarah",
+                "stop_reason": "end_turn",
+                "tool_turns": 1,
+                "summary": "NO_REPLY: Sarah only acknowledged the previous update.",
+            },
+            {
+                "message_id": 11,
+                "channel": "room_dm_a",
+                "incoming": "New message from Sarah",
+                "stop_reason": "fallback_reply_sent",
+                "tool_turns": 5,
+                "summary": "reply-required 채널 메시지가 일반 재시도에서는 reply/send 호출 없이 끝나서 fallback 회신을 전송했습니다.",
+            },
+            {
+                "message_id": 12,
+                "channel": "room_team",
+                "incoming": "New message from Joy",
+                "stop_reason": "end_turn",
+                "tool_turns": 3,
+                "summary": "Joy의 리스크 보고를 확인하고 그룹 채팅방에 응답했습니다.",
+            },
+        ]
+
+        notice = claude_any.format_channel_llm_summary_notice(records)
+
+        self.assertIn("handled 2 background update(s)", notice)
+        self.assertIn("Sarah x1", notice)
+        self.assertIn("Joy x1", notice)
+        self.assertIn("fallback_reply_sent x1", notice)
+        self.assertIn("latest=#12 Joy room_team", notice)
+        self.assertNotIn("NO_REPLY", notice)
+        self.assertNotIn("direct_handler_summary", notice)
+
+    def test_channel_summary_notice_quiet_when_only_no_reply(self):
+        notice = claude_any.format_channel_llm_summary_notice(
+            [
+                {
+                    "message_id": 13,
+                    "channel": "room_dm_a",
+                    "incoming": "New message from Sarah",
+                    "stop_reason": "end_turn",
+                    "summary": "NO_REPLY: no new task.",
+                }
+            ]
+        )
+
+        self.assertEqual("", notice)
+
     def test_channel_llm_prompt_warns_against_dm_label_recipient_misread(self):
         prompt = claude_any.format_channel_llm_batch_prompt(
             [
@@ -1525,6 +1578,64 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn("tools", calls[-1])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_fallback_reply_sent" in item for item in log_messages))
+
+    def test_channel_direct_router_response_fallback_replaces_deferred_text(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) == 1:
+                return {
+                    "content": [{"type": "text", "text": "I should reply to Sarah now."}],
+                    "stop_reason": "end_turn",
+                }
+            if len(calls) == 2:
+                return {
+                    "content": [{"type": "text", "text": "Let me send the fill-me-in response now."}],
+                    "stop_reason": "end_turn",
+                }
+            return {
+                "content": [{"type": "text", "text": "Let me send the fill-me-in response now."}],
+                "stop_reason": "end_turn",
+            }
+
+        with (
+            mock.patch.object(
+                claude_any,
+                "_channel_direct_tool_schemas",
+                return_value=[
+                    {
+                        "name": "mcp__ai-net-sse__send_message",
+                        "input_schema": {
+                            "type": "object",
+                            "properties": {"room_id": {"type": "string"}, "content": {"type": "string"}},
+                        },
+                    }
+                ],
+            ),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool", return_value=("message sent", False)) as execute_tool,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            text, stop_reason, _tool_turns = claude_any._channel_direct_llm_router_response(
+                25,
+                "수신 메시지를 처리하세요",
+                {
+                    "id": 25,
+                    "channel": "room_dm_generic",
+                    "message": "New message from Sarah",
+                    "meta": {"sse_source": "mcp-ai-net-sse", "message_id": "msg_sarah", "author_name": "Sarah"},
+                },
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("fallback_reply_sent", stop_reason)
+        sent_content = execute_tool.call_args_list[-1].args[0]["input"]["content"]
+        self.assertIn("Sarah, 메시지 확인했습니다", sent_content)
+        self.assertNotIn("Let me", sent_content)
+        self.assertIn("Sarah, 메시지 확인했습니다", text)
 
     def test_channel_direct_router_response_retries_deferred_reply_required_text(self):
         calls: list[dict[str, object]] = []
