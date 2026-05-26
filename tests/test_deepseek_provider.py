@@ -117,6 +117,12 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertIn("deepseek-v4-flash", models)
         write_cache.assert_called_once()
 
+    def test_provider_headers_include_deepseek_api_key(self):
+        headers = claude_any.provider_headers("deepseek", self.deepseek_cfg(api_key="sk-deepseek-test")["providers"]["deepseek"])
+        self.assertEqual("Bearer sk-deepseek-test", headers["authorization"])
+        self.assertEqual("sk-deepseek-test", headers["x-api-key"])
+        self.assertEqual("2023-06-01", headers["anthropic-version"])
+
 
 if __name__ == "__main__":
     unittest.main()

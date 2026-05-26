@@ -3949,7 +3949,7 @@ def provider_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
         if not pcfg.get("api_key"):
             raise RuntimeError("Anthropic API key is missing. Run: claude-anyctl api-key anthropic")
         headers["x-api-key"] = pcfg["api_key"]
-    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim"):
+    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek"):
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
     elif provider == "lm-studio":
