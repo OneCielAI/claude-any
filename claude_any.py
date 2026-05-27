@@ -262,7 +262,8 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "Do not stop after announcing what you plan to do. When the user asks you to create, edit, or run code, "
     "immediately use the available Claude Code tools such as Write, Edit, Read, and Bash as appropriate, "
     "except while Claude Code is in Plan Mode. In Plan Mode, first explore/read as needed, write or update the plan file named "
-    "by the plan_mode attachment, and only then call ExitPlanMode to request approval; do not call EnterPlanMode again. "
+    "by the plan_mode attachment, and only then call ExitPlanMode to leave Plan Mode; when bypass permissions is active, "
+    "claude-any auto-approves that plan exit, so do not ask the user separately and do not call EnterPlanMode again. "
     "then report the concrete result. If you decide not to use tools, provide the complete requested code or answer in the same turn. "
     "Use skills only when the user's request clearly matches that skill; never invoke keybindings-help unless the user asks about keybindings. "
     "Keep final answers concise and do not expose hidden chain-of-thought. "
@@ -3098,6 +3099,38 @@ def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: st
     if latest_tool_result_indicates_completed_work(body) and response_text.strip():
         return False
     return non_actionable_short_response(response_text)
+
+
+def should_recover_empty_end_turn_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
+    """Recover from non-Anthropic providers returning an empty end_turn.
+
+    Claude Code treats an assistant end_turn with no text and no tool call as a
+    completed turn. For implementation/resume prompts, ask Claude Code for the
+    task list to give the model a concrete next tool result and keep the loop
+    alive.
+    """
+    if tool_calls:
+        return False
+    if response_text.strip():
+        return False
+    if not has_tool(body, "TaskList"):
+        return False
+    latest = latest_user_text(body)
+    if not latest.strip():
+        return False
+    latest_tool_results = latest_user_tool_result_names(body)
+    if latest_tool_results:
+        return True
+    if short_resume_prompt(latest) and (latest_assistant_text(body) or plan_mode_active(body)):
+        return True
+    return likely_implementation_planning_request(latest)
+
+
+def empty_end_turn_notice() -> str:
+    return (
+        "[claude-any] Upstream model returned an empty end_turn with no text or "
+        "tool call. No work was performed; please retry or ask me to continue."
+    )
 
 
 def maybe_handle_plan_mode_tool_choice(handler: BaseHTTPRequestHandler, provider: str, body: dict[str, Any]) -> bool:
@@ -8087,10 +8120,14 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
                 "input": fixed_input,
             }
         )
-    if source_body is not None and should_auto_enter_plan_mode(source_body, text, message.get("tool_calls") or []):
+    emitted_tool_calls = [block for block in content if isinstance(block, dict) and block.get("type") == "tool_use"]
+    if source_body is not None and should_auto_enter_plan_mode(source_body, text, emitted_tool_calls):
         router_log("WARN", "auto-synthesized EnterPlanMode from short/empty upstream response")
         return synthetic_tool_use_response(model, "EnterPlanMode")
-    if source_body is not None and should_keep_work_alive_with_tasklist(source_body, text, message.get("tool_calls") or []):
+    if source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text, emitted_tool_calls):
+        router_log("WARN", "auto-synthesized TaskList from empty upstream end_turn")
+        return synthetic_tool_use_response(model, "TaskList")
+    if source_body is not None and should_keep_work_alive_with_tasklist(source_body, text, emitted_tool_calls):
         router_log("WARN", "auto-synthesized TaskList to keep work moving after tool result")
         content.append(
             {
@@ -8100,6 +8137,10 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
                 "input": {},
             }
         )
+        emitted_tool_calls.append(content[-1])
+    if source_body is not None and not text.strip() and not emitted_tool_calls:
+        text = empty_end_turn_notice()
+        content.append({"type": "text", "text": text})
     done_reason = data.get("done_reason")
     stop_reason = "tool_use" if any(block.get("type") == "tool_use" for block in content) else "end_turn"
     if done_reason == "length":
@@ -8558,6 +8599,33 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             }
             handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
             handler.wfile.flush()
+        elif source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls):
+            ensure_message_started()
+            router_log("WARN", "auto-synthesized TaskList from empty upstream end_turn stream")
+            tool_calls.append({"function": {"name": "TaskList", "arguments": {}}})
+            tool_id = f"toolu_ollama_empty_{int(time.time() * 1000)}"
+            tool_index = next_content_index
+            next_content_index += 1
+            tool_indices.append(tool_index)
+            tool_event = {
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": "TaskList",
+                    "input": {},
+                },
+            }
+            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
+            delta_event = {
+                "type": "content_block_delta",
+                "index": tool_index,
+                "delta": {"type": "input_json_delta", "partial_json": "{}"},
+            }
+            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
         elif text_suppressed_for_plan and not text_started and text_so_far:
             text_started = True
             text_index = next_content_index
@@ -8630,7 +8698,10 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             write_router_activity("error", provider, model, error="empty_stream", stream=True)
             empty_index = next_content_index
             next_content_index += 1
-            emit_text_block(empty_index, "")
+            notice = empty_end_turn_notice() if source_body is not None else ""
+            if notice:
+                text_so_far = notice
+            emit_text_block(empty_index, notice)
         # Determine stop reason
         stop_reason = "tool_use" if tool_calls else "end_turn"
         if chunk.get("done_reason") == "length":
@@ -9146,6 +9217,21 @@ def stream_openai_chat_to_anthropic_sse(
             )
             emit("content_block_delta", {"type": "content_block_delta", "index": tool_index, "delta": {"type": "input_json_delta", "partial_json": "{}"}})
             emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
+        elif source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls):
+            router_log("WARN", "auto-synthesized TaskList from empty upstream end_turn OpenAI stream")
+            tool_index = next_content_index
+            next_content_index += 1
+            tool_calls.append({"function": {"name": "TaskList", "arguments": {}}})
+            emit(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": tool_index,
+                    "content_block": {"type": "tool_use", "id": f"toolu_openai_empty_{int(time.time() * 1000)}", "name": "TaskList", "input": {}},
+                },
+            )
+            emit("content_block_delta", {"type": "content_block_delta", "index": tool_index, "delta": {"type": "input_json_delta", "partial_json": "{}"}})
+            emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
         elif text_suppressed_for_plan and not text_started and text_so_far:
             emit_text_delta(text_so_far)
 
@@ -9168,6 +9254,12 @@ def stream_openai_chat_to_anthropic_sse(
         if text_started and text_index is not None:
             emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
             text_stopped = True
+        if not text_started and not tool_calls:
+            text_so_far = empty_end_turn_notice() if source_body is not None else ""
+            emit_text_delta(text_so_far)
+            if text_index is not None:
+                emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
+                text_stopped = True
         stop_reason = "tool_use" if tool_calls else ("max_tokens" if finish_reason == "length" else "end_turn")
         write_anthropic_open_stream_stop(handler, {"stop_reason": stop_reason, "usage": {"output_tokens": output_tokens or max(1, len(text_so_far) // 4)}})
         return True
@@ -14379,6 +14471,7 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         "ANTHROPIC_DEFAULT_SONNET_MODEL": claude_model,
         "CLAUDE_CODE_SUBAGENT_MODEL": claude_model,
         "CLAUDE_ANY_MODEL_ALIAS": claude_model,
+        "CLAUDE_ANY_BYPASS_PERMISSIONS": "1",
     })
 
 
@@ -19243,6 +19336,7 @@ def launch_claude(
             "CLAUDE_CODE_DISABLE_TERMINAL_TITLE",
             "CLAUDE_CODE_ATTRIBUTION_HEADER",
             "CLAUDE_ANY_ADVISOR_MODEL",
+            "CLAUDE_ANY_BYPASS_PERMISSIONS",
             "CLAUDE_ANY_MODEL_ALIAS",
         ):
             env.pop(key, None)

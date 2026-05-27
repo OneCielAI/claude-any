@@ -103,11 +103,47 @@ TOOL_HINTS = {
     "TaskUpdate": "Use TaskUpdate with taskId and optional status pending, in_progress, completed, or deleted.",
 }
 PLAN_GUARD_MARKER = "[claude-any-plan-guard]"
+TRUE_ENV_VALUES = {"1", "true", "yes", "on"}
 
 
 def active() -> bool:
     provider = os.environ.get("CLAUDE_ANY_PROVIDER", "").strip()
     return provider in NON_NATIVE_PROVIDERS
+
+
+def env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in TRUE_ENV_VALUES
+
+
+def bypass_permissions_enabled() -> bool:
+    return env_truthy("CLAUDE_ANY_BYPASS_PERMISSIONS")
+
+
+def event_tool_name(event: dict[str, Any]) -> str:
+    for key in ("tool_name", "toolName", "tool"):
+        value = event.get(key)
+        if isinstance(value, str) and value:
+            return value
+    for key in ("tool", "tool_use", "toolUse", "request", "permission"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            name = value.get("name") or value.get("tool_name") or value.get("toolName")
+            if isinstance(name, str) and name:
+                return name
+    return ""
+
+
+def event_tool_input(event: dict[str, Any]) -> Any:
+    for key in ("tool_input", "toolInput", "input", "updatedInput"):
+        if key in event:
+            return event.get(key)
+    for key in ("tool", "tool_use", "toolUse", "request", "permission"):
+        value = event.get(key)
+        if isinstance(value, dict):
+            for input_key in ("tool_input", "toolInput", "input", "updatedInput"):
+                if input_key in value:
+                    return value.get(input_key)
+    return None
 
 
 def emit(obj: dict[str, Any]) -> None:
@@ -133,8 +169,8 @@ def log_json_event(event: dict[str, Any], result: dict[str, Any] | None = None) 
         record = {
             "time": int(time.time()),
             "hook_event_name": event.get("hook_event_name"),
-            "tool_name": event.get("tool_name"),
-            "tool_input": event.get("tool_input"),
+            "tool_name": event_tool_name(event),
+            "tool_input": event_tool_input(event),
         }
         if result is not None:
             record["guard_result"] = result
@@ -170,6 +206,21 @@ def pre_deny(reason: str, context: str = "") -> None:
     if context:
         out["hookSpecificOutput"]["additionalContext"] = context
     log_json_event({"hook_event_name": "PreToolUse"}, out)
+    emit(out)
+
+
+def permission_allow(event: dict[str, Any], updated: dict[str, Any], reason: str) -> None:
+    out: dict[str, Any] = {
+        "hookSpecificOutput": {
+            "hookEventName": "PermissionRequest",
+            "decision": {
+                "behavior": "allow",
+                "updatedInput": updated,
+            },
+        }
+    }
+    log_json_event(event, out)
+    log_event(reason)
     emit(out)
 
 
@@ -670,10 +721,25 @@ def handle_post_failure(event: dict[str, Any]) -> None:
         post_failure_context(hint)
 
 
+def handle_permission_request(event: dict[str, Any]) -> bool:
+    tool = event_tool_name(event)
+    if tool != "ExitPlanMode":
+        return False
+    if not bypass_permissions_enabled():
+        return False
+    raw = event_tool_input(event)
+    updated = raw if isinstance(raw, dict) else {}
+    permission_allow(
+        event,
+        updated,
+        "PermissionRequest auto-allowed ExitPlanMode because claude-any launched with bypass permissions.",
+    )
+    return True
+
+
 OBSERVE_ONLY_EVENTS = {
     "PostToolUse",
     "PostToolBatch",
-    "PermissionRequest",
     "PermissionDenied",
     "SessionStart",
     "SessionEnd",
@@ -756,6 +822,11 @@ def main() -> int:
         return handle_worktree_remove(event)
     if name in {"Stop", "SubagentStop"}:
         return handle_stop(event)
+    if name == "PermissionRequest":
+        if handle_permission_request(event):
+            return 0
+        log_json_event(event)
+        return 0
 
     # Lightweight observation for events we do not act on. Skip when inactive
     # to avoid touching disk on every event.
