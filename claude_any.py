@@ -2741,7 +2741,8 @@ def _message_content_blocks(message: dict[str, Any]) -> list[Any]:
 def anthropic_thinking_requested(body: dict[str, Any]) -> bool:
     thinking = body.get("thinking")
     if isinstance(thinking, dict):
-        return str(thinking.get("type") or "").lower() == "enabled"
+        thinking_type = str(thinking.get("type") or "").strip().lower()
+        return thinking_type not in ("", "disabled", "none", "off", "false")
     return bool(thinking)
 
 

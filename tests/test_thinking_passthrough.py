@@ -157,6 +157,37 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertIn("thinking", body)
         self.assertNotIn("thinking", out)
 
+    def test_strip_adaptive_thinking_request_for_non_anthropic_native_provider(self):
+        body = {
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        }
+
+        out = claude_any.normalize_thinking_for_non_anthropic_native_provider(
+            "deepseek",
+            {"native_compat": True},
+            body,
+        )
+
+        self.assertIsNot(out, body)
+        self.assertIn("thinking", body)
+        self.assertNotIn("thinking", out)
+
+    def test_disabled_thinking_request_is_not_treated_as_enabled(self):
+        body = {
+            "thinking": {"type": "disabled"},
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
+        }
+
+        out = claude_any.normalize_thinking_for_non_anthropic_native_provider(
+            "deepseek",
+            {"native_compat": True},
+            body,
+        )
+
+        self.assertIs(out, body)
+        self.assertIn("thinking", out)
+
     def test_strip_thinking_after_assistant_history_without_tool_continuation(self):
         body = {
             "thinking": {"type": "enabled", "budget_tokens": 1024},
