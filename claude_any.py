@@ -11815,7 +11815,8 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
         elif key in ("stream_idle_timeout", "stream_idle_timeout_ms", "idle_timeout", "idle_timeout_ms"):
             pcfg.pop("stream_idle_timeout_ms", None)
         elif key in ("rate_limit", "rate_limit_rpm", "rpm"):
-            pcfg.pop("rate_limit_rpm", None)
+            pcfg["rate_limit_rpm"] = 0
+            pcfg["rate_limit_status"] = False
         elif key in ("rate_limit_status", "rpm_status"):
             pcfg["rate_limit_status"] = False
         else:
@@ -11885,6 +11886,7 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
         if not fixed:
             if str(value).lower() in ("0", "false", "off", "disable", "disabled", "none", "unset"):
                 pcfg["rate_limit_rpm"] = 0
+                pcfg["rate_limit_status"] = False
                 return
             raise SystemExit("rate_limit_rpm must be a positive integer, or 0 to disable")
         pcfg["rate_limit_rpm"] = fixed
@@ -13341,6 +13343,12 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ja": "ルーター側の上流リクエスト数/分の制限。既定は off。正の RPM を設定すると待機制限を有効化します。",
         "zh": "路由器侧上游每分钟请求限制。默认关闭；设置正数 RPM 后启用等待限制。",
     },
+    "rate_limit_enabled": {
+        "en": "Toggle claude-any's router-side RPM limiter. Off means rate_limit_rpm=0 and no claude-any wait is inserted.",
+        "ko": "claude-any 라우터 내부 RPM 제한을 켜거나 끕니다. off면 rate_limit_rpm=0이며 claude-any가 대기 시간을 넣지 않습니다.",
+        "ja": "claude-any ルーター側 RPM 制限を切り替えます。off は rate_limit_rpm=0 で、claude-any は待機を挿入しません。",
+        "zh": "切换 claude-any 路由器侧 RPM 限制。off 表示 rate_limit_rpm=0，claude-any 不插入等待。",
+    },
     "rate_limit_status": {
         "en": "Show optional colored RPM usage status in Claude responses. Default is off.",
         "ko": "Claude 응답에 RPM 사용량 상태를 색상 텍스트로 표시합니다. 기본값은 off입니다.",
@@ -13462,6 +13470,7 @@ LLM_OPTION_TOGGLE_KEYS = {
     "stream_word_chunking",
     "native_compat",
     "think",
+    "rate_limit_enabled",
     "rate_limit_status",
     "router_debug_external_access",
 }
@@ -13477,11 +13486,23 @@ def llm_option_current_bool(provider: str, pcfg: dict[str, Any], key: str) -> bo
         return bool(pcfg.get("native_compat", default))
     if key == "think":
         return bool(pcfg.get("think", False))
+    if key == "rate_limit_enabled":
+        return bool(router_rate_limit_configured_rpm(provider, pcfg))
     if key == "rate_limit_status":
         return bool(pcfg.get("rate_limit_status", False))
     if key == "router_debug_external_access":
         return router_debug_external_access_enabled()
     return bool(pcfg.get(key, False))
+
+
+def rate_limit_status_label(provider: str, pcfg: dict[str, Any]) -> str:
+    rpm = router_rate_limit_configured_rpm(provider, pcfg)
+    return f"on ({rpm} rpm)" if rpm else "off"
+
+
+def rate_limit_rpm_label(provider: str, pcfg: dict[str, Any]) -> str:
+    rpm = router_rate_limit_configured_rpm(provider, pcfg)
+    return str(rpm) if rpm else "0 (off)"
 
 
 def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None = None) -> tuple[list[str], list[str]]:
@@ -13514,7 +13535,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         if bool(pcfg.get("stream_enabled", True)):
             add("Stream idle timeout ms", "stream_idle_timeout_ms", pcfg.get("stream_idle_timeout_ms", "auto"))
             add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
-        add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 0))
+        add("RPM limiter", "rate_limit_enabled", rate_limit_status_label(provider, pcfg))
+        add("Rate limit RPM", "rate_limit_rpm", rate_limit_rpm_label(provider, pcfg))
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", False)) else "off")
     else:
         if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
@@ -13523,7 +13545,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
         if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
-            add("Rate limit RPM", "rate_limit_rpm", pcfg.get("rate_limit_rpm", 0))
+            add("RPM limiter", "rate_limit_enabled", rate_limit_status_label(provider, pcfg))
+            add("Rate limit RPM", "rate_limit_rpm", rate_limit_rpm_label(provider, pcfg))
             add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", False)) else "off")
             add("Temperature", "temperature", pcfg.get("temperature", "default"))
             add("Top P", "top_p", pcfg.get("top_p", "default"))
@@ -13553,6 +13576,8 @@ def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> 
         return "true" if bool(pcfg.get("stream_word_chunking", False)) else "false"
     if key == "rate_limit_status":
         return "true" if bool(pcfg.get("rate_limit_status", False)) else "false"
+    if key == "rate_limit_enabled":
+        return "true" if bool(router_rate_limit_configured_rpm(provider, pcfg)) else "false"
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         if key == "num_ctx":
@@ -13583,6 +13608,19 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
         cfg["router_debug_message_preview_chars"] = min(fixed, 4000)
         save_config(cfg)
         return ["Router event message preview updated.", f"preview chars: {cfg['router_debug_message_preview_chars']}"]
+    if key == "rate_limit_enabled":
+        enabled = parse_bool(value, default=False)
+        if enabled:
+            if not router_rate_limit_configured_rpm(provider, pcfg):
+                pcfg["rate_limit_rpm"] = 60
+            save_config(cfg)
+            clear_model_cache()
+            return ["RPM limiter enabled.", f"rate_limit_rpm: {router_rate_limit_configured_rpm(provider, pcfg)}"]
+        pcfg["rate_limit_rpm"] = 0
+        pcfg["rate_limit_status"] = False
+        save_config(cfg)
+        clear_model_cache()
+        return ["RPM limiter disabled.", "rate_limit_rpm: 0", "rate_limit_status: off"]
     numeric_keys = {
         "context_window",
         "context",
@@ -13609,7 +13647,13 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
         "rpm",
         "top_k",
     }
-    if key in numeric_keys and value.lower() not in ("default", "unset", "none", "null", "0"):
+    disable_words = ("0", "false", "off", "disable", "disabled")
+    rate_limit_keys = ("rate_limit", "rate_limit_rpm", "rpm")
+    if (
+        key in numeric_keys
+        and value.lower() not in ("default", "unset", "none", "null", "0")
+        and not (key in rate_limit_keys and value.lower() in disable_words)
+    ):
         if not re.fullmatch(r"\d+", value):
             return [f"{key}: enter digits only, or use default/unset to clear."]
     clear_words = ("default", "unset", "none", "null")
@@ -13647,7 +13691,8 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         elif key in ("stream_idle_timeout", "stream_idle_timeout_ms", "idle_timeout", "idle_timeout_ms"):
             pcfg.pop("stream_idle_timeout_ms", None)
         elif key in ("rate_limit", "rate_limit_rpm", "rpm"):
-            pcfg.pop("rate_limit_rpm", None)
+            pcfg["rate_limit_rpm"] = 0
+            pcfg["rate_limit_status"] = False
         elif key in ("rate_limit_status", "rpm_status"):
             pcfg["rate_limit_status"] = False
         elif key in ("native", "native_compat"):
@@ -13703,8 +13748,9 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         return
     if key in ("rate_limit", "rate_limit_rpm", "rpm"):
         fixed = positive_int(value)
-        if value in (0, "0", False, None):
+        if value in (0, "0", False, None) or str(value).lower() in ("false", "off", "disable", "disabled", "none", "unset"):
             pcfg["rate_limit_rpm"] = 0
+            pcfg["rate_limit_status"] = False
             return
         if not fixed:
             raise SystemExit("rate_limit_rpm must be a positive integer, or 0/unset to disable")

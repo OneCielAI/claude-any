@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import claude_any
 
@@ -48,6 +49,47 @@ class RateLimitDefaultTests(unittest.TestCase):
 
         self.assertEqual(8, cfg["providers"]["ollama-cloud"]["rate_limit_rpm"])
         self.assertTrue(cfg["providers"]["ollama-cloud"]["rate_limit_status"])
+
+    def test_llm_options_expose_explicit_rpm_limiter_toggle(self):
+        pcfg = {"rate_limit_rpm": 0, "rate_limit_status": False}
+        with (
+            mock.patch.object(claude_any, "router_debug_external_access_enabled", return_value=False),
+            mock.patch.object(claude_any, "router_debug_message_preview_chars", return_value=0),
+        ):
+            rows, values = claude_any.llm_option_panel_rows("ollama-cloud", pcfg, "en")
+
+        self.assertIn("rate_limit_enabled", values)
+        limiter_row = rows[values.index("rate_limit_enabled")]
+        rpm_row = rows[values.index("rate_limit_rpm")]
+        self.assertIn("RPM limiter", limiter_row)
+        self.assertIn("off", limiter_row)
+        self.assertIn("0 (off)", rpm_row)
+
+    def test_llm_options_disable_rpm_limiter_sets_rpm_zero_and_status_off(self):
+        cfg = {
+            "providers": {
+                "ollama-cloud": {"rate_limit_rpm": 8, "rate_limit_status": True},
+            }
+        }
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config") as save_config,
+            mock.patch.object(claude_any, "clear_model_cache"),
+        ):
+            messages = claude_any.set_llm_option_config("ollama-cloud", "rate_limit_enabled", "false")
+
+        self.assertEqual(0, cfg["providers"]["ollama-cloud"]["rate_limit_rpm"])
+        self.assertFalse(cfg["providers"]["ollama-cloud"]["rate_limit_status"])
+        self.assertIn("RPM limiter disabled.", messages)
+        save_config.assert_called_once_with(cfg)
+
+    def test_setting_rate_limit_rpm_zero_also_disables_status(self):
+        pcfg = {"rate_limit_rpm": 8, "rate_limit_status": True}
+
+        claude_any.apply_ollama_option(pcfg, "rate_limit_rpm=0")
+
+        self.assertEqual(0, pcfg["rate_limit_rpm"])
+        self.assertFalse(pcfg["rate_limit_status"])
 
 
 if __name__ == "__main__":
