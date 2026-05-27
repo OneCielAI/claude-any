@@ -1,6 +1,7 @@
 import unittest
 import json
 from io import BytesIO
+from unittest import mock
 
 import claude_any
 
@@ -824,6 +825,85 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertIn('"index": 0, "delta": {"type": "text_delta"', output)
         self.assertIn('"type": "content_block_stop", "index": 0', output)
         self.assertIn('"stop_reason": "end_turn"', output)
+
+    def test_native_stream_suppressed_thinking_emits_keepalive(self):
+        body = body_with_tools("continue implementation", ["Read", "Bash"])
+
+        class Handler:
+            def __init__(self):
+                self.wfile = BytesIO()
+
+        handler = Handler()
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private reasoning"}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"done"}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        lines = []
+        for event in events:
+            lines.extend(f"{line}\n".encode("utf-8") for line in event.splitlines())
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            lines,
+            "deepseek-v4-flash",
+            word_chunking=False,
+            source_body=body,
+            preserve_thinking=False,
+            provider="deepseek",
+            normalize_tool_use=True,
+        )
+        output = handler.wfile.getvalue().decode("utf-8")
+
+        self.assertIn(": suppressed-thinking", output)
+        self.assertNotIn("private reasoning", output)
+        self.assertIn('"text": "done"', output)
+        self.assertIn('"stop_reason": "end_turn"', output)
+
+    def test_native_stream_client_disconnect_is_not_forward_error(self):
+        body = body_with_tools("continue implementation", ["Read", "Bash"])
+
+        class FailingWFile:
+            def write(self, data):
+                raise ConnectionResetError("client closed")
+
+            def flush(self):
+                pass
+
+        class Handler:
+            def __init__(self):
+                self.wfile = FailingWFile()
+
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}\n\n',
+        ]
+        lines = []
+        for event in events:
+            lines.extend(f"{line}\n".encode("utf-8") for line in event.splitlines())
+
+        with mock.patch.object(claude_any, "router_log") as router_log:
+            claude_any._rebatch_anthropic_sse_text(
+                Handler(),
+                lines,
+                "deepseek-v4-flash",
+                word_chunking=False,
+                source_body=body,
+                preserve_thinking=False,
+                provider="deepseek",
+                normalize_tool_use=True,
+            )
+
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("anthropic_sse_client_disconnected" in item for item in log_messages))
+        self.assertFalse(any("anthropic_sse_forward_error" in item for item in log_messages))
 
     def test_native_stream_suggestion_mode_does_not_synthesize_tasklist(self):
         body = body_with_tools("continue implementation", ["TaskList", "Read", "Bash"])

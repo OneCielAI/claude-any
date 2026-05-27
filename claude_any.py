@@ -8726,13 +8726,32 @@ def _rebatch_anthropic_sse_text(
     buffered_tool_uses: dict[int, dict[str, Any]] = {}
     pending_message_delta: tuple[str | None, str] | None = None
     pending_message_stop: tuple[str | None, str] | None = None
+    last_suppressed_keepalive_at = 0.0
+
+    class ClientStreamDisconnected(Exception):
+        pass
 
     def emit_raw(event_type: str | None, data_str: str) -> None:
-        if event_type:
-            handler.wfile.write(f"event: {event_type}\ndata: {data_str}\n\n".encode())
-        else:
-            handler.wfile.write(f"data: {data_str}\n\n".encode())
-        handler.wfile.flush()
+        try:
+            if event_type:
+                handler.wfile.write(f"event: {event_type}\ndata: {data_str}\n\n".encode())
+            else:
+                handler.wfile.write(f"data: {data_str}\n\n".encode())
+            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as exc:
+            raise ClientStreamDisconnected(f"{type(exc).__name__}: {exc}") from exc
+
+    def emit_suppressed_keepalive(force: bool = False) -> None:
+        nonlocal last_suppressed_keepalive_at
+        now = time.time()
+        if not force and now - last_suppressed_keepalive_at < 1.0:
+            return
+        try:
+            handler.wfile.write(b": suppressed-thinking\n\n")
+            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError) as exc:
+            raise ClientStreamDisconnected(f"{type(exc).__name__}: {exc}") from exc
+        last_suppressed_keepalive_at = now
 
     def emit_text_delta(index: int, text: str) -> None:
         if not text:
@@ -9040,6 +9059,7 @@ def _rebatch_anthropic_sse_text(
                     suppressed_content_indices.add(index)
                     suppressed_thinking_blocks[index] = dict(content_block)
                     router_log("WARN", f"suppressed Anthropic thinking response block for non-Anthropic provider model={model}")
+                    emit_suppressed_keepalive(force=True)
                     return
                 if index in content_index_map:
                     mapped_index = content_index_map[index]
@@ -9136,8 +9156,10 @@ def _rebatch_anthropic_sse_text(
             mapped_index = mapped_content_index(index)
             if isinstance(index, int) and mapped_index is None:
                 append_suppressed_thinking_delta(index, delta)
+                emit_suppressed_keepalive()
                 return
             if not preserve_thinking and delta.get("type") in {"thinking_delta", "signature_delta"}:
+                emit_suppressed_keepalive()
                 return
             if normalize_tool_use and isinstance(mapped_index, int) and mapped_index in buffered_tool_uses:
                 if delta.get("type") == "input_json_delta":
@@ -9211,6 +9233,14 @@ def _rebatch_anthropic_sse_text(
         flush_suppressed_thinking_passback()
         if pending_message_delta is not None or pending_message_stop is not None:
             emit_pending_message_end()
+    except ClientStreamDisconnected as exc:
+        router_log(
+            "WARN",
+            f"anthropic_sse_client_disconnected model={model} "
+            f"text_len={len(text_so_far)} emitted_tool_use={emitted_tool_use} "
+            f"suppressed_blocks={len(suppressed_thinking_passback_blocks) + len(suppressed_thinking_blocks)} "
+            f"error={exc}",
+        )
     except Exception as exc:
         router_log("ERROR", f"anthropic_sse_forward_error model={model} error={type(exc).__name__}: {exc}")
         try:
