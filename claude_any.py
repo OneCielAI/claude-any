@@ -2756,6 +2756,14 @@ def anthropic_tool_continuation_block_count(body: dict[str, Any]) -> int:
     return count
 
 
+def anthropic_assistant_history_count(body: dict[str, Any]) -> int:
+    count = 0
+    for message in body.get("messages") or []:
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            count += 1
+    return count
+
+
 def strip_anthropic_thinking_blocks_from_messages(body: dict[str, Any]) -> dict[str, Any]:
     messages = body.get("messages")
     if not isinstance(messages, list):
@@ -2819,7 +2827,8 @@ def normalize_thinking_for_non_anthropic_native_provider(provider: str, pcfg: di
         return body
     synthetic_tool = has_claude_any_synthetic_tool_use(body)
     continuation_blocks = anthropic_tool_continuation_block_count(body)
-    if not synthetic_tool and continuation_blocks <= 0:
+    assistant_history = anthropic_assistant_history_count(body)
+    if not synthetic_tool and continuation_blocks <= 0 and assistant_history <= 0 and thinking_blocks <= 0:
         return body
     out = strip_anthropic_thinking_blocks_from_messages(body)
     out = dict(out)
@@ -2827,7 +2836,8 @@ def normalize_thinking_for_non_anthropic_native_provider(provider: str, pcfg: di
     router_log(
         "WARN",
         "removed Anthropic thinking request and thinking content blocks for non-Anthropic native tool continuation "
-        f"provider={provider} synthetic_tool={synthetic_tool} continuation_blocks={continuation_blocks} thinking_blocks={thinking_blocks}",
+        f"provider={provider} synthetic_tool={synthetic_tool} continuation_blocks={continuation_blocks} "
+        f"assistant_history={assistant_history} thinking_blocks={thinking_blocks}",
     )
     return out
 

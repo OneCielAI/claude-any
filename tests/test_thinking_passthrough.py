@@ -155,6 +155,30 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertIs(out, body)
         self.assertIn("thinking", out)
 
+    def test_strip_thinking_after_assistant_history_without_tool_continuation(self):
+        body = {
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "phase 2 개발진행"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "Phase 2 개발을 바로 시작하겠습니다."}]},
+                {
+                    "role": "user",
+                    "content": [],
+                    "attachment": {"type": "plan_mode", "filePath": "/tmp/plan.md"},
+                },
+            ],
+        }
+
+        out = claude_any.normalize_thinking_for_non_anthropic_native_provider(
+            "deepseek",
+            {"native_compat": True},
+            body,
+        )
+
+        self.assertIsNot(out, body)
+        self.assertIn("thinking", body)
+        self.assertNotIn("thinking", out)
+
     def test_strip_thinking_blocks_for_real_tool_continuation(self):
         body = {
             "thinking": {"type": "enabled", "budget_tokens": 1024},
