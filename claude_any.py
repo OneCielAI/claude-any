@@ -8986,14 +8986,10 @@ def _rebatch_anthropic_sse_text(
                 patched["delta"] = patched_delta
                 pending_message_delta = (event_type, json.dumps(patched, ensure_ascii=False))
                 return
-            if (
-                stop_reason == "end_turn"
-                and source_body is not None
-                and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls)
-            ):
+            if source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls):
                 for index in list(text_buffers.keys()):
                     flush_buffer(index, force=True)
-                router_log("WARN", "auto-synthesized TaskList from empty Anthropic-compatible end_turn")
+                router_log("WARN", f"auto-synthesized TaskList from empty Anthropic-compatible message_delta stop_reason={stop_reason or '-'}")
                 emit_tasklist_tool(next_content_index)
                 next_content_index += 1
                 saw_tool_use = True
