@@ -265,7 +265,9 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "except while Claude Code is in Plan Mode. In Plan Mode, first explore/read as needed, write or update the plan file named "
     "by the plan_mode attachment, and only then call ExitPlanMode to leave Plan Mode; when bypass permissions is active, "
     "claude-any auto-approves that plan exit, so do not ask the user separately and do not call EnterPlanMode again. "
-    "then report the concrete result. If you decide not to use tools, provide the complete requested code or answer in the same turn. "
+    "then report the concrete result. If the task has several reasonable implementation parts, do all in-scope parts; "
+    "do not ask the user which part to start or whether to do all unless the user explicitly requested a choice. "
+    "If you decide not to use tools, provide the complete requested code or answer in the same turn. "
     "Use skills only when the user's request clearly matches that skill; never invoke keybindings-help unless the user asks about keybindings. "
     "Keep final answers concise and do not expose hidden chain-of-thought. "
     "When calling Claude Code tools, use exactly the tool schema and do not invent extra fields. "
@@ -3139,6 +3141,20 @@ def latest_user_tool_result_text(body: dict[str, Any]) -> str:
     return latest
 
 
+def synthetic_tasklist_tool_use_id(tool_id: str, name: str) -> bool:
+    if name != "TaskList":
+        return False
+    prefixes = (
+        "toolu_ollama_keepalive_",
+        "toolu_ollama_choice_",
+        "toolu_openai_keepalive_",
+        "toolu_openai_choice_",
+        "toolu_anthropic_choice_",
+        "toolu_claude_any_TaskList_",
+    )
+    return any(tool_id.startswith(prefix) for prefix in prefixes)
+
+
 def recent_synthetic_tasklist_count(body: dict[str, Any]) -> int:
     count = 0
     for message in reversed(body.get("messages") or []):
@@ -3153,7 +3169,7 @@ def recent_synthetic_tasklist_count(body: dict[str, Any]) -> int:
         for block in content:
             if not isinstance(block, dict) or block.get("type") != "tool_use":
                 continue
-            if block.get("name") == "TaskList" and str(block.get("id") or "").startswith("toolu_ollama_keepalive_"):
+            if synthetic_tasklist_tool_use_id(str(block.get("id") or ""), str(block.get("name") or "")):
                 found_keepalive = True
         if found_keepalive:
             count += 1
@@ -3189,6 +3205,61 @@ def short_resume_prompt(text: str) -> bool:
     # Language-agnostic: a very short imperative with no question or code-like
     # syntax after an unfinished assistant turn is a request to proceed.
     return not re.search(r"[?？`{};/\\\\]|https?://", normalized)
+
+
+WORK_REQUEST_RE = re.compile(
+    r"\b("
+    r"implement|build|fix|edit|code|create|update|continue|proceed|start|develop|debug|test|run|commit|push|merge|deploy"
+    r")\b|"
+    r"(구현|수정|개발|진행|시작|처리|테스트|푸시|커밋|병합|배포|고쳐|만들|작성|추가)",
+    re.IGNORECASE,
+)
+
+
+CLARIFYING_CHOICE_RE = re.compile(
+    r"(진행할까요|하시겠어요|할까요|원하시|말씀해주시겠어요|선택|먼저.*할|셋\s*다|한\s*번에|"
+    r"would you like|do you want|should i|which .*should|choose|proceed with|all at once)",
+    re.IGNORECASE,
+)
+
+
+def latest_user_looks_like_work_request(body: dict[str, Any]) -> bool:
+    latest = latest_user_text(body)
+    normalized = re.sub(r"\s+", " ", latest or "").strip()
+    if not normalized:
+        return False
+    if likely_implementation_planning_request(latest):
+        return True
+    if short_resume_prompt(latest) and latest_assistant_text(body):
+        return True
+    return bool(WORK_REQUEST_RE.search(normalized))
+
+
+def response_asks_for_user_choice_or_permission(text: str) -> bool:
+    normalized = re.sub(r"\s+", " ", text or "").strip()
+    if not normalized:
+        return False
+    if not ("?" in normalized or "？" in normalized or CLARIFYING_CHOICE_RE.search(normalized)):
+        return False
+    return bool(CLARIFYING_CHOICE_RE.search(normalized))
+
+
+def should_auto_continue_choice_question_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
+    if tool_calls:
+        return False
+    if not has_tool(body, "TaskList"):
+        return False
+    if latest_tool_result_indicates_completed_work(body):
+        return False
+    if recent_synthetic_tasklist_count(body) >= 2:
+        return False
+    if not response_asks_for_user_choice_or_permission(response_text):
+        return False
+    if plan_mode_active(body):
+        return True
+    if latest_user_looks_like_work_request(body):
+        return True
+    return bool(latest_user_tool_result_names(body))
 
 
 def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
@@ -3243,6 +3314,32 @@ def empty_end_turn_notice() -> str:
         "[claude-any] Upstream model returned an empty end_turn with no text or "
         "tool call. No work was performed; please retry or ask me to continue."
     )
+
+
+def append_synthetic_tasklist_to_message(message: dict[str, Any], model: str, source_body: dict[str, Any], reason: str) -> dict[str, Any]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        content = [{"type": "text", "text": anthropic_content_to_text(content)}] if content else []
+    tool_calls = [block for block in content if isinstance(block, dict) and block.get("type") == "tool_use"]
+    text = anthropic_content_to_text(content)
+    if not should_auto_continue_choice_question_with_tasklist(source_body, text, tool_calls):
+        return message
+    now = int(time.time() * 1000)
+    out = dict(message)
+    out_content = list(content)
+    out_content.append(
+        {
+            "type": "tool_use",
+            "id": f"toolu_claude_any_TaskList_{reason}_{now}",
+            "name": "TaskList",
+            "input": {},
+        }
+    )
+    out["content"] = out_content
+    out["stop_reason"] = "tool_use"
+    out.setdefault("model", model or message.get("model") or "claude-any-router")
+    router_log("WARN", f"auto-synthesized TaskList after clarification question ({reason})")
+    return out
 
 
 def maybe_handle_plan_mode_tool_choice(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> bool:
@@ -8306,6 +8403,17 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
             }
         )
         emitted_tool_calls.append(content[-1])
+    if source_body is not None and should_auto_continue_choice_question_with_tasklist(source_body, text, emitted_tool_calls):
+        router_log("WARN", "auto-synthesized TaskList after clarification question")
+        content.append(
+            {
+                "type": "tool_use",
+                "id": f"toolu_ollama_choice_{int(time.time() * 1000)}",
+                "name": "TaskList",
+                "input": {},
+            }
+        )
+        emitted_tool_calls.append(content[-1])
     if source_body is not None and not text.strip() and not emitted_tool_calls:
         text = empty_end_turn_notice()
         content.append({"type": "text", "text": text})
@@ -8363,7 +8471,13 @@ def _split_word_buffer(buf: str, force: bool = False, max_buffer: int = STREAM_W
     return "", buf
 
 
-def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any, model: str = "claude-any-upstream", word_chunking: bool = True) -> None:
+def _rebatch_anthropic_sse_text(
+    handler: BaseHTTPRequestHandler,
+    resp: Any,
+    model: str = "claude-any-upstream",
+    word_chunking: bool = True,
+    source_body: dict[str, Any] | None = None,
+) -> None:
     """
     Parse upstream Anthropic SSE and re-emit it with text_delta events buffered
     to word boundaries. Non-text events (message_start/stop, content_block_start/
@@ -8375,6 +8489,9 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any, mode
     pending_event_lines: list[str] = []
     saw_message_start = False
     saw_message_stop = False
+    text_so_far = ""
+    saw_tool_use = False
+    next_content_index = 0
     open_content_blocks: set[int] = set()
 
     def emit_raw(event_type: str | None, data_str: str) -> None:
@@ -8402,8 +8519,34 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any, mode
         text_buffers[index] = remainder
         emit_text_delta(index, to_flush)
 
+    def emit_tasklist_tool(index: int) -> None:
+        tool_id = f"toolu_anthropic_choice_{int(time.time() * 1000)}"
+        emit_raw(
+            "content_block_start",
+            json.dumps(
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "tool_use", "id": tool_id, "name": "TaskList", "input": {}},
+                },
+                ensure_ascii=False,
+            ),
+        )
+        emit_raw(
+            "content_block_delta",
+            json.dumps(
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": "{}"},
+                },
+                ensure_ascii=False,
+            ),
+        )
+        emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": index}, ensure_ascii=False))
+
     def process_event(event_type: str | None, data_str: str) -> None:
-        nonlocal saw_message_start, saw_message_stop
+        nonlocal saw_message_start, saw_message_stop, text_so_far, saw_tool_use, next_content_index
         try:
             event = json.loads(data_str)
         except Exception:
@@ -8421,10 +8564,35 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any, mode
             index = event.get("index")
             if isinstance(index, int):
                 open_content_blocks.add(index)
+                next_content_index = max(next_content_index, index + 1)
+            content_block = event.get("content_block") if isinstance(event.get("content_block"), dict) else {}
+            if content_block.get("type") == "tool_use":
+                saw_tool_use = True
         elif evt_type == "content_block_stop":
             index = event.get("index")
             if isinstance(index, int):
                 open_content_blocks.discard(index)
+        elif evt_type == "message_delta":
+            delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+            stop_reason = str(delta.get("stop_reason") or "")
+            tool_calls = [{"type": "tool_use"}] if saw_tool_use else []
+            if (
+                stop_reason == "end_turn"
+                and source_body is not None
+                and should_auto_continue_choice_question_with_tasklist(source_body, text_so_far, tool_calls)
+            ):
+                for index in list(text_buffers.keys()):
+                    flush_buffer(index, force=True)
+                router_log("WARN", "auto-synthesized TaskList after clarification question Anthropic-compatible stream")
+                emit_tasklist_tool(next_content_index)
+                next_content_index += 1
+                saw_tool_use = True
+                patched = dict(event)
+                patched_delta = dict(delta)
+                patched_delta["stop_reason"] = "tool_use"
+                patched["delta"] = patched_delta
+                emit_raw(event_type, json.dumps(patched, ensure_ascii=False))
+                return
         if evt_type == "content_block_delta":
             delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
             index = event.get("index")
@@ -8432,6 +8600,7 @@ def _rebatch_anthropic_sse_text(handler: BaseHTTPRequestHandler, resp: Any, mode
                 text = delta.get("text") or ""
                 if not text:
                     return
+                text_so_far += text
                 if not word_chunking:
                     emit_raw(event_type, data_str)
                     return
@@ -8827,6 +8996,33 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             router_log("WARN", "auto-synthesized TaskList to keep work moving after tool result stream")
             tool_calls.append({"function": {"name": "TaskList", "arguments": {}}})
             tool_id = f"toolu_ollama_keepalive_{int(time.time() * 1000)}"
+            tool_index = next_content_index
+            next_content_index += 1
+            tool_indices.append(tool_index)
+            tool_event = {
+                "type": "content_block_start",
+                "index": tool_index,
+                "content_block": {
+                    "type": "tool_use",
+                    "id": tool_id,
+                    "name": "TaskList",
+                    "input": {},
+                },
+            }
+            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
+            delta_event = {
+                "type": "content_block_delta",
+                "index": tool_index,
+                "delta": {"type": "input_json_delta", "partial_json": "{}"},
+            }
+            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
+        if source_body is not None and should_auto_continue_choice_question_with_tasklist(source_body, text_so_far, tool_calls):
+            ensure_message_started()
+            router_log("WARN", "auto-synthesized TaskList after clarification question stream")
+            tool_calls.append({"function": {"name": "TaskList", "arguments": {}}})
+            tool_id = f"toolu_ollama_choice_{int(time.time() * 1000)}"
             tool_index = next_content_index
             next_content_index += 1
             tool_indices.append(tool_index)
@@ -9419,6 +9615,22 @@ def stream_openai_chat_to_anthropic_sse(
             emit("content_block_delta", {"type": "content_block_delta", "index": tool_index, "delta": {"type": "input_json_delta", "partial_json": "{}"}})
             emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
 
+        if source_body is not None and should_auto_continue_choice_question_with_tasklist(source_body, text_so_far, tool_calls):
+            router_log("WARN", "auto-synthesized TaskList after clarification question OpenAI stream")
+            tool_index = next_content_index
+            next_content_index += 1
+            tool_calls.append({"function": {"name": "TaskList", "arguments": {}}})
+            emit(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": tool_index,
+                    "content_block": {"type": "tool_use", "id": f"toolu_openai_choice_{int(time.time() * 1000)}", "name": "TaskList", "input": {}},
+                },
+            )
+            emit("content_block_delta", {"type": "content_block_delta", "index": tool_index, "delta": {"type": "input_json_delta", "partial_json": "{}"}})
+            emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
+
         if text_started and text_index is not None:
             emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
             text_stopped = True
@@ -9938,18 +10150,21 @@ class RouterHandler(BaseHTTPRequestHandler):
                     self.send_header("cache-control", "no-cache")
                     self.send_header("connection", "close")
                     self.end_headers()
-                    _rebatch_anthropic_sse_text(self, resp, upstream_model, word_chunking=word_chunking)
+                    _rebatch_anthropic_sse_text(self, resp, upstream_model, word_chunking=word_chunking, source_body=body)
                 else:
                     self.send_response(status)
                     self.send_header("content-type", ctype)
                     self.end_headers()
                     raw_resp = resp.read()
                     notice = rate_limit_notice(waited, rpm_used, rpm_limit, bool(pcfg.get("rate_limit_status", False)))
-                    if notice and "application/json" in ctype:
+                    if "application/json" in ctype:
                         try:
                             payload = json.loads(raw_resp.decode("utf-8", errors="replace"))
                             if isinstance(payload, dict):
-                                raw_resp = json.dumps(prepend_anthropic_text(payload, notice), ensure_ascii=False).encode("utf-8")
+                                payload = append_synthetic_tasklist_to_message(payload, upstream_model, body, "native_json")
+                                if notice:
+                                    payload = prepend_anthropic_text(payload, notice)
+                                raw_resp = json.dumps(payload, ensure_ascii=False).encode("utf-8")
                         except Exception:
                             pass
                     self.wfile.write(raw_resp)
