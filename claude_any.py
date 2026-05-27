@@ -2754,6 +2754,39 @@ def anthropic_tool_continuation_block_count(body: dict[str, Any]) -> int:
     return count
 
 
+def strip_anthropic_thinking_blocks_from_messages(body: dict[str, Any]) -> dict[str, Any]:
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+    changed = False
+    out_messages: list[Any] = []
+    for message in messages:
+        if not isinstance(message, dict):
+            out_messages.append(message)
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            out_messages.append(message)
+            continue
+        filtered = [
+            block
+            for block in content
+            if not (isinstance(block, dict) and block.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES)
+        ]
+        if len(filtered) != len(content):
+            new_message = dict(message)
+            new_message["content"] = filtered
+            out_messages.append(new_message)
+            changed = True
+        else:
+            out_messages.append(message)
+    if not changed:
+        return body
+    out = dict(body)
+    out["messages"] = out_messages
+    return out
+
+
 def has_claude_any_synthetic_tool_use(body: dict[str, Any]) -> bool:
     for message in body.get("messages") or []:
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -2776,23 +2809,23 @@ def should_defer_forced_tool_choice_for_thinking(provider: str, pcfg: dict[str, 
 
 
 def normalize_thinking_for_non_anthropic_native_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
-    if "thinking" not in body or not anthropic_thinking_requested(body):
+    thinking_requested = anthropic_thinking_requested(body)
+    thinking_blocks = anthropic_thinking_block_count(body)
+    if not thinking_requested and thinking_blocks <= 0:
         return body
     if not provider_native_compat_enabled(provider, pcfg):
-        return body
-    thinking_blocks = anthropic_thinking_block_count(body)
-    if thinking_blocks > 0:
         return body
     synthetic_tool = has_claude_any_synthetic_tool_use(body)
     continuation_blocks = anthropic_tool_continuation_block_count(body)
     if not synthetic_tool and continuation_blocks <= 0:
         return body
-    out = dict(body)
+    out = strip_anthropic_thinking_blocks_from_messages(body)
+    out = dict(out)
     out.pop("thinking", None)
     router_log(
         "WARN",
-        "removed Anthropic thinking request because transcript has tool continuation without passback thinking blocks "
-        f"provider={provider} synthetic_tool={synthetic_tool} continuation_blocks={continuation_blocks}",
+        "removed Anthropic thinking request and thinking content blocks for non-Anthropic native tool continuation "
+        f"provider={provider} synthetic_tool={synthetic_tool} continuation_blocks={continuation_blocks} thinking_blocks={thinking_blocks}",
     )
     return out
 

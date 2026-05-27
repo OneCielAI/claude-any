@@ -101,6 +101,45 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertNotIn("thinking", out)
         self.assertEqual(2, claude_any.anthropic_tool_continuation_block_count(body))
 
+    def test_strip_thinking_blocks_even_without_top_level_thinking_for_tool_continuation(self):
+        body = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "hidden", "signature": "sig"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_real_123",
+                            "name": "Read",
+                            "input": {"file_path": "x"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_real_123",
+                            "content": "file contents",
+                        }
+                    ],
+                },
+            ],
+        }
+
+        out = claude_any.normalize_thinking_for_non_anthropic_native_provider(
+            "deepseek",
+            {"native_compat": True},
+            body,
+        )
+
+        self.assertIsNot(out, body)
+        self.assertNotIn("thinking", out)
+        self.assertEqual(0, claude_any.anthropic_thinking_block_count(out))
+        self.assertEqual(1, claude_any.anthropic_thinking_block_count(body))
+
     def test_keep_initial_thinking_request_without_tool_continuation(self):
         body = {
             "thinking": {"type": "enabled", "budget_tokens": 1024},
@@ -116,7 +155,47 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertIs(out, body)
         self.assertIn("thinking", out)
 
-    def test_preserve_thinking_for_real_anthropic_history(self):
+    def test_strip_thinking_blocks_for_real_tool_continuation(self):
+        body = {
+            "thinking": {"type": "enabled", "budget_tokens": 1024},
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "hidden", "signature": "sig"},
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_real_123",
+                            "name": "Read",
+                            "input": {"file_path": "x"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": "toolu_real_123",
+                            "content": "file contents",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        out = claude_any.normalize_thinking_for_non_anthropic_native_provider(
+            "vllm",
+            {"native_compat": True},
+            body,
+        )
+
+        self.assertIsNot(out, body)
+        self.assertNotIn("thinking", out)
+        self.assertEqual(0, claude_any.anthropic_thinking_block_count(out))
+        self.assertEqual(1, claude_any.anthropic_thinking_block_count(body))
+
+    def test_preserve_thinking_for_anthropic_native_history(self):
         body = {
             "thinking": {"type": "enabled", "budget_tokens": 1024},
             "messages": [
@@ -136,13 +215,14 @@ class ThinkingPassthroughTests(unittest.TestCase):
         }
 
         out = claude_any.normalize_thinking_for_non_anthropic_native_provider(
-            "vllm",
+            "anthropic",
             {"native_compat": True},
             body,
         )
 
         self.assertIs(out, body)
-        self.assertEqual(1, claude_any.anthropic_thinking_block_count(body))
+        self.assertIn("thinking", out)
+        self.assertEqual(1, claude_any.anthropic_thinking_block_count(out))
 
     def test_openai_conversion_does_not_leak_thinking_text(self):
         body = {
