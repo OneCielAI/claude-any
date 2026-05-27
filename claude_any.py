@@ -7993,6 +7993,7 @@ def advisor_visible_summary(advisor_text: str, trigger: str, limit: int = 700) -
 
 
 def call_provider_chat_once(provider: str, pcfg: dict[str, Any], body: dict[str, Any], model: str) -> dict[str, Any]:
+    body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
     if provider in ("ollama", "ollama-cloud"):
         base = pcfg.get("base_url", "").rstrip("/")
         req_body = ollama_chat_request(model, body, pcfg, stream=False)
@@ -9308,6 +9309,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
 
 def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
     _update_tool_schema_registry(body.get("tools"))
+    body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     base = pcfg.get("base_url", "").rstrip("/")
     original_body = body
@@ -10061,6 +10063,7 @@ def open_openai_stream_with_rate_retry(
 
 def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> None:
     _update_tool_schema_registry(body.get("tools"))
+    body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     if provider == "nvidia-hosted":
         model = ncp_model_id_for_nvidia_hosted(model)
@@ -10251,6 +10254,8 @@ class RouterHandler(BaseHTTPRequestHandler):
         if path != "/v1/messages":
             write_json(self, {"type": "error", "error": {"type": "not_found_error", "message": path}}, 404)
             return
+        _update_tool_schema_registry(body.get("tools"))
+        body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
         request_id = f"{os.getpid()}-{time.time_ns()}"
         EVENT_BUS.publish(
             level="info",
@@ -10266,7 +10271,6 @@ class RouterHandler(BaseHTTPRequestHandler):
                 **router_event_message_preview(body, cfg),
             },
         )
-        _update_tool_schema_registry(body.get("tools"))
         dump_request_for_trace(provider, path, body)
         if maybe_handle_plan_mode_tool_choice(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="plan_mode.short_circuit", message="plan mode tool choice handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
@@ -10282,6 +10286,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         body = body_with_pending_channel_messages(body)
         body = body_with_pending_channel_summaries(body)
         body = body_with_channel_tool_result_context(body)
+        body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
         try:
             if provider in ("ollama", "ollama-cloud"):
