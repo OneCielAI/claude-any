@@ -2737,6 +2737,23 @@ def anthropic_thinking_block_count(body: dict[str, Any]) -> int:
     return count
 
 
+def anthropic_tool_continuation_block_count(body: dict[str, Any]) -> int:
+    count = 0
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        role = message.get("role")
+        for block in _message_content_blocks(message):
+            if not isinstance(block, dict):
+                continue
+            block_type = block.get("type")
+            if role == "assistant" and block_type == "tool_use":
+                count += 1
+            elif role == "user" and block_type == "tool_result":
+                count += 1
+    return count
+
+
 def has_claude_any_synthetic_tool_use(body: dict[str, Any]) -> bool:
     for message in body.get("messages") or []:
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -2758,19 +2775,24 @@ def should_defer_forced_tool_choice_for_thinking(provider: str, pcfg: dict[str, 
     return provider_native_compat_enabled(provider, pcfg)
 
 
-def strip_thinking_for_synthetic_tool_history(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+def normalize_thinking_for_non_anthropic_native_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     if "thinking" not in body or not anthropic_thinking_requested(body):
         return body
     if not provider_native_compat_enabled(provider, pcfg):
         return body
-    if not has_claude_any_synthetic_tool_use(body):
+    thinking_blocks = anthropic_thinking_block_count(body)
+    if thinking_blocks > 0:
+        return body
+    synthetic_tool = has_claude_any_synthetic_tool_use(body)
+    continuation_blocks = anthropic_tool_continuation_block_count(body)
+    if not synthetic_tool and continuation_blocks <= 0:
         return body
     out = dict(body)
     out.pop("thinking", None)
     router_log(
         "WARN",
-        "removed Anthropic thinking request because transcript contains claude-any synthetic tool_use "
-        f"provider={provider} thinking_blocks={anthropic_thinking_block_count(body)}",
+        "removed Anthropic thinking request because transcript has tool continuation without passback thinking blocks "
+        f"provider={provider} synthetic_tool={synthetic_tool} continuation_blocks={continuation_blocks}",
     )
     return out
 
@@ -3303,6 +3325,21 @@ def summarize_messages_for_trace(messages: Any, max_messages: int = 30) -> list[
                             "content": _truncate_for_dump(anthropic_content_to_text(block.get("content", "")), 1200),
                         }
                     )
+                elif block_type == "thinking":
+                    blocks.append(
+                        {
+                            "type": "thinking",
+                            "thinking_len": len(str(block.get("thinking") or "")),
+                            "has_signature": bool(block.get("signature")),
+                        }
+                    )
+                elif block_type == "redacted_thinking":
+                    blocks.append(
+                        {
+                            "type": "redacted_thinking",
+                            "data_len": len(str(block.get("data") or "")),
+                        }
+                    )
                 else:
                     blocks.append({"type": block_type or "unknown"})
         else:
@@ -3328,6 +3365,9 @@ def dump_request_for_trace(provider: str, path: str, body: dict[str, Any]) -> No
             "path": path,
             "model": body.get("model"),
             "stream": body.get("stream"),
+            "thinking": body.get("thinking"),
+            "thinking_blocks": anthropic_thinking_block_count(body),
+            "tool_continuation_blocks": anthropic_tool_continuation_block_count(body),
             "messages_count": len(body.get("messages") or []),
             "messages": summarize_messages_for_trace(body.get("messages")),
             "system": _truncate_for_dump(body.get("system")),
@@ -9832,7 +9872,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to OpenAI-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_openai_compatible_chat(self, provider, pcfg, body)
                 return
-            body = strip_thinking_for_synthetic_tool_history(provider, pcfg, body)
+            body = normalize_thinking_for_non_anthropic_native_provider(provider, pcfg, body)
             body = cap_anthropic_body_for_provider(provider, pcfg, body)
             body = apply_provider_request_options(provider, pcfg, body)
             upstream_model = resolve_requested_model(provider, pcfg, body.get("model"))
