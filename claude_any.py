@@ -2944,6 +2944,8 @@ def remember_suppressed_thinking_passback(provider: str, model: str, blocks: lis
 def rehydrate_suppressed_thinking_passback(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     if preserves_anthropic_thinking_contract(provider, pcfg):
         return body
+    if latest_user_is_claude_code_suggestion_mode(body):
+        return body
     if not SUPPRESSED_THINKING_PASSBACK_CACHE:
         return body
     messages = body.get("messages")
@@ -3078,33 +3080,68 @@ def is_guard_feedback_text(text: str) -> bool:
     )
 
 
+SYSTEM_REMINDER_BLOCK_RE = re.compile(r"<system-reminder>.*?</system-reminder>", re.DOTALL)
+CLAUDE_CODE_SUGGESTION_MODE_PREFIX = "[SUGGESTION MODE:"
+
+
+def strip_claude_code_system_reminders(text: str) -> str:
+    return SYSTEM_REMINDER_BLOCK_RE.sub("", text or "").strip()
+
+
+def is_claude_code_suggestion_mode_text(text: str) -> bool:
+    return strip_claude_code_system_reminders(text).lstrip().startswith(CLAUDE_CODE_SUGGESTION_MODE_PREFIX)
+
+
+def user_intent_text_from_message(message: dict[str, Any]) -> str:
+    if not isinstance(message, dict) or message.get("role") != "user":
+        return ""
+    if message.get("isMeta") is True:
+        return ""
+    content = message.get("content")
+    if isinstance(content, str):
+        text = strip_claude_code_system_reminders(content)
+        return "" if is_guard_feedback_text(text) else text
+    if not isinstance(content, list):
+        # Claude Code can inject user-role attachment records such as
+        # plan_mode_exit. They are state metadata, not new user intent.
+        return ""
+    # Claude Code sends tool_result blocks as user-role messages. Those are not
+    # user intent. System reminders can also arrive as text blocks adjacent to
+    # the real prompt, so remove them before classifying resume prompts.
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, str):
+            text = strip_claude_code_system_reminders(block)
+        elif isinstance(block, dict) and block.get("type") == "text":
+            text = strip_claude_code_system_reminders(str(block.get("text", "")))
+        else:
+            continue
+        if text and not is_guard_feedback_text(text):
+            parts.append(text)
+    return "\n".join(parts).strip()
+
+
 def latest_user_text(body: dict[str, Any]) -> str:
     for message in reversed(body.get("messages") or []):
-        if not isinstance(message, dict) or message.get("role") != "user":
-            continue
-        if message.get("isMeta") is True:
-            continue
-        content = message.get("content")
-        if isinstance(content, str):
-            if is_guard_feedback_text(content):
-                continue
-            return content
-        if not isinstance(content, list):
-            # Claude Code can inject user-role attachment records such as
-            # plan_mode_exit. They are state metadata, not new user intent.
-            continue
-        # Claude Code sends tool_result blocks as user-role messages. Those are
-        # not new user intent; treating them as prompts can repeatedly trigger
-        # synthetic self-tools such as EnterPlanMode.
-        text_blocks = [
-            block for block in content
-            if isinstance(block, str) or (isinstance(block, dict) and block.get("type") == "text")
-        ]
-        text = anthropic_content_to_text(text_blocks)
-        if not text or is_guard_feedback_text(text):
+        text = user_intent_text_from_message(message) if isinstance(message, dict) else ""
+        if not text:
             continue
         return text
     return ""
+
+
+def latest_user_intent_message_index(body: dict[str, Any]) -> int | None:
+    messages = body.get("messages") or []
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if isinstance(message, dict) and user_intent_text_from_message(message):
+            return index
+    return None
+
+
+def latest_user_is_claude_code_suggestion_mode(body: dict[str, Any]) -> bool:
+    latest = latest_user_text(body)
+    return bool(latest and is_claude_code_suggestion_mode_text(latest))
 
 
 def router_debug_message_preview_chars(cfg: dict[str, Any] | None = None) -> int:
@@ -3326,12 +3363,15 @@ def synthetic_tasklist_tool_use_id(tool_id: str, name: str) -> bool:
     return any(tool_id.startswith(prefix) for prefix in prefixes)
 
 
-def recent_synthetic_tasklist_count(body: dict[str, Any]) -> int:
+def recent_synthetic_tasklist_count(body: dict[str, Any], after_message_index: int | None = None) -> int:
     count = 0
-    for message in reversed(body.get("messages") or []):
+    messages = body.get("messages") or []
+    if after_message_index is not None:
+        messages = messages[after_message_index + 1 :]
+    for message in reversed(messages):
         if not isinstance(message, dict):
             continue
-        if message.get("role") == "user" and isinstance(message.get("content"), str):
+        if after_message_index is None and message.get("role") == "user" and user_intent_text_from_message(message):
             break
         content = message.get("content")
         if message.get("role") != "assistant" or not isinstance(content, list):
@@ -3406,11 +3446,14 @@ def response_asks_for_user_choice_or_permission(text: str) -> bool:
 def should_auto_continue_choice_question_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
     if tool_calls:
         return False
+    if latest_user_is_claude_code_suggestion_mode(body):
+        return False
     if not has_tool(body, "TaskList"):
         return False
     if latest_tool_result_indicates_completed_work(body):
         return False
-    if recent_synthetic_tasklist_count(body) >= 2:
+    intent_index = latest_user_intent_message_index(body)
+    if recent_synthetic_tasklist_count(body, after_message_index=intent_index) >= 2:
         return False
     if not response_asks_for_user_choice_or_permission(response_text):
         return False
@@ -3422,6 +3465,8 @@ def should_auto_continue_choice_question_with_tasklist(body: dict[str, Any], res
 def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
     if tool_calls:
         return False
+    if latest_user_is_claude_code_suggestion_mode(body):
+        return False
     if not has_tool(body, "TaskList"):
         return False
     latest_names = latest_user_tool_result_names(body)
@@ -3432,7 +3477,8 @@ def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: st
         return False
     if "TaskList" in latest_names:
         max_keepalive = 6 if tasklist_result_has_active_work(latest_result_text) else 2
-        if recent_synthetic_tasklist_count(body) >= max_keepalive:
+        intent_index = latest_user_intent_message_index(body)
+        if recent_synthetic_tasklist_count(body, after_message_index=intent_index) >= max_keepalive:
             return False
     if not any(name in WORK_CONTINUATION_RESULT_TOOLS for name in latest_names):
         return False
@@ -3456,6 +3502,8 @@ def should_recover_empty_end_turn_with_tasklist(body: dict[str, Any], response_t
     alive.
     """
     if tool_calls:
+        return False
+    if latest_user_is_claude_code_suggestion_mode(body):
         return False
     if response_text.strip():
         return False
@@ -8767,6 +8815,14 @@ def _rebatch_anthropic_sse_text(
     def flush_suppressed_thinking_passback() -> None:
         if preserve_thinking or not suppressed_thinking_passback_blocks:
             return
+        if source_body is not None and latest_user_is_claude_code_suggestion_mode(source_body):
+            router_log(
+                "DEBUG",
+                f"discarded suppressed Anthropic thinking passback blocks for suggestion-mode request "
+                f"provider={provider} model={model} blocks={len(suppressed_thinking_passback_blocks)}",
+            )
+            suppressed_thinking_passback_blocks.clear()
+            return
         remember_suppressed_thinking_passback(provider, model, suppressed_thinking_passback_blocks)
         suppressed_thinking_passback_blocks.clear()
 
@@ -8822,7 +8878,8 @@ def _rebatch_anthropic_sse_text(
         if source_body is not None:
             try:
                 latest_names = latest_user_tool_result_names(source_body)
-                synthetic_count = recent_synthetic_tasklist_count(source_body)
+                intent_index = latest_user_intent_message_index(source_body)
+                synthetic_count = recent_synthetic_tasklist_count(source_body, after_message_index=intent_index)
                 has_tasklist_tool = has_tool(source_body, "TaskList")
                 if emitted_tool_use:
                     recovery_reason = ""

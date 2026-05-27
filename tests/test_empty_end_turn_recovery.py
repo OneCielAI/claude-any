@@ -14,6 +14,27 @@ def body_with_tools(user_text: str, tool_names: list[str]) -> dict:
 
 
 class EmptyEndTurnRecoveryTests(unittest.TestCase):
+    def test_latest_user_text_ignores_system_reminder_blocks(self):
+        body = body_with_tools("initial task", ["TaskList"])
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "<system-reminder>\n"
+                            "The task tools haven't been used recently.\n"
+                            "</system-reminder>\n"
+                        ),
+                    },
+                    {"type": "text", "text": "계속"},
+                ],
+            }
+        )
+
+        self.assertEqual("계속", claude_any.latest_user_text(body))
+
     def test_empty_resume_turn_synthesizes_tasklist(self):
         body = body_with_tools("continue implementation", ["TaskList", "Read", "Edit"])
         body["messages"].insert(
@@ -586,6 +607,161 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertIn("The status check completed", output)
         self.assertIn('"name": "TaskList"', output)
         self.assertIn('"stop_reason": "tool_use"', output)
+
+    def test_native_stream_fresh_resume_ignores_prior_synthetic_tasklist_limit(self):
+        body = body_with_tools("continue implementation", ["TaskList", "Read", "Bash"])
+        for index in range(3):
+            tool_id = f"toolu_anthropic_choice_prior_{index}"
+            body["messages"].append(
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": tool_id,
+                            "name": "TaskList",
+                            "input": {},
+                        }
+                    ],
+                }
+            )
+            body["messages"].append(
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_id,
+                            "content": "#1 [completed] Existing task",
+                        }
+                    ],
+                }
+            )
+        body["messages"].append({"role": "assistant", "content": [{"type": "text", "text": "No response requested."}]})
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "<system-reminder>\n"
+                            "The task tools haven't been used recently.\n"
+                            "</system-reminder>\n"
+                        ),
+                    },
+                    {"type": "text", "text": "계속"},
+                ],
+            }
+        )
+
+        class Handler:
+            def __init__(self):
+                self.wfile = BytesIO()
+
+        handler = Handler()
+        long_prose = (
+            "I have the current status and should continue by checking the next "
+            "implementation step before reporting completion."
+        )
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            f'event: content_block_delta\ndata: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{json.dumps(long_prose)}}}}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        lines = []
+        for event in events:
+            lines.extend(f"{line}\n".encode("utf-8") for line in event.splitlines())
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            lines,
+            "deepseek-v4-flash",
+            word_chunking=False,
+            source_body=body,
+            preserve_thinking=False,
+            provider="deepseek",
+            normalize_tool_use=True,
+        )
+        output = handler.wfile.getvalue().decode("utf-8")
+
+        self.assertIn("I have the current status", output)
+        self.assertIn('"name": "TaskList"', output)
+        self.assertIn('"stop_reason": "tool_use"', output)
+
+    def test_native_stream_suggestion_mode_does_not_synthesize_tasklist(self):
+        body = body_with_tools("continue implementation", ["TaskList", "Read", "Bash"])
+        body["messages"].append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_status",
+                        "name": "Bash",
+                        "input": {"command": "check current status"},
+                    }
+                ],
+            }
+        )
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_status",
+                        "content": "healthy",
+                    }
+                ],
+            }
+        )
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "[SUGGESTION MODE: Suggest what the user might naturally type next into Claude Code.]",
+                    }
+                ],
+            }
+        )
+
+        class Handler:
+            def __init__(self):
+                self.wfile = BytesIO()
+
+        handler = Handler()
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private reasoning"}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        lines = []
+        for event in events:
+            lines.extend(f"{line}\n".encode("utf-8") for line in event.splitlines())
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            lines,
+            "deepseek-v4-flash",
+            word_chunking=False,
+            source_body=body,
+            preserve_thinking=False,
+            provider="deepseek",
+            normalize_tool_use=True,
+        )
+        output = handler.wfile.getvalue().decode("utf-8")
+
+        self.assertNotIn("private reasoning", output)
+        self.assertNotIn('"name": "TaskList"', output)
+        self.assertIn("empty end_turn", output)
+        self.assertIn('"stop_reason": "end_turn"', output)
 
     def test_native_stream_empty_max_tokens_after_resume_synthesizes_tasklist(self):
         body = body_with_tools("continue implementation", ["TaskList", "Read", "Bash"])
