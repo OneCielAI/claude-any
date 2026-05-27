@@ -5,6 +5,9 @@ import claude_any
 
 
 class ThinkingPassthroughTests(unittest.TestCase):
+    def setUp(self):
+        claude_any.clear_suppressed_thinking_passback_cache()
+
     def test_do_not_defer_plan_mode_synthesis_for_non_anthropic_thinking(self):
         body = {
             "thinking": {"type": "enabled", "budget_tokens": 1024},
@@ -301,6 +304,43 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertEqual(1, claude_any.anthropic_thinking_block_count({"messages": [{"role": "assistant", "content": message["content"]}]}))
         self.assertEqual(0, claude_any.anthropic_thinking_block_count({"messages": [{"role": "assistant", "content": out["content"]}]}))
 
+    def test_rehydrate_suppressed_thinking_passback_for_non_anthropic_provider(self):
+        claude_any.remember_suppressed_thinking_passback(
+            "deepseek",
+            "model",
+            [{"type": "thinking", "thinking": "private reasoning", "signature": "sig"}],
+        )
+        body = {
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "visible answer"}]},
+            ]
+        }
+
+        out = claude_any.rehydrate_suppressed_thinking_passback(
+            "deepseek",
+            {"native_compat": True},
+            body,
+        )
+
+        self.assertIsNot(out, body)
+        self.assertEqual("thinking", out["messages"][1]["content"][0]["type"])
+        self.assertEqual("visible answer", out["messages"][1]["content"][1]["text"])
+        self.assertEqual(1, claude_any.anthropic_thinking_block_count(out))
+
+    def test_do_not_rehydrate_suppressed_thinking_passback_for_anthropic_provider(self):
+        claude_any.remember_suppressed_thinking_passback(
+            "deepseek",
+            "model",
+            [{"type": "thinking", "thinking": "private reasoning", "signature": "sig"}],
+        )
+        body = {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "visible answer"}]}]}
+
+        out = claude_any.rehydrate_suppressed_thinking_passback("anthropic", {}, body)
+
+        self.assertIs(out, body)
+        self.assertEqual(0, claude_any.anthropic_thinking_block_count(out))
+
     def test_preserve_thinking_response_blocks_for_anthropic_provider(self):
         message = {
             "content": [
@@ -347,6 +387,7 @@ class ThinkingPassthroughTests(unittest.TestCase):
             "model",
             word_chunking=False,
             preserve_thinking=False,
+            provider="deepseek",
         )
 
         output = handler.wfile.getvalue().decode("utf-8")
@@ -355,6 +396,12 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertIn("visible answer", output)
         self.assertIn('"index": 0', output)
         self.assertNotIn('"index": 1', output)
+        rehydrated = claude_any.rehydrate_suppressed_thinking_passback(
+            "deepseek",
+            {"native_compat": True},
+            {"messages": [{"role": "assistant", "content": [{"type": "text", "text": "visible answer"}]}]},
+        )
+        self.assertEqual(1, claude_any.anthropic_thinking_block_count(rehydrated))
 
     def test_rebatch_normalizes_native_stream_tool_use_for_non_anthropic_provider(self):
         class FakeHandler:
