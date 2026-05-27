@@ -8658,6 +8658,8 @@ def _rebatch_anthropic_sse_text(
     suppressed_thinking_blocks: dict[int, dict[str, Any]] = {}
     suppressed_thinking_passback_blocks: list[dict[str, Any]] = []
     buffered_tool_uses: dict[int, dict[str, Any]] = {}
+    pending_message_delta: tuple[str | None, str] | None = None
+    pending_message_stop: tuple[str | None, str] | None = None
 
     def emit_raw(event_type: str | None, data_str: str) -> None:
         if event_type:
@@ -8675,6 +8677,21 @@ def _rebatch_anthropic_sse_text(
             "delta": {"type": "text_delta", "text": text},
         }
         emit_raw("content_block_delta", json.dumps(payload, ensure_ascii=False))
+
+    def emit_text_block(index: int, text: str) -> None:
+        emit_raw(
+            "content_block_start",
+            json.dumps(
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "text", "text": ""},
+                },
+                ensure_ascii=False,
+            ),
+        )
+        emit_text_delta(index, text)
+        emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": index}, ensure_ascii=False))
 
     def flush_buffer(index: int, force: bool = False) -> None:
         buf = text_buffers.get(index, "")
@@ -8742,6 +8759,72 @@ def _rebatch_anthropic_sse_text(
         remember_suppressed_thinking_passback(provider, model, suppressed_thinking_passback_blocks)
         suppressed_thinking_passback_blocks.clear()
 
+    def patched_message_delta(stop_reason: str) -> str:
+        event: dict[str, Any] = {}
+        if pending_message_delta is not None:
+            try:
+                parsed = json.loads(pending_message_delta[1])
+                if isinstance(parsed, dict):
+                    event = dict(parsed)
+            except Exception:
+                event = {}
+        if not event:
+            event = {
+                "type": "message_delta",
+                "delta": {"stop_reason": None, "stop_sequence": None},
+                "usage": {"output_tokens": max(1, len(text_so_far) // 4)},
+            }
+        delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
+        patched_delta = dict(delta)
+        patched_delta["stop_reason"] = stop_reason
+        patched_delta.setdefault("stop_sequence", None)
+        event["delta"] = patched_delta
+        event.setdefault("type", "message_delta")
+        event.setdefault("usage", {"output_tokens": max(1, len(text_so_far) // 4)})
+        return json.dumps(event, ensure_ascii=False)
+
+    def emit_pending_message_end(default_stop_reason: str = "end_turn") -> None:
+        stop_reason = default_stop_reason
+        if pending_message_delta is not None:
+            try:
+                parsed = json.loads(pending_message_delta[1])
+                if isinstance(parsed, dict):
+                    delta = parsed.get("delta") if isinstance(parsed.get("delta"), dict) else {}
+                    stop_reason = str(delta.get("stop_reason") or stop_reason)
+            except Exception:
+                pass
+        emit_raw(
+            pending_message_delta[0] if pending_message_delta is not None else "message_delta",
+            patched_message_delta(stop_reason),
+        )
+        emit_raw(
+            pending_message_stop[0] if pending_message_stop is not None else "message_stop",
+            pending_message_stop[1] if pending_message_stop is not None else "{\"type\":\"message_stop\"}",
+        )
+
+    def recover_hidden_only_response_if_needed() -> None:
+        nonlocal next_content_index, saw_tool_use, text_so_far, pending_message_delta
+        if text_so_far.strip() or saw_tool_use:
+            return
+        if not suppressed_thinking_passback_blocks:
+            return
+        if source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, []):
+            router_log("WARN", "auto-synthesized TaskList from hidden-only Anthropic-compatible stream")
+            emit_tasklist_tool(next_content_index)
+            next_content_index += 1
+            saw_tool_use = True
+            pending_message_delta = (
+                pending_message_delta[0] if pending_message_delta is not None else "message_delta",
+                patched_message_delta("tool_use"),
+            )
+            return
+        notice = empty_end_turn_notice() if source_body is not None else ""
+        router_log("WARN", f"anthropic_hidden_only_stream provider={provider} model={model}")
+        emit_text_block(next_content_index, notice)
+        next_content_index += 1
+        if notice:
+            text_so_far = notice
+
     def append_tool_partial(tool_state: dict[str, Any], partial: Any) -> None:
         if partial is None:
             return
@@ -8804,7 +8887,7 @@ def _rebatch_anthropic_sse_text(
         emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": index}, ensure_ascii=False))
 
     def process_event(event_type: str | None, data_str: str) -> None:
-        nonlocal saw_message_start, saw_message_stop, text_so_far, saw_tool_use, next_content_index
+        nonlocal saw_message_start, saw_message_stop, text_so_far, saw_tool_use, next_content_index, pending_message_delta, pending_message_stop
         try:
             event = json.loads(data_str)
         except Exception:
@@ -8818,6 +8901,8 @@ def _rebatch_anthropic_sse_text(
             saw_message_start = True
         elif evt_type == "message_stop":
             saw_message_stop = True
+            pending_message_stop = (event_type, data_str)
+            return
         elif evt_type == "content_block_start":
             index = event.get("index")
             content_block = event.get("content_block") if isinstance(event.get("content_block"), dict) else {}
@@ -8885,8 +8970,10 @@ def _rebatch_anthropic_sse_text(
                 patched_delta = dict(delta)
                 patched_delta["stop_reason"] = "tool_use"
                 patched["delta"] = patched_delta
-                emit_raw(event_type, json.dumps(patched, ensure_ascii=False))
+                pending_message_delta = (event_type, json.dumps(patched, ensure_ascii=False))
                 return
+            pending_message_delta = (event_type, data_str)
+            return
         if evt_type == "content_block_delta":
             delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
             index = event.get("index")
@@ -8964,7 +9051,10 @@ def _rebatch_anthropic_sse_text(
             flush_buffer(index, force=True)
         for index in list(suppressed_thinking_blocks.keys()):
             finish_suppressed_thinking_block(index)
+        recover_hidden_only_response_if_needed()
         flush_suppressed_thinking_passback()
+        if pending_message_delta is not None or pending_message_stop is not None:
+            emit_pending_message_end()
     except Exception as exc:
         router_log("ERROR", f"anthropic_sse_forward_error model={model} error={type(exc).__name__}: {exc}")
         try:
@@ -8977,7 +9067,10 @@ def _rebatch_anthropic_sse_text(
                 flush_buffer(index, force=True)
             for index in list(suppressed_thinking_blocks.keys()):
                 finish_suppressed_thinking_block(index)
+            recover_hidden_only_response_if_needed()
             flush_suppressed_thinking_passback()
+            if pending_message_delta is not None or pending_message_stop is not None:
+                emit_pending_message_end()
             for index in sorted(open_content_blocks):
                 emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": index}, ensure_ascii=False))
             open_content_blocks.clear()
