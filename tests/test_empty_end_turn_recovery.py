@@ -632,7 +632,7 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
                         {
                             "type": "tool_result",
                             "tool_use_id": tool_id,
-                            "content": "#1 [completed] Existing task",
+                            "content": "#1 [in progress] Existing task\n#2 [completed] Previous task",
                         }
                     ],
                 }
@@ -690,6 +690,72 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertIn("I have the current status", output)
         self.assertIn('"name": "TaskList"', output)
         self.assertIn('"stop_reason": "tool_use"', output)
+
+    def test_native_stream_completed_tasklist_question_does_not_loop_tasklist(self):
+        body = body_with_tools("continue implementation", ["TaskList", "Read", "Bash"])
+        body["messages"].append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_anthropic_choice_prior",
+                        "name": "TaskList",
+                        "input": {},
+                    }
+                ],
+            }
+        )
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_anthropic_choice_prior",
+                        "content": (
+                            "#9 [completed] Create DB tables for schema versioning\n"
+                            "#10 [completed] LLM dynamic schema detection + schema service"
+                        ),
+                    }
+                ],
+            }
+        )
+        body["messages"].append({"role": "user", "content": [{"type": "text", "text": "계속"}]})
+
+        class Handler:
+            def __init__(self):
+                self.wfile = BytesIO()
+
+        handler = Handler()
+        question = "The known tasks are complete. Should I verify the deployment or summarize the result?"
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            f'event: content_block_delta\ndata: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{json.dumps(question)}}}}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":25}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        lines = []
+        for event in events:
+            lines.extend(f"{line}\n".encode("utf-8") for line in event.splitlines())
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            lines,
+            "deepseek-v4-flash",
+            word_chunking=False,
+            source_body=body,
+            preserve_thinking=False,
+            provider="deepseek",
+            normalize_tool_use=True,
+        )
+        output = handler.wfile.getvalue().decode("utf-8")
+
+        self.assertIn("The known tasks are complete", output)
+        self.assertNotIn('"name": "TaskList"', output)
+        self.assertIn('"stop_reason": "end_turn"', output)
 
     def test_native_stream_suggestion_mode_does_not_synthesize_tasklist(self):
         body = body_with_tools("continue implementation", ["TaskList", "Read", "Bash"])

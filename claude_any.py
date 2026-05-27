@@ -3392,6 +3392,8 @@ def tasklist_result_has_active_work(text: str) -> bool:
     if not normalized:
         return False
     # This parses Claude Code's task-list tool output, not user-facing prose.
+    if re.search(r"\[\s*(in progress|open|pending)\s*\]", normalized):
+        return True
     for label in ("in progress", "open", "pending"):
         for match in re.finditer(rf"\b(\d+)\s+{re.escape(label)}\b", normalized):
             if int(match.group(1)) > 0:
@@ -3450,7 +3452,10 @@ def should_auto_continue_choice_question_with_tasklist(body: dict[str, Any], res
         return False
     if not has_tool(body, "TaskList"):
         return False
+    latest_names = latest_user_tool_result_names(body)
     if latest_tool_result_indicates_completed_work(body):
+        return False
+    if "TaskList" in latest_names and not tasklist_result_has_active_work(latest_user_tool_result_text(body)):
         return False
     intent_index = latest_user_intent_message_index(body)
     if recent_synthetic_tasklist_count(body, after_message_index=intent_index) >= 2:
@@ -3476,7 +3481,9 @@ def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: st
     if latest_names == ["TaskList"] and "No tasks found" in latest_result_text:
         return False
     if "TaskList" in latest_names:
-        max_keepalive = 6 if tasklist_result_has_active_work(latest_result_text) else 2
+        if not tasklist_result_has_active_work(latest_result_text):
+            return False
+        max_keepalive = 6
         intent_index = latest_user_intent_message_index(body)
         if recent_synthetic_tasklist_count(body, after_message_index=intent_index) >= max_keepalive:
             return False
@@ -3511,6 +3518,8 @@ def should_recover_empty_end_turn_with_tasklist(body: dict[str, Any], response_t
         return False
     latest_tool_results = latest_user_tool_result_names(body)
     if latest_tool_results:
+        if "TaskList" in latest_tool_results and not tasklist_result_has_active_work(latest_user_tool_result_text(body)):
+            return False
         return True
     latest = latest_user_text(body)
     if not latest.strip():
