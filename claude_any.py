@@ -3387,6 +3387,8 @@ def latest_user_looks_like_work_request(body: dict[str, Any]) -> bool:
         return True
     if short_resume_prompt(latest) and latest_assistant_text(body):
         return True
+    if short_resume_prompt(latest) and latest_user_tool_result_names(body):
+        return True
     return False
 
 
@@ -8813,16 +8815,6 @@ def _rebatch_anthropic_sse_text(
 
     def recover_hidden_only_response_if_needed() -> None:
         nonlocal next_content_index, saw_tool_use, emitted_tool_use, text_so_far, pending_message_delta
-        if text_so_far.strip() or emitted_tool_use:
-            if suppressed_thinking_passback_blocks:
-                router_log(
-                    "DEBUG",
-                    "anthropic_hidden_recovery_skipped "
-                    f"provider={provider} model={model} reason=visible_or_tool "
-                    f"text_len={len(text_so_far.strip())} emitted_tool_use={emitted_tool_use} "
-                    f"suppressed_blocks={len(suppressed_thinking_passback_blocks)}",
-                )
-            return
         recovery_reason = ""
         latest_names: list[str] = []
         synthetic_count = 0
@@ -8832,7 +8824,9 @@ def _rebatch_anthropic_sse_text(
                 latest_names = latest_user_tool_result_names(source_body)
                 synthetic_count = recent_synthetic_tasklist_count(source_body)
                 has_tasklist_tool = has_tool(source_body, "TaskList")
-                if should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, []):
+                if emitted_tool_use:
+                    recovery_reason = ""
+                elif should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, []):
                     recovery_reason = "hidden-only" if suppressed_thinking_passback_blocks else "empty"
                 elif should_keep_work_alive_with_tasklist(source_body, text_so_far, []):
                     recovery_reason = "keepalive"
@@ -8855,6 +8849,17 @@ def _rebatch_anthropic_sse_text(
                 pending_message_delta[0] if pending_message_delta is not None else "message_delta",
                 patched_message_delta("tool_use"),
             )
+            return
+        if text_so_far.strip() or emitted_tool_use:
+            if suppressed_thinking_passback_blocks:
+                router_log(
+                    "DEBUG",
+                    "anthropic_hidden_recovery_skipped "
+                    f"provider={provider} model={model} reason=visible_or_tool "
+                    f"text_len={len(text_so_far.strip())} emitted_tool_use={emitted_tool_use} "
+                    f"latest_tool_results={','.join(latest_names) or '-'} "
+                    f"synthetic_tasklists={synthetic_count} suppressed_blocks={len(suppressed_thinking_passback_blocks)}",
+                )
             return
         if not suppressed_thinking_passback_blocks:
             return
