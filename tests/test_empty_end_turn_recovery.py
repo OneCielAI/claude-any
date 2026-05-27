@@ -1,4 +1,5 @@
 import unittest
+import json
 from io import BytesIO
 
 import claude_any
@@ -443,6 +444,80 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         )
         output = handler.wfile.getvalue().decode("utf-8")
 
+        self.assertIn('"name": "TaskList"', output)
+        self.assertIn('"stop_reason": "tool_use"', output)
+
+    def test_native_stream_resume_after_tool_result_with_prose_synthesizes_tasklist(self):
+        body = body_with_tools("continue implementation", ["TaskList", "Read", "Bash"])
+        body["messages"].append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_status",
+                        "name": "Bash",
+                        "input": {"command": "check current status"},
+                    }
+                ],
+            }
+        )
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_status",
+                        "content": "healthy\nno rows returned",
+                    }
+                ],
+            }
+        )
+        body["messages"].append(
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "No response requested."}],
+            }
+        )
+        body["messages"].append({"role": "user", "content": [{"type": "text", "text": "continue"}]})
+
+        class Handler:
+            def __init__(self):
+                self.wfile = BytesIO()
+
+        handler = Handler()
+        long_prose = (
+            "The status check completed and the system is healthy, but the "
+            "queried records are still empty. I should continue by inspecting "
+            "the relevant migration and service code before deciding the next "
+            "implementation step."
+        )
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            f'event: content_block_delta\ndata: {{"type":"content_block_delta","index":0,"delta":{{"type":"text_delta","text":{json.dumps(long_prose)}}}}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":80}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        lines = []
+        for event in events:
+            lines.extend(f"{line}\n".encode("utf-8") for line in event.splitlines())
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            lines,
+            "deepseek-v4-flash",
+            word_chunking=False,
+            source_body=body,
+            preserve_thinking=False,
+            provider="deepseek",
+            normalize_tool_use=True,
+        )
+        output = handler.wfile.getvalue().decode("utf-8")
+
+        self.assertIn("The status check completed", output)
         self.assertIn('"name": "TaskList"', output)
         self.assertIn('"stop_reason": "tool_use"', output)
 

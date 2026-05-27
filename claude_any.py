@@ -3436,7 +3436,13 @@ def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: st
         return False
     if latest_tool_result_indicates_completed_work(body) and response_text.strip():
         return False
-    return non_actionable_short_response(response_text)
+    if non_actionable_short_response(response_text):
+        return True
+    normalized = re.sub(r"\s+", " ", response_text or "").strip()
+    # A resume/continue prompt after a tool result should not end the loop with
+    # prose only. Keep this structural and bounded: do not inspect task names,
+    # domains, languages, or provider-specific text.
+    return latest_user_looks_like_work_request(body) and len(normalized) <= 1200
 
 
 def should_recover_empty_end_turn_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
