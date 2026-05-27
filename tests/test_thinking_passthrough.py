@@ -328,6 +328,35 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertEqual("visible answer", out["messages"][1]["content"][1]["text"])
         self.assertEqual(1, claude_any.anthropic_thinking_block_count(out))
 
+    def test_rehydrate_more_than_initial_small_passback_window(self):
+        old_limit = claude_any.SUPPRESSED_THINKING_PASSBACK_MAX
+        claude_any.SUPPRESSED_THINKING_PASSBACK_MAX = 64
+        try:
+            for index in range(32):
+                claude_any.remember_suppressed_thinking_passback(
+                    "deepseek",
+                    "model",
+                    [{"type": "thinking", "thinking": f"private reasoning {index}", "signature": f"sig-{index}"}],
+                )
+            body = {
+                "messages": [
+                    {"role": "assistant", "content": [{"type": "text", "text": f"visible {index}"}]}
+                    for index in range(32)
+                ]
+            }
+
+            out = claude_any.rehydrate_suppressed_thinking_passback(
+                "deepseek",
+                {"native_compat": True},
+                body,
+            )
+
+            self.assertEqual(32, claude_any.anthropic_thinking_block_count(out))
+            self.assertEqual("private reasoning 0", out["messages"][0]["content"][0]["thinking"])
+            self.assertEqual("private reasoning 31", out["messages"][-1]["content"][0]["thinking"])
+        finally:
+            claude_any.SUPPRESSED_THINKING_PASSBACK_MAX = old_limit
+
     def test_do_not_rehydrate_suppressed_thinking_passback_for_anthropic_provider(self):
         claude_any.remember_suppressed_thinking_passback(
             "deepseek",

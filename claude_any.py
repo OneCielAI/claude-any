@@ -246,7 +246,21 @@ TASK_UPDATE_STATUS_ALIASES = {
 # #25720, #29950 and Piebald-AI/claude-code-system-prompts for tool semantics.
 PLAN_MODE_SELF_TOOLS: tuple[str, ...] = ("EnterPlanMode", "ExitPlanMode")
 ANTHROPIC_THINKING_BLOCK_TYPES: tuple[str, ...] = ("thinking", "redacted_thinking")
-SUPPRESSED_THINKING_PASSBACK_MAX = 16
+
+
+def positive_env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name) or "").strip()
+    if raw:
+        try:
+            value = int(raw)
+            if value > 0:
+                return value
+        except ValueError:
+            pass
+    return default
+
+
+SUPPRESSED_THINKING_PASSBACK_MAX = positive_env_int("CLAUDE_ANY_THINKING_PASSBACK_MAX", 4096)
 SUPPRESSED_THINKING_PASSBACK_CACHE: list[dict[str, Any]] = []
 DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC: tuple[str, ...] = (
     "EnterWorktree",
