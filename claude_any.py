@@ -8651,6 +8651,7 @@ def _rebatch_anthropic_sse_text(
     saw_message_stop = False
     text_so_far = ""
     saw_tool_use = False
+    emitted_tool_use = False
     next_content_index = 0
     open_content_blocks: set[int] = set()
     content_index_map: dict[int, int] = {}
@@ -8702,6 +8703,7 @@ def _rebatch_anthropic_sse_text(
         emit_text_delta(index, to_flush)
 
     def emit_tasklist_tool(index: int) -> None:
+        nonlocal emitted_tool_use
         tool_id = f"toolu_anthropic_choice_{int(time.time() * 1000)}"
         emit_raw(
             "content_block_start",
@@ -8726,6 +8728,7 @@ def _rebatch_anthropic_sse_text(
             ),
         )
         emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": index}, ensure_ascii=False))
+        emitted_tool_use = True
 
     def mapped_content_index(index: Any) -> int | None:
         if not isinstance(index, int):
@@ -8803,8 +8806,8 @@ def _rebatch_anthropic_sse_text(
         )
 
     def recover_hidden_only_response_if_needed() -> None:
-        nonlocal next_content_index, saw_tool_use, text_so_far, pending_message_delta
-        if text_so_far.strip() or saw_tool_use:
+        nonlocal next_content_index, saw_tool_use, emitted_tool_use, text_so_far, pending_message_delta
+        if text_so_far.strip() or emitted_tool_use:
             return
         if not suppressed_thinking_passback_blocks:
             return
@@ -8824,6 +8827,10 @@ def _rebatch_anthropic_sse_text(
         next_content_index += 1
         if notice:
             text_so_far = notice
+        pending_message_delta = (
+            pending_message_delta[0] if pending_message_delta is not None else "message_delta",
+            patched_message_delta("end_turn"),
+        )
 
     def append_tool_partial(tool_state: dict[str, Any], partial: Any) -> None:
         if partial is None:
@@ -8834,6 +8841,7 @@ def _rebatch_anthropic_sse_text(
             tool_state["partial_json"] = str(tool_state.get("partial_json") or "") + json.dumps(partial, ensure_ascii=False)
 
     def emit_normalized_tool_use(index: int, tool_state: dict[str, Any]) -> None:
+        nonlocal emitted_tool_use
         raw_name = str(tool_state.get("name") or "")
         raw_args = str(tool_state.get("partial_json") or "")
         parsed_args = normalize_tool_arguments(raw_name, raw_args)
@@ -8847,6 +8855,10 @@ def _rebatch_anthropic_sse_text(
         if isinstance(source_body, dict):
             mapped_name, mapped_input = plan_mode_tool_name_for_emit(source_body, matched_name, fixed_input)
             if mapped_name is None:
+                router_log(
+                    "WARN",
+                    f"dropped upstream tool_use before emit raw_name={raw_name!r} matched_name={matched_name!r}",
+                )
                 return
             matched_name, fixed_input = mapped_name, mapped_input
         tool_id = str(tool_state.get("id") or f"toolu_anthropic_{int(time.time() * 1000)}_{index}")
@@ -8885,9 +8897,10 @@ def _rebatch_anthropic_sse_text(
             ),
         )
         emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": index}, ensure_ascii=False))
+        emitted_tool_use = True
 
     def process_event(event_type: str | None, data_str: str) -> None:
-        nonlocal saw_message_start, saw_message_stop, text_so_far, saw_tool_use, next_content_index, pending_message_delta, pending_message_stop
+        nonlocal saw_message_start, saw_message_stop, text_so_far, saw_tool_use, emitted_tool_use, next_content_index, pending_message_delta, pending_message_stop
         try:
             event = json.loads(data_str)
         except Exception:
@@ -8936,6 +8949,7 @@ def _rebatch_anthropic_sse_text(
                     if isinstance(initial_input, dict) and initial_input:
                         append_tool_partial(buffered_tool_uses[mapped_index], initial_input)
                     return
+                emitted_tool_use = True
         elif evt_type == "content_block_stop":
             index = event.get("index")
             mapped_index = mapped_content_index(index)
@@ -8954,7 +8968,7 @@ def _rebatch_anthropic_sse_text(
         elif evt_type == "message_delta":
             delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
             stop_reason = str(delta.get("stop_reason") or "")
-            tool_calls = [{"type": "tool_use"}] if saw_tool_use else []
+            tool_calls = [{"type": "tool_use"}] if emitted_tool_use else []
             if (
                 stop_reason == "end_turn"
                 and source_body is not None

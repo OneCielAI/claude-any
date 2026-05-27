@@ -193,11 +193,77 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
             source_body=body,
             preserve_thinking=False,
             provider="deepseek",
+            normalize_tool_use=True,
         )
         output = handler.wfile.getvalue().decode("utf-8")
 
         self.assertNotIn("private reasoning", output)
         self.assertNotIn("thinking_delta", output)
+        self.assertIn('"name": "TaskList"', output)
+        self.assertIn('"stop_reason": "tool_use"', output)
+
+    def test_native_stream_dropped_tool_use_still_recovers_hidden_only_response(self):
+        body = body_with_tools("continue implementation", ["TaskList", "EnterPlanMode", "Read"])
+        body["messages"].append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_enter_plan",
+                        "name": "EnterPlanMode",
+                        "input": {},
+                    }
+                ],
+            }
+        )
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_enter_plan",
+                        "content": "entered plan mode",
+                    }
+                ],
+            }
+        )
+
+        class Handler:
+            def __init__(self):
+                self.wfile = BytesIO()
+
+        handler = Handler()
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private reasoning"}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_repeat_plan","name":"EnterPlanMode","input":{}}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{}"}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":1}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"tool_use","stop_sequence":null},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        lines = []
+        for event in events:
+            lines.extend(f"{line}\n".encode("utf-8") for line in event.splitlines())
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            lines,
+            "deepseek-v4-flash",
+            word_chunking=False,
+            source_body=body,
+            preserve_thinking=False,
+            provider="deepseek",
+            normalize_tool_use=True,
+        )
+        output = handler.wfile.getvalue().decode("utf-8")
+
+        self.assertNotIn("private reasoning", output)
+        self.assertNotIn("toolu_repeat_plan", output)
         self.assertIn('"name": "TaskList"', output)
         self.assertIn('"stop_reason": "tool_use"', output)
 
