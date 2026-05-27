@@ -245,6 +245,7 @@ TASK_UPDATE_STATUS_ALIASES = {
 # by non-Anthropic models. See docs/notes from anthropics/claude-code issues
 # #25720, #29950 and Piebald-AI/claude-code-system-prompts for tool semantics.
 PLAN_MODE_SELF_TOOLS: tuple[str, ...] = ("EnterPlanMode", "ExitPlanMode")
+ANTHROPIC_THINKING_BLOCK_TYPES: tuple[str, ...] = ("thinking", "redacted_thinking")
 DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC: tuple[str, ...] = (
     "EnterWorktree",
     "ExitWorktree",
@@ -2718,6 +2719,62 @@ def _message_content_blocks(message: dict[str, Any]) -> list[Any]:
     return []
 
 
+def anthropic_thinking_requested(body: dict[str, Any]) -> bool:
+    thinking = body.get("thinking")
+    if isinstance(thinking, dict):
+        return str(thinking.get("type") or "").lower() == "enabled"
+    return bool(thinking)
+
+
+def anthropic_thinking_block_count(body: dict[str, Any]) -> int:
+    count = 0
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        for block in _message_content_blocks(message):
+            if isinstance(block, dict) and block.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES:
+                count += 1
+    return count
+
+
+def has_claude_any_synthetic_tool_use(body: dict[str, Any]) -> bool:
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        for block in _message_content_blocks(message):
+            if not isinstance(block, dict) or block.get("type") != "tool_use":
+                continue
+            tool_id = str(block.get("id") or "")
+            if tool_id.startswith("toolu_claude_any_"):
+                return True
+    return False
+
+
+def should_defer_forced_tool_choice_for_thinking(provider: str, pcfg: dict[str, Any], body: dict[str, Any], name: str | None) -> bool:
+    if name not in PLAN_MODE_SELF_TOOLS:
+        return False
+    if not anthropic_thinking_requested(body):
+        return False
+    return provider_native_compat_enabled(provider, pcfg)
+
+
+def strip_thinking_for_synthetic_tool_history(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    if "thinking" not in body or not anthropic_thinking_requested(body):
+        return body
+    if not provider_native_compat_enabled(provider, pcfg):
+        return body
+    if not has_claude_any_synthetic_tool_use(body):
+        return body
+    out = dict(body)
+    out.pop("thinking", None)
+    router_log(
+        "WARN",
+        "removed Anthropic thinking request because transcript contains claude-any synthetic tool_use "
+        f"provider={provider} thinking_blocks={anthropic_thinking_block_count(body)}",
+    )
+    return out
+
+
 def plan_mode_active(body: dict[str, Any]) -> bool:
     """Infer Claude Code Plan Mode from tool history and plan-mode attachments."""
     active = False
@@ -3133,12 +3190,18 @@ def empty_end_turn_notice() -> str:
     )
 
 
-def maybe_handle_plan_mode_tool_choice(handler: BaseHTTPRequestHandler, provider: str, body: dict[str, Any]) -> bool:
+def maybe_handle_plan_mode_tool_choice(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> bool:
     """Support Claude Code's forced Plan-mode entry without relying on upstream model behavior."""
     if provider == "anthropic":
         return False
     name = forced_tool_choice_name(body)
     if name != "EnterPlanMode":
+        return False
+    if should_defer_forced_tool_choice_for_thinking(provider, pcfg, body, name):
+        router_log(
+            "INFO",
+            f"deferred forced {name} tool_choice to native Anthropic-compatible upstream because thinking is enabled",
+        )
         return False
     # Claude Code may force this tool when the user uses /plan or toggles Plan mode.
     # Returning a valid tool_use locally is more reliable than asking arbitrary
@@ -7849,6 +7912,22 @@ def write_anthropic_message_response(handler: BaseHTTPRequestHandler, message: d
             handler.wfile.write(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': index, 'content_block': {'type': 'text', 'text': ''}}, ensure_ascii=False)}\n\n".encode())
             handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'text_delta', 'text': block.get('text', '')}}, ensure_ascii=False)}\n\n".encode())
             handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
+        elif btype == "thinking":
+            start = {"type": "content_block_start", "index": index, "content_block": {"type": "thinking", "thinking": ""}}
+            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(start, ensure_ascii=False)}\n\n".encode())
+            thinking_text = str(block.get("thinking") or "")
+            if thinking_text:
+                delta = {"type": "content_block_delta", "index": index, "delta": {"type": "thinking_delta", "thinking": thinking_text}}
+                handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta, ensure_ascii=False)}\n\n".encode())
+            signature = str(block.get("signature") or "")
+            if signature:
+                delta = {"type": "content_block_delta", "index": index, "delta": {"type": "signature_delta", "signature": signature}}
+                handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
+        elif btype == "redacted_thinking":
+            start = {"type": "content_block_start", "index": index, "content_block": block}
+            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(start, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
         elif btype == "tool_use":
             tool_input = block.get("input") or {}
             start = {"type": "content_block_start", "index": index, "content_block": {**block, "input": {}}}
@@ -7866,6 +7945,22 @@ def _write_anthropic_stream_block(handler: BaseHTTPRequestHandler, index: int, b
     if btype == "text":
         handler.wfile.write(f"event: content_block_start\ndata: {json.dumps({'type': 'content_block_start', 'index': index, 'content_block': {'type': 'text', 'text': ''}}, ensure_ascii=False)}\n\n".encode())
         handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps({'type': 'content_block_delta', 'index': index, 'delta': {'type': 'text_delta', 'text': block.get('text', '')}}, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
+    elif btype == "thinking":
+        start = {"type": "content_block_start", "index": index, "content_block": {"type": "thinking", "thinking": ""}}
+        handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(start, ensure_ascii=False)}\n\n".encode())
+        thinking_text = str(block.get("thinking") or "")
+        if thinking_text:
+            delta = {"type": "content_block_delta", "index": index, "delta": {"type": "thinking_delta", "thinking": thinking_text}}
+            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta, ensure_ascii=False)}\n\n".encode())
+        signature = str(block.get("signature") or "")
+        if signature:
+            delta = {"type": "content_block_delta", "index": index, "delta": {"type": "signature_delta", "signature": signature}}
+            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta, ensure_ascii=False)}\n\n".encode())
+        handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
+    elif btype == "redacted_thinking":
+        start = {"type": "content_block_start", "index": index, "content_block": block}
+        handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(start, ensure_ascii=False)}\n\n".encode())
         handler.wfile.write(f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': index}, ensure_ascii=False)}\n\n".encode())
     elif btype == "tool_use":
         tool_input = block.get("input") or {}
@@ -9713,7 +9808,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             },
         )
         dump_request_for_trace(provider, path, body)
-        if maybe_handle_plan_mode_tool_choice(self, provider, body):
+        if maybe_handle_plan_mode_tool_choice(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="plan_mode.short_circuit", message="plan mode tool choice handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
         body = filter_blocked_tools(provider, pcfg, body)
@@ -9737,6 +9832,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to OpenAI-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_openai_compatible_chat(self, provider, pcfg, body)
                 return
+            body = strip_thinking_for_synthetic_tool_history(provider, pcfg, body)
             body = cap_anthropic_body_for_provider(provider, pcfg, body)
             body = apply_provider_request_options(provider, pcfg, body)
             upstream_model = resolve_requested_model(provider, pcfg, body.get("model"))
