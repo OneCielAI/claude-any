@@ -8808,10 +8808,40 @@ def _rebatch_anthropic_sse_text(
     def recover_hidden_only_response_if_needed() -> None:
         nonlocal next_content_index, saw_tool_use, emitted_tool_use, text_so_far, pending_message_delta
         if text_so_far.strip() or emitted_tool_use:
+            if suppressed_thinking_passback_blocks:
+                router_log(
+                    "DEBUG",
+                    "anthropic_hidden_recovery_skipped "
+                    f"provider={provider} model={model} reason=visible_or_tool "
+                    f"text_len={len(text_so_far.strip())} emitted_tool_use={emitted_tool_use} "
+                    f"suppressed_blocks={len(suppressed_thinking_passback_blocks)}",
+                )
             return
-        if source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, []):
-            reason = "hidden-only" if suppressed_thinking_passback_blocks else "empty"
-            router_log("WARN", f"auto-synthesized TaskList from {reason} Anthropic-compatible stream")
+        recovery_reason = ""
+        latest_names: list[str] = []
+        synthetic_count = 0
+        has_tasklist_tool = False
+        if source_body is not None:
+            try:
+                latest_names = latest_user_tool_result_names(source_body)
+                synthetic_count = recent_synthetic_tasklist_count(source_body)
+                has_tasklist_tool = has_tool(source_body, "TaskList")
+                if should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, []):
+                    recovery_reason = "hidden-only" if suppressed_thinking_passback_blocks else "empty"
+                elif should_keep_work_alive_with_tasklist(source_body, text_so_far, []):
+                    recovery_reason = "keepalive"
+            except Exception as exc:
+                router_log(
+                    "WARN",
+                    "anthropic_hidden_recovery_state_error "
+                    f"provider={provider} model={model} error={type(exc).__name__}: {exc}",
+                )
+        if recovery_reason:
+            router_log(
+                "WARN",
+                f"auto-synthesized TaskList from {recovery_reason} Anthropic-compatible stream "
+                f"latest_tool_results={','.join(latest_names) or '-'} synthetic_tasklists={synthetic_count}",
+            )
             emit_tasklist_tool(next_content_index)
             next_content_index += 1
             saw_tool_use = True
@@ -8822,6 +8852,13 @@ def _rebatch_anthropic_sse_text(
             return
         if not suppressed_thinking_passback_blocks:
             return
+        router_log(
+            "WARN",
+            "anthropic_hidden_recovery_not_applicable "
+            f"provider={provider} model={model} has_tasklist={has_tasklist_tool} "
+            f"latest_tool_results={','.join(latest_names) or '-'} synthetic_tasklists={synthetic_count} "
+            f"suppressed_blocks={len(suppressed_thinking_passback_blocks)}",
+        )
         notice = empty_end_turn_notice() if source_body is not None else ""
         router_log("WARN", f"anthropic_hidden_only_stream provider={provider} model={model}")
         emit_text_block(next_content_index, notice)
@@ -8987,10 +9024,21 @@ def _rebatch_anthropic_sse_text(
                 patched["delta"] = patched_delta
                 pending_message_delta = (event_type, json.dumps(patched, ensure_ascii=False))
                 return
-            if source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls):
+            should_recover = source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls)
+            should_keep_alive = (
+                source_body is not None
+                and not should_recover
+                and should_keep_work_alive_with_tasklist(source_body, text_so_far, tool_calls)
+            )
+            if should_recover or should_keep_alive:
                 for index in list(text_buffers.keys()):
                     flush_buffer(index, force=True)
-                router_log("WARN", f"auto-synthesized TaskList from empty Anthropic-compatible message_delta stop_reason={stop_reason or '-'}")
+                reason = "empty" if should_recover else "keepalive"
+                router_log(
+                    "WARN",
+                    f"auto-synthesized TaskList from {reason} Anthropic-compatible message_delta "
+                    f"stop_reason={stop_reason or '-'}",
+                )
                 emit_tasklist_tool(next_content_index)
                 next_content_index += 1
                 saw_tool_use = True
