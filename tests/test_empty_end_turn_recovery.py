@@ -14,7 +14,7 @@ def body_with_tools(user_text: str, tool_names: list[str]) -> dict:
 
 class EmptyEndTurnRecoveryTests(unittest.TestCase):
     def test_empty_resume_turn_synthesizes_tasklist(self):
-        body = body_with_tools("phase 2 개발진행", ["TaskList", "Read", "Edit"])
+        body = body_with_tools("continue implementation", ["TaskList", "Read", "Edit"])
         body["messages"].insert(
             0,
             {
@@ -37,7 +37,7 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertEqual("tool_use", message["content"][0]["type"])
 
     def test_empty_turn_without_tasklist_returns_visible_notice(self):
-        body = body_with_tools("phase 2 개발진행", ["Read", "Edit"])
+        body = body_with_tools("continue implementation", ["Read", "Edit"])
         data = {
             "message": {"content": ""},
             "done": True,
@@ -68,7 +68,7 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertIn("empty end_turn", message["content"][0]["text"])
 
     def test_choice_question_in_plan_mode_synthesizes_tasklist(self):
-        body = body_with_tools("phase 2 개발진행", ["TaskList", "Read", "ExitPlanMode"])
+        body = body_with_tools("continue implementation", ["TaskList", "Read", "ExitPlanMode"])
         body["messages"].append(
             {
                 "role": "user",
@@ -79,8 +79,8 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         data = {
             "message": {
                 "content": (
-                    "이 세 가지 중 지금 당장 구현을 시작할 부분을 말씀해주시겠어요? "
-                    "아니면 셋 다 한 번에 진행할까요?"
+                    "Which implementation part should I start now? "
+                    "Or should I proceed with every in-scope part?"
                 )
             },
             "done": True,
@@ -95,7 +95,7 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertEqual("TaskList", message["content"][-1]["name"])
 
     def test_native_json_choice_question_synthesizes_tasklist(self):
-        body = body_with_tools("phase 2 개발진행", ["TaskList", "Read", "ExitPlanMode"])
+        body = body_with_tools("continue implementation", ["TaskList", "Read", "ExitPlanMode"])
         body["messages"].append(
             {
                 "role": "user",
@@ -108,7 +108,7 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
             "type": "message",
             "role": "assistant",
             "model": "deepseek-v4-flash",
-            "content": [{"type": "text", "text": "먼저 어떤 부분을 구현할까요?"}],
+            "content": [{"type": "text", "text": "Which part should I implement first?"}],
             "stop_reason": "end_turn",
             "usage": {"input_tokens": 1, "output_tokens": 1},
         }
@@ -119,7 +119,7 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertEqual("TaskList", patched["content"][-1]["name"])
 
     def test_native_stream_choice_question_synthesizes_tasklist(self):
-        body = body_with_tools("phase 2 개발진행", ["TaskList", "Read", "ExitPlanMode"])
+        body = body_with_tools("continue implementation", ["TaskList", "Read", "ExitPlanMode"])
         body["messages"].append(
             {
                 "role": "user",
@@ -136,7 +136,7 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         events = [
             'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
             'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
-            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"어떤 부분을 먼저 구현할까요?"}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Which part should I implement first?"}}\n\n',
             'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
             'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n',
             'event: message_stop\ndata: {"type":"message_stop"}\n\n',

@@ -2813,9 +2813,7 @@ def has_claude_any_synthetic_tool_use(body: dict[str, Any]) -> bool:
 def should_defer_forced_tool_choice_for_thinking(provider: str, pcfg: dict[str, Any], body: dict[str, Any], name: str | None) -> bool:
     if name not in PLAN_MODE_SELF_TOOLS:
         return False
-    if not anthropic_thinking_requested(body):
-        return False
-    return provider_native_compat_enabled(provider, pcfg)
+    return False
 
 
 def normalize_thinking_for_non_anthropic_native_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
@@ -2828,14 +2826,12 @@ def normalize_thinking_for_non_anthropic_native_provider(provider: str, pcfg: di
     synthetic_tool = has_claude_any_synthetic_tool_use(body)
     continuation_blocks = anthropic_tool_continuation_block_count(body)
     assistant_history = anthropic_assistant_history_count(body)
-    if not synthetic_tool and continuation_blocks <= 0 and assistant_history <= 0 and thinking_blocks <= 0:
-        return body
     out = strip_anthropic_thinking_blocks_from_messages(body)
     out = dict(out)
     out.pop("thinking", None)
     router_log(
         "WARN",
-        "removed Anthropic thinking request and thinking content blocks for non-Anthropic native tool continuation "
+        "removed Anthropic thinking request and thinking content blocks for non-Anthropic native provider "
         f"provider={provider} synthetic_tool={synthetic_tool} continuation_blocks={continuation_blocks} "
         f"assistant_history={assistant_history} thinking_blocks={thinking_blocks}",
     )
@@ -3217,22 +3213,6 @@ def short_resume_prompt(text: str) -> bool:
     return not re.search(r"[?？`{};/\\\\]|https?://", normalized)
 
 
-WORK_REQUEST_RE = re.compile(
-    r"\b("
-    r"implement|build|fix|edit|code|create|update|continue|proceed|start|develop|debug|test|run|commit|push|merge|deploy"
-    r")\b|"
-    r"(구현|수정|개발|진행|시작|처리|테스트|푸시|커밋|병합|배포|고쳐|만들|작성|추가)",
-    re.IGNORECASE,
-)
-
-
-CLARIFYING_CHOICE_RE = re.compile(
-    r"(진행할까요|하시겠어요|할까요|원하시|말씀해주시겠어요|선택|먼저.*할|셋\s*다|한\s*번에|"
-    r"would you like|do you want|should i|which .*should|choose|proceed with|all at once)",
-    re.IGNORECASE,
-)
-
-
 def latest_user_looks_like_work_request(body: dict[str, Any]) -> bool:
     latest = latest_user_text(body)
     normalized = re.sub(r"\s+", " ", latest or "").strip()
@@ -3242,16 +3222,18 @@ def latest_user_looks_like_work_request(body: dict[str, Any]) -> bool:
         return True
     if short_resume_prompt(latest) and latest_assistant_text(body):
         return True
-    return bool(WORK_REQUEST_RE.search(normalized))
+    return False
 
 
 def response_asks_for_user_choice_or_permission(text: str) -> bool:
     normalized = re.sub(r"\s+", " ", text or "").strip()
     if not normalized:
         return False
-    if not ("?" in normalized or "？" in normalized or CLARIFYING_CHOICE_RE.search(normalized)):
+    if "?" not in normalized and "？" not in normalized:
         return False
-    return bool(CLARIFYING_CHOICE_RE.search(normalized))
+    # Structural guard: do not inspect language-specific words. A question-only
+    # end_turn inside Plan Mode is a pause, not progress.
+    return len(normalized) <= 1200
 
 
 def should_auto_continue_choice_question_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
@@ -3267,9 +3249,7 @@ def should_auto_continue_choice_question_with_tasklist(body: dict[str, Any], res
         return False
     if plan_mode_active(body):
         return True
-    if latest_user_looks_like_work_request(body):
-        return True
-    return bool(latest_user_tool_result_names(body))
+    return bool(latest_user_tool_result_names(body) and latest_user_looks_like_work_request(body))
 
 
 def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:

@@ -4,7 +4,7 @@ import claude_any
 
 
 class ThinkingPassthroughTests(unittest.TestCase):
-    def test_defer_plan_mode_synthesis_when_native_provider_requests_thinking(self):
+    def test_do_not_defer_plan_mode_synthesis_for_non_anthropic_thinking(self):
         body = {
             "thinking": {"type": "enabled", "budget_tokens": 1024},
             "tool_choice": {"type": "tool", "name": "EnterPlanMode"},
@@ -12,7 +12,7 @@ class ThinkingPassthroughTests(unittest.TestCase):
             "messages": [{"role": "user", "content": [{"type": "text", "text": "plan"}]}],
         }
 
-        self.assertTrue(
+        self.assertFalse(
             claude_any.should_defer_forced_tool_choice_for_thinking(
                 "vllm",
                 {"native_compat": True},
@@ -140,7 +140,7 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertEqual(0, claude_any.anthropic_thinking_block_count(out))
         self.assertEqual(1, claude_any.anthropic_thinking_block_count(body))
 
-    def test_keep_initial_thinking_request_without_tool_continuation(self):
+    def test_strip_initial_thinking_request_for_non_anthropic_native_provider(self):
         body = {
             "thinking": {"type": "enabled", "budget_tokens": 1024},
             "messages": [{"role": "user", "content": [{"type": "text", "text": "hello"}]}],
@@ -152,15 +152,16 @@ class ThinkingPassthroughTests(unittest.TestCase):
             body,
         )
 
-        self.assertIs(out, body)
-        self.assertIn("thinking", out)
+        self.assertIsNot(out, body)
+        self.assertIn("thinking", body)
+        self.assertNotIn("thinking", out)
 
     def test_strip_thinking_after_assistant_history_without_tool_continuation(self):
         body = {
             "thinking": {"type": "enabled", "budget_tokens": 1024},
             "messages": [
-                {"role": "user", "content": [{"type": "text", "text": "phase 2 개발진행"}]},
-                {"role": "assistant", "content": [{"type": "text", "text": "Phase 2 개발을 바로 시작하겠습니다."}]},
+                {"role": "user", "content": [{"type": "text", "text": "continue implementation"}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "I will continue implementation now."}]},
                 {
                     "role": "user",
                     "content": [],
