@@ -9078,8 +9078,11 @@ def _rebatch_anthropic_sse_text(
                     return
                 patched = dict(event)
                 patched["index"] = mapped_index
-                event = patched
-                data_str = json.dumps(event, ensure_ascii=False)
+                data_str = json.dumps(patched, ensure_ascii=False)
+                if isinstance(mapped_index, int) and word_chunking:
+                    flush_buffer(mapped_index, force=True)
+                emit_raw(event_type, data_str)
+                return
         elif evt_type == "message_delta":
             delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
             stop_reason = str(delta.get("stop_reason") or "")
