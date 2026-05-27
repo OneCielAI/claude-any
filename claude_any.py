@@ -8809,10 +8809,9 @@ def _rebatch_anthropic_sse_text(
         nonlocal next_content_index, saw_tool_use, emitted_tool_use, text_so_far, pending_message_delta
         if text_so_far.strip() or emitted_tool_use:
             return
-        if not suppressed_thinking_passback_blocks:
-            return
         if source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, []):
-            router_log("WARN", "auto-synthesized TaskList from hidden-only Anthropic-compatible stream")
+            reason = "hidden-only" if suppressed_thinking_passback_blocks else "empty"
+            router_log("WARN", f"auto-synthesized TaskList from {reason} Anthropic-compatible stream")
             emit_tasklist_tool(next_content_index)
             next_content_index += 1
             saw_tool_use = True
@@ -8820,6 +8819,8 @@ def _rebatch_anthropic_sse_text(
                 pending_message_delta[0] if pending_message_delta is not None else "message_delta",
                 patched_message_delta("tool_use"),
             )
+            return
+        if not suppressed_thinking_passback_blocks:
             return
         notice = empty_end_turn_notice() if source_body is not None else ""
         router_log("WARN", f"anthropic_hidden_only_stream provider={provider} model={model}")

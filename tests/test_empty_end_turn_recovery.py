@@ -328,6 +328,67 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertIn('"name": "TaskList"', output)
         self.assertIn('"stop_reason": "tool_use"', output)
 
+    def test_native_stream_hidden_only_without_message_delta_synthesizes_tasklist(self):
+        body = body_with_tools("continue implementation", ["TaskList", "Read", "Bash"])
+        body["messages"].append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_health",
+                        "name": "Bash",
+                        "input": {"command": "check health"},
+                    }
+                ],
+            }
+        )
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_health",
+                        "content": "healthy",
+                    }
+                ],
+            }
+        )
+
+        class Handler:
+            def __init__(self):
+                self.wfile = BytesIO()
+
+        handler = Handler()
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"private reasoning"}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        lines = []
+        for event in events:
+            lines.extend(f"{line}\n".encode("utf-8") for line in event.splitlines())
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            lines,
+            "deepseek-v4-flash",
+            word_chunking=False,
+            source_body=body,
+            preserve_thinking=False,
+            provider="deepseek",
+            normalize_tool_use=True,
+        )
+        output = handler.wfile.getvalue().decode("utf-8")
+
+        self.assertNotIn("private reasoning", output)
+        self.assertNotIn("thinking_delta", output)
+        self.assertIn('"name": "TaskList"', output)
+        self.assertIn('"stop_reason": "tool_use"', output)
+
     def test_native_stream_empty_end_turn_after_tool_result_synthesizes_tasklist(self):
         body = body_with_tools("continue implementation", ["TaskList", "Read", "Bash"])
         body["messages"].append(
