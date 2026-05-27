@@ -2687,6 +2687,23 @@ def tool_names_in_body(body: dict[str, Any]) -> set[str]:
     return names
 
 
+def _match_available_tool_name(name: str, available: set[str]) -> str | None:
+    if not available:
+        return None
+    low = name.lower()
+    for candidate in sorted(available):
+        if candidate == name:
+            return candidate
+    for candidate in sorted(available):
+        if candidate.lower() == low:
+            return candidate
+    for candidate in sorted(available):
+        candidate_low = candidate.lower()
+        if low and (low in candidate_low or candidate_low in low):
+            return candidate
+    return None
+
+
 def synthetic_tool_use_response(model: str, tool_name: str, tool_input: dict[str, Any] | None = None) -> dict[str, Any]:
     now = int(time.time() * 1000)
     return {
@@ -8502,6 +8519,7 @@ def _rebatch_anthropic_sse_text(
     word_chunking: bool = True,
     source_body: dict[str, Any] | None = None,
     preserve_thinking: bool = True,
+    normalize_tool_use: bool = False,
 ) -> None:
     """
     Parse upstream Anthropic SSE and re-emit it with text_delta events buffered
@@ -8521,6 +8539,7 @@ def _rebatch_anthropic_sse_text(
     open_content_blocks: set[int] = set()
     content_index_map: dict[int, int] = {}
     suppressed_content_indices: set[int] = set()
+    buffered_tool_uses: dict[int, dict[str, Any]] = {}
 
     def emit_raw(event_type: str | None, data_str: str) -> None:
         if event_type:
@@ -8580,6 +8599,67 @@ def _rebatch_anthropic_sse_text(
             return None
         return content_index_map.get(index, index)
 
+    def append_tool_partial(tool_state: dict[str, Any], partial: Any) -> None:
+        if partial is None:
+            return
+        if isinstance(partial, str):
+            tool_state["partial_json"] = str(tool_state.get("partial_json") or "") + partial
+        else:
+            tool_state["partial_json"] = str(tool_state.get("partial_json") or "") + json.dumps(partial, ensure_ascii=False)
+
+    def emit_normalized_tool_use(index: int, tool_state: dict[str, Any]) -> None:
+        raw_name = str(tool_state.get("name") or "")
+        raw_args = str(tool_state.get("partial_json") or "")
+        parsed_args = normalize_tool_arguments(raw_name, raw_args)
+        if not raw_name:
+            raw_name = infer_tool_name_from_args(parsed_args)
+        available = tool_names_in_body(source_body or {}) if isinstance(source_body, dict) else set()
+        matched_name = _match_available_tool_name(raw_name, available) or _fuzzy_match_tool_name(raw_name) or raw_name
+        if not matched_name:
+            matched_name = infer_tool_name_from_args(parsed_args)
+        fixed_input = _validate_and_fix_tool_input(matched_name, parsed_args)
+        if isinstance(source_body, dict):
+            mapped_name, mapped_input = plan_mode_tool_name_for_emit(source_body, matched_name, fixed_input)
+            if mapped_name is None:
+                return
+            matched_name, fixed_input = mapped_name, mapped_input
+        tool_id = str(tool_state.get("id") or f"toolu_anthropic_{int(time.time() * 1000)}_{index}")
+        _remember_channel_injected_tool_use(source_body, tool_id, matched_name, fixed_input)
+        append_tool_call_log(
+            "anthropic_stream_tool_call",
+            {
+                "model": model,
+                "raw_name": raw_name,
+                "matched_name": matched_name,
+                "raw_arguments": raw_args,
+                "emitted_input": fixed_input,
+                "sse_index": index,
+            },
+        )
+        emit_raw(
+            "content_block_start",
+            json.dumps(
+                {
+                    "type": "content_block_start",
+                    "index": index,
+                    "content_block": {"type": "tool_use", "id": tool_id, "name": matched_name, "input": {}},
+                },
+                ensure_ascii=False,
+            ),
+        )
+        emit_raw(
+            "content_block_delta",
+            json.dumps(
+                {
+                    "type": "content_block_delta",
+                    "index": index,
+                    "delta": {"type": "input_json_delta", "partial_json": json.dumps(fixed_input, ensure_ascii=False)},
+                },
+                ensure_ascii=False,
+            ),
+        )
+        emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": index}, ensure_ascii=False))
+
     def process_event(event_type: str | None, data_str: str) -> None:
         nonlocal saw_message_start, saw_message_stop, text_so_far, saw_tool_use, next_content_index
         try:
@@ -8598,6 +8678,7 @@ def _rebatch_anthropic_sse_text(
         elif evt_type == "content_block_start":
             index = event.get("index")
             content_block = event.get("content_block") if isinstance(event.get("content_block"), dict) else {}
+            mapped_index: int | None = None
             if isinstance(index, int):
                 if not preserve_thinking and content_block.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES:
                     suppressed_content_indices.add(index)
@@ -8616,6 +8697,16 @@ def _rebatch_anthropic_sse_text(
                 data_str = json.dumps(event, ensure_ascii=False)
             if content_block.get("type") == "tool_use":
                 saw_tool_use = True
+                if normalize_tool_use and mapped_index is not None:
+                    buffered_tool_uses[mapped_index] = {
+                        "id": str(content_block.get("id") or ""),
+                        "name": str(content_block.get("name") or ""),
+                        "partial_json": "",
+                    }
+                    initial_input = content_block.get("input")
+                    if isinstance(initial_input, dict) and initial_input:
+                        append_tool_partial(buffered_tool_uses[mapped_index], initial_input)
+                    return
         elif evt_type == "content_block_stop":
             index = event.get("index")
             mapped_index = mapped_content_index(index)
@@ -8623,6 +8714,9 @@ def _rebatch_anthropic_sse_text(
                 return
             if mapped_index is not None:
                 open_content_blocks.discard(mapped_index)
+                if normalize_tool_use and mapped_index in buffered_tool_uses:
+                    emit_normalized_tool_use(mapped_index, buffered_tool_uses.pop(mapped_index))
+                    return
                 patched = dict(event)
                 patched["index"] = mapped_index
                 event = patched
@@ -8656,6 +8750,10 @@ def _rebatch_anthropic_sse_text(
                 return
             if not preserve_thinking and delta.get("type") in {"thinking_delta", "signature_delta"}:
                 return
+            if normalize_tool_use and isinstance(mapped_index, int) and mapped_index in buffered_tool_uses:
+                if delta.get("type") == "input_json_delta":
+                    append_tool_partial(buffered_tool_uses[mapped_index], delta.get("partial_json"))
+                return
             if mapped_index is not None:
                 patched = dict(event)
                 patched["index"] = mapped_index
@@ -8680,6 +8778,9 @@ def _rebatch_anthropic_sse_text(
             if isinstance(index, int) and mapped_index is None:
                 return
             if mapped_index is not None:
+                if normalize_tool_use and mapped_index in buffered_tool_uses:
+                    emit_normalized_tool_use(mapped_index, buffered_tool_uses.pop(mapped_index))
+                    return
                 patched = dict(event)
                 patched["index"] = mapped_index
                 event = patched
@@ -10165,6 +10266,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 **router_event_message_preview(body, cfg),
             },
         )
+        _update_tool_schema_registry(body.get("tools"))
         dump_request_for_trace(provider, path, body)
         if maybe_handle_plan_mode_tool_choice(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="plan_mode.short_circuit", message="plan mode tool choice handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
@@ -10230,6 +10332,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                         word_chunking=word_chunking,
                         source_body=body,
                         preserve_thinking=preserves_anthropic_thinking_contract(provider, pcfg),
+                        normalize_tool_use=not preserves_anthropic_thinking_contract(provider, pcfg),
                     )
                 else:
                     self.send_response(status)

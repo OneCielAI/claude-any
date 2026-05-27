@@ -325,6 +325,57 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertIn('"index": 0', output)
         self.assertNotIn('"index": 1', output)
 
+    def test_rebatch_normalizes_native_stream_tool_use_for_non_anthropic_provider(self):
+        class FakeHandler:
+            def __init__(self):
+                self.wfile = io.BytesIO()
+
+        def sse(event_name, payload):
+            return f"event: {event_name}\ndata: {claude_any.json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+        chunks = [
+            sse("message_start", {"type": "message_start", "message": {"id": "msg", "type": "message", "role": "assistant", "content": [], "model": "model"}}),
+            sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": "toolu_bad", "name": "Bash", "input": {}}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "echo hello"}}),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": 3}}),
+            sse("message_stop", {"type": "message_stop"}),
+        ]
+        handler = FakeHandler()
+
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            io.BytesIO(b"".join(chunks)),
+            "model",
+            source_body={"tools": [{"name": "Bash", "input_schema": {"type": "object"}}]},
+            preserve_thinking=False,
+            normalize_tool_use=True,
+        )
+
+        payloads = []
+        for event_block in handler.wfile.getvalue().decode("utf-8").split("\n\n"):
+            data_lines = [line[5:].strip() for line in event_block.splitlines() if line.startswith("data:")]
+            if data_lines:
+                payloads.append(claude_any.json.loads("\n".join(data_lines)))
+        tool_starts = [
+            payload
+            for payload in payloads
+            if payload.get("type") == "content_block_start"
+            and isinstance(payload.get("content_block"), dict)
+            and payload["content_block"].get("type") == "tool_use"
+        ]
+        tool_deltas = [
+            payload
+            for payload in payloads
+            if payload.get("type") == "content_block_delta"
+            and isinstance(payload.get("delta"), dict)
+            and payload["delta"].get("type") == "input_json_delta"
+        ]
+
+        self.assertEqual("Bash", tool_starts[0]["content_block"]["name"])
+        emitted_input = claude_any.json.loads(tool_deltas[0]["delta"]["partial_json"])
+        self.assertEqual("echo hello", emitted_input["command"])
+
     def test_openai_conversion_does_not_leak_thinking_text(self):
         body = {
             "messages": [
