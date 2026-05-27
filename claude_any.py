@@ -3453,12 +3453,12 @@ def should_recover_empty_end_turn_with_tasklist(body: dict[str, Any], response_t
         return False
     if not has_tool(body, "TaskList"):
         return False
-    latest = latest_user_text(body)
-    if not latest.strip():
-        return False
     latest_tool_results = latest_user_tool_result_names(body)
     if latest_tool_results:
         return True
+    latest = latest_user_text(body)
+    if not latest.strip():
+        return False
     if short_resume_prompt(latest) and (latest_assistant_text(body) or plan_mode_active(body)):
         return True
     return likely_implementation_planning_request(latest)
