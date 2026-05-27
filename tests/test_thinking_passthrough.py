@@ -1,3 +1,4 @@
+import io
 import unittest
 
 import claude_any
@@ -248,6 +249,81 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertIs(out, body)
         self.assertIn("thinking", out)
         self.assertEqual(1, claude_any.anthropic_thinking_block_count(out))
+
+    def test_strip_thinking_response_blocks_for_non_anthropic_provider(self):
+        message = {
+            "content": [
+                {"type": "thinking", "thinking": "private reasoning", "signature": "sig"},
+                {"type": "text", "text": "visible answer"},
+            ],
+            "stop_reason": "end_turn",
+        }
+
+        out = claude_any.normalize_response_thinking_for_non_anthropic_provider(
+            "vllm",
+            {"native_compat": True},
+            message,
+        )
+
+        self.assertIsNot(out, message)
+        self.assertEqual([{"type": "text", "text": "visible answer"}], out["content"])
+        self.assertEqual(1, claude_any.anthropic_thinking_block_count({"messages": [{"role": "assistant", "content": message["content"]}]}))
+        self.assertEqual(0, claude_any.anthropic_thinking_block_count({"messages": [{"role": "assistant", "content": out["content"]}]}))
+
+    def test_preserve_thinking_response_blocks_for_anthropic_provider(self):
+        message = {
+            "content": [
+                {"type": "thinking", "thinking": "private reasoning", "signature": "sig"},
+                {"type": "text", "text": "visible answer"},
+            ],
+        }
+
+        out = claude_any.normalize_response_thinking_for_non_anthropic_provider(
+            "anthropic",
+            {},
+            message,
+        )
+
+        self.assertIs(out, message)
+        self.assertEqual(2, len(out["content"]))
+
+    def test_rebatch_suppresses_thinking_stream_blocks_for_non_anthropic_provider(self):
+        class FakeHandler:
+            def __init__(self):
+                self.wfile = io.BytesIO()
+
+        def sse(event_name, payload):
+            return f"event: {event_name}\ndata: {claude_any.json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+        chunks = [
+            sse("message_start", {"type": "message_start", "message": {"id": "msg", "type": "message", "role": "assistant", "content": [], "model": "model"}}),
+            sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "private reasoning"}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "signature_delta", "signature": "sig"}}),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            sse("content_block_start", {"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "visible answer"}}),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 1}),
+            sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 3}}),
+            sse("message_stop", {"type": "message_stop"}),
+        ]
+        resp = io.BytesIO(b"".join(chunks))
+        handler = FakeHandler()
+
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            resp,
+            "model",
+            word_chunking=False,
+            preserve_thinking=False,
+        )
+
+        output = handler.wfile.getvalue().decode("utf-8")
+        self.assertNotIn("thinking_delta", output)
+        self.assertNotIn("private reasoning", output)
+        self.assertIn("visible answer", output)
+        self.assertIn('"index": 0', output)
+        self.assertNotIn('"index": 1', output)
 
     def test_openai_conversion_does_not_leak_thinking_text(self):
         body = {

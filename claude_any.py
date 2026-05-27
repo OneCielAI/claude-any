@@ -2816,12 +2816,19 @@ def should_defer_forced_tool_choice_for_thinking(provider: str, pcfg: dict[str, 
     return False
 
 
-def normalize_thinking_for_non_anthropic_native_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+def preserves_anthropic_thinking_contract(provider: str, pcfg: dict[str, Any]) -> bool:
+    configured = pcfg.get("preserve_anthropic_thinking")
+    if configured is not None:
+        return bool(configured)
+    return provider == "anthropic"
+
+
+def normalize_thinking_for_non_anthropic_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     thinking_requested = anthropic_thinking_requested(body)
     thinking_blocks = anthropic_thinking_block_count(body)
     if not thinking_requested and thinking_blocks <= 0:
         return body
-    if not provider_native_compat_enabled(provider, pcfg):
+    if preserves_anthropic_thinking_contract(provider, pcfg):
         return body
     synthetic_tool = has_claude_any_synthetic_tool_use(body)
     continuation_blocks = anthropic_tool_continuation_block_count(body)
@@ -2831,9 +2838,36 @@ def normalize_thinking_for_non_anthropic_native_provider(provider: str, pcfg: di
     out.pop("thinking", None)
     router_log(
         "WARN",
-        "removed Anthropic thinking request and thinking content blocks for non-Anthropic native provider "
+        "removed Anthropic thinking request and thinking content blocks for non-Anthropic provider "
         f"provider={provider} synthetic_tool={synthetic_tool} continuation_blocks={continuation_blocks} "
         f"assistant_history={assistant_history} thinking_blocks={thinking_blocks}",
+    )
+    return out
+
+
+def normalize_thinking_for_non_anthropic_native_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    return normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
+
+
+def normalize_response_thinking_for_non_anthropic_provider(provider: str, pcfg: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
+    if preserves_anthropic_thinking_contract(provider, pcfg):
+        return message
+    content = message.get("content")
+    if not isinstance(content, list):
+        return message
+    filtered = [
+        block
+        for block in content
+        if not (isinstance(block, dict) and block.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES)
+    ]
+    if len(filtered) == len(content):
+        return message
+    out = dict(message)
+    out["content"] = filtered or [{"type": "text", "text": ""}]
+    router_log(
+        "WARN",
+        f"removed Anthropic thinking response blocks for non-Anthropic provider provider={provider} "
+        f"thinking_blocks={len(content) - len(filtered)}",
     )
     return out
 
@@ -8467,12 +8501,14 @@ def _rebatch_anthropic_sse_text(
     model: str = "claude-any-upstream",
     word_chunking: bool = True,
     source_body: dict[str, Any] | None = None,
+    preserve_thinking: bool = True,
 ) -> None:
     """
     Parse upstream Anthropic SSE and re-emit it with text_delta events buffered
-    to word boundaries. Non-text events (message_start/stop, content_block_start/
-    stop, input_json_delta, thinking_delta, message_delta, ping, error) are
-    forwarded unchanged in the same SSE framing.
+    to word boundaries. Non-text events are forwarded in the same SSE framing.
+    When the selected provider cannot preserve Anthropic's thinking passback
+    contract, thinking blocks are suppressed and later content block indices are
+    compacted.
     """
     text_buffers: dict[int, str] = {}
     pending_event_type: str | None = None
@@ -8483,6 +8519,8 @@ def _rebatch_anthropic_sse_text(
     saw_tool_use = False
     next_content_index = 0
     open_content_blocks: set[int] = set()
+    content_index_map: dict[int, int] = {}
+    suppressed_content_indices: set[int] = set()
 
     def emit_raw(event_type: str | None, data_str: str) -> None:
         if event_type:
@@ -8535,6 +8573,13 @@ def _rebatch_anthropic_sse_text(
         )
         emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": index}, ensure_ascii=False))
 
+    def mapped_content_index(index: Any) -> int | None:
+        if not isinstance(index, int):
+            return None
+        if index in suppressed_content_indices:
+            return None
+        return content_index_map.get(index, index)
+
     def process_event(event_type: str | None, data_str: str) -> None:
         nonlocal saw_message_start, saw_message_stop, text_so_far, saw_tool_use, next_content_index
         try:
@@ -8552,16 +8597,36 @@ def _rebatch_anthropic_sse_text(
             saw_message_stop = True
         elif evt_type == "content_block_start":
             index = event.get("index")
-            if isinstance(index, int):
-                open_content_blocks.add(index)
-                next_content_index = max(next_content_index, index + 1)
             content_block = event.get("content_block") if isinstance(event.get("content_block"), dict) else {}
+            if isinstance(index, int):
+                if not preserve_thinking and content_block.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES:
+                    suppressed_content_indices.add(index)
+                    router_log("WARN", f"suppressed Anthropic thinking response block for non-Anthropic provider model={model}")
+                    return
+                if index in content_index_map:
+                    mapped_index = content_index_map[index]
+                else:
+                    mapped_index = next_content_index
+                    content_index_map[index] = mapped_index
+                    next_content_index += 1
+                open_content_blocks.add(mapped_index)
+                patched = dict(event)
+                patched["index"] = mapped_index
+                event = patched
+                data_str = json.dumps(event, ensure_ascii=False)
             if content_block.get("type") == "tool_use":
                 saw_tool_use = True
         elif evt_type == "content_block_stop":
             index = event.get("index")
-            if isinstance(index, int):
-                open_content_blocks.discard(index)
+            mapped_index = mapped_content_index(index)
+            if isinstance(index, int) and mapped_index is None:
+                return
+            if mapped_index is not None:
+                open_content_blocks.discard(mapped_index)
+                patched = dict(event)
+                patched["index"] = mapped_index
+                event = patched
+                data_str = json.dumps(event, ensure_ascii=False)
         elif evt_type == "message_delta":
             delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
             stop_reason = str(delta.get("stop_reason") or "")
@@ -8586,7 +8651,17 @@ def _rebatch_anthropic_sse_text(
         if evt_type == "content_block_delta":
             delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
             index = event.get("index")
-            if isinstance(index, int) and delta.get("type") == "text_delta":
+            mapped_index = mapped_content_index(index)
+            if isinstance(index, int) and mapped_index is None:
+                return
+            if not preserve_thinking and delta.get("type") in {"thinking_delta", "signature_delta"}:
+                return
+            if mapped_index is not None:
+                patched = dict(event)
+                patched["index"] = mapped_index
+                event = patched
+                data_str = json.dumps(event, ensure_ascii=False)
+            if isinstance(mapped_index, int) and delta.get("type") == "text_delta":
                 text = delta.get("text") or ""
                 if not text:
                     return
@@ -8594,15 +8669,23 @@ def _rebatch_anthropic_sse_text(
                 if not word_chunking:
                     emit_raw(event_type, data_str)
                     return
-                text_buffers[index] = text_buffers.get(index, "") + text
-                flush_buffer(index, force=False)
+                text_buffers[mapped_index] = text_buffers.get(mapped_index, "") + text
+                flush_buffer(mapped_index, force=False)
                 return
             emit_raw(event_type, data_str)
             return
         if evt_type == "content_block_stop":
             index = event.get("index")
-            if isinstance(index, int) and word_chunking:
-                flush_buffer(index, force=True)
+            mapped_index = mapped_content_index(index)
+            if isinstance(index, int) and mapped_index is None:
+                return
+            if mapped_index is not None:
+                patched = dict(event)
+                patched["index"] = mapped_index
+                event = patched
+                data_str = json.dumps(event, ensure_ascii=False)
+            if isinstance(mapped_index, int) and word_chunking:
+                flush_buffer(mapped_index, force=True)
             emit_raw(event_type, data_str)
             return
         emit_raw(event_type, data_str)
@@ -10107,7 +10190,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to OpenAI-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_openai_compatible_chat(self, provider, pcfg, body)
                 return
-            body = normalize_thinking_for_non_anthropic_native_provider(provider, pcfg, body)
+            body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
             body = cap_anthropic_body_for_provider(provider, pcfg, body)
             body = apply_provider_request_options(provider, pcfg, body)
             upstream_model = resolve_requested_model(provider, pcfg, body.get("model"))
@@ -10140,7 +10223,14 @@ class RouterHandler(BaseHTTPRequestHandler):
                     self.send_header("cache-control", "no-cache")
                     self.send_header("connection", "close")
                     self.end_headers()
-                    _rebatch_anthropic_sse_text(self, resp, upstream_model, word_chunking=word_chunking, source_body=body)
+                    _rebatch_anthropic_sse_text(
+                        self,
+                        resp,
+                        upstream_model,
+                        word_chunking=word_chunking,
+                        source_body=body,
+                        preserve_thinking=preserves_anthropic_thinking_contract(provider, pcfg),
+                    )
                 else:
                     self.send_response(status)
                     self.send_header("content-type", ctype)
@@ -10151,6 +10241,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                         try:
                             payload = json.loads(raw_resp.decode("utf-8", errors="replace"))
                             if isinstance(payload, dict):
+                                payload = normalize_response_thinking_for_non_anthropic_provider(provider, pcfg, payload)
                                 payload = append_synthetic_tasklist_to_message(payload, upstream_model, body, "native_json")
                                 if notice:
                                     payload = prepend_anthropic_text(payload, notice)
