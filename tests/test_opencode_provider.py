@@ -337,6 +337,49 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("visible answer", assistant["content"])
         self.assertEqual("Bash", assistant["tool_calls"][0]["function"]["name"])
 
+    def test_zen_deepseek_backfills_empty_reasoning_for_legacy_history(self):
+        pcfg = self.opencode_cfg(
+            api_key="sk-opencode-test",
+            current_model="deepseek-v4-flash-free",
+        )["providers"]["opencode"]
+        body = {
+            "model": "claude-any-opencode-deepseek-v4-flash-free",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "legacy answer"},
+                        {"type": "tool_use", "id": "call_1", "name": "Read", "input": {"file_path": "a.txt"}},
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "call_1", "content": "ok"},
+                    ],
+                },
+            ],
+            "tools": [
+                {
+                    "name": "Read",
+                    "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        request = claude_any.openai_compatible_chat_request(
+            "opencode",
+            "deepseek-v4-flash-free",
+            body,
+            pcfg,
+            stream=False,
+        )
+
+        assistant = [item for item in request["messages"] if item.get("role") == "assistant"][-1]
+        self.assertIn("reasoning_content", assistant)
+        self.assertEqual("", assistant["reasoning_content"])
+        self.assertEqual("legacy answer", assistant["content"])
+
     def test_non_deepseek_openai_chat_still_strips_anthropic_thinking(self):
         pcfg = self.opencode_cfg(api_key="sk-opencode-test", current_model="glm-5.1")["providers"]["opencode"]
         body = {

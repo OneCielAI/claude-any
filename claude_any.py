@@ -8027,7 +8027,7 @@ def anthropic_tools_to_ollama(tools: Any) -> list[dict[str, Any]]:
     return out
 
 
-def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
+def anthropic_messages_to_openai(body: dict[str, Any], reasoning_passback: bool = False) -> list[dict[str, Any]]:
     messages = anthropic_system_to_ollama_messages(body.get("system"))
     messages.append(ollama_claude_code_reminder())
     messages.extend(claude_code_state_messages(body))
@@ -8073,7 +8073,7 @@ def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
                 else:
                     text_blocks.append(block)
             out: dict[str, Any] = {"role": "assistant", "content": compact_message_text_for_prompt(anthropic_content_to_text(text_blocks))}
-            if reasoning_seen:
+            if reasoning_seen or reasoning_passback:
                 out["reasoning_content"] = "\n".join(reasoning_parts)
             if tool_calls:
                 out["tool_calls"] = tool_calls
@@ -8120,7 +8120,10 @@ def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
             if text:
                 messages.append({"role": "user", "content": compact_message_text_for_prompt(text)})
             continue
-        messages.append({"role": role, "content": compact_message_text_for_prompt(anthropic_content_to_text(content))})
+        out = {"role": role, "content": compact_message_text_for_prompt(anthropic_content_to_text(content))}
+        if role == "assistant" and reasoning_passback:
+            out["reasoning_content"] = ""
+        messages.append(out)
     return messages
 
 
@@ -8569,7 +8572,8 @@ def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], 
 
 
 def openai_compatible_chat_request(provider: str, model: str, body: dict[str, Any], pcfg: dict[str, Any], stream: bool = False) -> dict[str, Any]:
-    messages = anthropic_messages_to_openai(body)
+    reasoning_passback = openai_chat_reasoning_passback_enabled(provider, model, pcfg)
+    messages = anthropic_messages_to_openai(body, reasoning_passback=reasoning_passback)
     tools = anthropic_tools_to_ollama(body.get("tools"))
     context_limit = openai_context_limit_for_budget(provider, pcfg)
     configured = configured_output_tokens(pcfg, body)
