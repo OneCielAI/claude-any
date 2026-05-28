@@ -76,7 +76,7 @@ passes normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.101`
+Current version: `0.1.102`
 
 ## Why This Exists
 
@@ -531,6 +531,11 @@ steps under that larger model's supervision.
 
 ### Nightly
 
+- **Claude native model registry refresh**: Anthropic native model refresh now
+  prefers the official Claude model documentation before falling back to API
+  model-list endpoints, stores the refreshed list in a provider-scoped
+  `model-registry.json`, and records per-model recommended presets plus
+  conservative CLI parameters separately from provider hard limits.
 - **OpenCode Zen and Go providers**: added first-class `opencode` and
   `opencode-go` providers for `https://opencode.ai/zen` and
   `https://opencode.ai/zen/go`. The model picker reads the live `/v1/models`
