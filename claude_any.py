@@ -18707,6 +18707,27 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     )
 
 
+def _format_channel_web_chat_wake_item(message: dict[str, Any]) -> str:
+    channel = str(message.get("channel") or "default")
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    reply_channel = str(meta.get("reply_channel") or channel)
+    thread = str(message.get("thread_id") or meta.get("thread_id") or reply_channel)
+    mid = str(message.get("id") or "")
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
+    fields = [f"id={mid}", f"channel={reply_channel}", f"thread={thread}"]
+    return " ".join(field for field in fields if not field.endswith("=")) + f" user={json.dumps(body, ensure_ascii=False)}"
+
+
+def format_channel_web_chat_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
+    items = " ; ".join(_format_channel_web_chat_wake_item(message) for message in messages)
+    count = len(messages)
+    return (
+        f"[claude-any web chat] {count} browser message(s): {items}. "
+        "Answer in the active Claude Code session. Use current context and tools/MCP if useful. "
+        "Reply to the browser with claude-any-router send_message on the listed channel/thread_id, recipients='web', delivery=['web']."
+    )
+
+
 def _channel_wake_message_noise_reason(message: dict[str, Any]) -> str | None:
     body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip().lower()
     kind = str(message.get("kind") or "").strip().lower()
@@ -20338,7 +20359,10 @@ def _inject_pending_channel_messages(
             continue
         pending.append(message)
     if pending:
-        prompt = format_channel_wake_batch_prompt(pending)
+        if web_chat_only and all(_channel_message_is_web_chat_request(message) for message in pending):
+            prompt = format_channel_web_chat_wake_batch_prompt(pending)
+        else:
+            prompt = format_channel_wake_batch_prompt(pending)
         submit_bytes = _channel_wake_enter_bytes(enter_bytes)
         _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
         with _CHANNEL_STDIN_WAKE_LOCK:

@@ -553,6 +553,34 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("room_phase1sim", prompt)
         self.assertNotIn("\n", prompt)
 
+    def test_web_chat_wake_prompt_is_compact_and_omits_raw_metadata(self):
+        prompt = claude_any.format_channel_web_chat_wake_batch_prompt(
+            [
+                {
+                    "id": 6,
+                    "channel": "web-chat-session",
+                    "sender_id": "web-user",
+                    "thread_id": "thread-1",
+                    "message": "현재상태는",
+                    "kind": "web_chat",
+                    "meta": {
+                        "source": "claude-any-web-chat",
+                        "reply_channel": "web-chat-session",
+                        "reply_recipient": "web",
+                        "reply_instruction": "long routing text",
+                    },
+                }
+            ]
+        )
+        self.assertIn("claude-any web chat", prompt)
+        self.assertIn("현재상태는", prompt)
+        self.assertIn("channel=web-chat-session", prompt)
+        self.assertIn("thread=thread-1", prompt)
+        self.assertIn("send_message", prompt)
+        self.assertNotIn("metadata=", prompt)
+        self.assertNotIn("reply_instruction", prompt)
+        self.assertNotIn("\n", prompt)
+
     def test_channel_wake_enter_bytes_can_be_overridden(self):
         with (
             mock.patch.dict(os.environ, {}, clear=True),
@@ -697,6 +725,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(3, last_id)
         payload = write_all.call_args_list[0].args[1]
         self.assertIn("마지막 작업 요약".encode("utf-8"), payload)
+        self.assertIn(b"claude-any web chat", payload)
+        self.assertNotIn(b"metadata=", payload)
         self.assertNotIn(b"hello Sarah", payload)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("reason=not_web_chat" in item and "message_id=2" in item for item in log_messages))
