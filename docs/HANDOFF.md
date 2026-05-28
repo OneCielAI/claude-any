@@ -26,7 +26,7 @@ The latest production path is:
 - MCP notification events are persisted into `chat-messages.jsonl`.
 - AI-Net/SSE notifications can trigger immediate direct LLM handling, use MCP tools, and receive tool-result follow-up context.
 - Direct channel handling no longer spawns hidden Claude Code `-p`; it uses the routed `/v1/messages` path, executes MCP tools over the initialized SSE connection, forwards `tool_result` blocks back to the same LLM turn, queues summaries durably, and injects those summaries into the next visible routed request.
-- The router now has a local provider test chat UI at `/ca/web/chat`. It sends a standalone text-only browser conversation to the same `/v1/messages` path as Claude Code, is not attached to an existing terminal transcript or tool executor, and deliberately does not create Cloudflare/Tailscale/public-network resources.
+- The router now has a local session chat UI at `/ca/web/chat`. It posts browser messages into `/ca/channel/messages`, the active Claude Code session consumes them through the channel bridge with its normal tools/MCP servers, and replies return through the built-in `claude-any-router` MCP `send_message` tool plus `/ca/channel/stream`.
 
 The previous stable `0.1.99` included automatic MCP channel capability probing through timeout/error classification. `0.1.100` adds DeepSeek.com, shared-host router isolation, automatic API-key setup routing, unique nightly versions, router cleanup hardening, and LLM channel direct handling diagnostics.
 

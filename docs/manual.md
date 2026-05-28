@@ -756,12 +756,11 @@ The router serves a local browser chat UI at:
 http://127.0.0.1:8799/ca/web/chat
 ```
 
-The page sends a standalone text-only browser conversation to the same
-Anthropic-compatible `/v1/messages` route used by Claude Code, so it follows the
-currently selected provider, model, and router settings. It is not attached to an
-existing Claude Code terminal transcript, task state, or tool executor. Claude
-Code tools, MCP tools, shell access, and filesystem access are not available from
-this page. It is deliberately
+The page posts browser messages to `/ca/channel/messages`, where they are picked
+up by the active Claude Code session through the Claude Any channel bridge. The
+active session can use its normal Claude Code tools and configured MCP servers.
+Replies are sent back with the built-in `claude-any-router` MCP `send_message`
+tool and streamed to the browser through `/ca/channel/stream`. It is deliberately
 local-only by default and does not create
 Cloudflare tunnels, Tailscale routes, DNS records, or public hostnames. If the
 selected provider is Anthropic and the browser chat should use the router, turn

@@ -20,24 +20,24 @@ class WebChatUiTests(unittest.TestCase):
         html = claude_any.render_router_home_html(cfg, provider, pcfg)
 
         self.assertIn("/ca/web/chat", html)
-        self.assertIn("Standalone text-only chat", html)
+        self.assertIn("active Claude Code session", html)
 
-    def test_web_chat_posts_to_router_messages_endpoint(self):
+    def test_web_chat_posts_to_channel_bridge_and_streams_replies(self):
         cfg = self._cfg()
         provider, pcfg = claude_any.get_current_provider(cfg)
         model = claude_any.current_alias(cfg)
 
         html = claude_any.render_web_chat_html(cfg, provider, pcfg)
 
-        self.assertIn("Provider Web Chat", html)
-        self.assertIn("/v1/messages", html)
-        self.assertIn("not attached to an existing Claude Code terminal session", html)
-        self.assertIn("standalone text-only browser conversation", html)
-        self.assertIn("Claude Code tools, MCP tools, shell, and filesystem access are not available here", html)
-        self.assertIn("TEXT_ONLY_SYSTEM_PROMPT", html)
-        self.assertIn("system: TEXT_ONLY_SYSTEM_PROMPT", html)
-        self.assertIn("Provider Web Chat has no tool executor", html)
-        self.assertIn("text/event-stream", html)
+        self.assertIn("Session Web Chat", html)
+        self.assertIn("/ca/channel/messages", html)
+        self.assertIn("/ca/channel/stream", html)
+        self.assertIn("active Claude Code session", html)
+        self.assertIn("configured tools and MCP servers remain available", html)
+        self.assertIn("claude-any-router send_message tool", html)
+        self.assertIn("delivery: ['llm', 'native']", html)
+        self.assertNotIn("TEXT_ONLY_SYSTEM_PROMPT", html)
+        self.assertNotIn("system: TEXT_ONLY_SYSTEM_PROMPT", html)
         self.assertIn(model, html)
         self.assertIn(".bubble", html)
         self.assertIn("bubble.className = 'bubble'", html)

@@ -19,7 +19,7 @@
 > - **低成本** — [Ollama Cloud](https://ollama.com/cloud) 提供 GLM、Qwen、DeepSeek 等开源权重模型，价格远低于前沿模型。
 > - **免费 + 本地** — 在自己的 GPU 上使用 [Ollama](https://ollama.com/) 或 [vLLM](https://github.com/vllm-project/vllm)，完全离线。
 > - **支持 Plan Mode + Advisor** — 在 non-Anthropic provider 上保留 Claude Code Plan Mode，并可使用长上下文 Advisor 模型进行工作审查。
-> - **本地 provider 浏览器聊天** — router 提供 `/ca/web/chat`，通过与 Claude Code 相同的 `/v1/messages` 路径向当前 provider 发送独立 text-only 浏览器会话；它不会附着到正在运行的 Claude Code 终端会话或 tool executor。
+> - **会话浏览器聊天** — router 提供 `/ca/web/chat`，把浏览器消息注入 active Claude Code session 的 channel inbox，并通过同一 channel stream 接收回复。active session 的 Claude Code tools 和 MCP tools 仍可使用。
 > - **平滑使用免费模型 RPM** — Claude Code 会花时间读取文件和执行 tool，Claude Any 会利用这些自然间隔进行 RPM pacing，让 NVIDIA hosted 免费模型在严格的每分钟限制下也更容易使用。
 >
 > 在 Claude Code 启动**之前**，通过控制台菜单选择 provider、模型、Base URL、API 密钥、流式行为以及 LLM 选项。Claude Code 本体保持原样运行 —— 所有原生工具、slash 命令和工作流都不受影响。
@@ -30,7 +30,7 @@
 
 1. **支持 DeepSeek.com provider** — 可以把 DeepSeek 的 Anthropic 兼容 Claude Code endpoint 作为正式 provider 选择，并提供模型 preset 和 API key 设置流程。
 2. **共享主机上的 router 生命周期更安全** — router 默认使用按用户分配的稳定端口，并在启动前清理同一用户的 stale router，减少 Robert/Sarah 这类多会话互相串线的问题。
-3. **Router provider 浏览器聊天和可选 Anthropic 路由** — `/ca/web/chat` 提供向当前 provider 发送独立 text-only `/v1/messages` 会话的本地 router chat UI；需要 SSE/channel/observability 时，Anthropic 也可以选择走 Claude Any router。
+3. **Router 会话浏览器聊天和可选 Anthropic 路由** — `/ca/web/chat` 提供向 active Claude Code session 注入消息并通过 channel stream 接收回复的本地 router chat UI；需要 SSE/channel/observability 时，Anthropic 也可以选择走 Claude Any router。
 
 ### 2026-05-15
 
@@ -780,10 +780,10 @@ Claude Any router 运行时，可以打开：
 http://127.0.0.1:8799/ca/web/chat
 ```
 
-这个页面是本地 provider 测试 chat UI，通过 Claude Code 同样使用的 Anthropic 兼容
-`/v1/messages` 路径向当前 provider 发送独立会话请求。浏览器维护自己的会话历史，
-不会自动连接到正在运行的 Claude Code 终端 transcript 或任务状态。该页面是 text-only：
-Claude Code tools、MCP tools、shell 和文件系统访问都不可用。它不会自动创建 Cloudflare
+这个页面是本地 session chat UI。浏览器消息会写入 `/ca/channel/messages`，
+由 active Claude Code session 通过 channel bridge 处理。Claude Code 可以继续使用
+Read/Bash/Edit 和 MCP tools，并通过内置 `claude-any-router` MCP `send_message`
+tool 把回复发回同一个 web chat channel。浏览器通过 `/ca/channel/stream` 订阅回复。它不会自动创建 Cloudflare
 tunnel、public DNS、Tailscale route 或公开 hostname。如果当前 provider 是
 Anthropic，并且希望该页面或其它 router 功能处理 Anthropic 流量，请启用
 Anthropic 的 `route_through_router` 选项并设置 Anthropic API key。

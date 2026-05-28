@@ -584,6 +584,39 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(b"\n", claude_any._channel_synthetic_enter_bytes_from_user_input(b"\n"))
         self.assertEqual(b"\r\n", claude_any._channel_synthetic_enter_bytes_from_user_input(b"hello\r\n"))
 
+    def test_builtin_channel_mcp_exposes_reply_tools(self):
+        tools = claude_any._channel_mcp_tool_schemas()
+        names = [tool.get("name") for tool in tools]
+
+        self.assertIn("send_message", names)
+        self.assertIn("get_messages", names)
+        send_schema = next(tool for tool in tools if tool.get("name") == "send_message")
+        self.assertIn("channel", send_schema["inputSchema"]["required"])
+        self.assertIn("message", send_schema["inputSchema"]["required"])
+
+    def test_builtin_channel_mcp_send_message_appends_web_delivery_reply(self):
+        with mock.patch.object(claude_any, "append_chat_message", return_value={"id": 44, "message": "done"}) as append:
+            response = claude_any._channel_mcp_tool_call_response(
+                7,
+                {
+                    "name": "send_message",
+                    "arguments": {
+                        "channel": "web-chat-session",
+                        "message": "작업 결과입니다.",
+                        "thread_id": "session",
+                    },
+                },
+            )
+
+        self.assertEqual(7, response["id"])
+        self.assertFalse(response["result"]["isError"])
+        payload = append.call_args.args[0]
+        self.assertEqual("web-chat-session", payload["channel"])
+        self.assertEqual("작업 결과입니다.", payload["message"])
+        self.assertEqual(["web"], payload["delivery"])
+        self.assertEqual("web", payload["recipients"])
+        self.assertEqual("claude-code", payload["sender_id"])
+
     def test_inject_pending_channel_messages_writes_prompt_to_child_stdin(self):
         messages = [
             {

@@ -5447,7 +5447,7 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
     upstream_text = " · ".join(bit for bit in upstream_bits if bit)
     links = [
         ("Events UI", "/ca/events", "Live router event stream with filters"),
-        ("Provider web chat", "/ca/web/chat", "Standalone text-only chat for the current provider"),
+        ("Session web chat", "/ca/web/chat", "Bridge messages into the active Claude Code session"),
         ("Recent events JSON", "/ca/events/recent", "Latest structured event records"),
         ("Events SSE", "/ca/events/stream", "Server-sent events stream"),
         ("Chat health", "/ca/chat/health", "Agent chat component status"),
@@ -5627,12 +5627,6 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
 def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any]) -> str:
     model = current_alias(cfg)
     timeout_ms = positive_int(pcfg.get("request_timeout_ms")) or DEFAULT_REQUEST_TIMEOUT_MS
-    max_tokens = (
-        claude_code_output_token_limit(provider, pcfg)
-        or positive_int(pcfg.get("max_output_tokens"))
-        or positive_int(MODEL_PRESETS.get("default", {}).get("max_output_tokens"))
-        or 4096
-    )
     api_status = api_key_status_line(provider, pcfg)
     mode = provider_mode_label(provider, pcfg)
     escaped_model = html_lib.escape(model)
@@ -5732,6 +5726,7 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
         <div><div class="meta-label">Model</div><div class="meta-value">{escaped_model}</div></div>
         <div><div class="meta-label">API</div><div class="meta-value">{escaped_api_status}</div></div>
         <div><div class="meta-label">Timeout</div><div class="meta-value">{timeout_ms:,} ms</div></div>
+        <div><div class="meta-label">Bridge</div><div class="meta-value">active session channel</div></div>
       </div>
       <div class="nav">
         <a href="/">Router Home</a>
@@ -5743,8 +5738,8 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
     <main>
       <header>
         <div>
-          <h1>Provider Web Chat</h1>
-          <div class="sub">Standalone text-only browser chat for the selected provider through <code>/v1/messages</code>; it is not attached to an existing Claude Code terminal session or tool executor.</div>
+          <h1>Session Web Chat</h1>
+          <div class="sub">Send messages into the active Claude Code session through the Claude Any channel bridge and stream replies from the same channel.</div>
         </div>
         <div class="pill" id="statePill">ready</div>
       </header>
@@ -5754,27 +5749,25 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
           <textarea id="prompt" placeholder="Type a message..." autocomplete="off"></textarea>
           <button class="primary" id="sendButton" type="submit">Send</button>
         </div>
-        <div class="hint">Enter sends. Shift+Enter inserts a new line. This page starts a separate text-only browser conversation. Claude Code tools, MCP tools, shell, and filesystem access are not available here.</div>
+        <div class="hint">Enter sends. Shift+Enter inserts a new line. The active Claude Code session handles the message, so its configured tools and MCP servers remain available.</div>
       </form>
     </main>
   </div>
   <script>
     const MODEL = {json.dumps(model)};
-    const MAX_TOKENS = {int(max_tokens)};
     const transcript = document.getElementById('transcript');
     const composer = document.getElementById('composer');
     const prompt = document.getElementById('prompt');
     const sendButton = document.getElementById('sendButton');
     const clearButton = document.getElementById('clearButton');
     const statePill = document.getElementById('statePill');
-    const history = [];
-    const TEXT_ONLY_SYSTEM_PROMPT = [
-      'You are running inside Claude Any Provider Web Chat.',
-      'This standalone browser chat is text-only and is not attached to an existing Claude Code terminal session.',
-      'You do not have Claude Code tools, MCP tools, shell access, filesystem access, browser automation, or the user\\'s active terminal transcript in this interface.',
-      'Do not claim that you inspected files, listed folders, ran commands, opened URLs, or called tools.',
-      'If the user asks for tool-backed work, explain that this Web Chat cannot execute tools and ask them to use the Claude Code terminal session or paste the relevant data.'
-    ].join(' ');
+    const SESSION_KEY = 'claude-any-web-chat-session';
+    const LAST_ID_KEY = 'claude-any-web-chat-last-id';
+    const sessionId = localStorage.getItem(SESSION_KEY) || (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(16).slice(2));
+    localStorage.setItem(SESSION_KEY, sessionId);
+    const channel = 'web-chat-' + sessionId;
+    let lastId = Number(localStorage.getItem(LAST_ID_KEY) || '0') || 0;
+    let eventSource = null;
     function setState(text, cls = '') {{
       statePill.textContent = text;
       statePill.className = 'pill ' + cls;
@@ -5790,99 +5783,74 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
       transcript.scrollTop = transcript.scrollHeight;
       return bubble;
     }}
-    function extractTextFromContent(content) {{
-      if (typeof content === 'string') return content;
-      if (!Array.isArray(content)) return '';
-      return content.map(block => {{
-        if (typeof block === 'string') return block;
-        if (!block || typeof block !== 'object') return '';
-        if (block.type === 'text') return block.text || '';
-        if (block.type === 'tool_use') return `[tool_use ${{block.name || block.id || ''}} requested, but Provider Web Chat has no tool executor]`;
-        return block.text || '';
-      }}).filter(Boolean).join('\\n');
-    }}
-    async function readStream(response, bubble) {{
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let text = '';
-      while (true) {{
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        buffer += decoder.decode(chunk.value, {{stream: true}});
-        let sep;
-        while ((sep = buffer.indexOf('\\n\\n')) >= 0) {{
-          const packet = buffer.slice(0, sep);
-          buffer = buffer.slice(sep + 2);
-          for (const line of packet.split('\\n')) {{
-            if (!line.startsWith('data:')) continue;
-            const raw = line.slice(5).trim();
-            if (!raw || raw === '[DONE]') continue;
-            let event;
-            try {{ event = JSON.parse(raw); }} catch {{ continue; }}
-            if (event.type === 'content_block_delta' && event.delta && event.delta.type === 'text_delta') {{
-              text += event.delta.text || '';
-              bubble.textContent = text;
-            }} else if (event.type === 'content_block_start' && event.content_block && event.content_block.type === 'text') {{
-              text += event.content_block.text || '';
-              bubble.textContent = text;
-            }} else if (event.type === 'content_block_start' && event.content_block && event.content_block.type === 'tool_use') {{
-              const toolName = event.content_block.name || event.content_block.id || 'tool';
-              text += `${{text ? '\\n' : ''}}[tool_use ${{toolName}} requested, but Provider Web Chat has no tool executor]`;
-              bubble.textContent = text;
-              bubble.classList.add('error');
-              setState('tool unavailable', 'error');
-            }} else if (event.type === 'message_delta' && event.delta && event.delta.stop_reason) {{
-              setState(event.delta.stop_reason);
-            }} else if (event.type === 'error') {{
-              throw new Error(event.error && event.error.message ? event.error.message : 'stream error');
-            }}
-          }}
-          transcript.scrollTop = transcript.scrollHeight;
-        }}
+    function rememberLastId(id) {{
+      const numeric = Number(id || 0) || 0;
+      if (numeric > lastId) {{
+        lastId = numeric;
+        localStorage.setItem(LAST_ID_KEY, String(lastId));
       }}
-      return text;
+    }}
+    function renderIncomingMessage(message) {{
+      rememberLastId(message.id);
+      if (message.sender_id === 'web-user') return;
+      const text = message.message || '';
+      if (!text.trim()) return;
+      addBubble('assistant', text);
+      setState('reply received', 'ok');
+    }}
+    function startChannelStream() {{
+      if (eventSource) eventSource.close();
+      const url = `/ca/channel/stream?channel=${{encodeURIComponent(channel)}}&recipient=web&after=${{lastId}}&timeout=3600`;
+      eventSource = new EventSource(url);
+      eventSource.onopen = () => setState('listening', 'ok');
+      eventSource.onmessage = ev => {{
+        try {{
+          const message = JSON.parse(ev.data);
+          renderIncomingMessage(message);
+        }} catch {{}}
+      }};
+      eventSource.onerror = () => {{
+        if (eventSource) eventSource.close();
+        setState('reconnecting');
+        setTimeout(startChannelStream, 1200);
+      }};
     }}
     async function sendMessage(text) {{
-      history.push({{role: 'user', content: text}});
       addBubble('user', text);
-      const bubble = addBubble('assistant', '');
-      setState('thinking');
+      setState('queued');
       sendButton.disabled = true;
       try {{
-        const response = await fetch('/v1/messages', {{
+        const response = await fetch('/ca/channel/messages', {{
           method: 'POST',
-          headers: {{'content-type': 'application/json', 'accept': 'text/event-stream, application/json'}},
+          headers: {{'content-type': 'application/json', 'accept': 'application/json'}},
           body: JSON.stringify({{
-            model: MODEL,
-            max_tokens: MAX_TOKENS,
-            system: TEXT_ONLY_SYSTEM_PROMPT,
-            stream: true,
-            messages: history
+            channel,
+            sender_id: 'web-user',
+            recipients: ['all'],
+            delivery: ['llm', 'native'],
+            thread_id: sessionId,
+            kind: 'web_chat',
+            message: text,
+            meta: {{
+              source: 'claude-any-web-chat',
+              web_chat_session: sessionId,
+              reply_channel: channel,
+              reply_recipient: 'web',
+              reply_instruction: 'Use the claude-any-router send_message tool to answer this browser chat on the same channel/thread_id with recipients web and delivery web.'
+            }}
           }})
         }});
         if (!response.ok) {{
           const fallback = await response.text();
           throw new Error(fallback || `HTTP ${{response.status}}`);
         }}
-        let assistantText = '';
-        const contentType = response.headers.get('content-type') || '';
-        if (response.body && contentType.includes('text/event-stream')) {{
-          assistantText = await readStream(response, bubble);
-        }} else {{
-          const json = await response.json();
-          assistantText = extractTextFromContent(json.content);
-          bubble.textContent = assistantText || JSON.stringify(json, null, 2);
-        }}
-        if (!assistantText.trim()) {{
-          bubble.textContent = '(empty response)';
-        }}
-        history.push({{role: 'assistant', content: bubble.textContent}});
-        setState('ready', 'ok');
+        const json = await response.json();
+        if (json.message) rememberLastId(json.message.id);
+        addBubble('system', 'Message queued for the active Claude Code session. Waiting for a channel reply...');
+        setState('waiting for session');
       }} catch (err) {{
-        bubble.textContent = String(err && err.message ? err.message : err);
+        const bubble = addBubble('assistant', String(err && err.message ? err.message : err));
         bubble.classList.add('error');
-        history.pop();
         setState('error', 'error');
       }} finally {{
         sendButton.disabled = false;
@@ -5903,12 +5871,12 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
       }}
     }});
     clearButton.addEventListener('click', () => {{
-      history.length = 0;
       transcript.innerHTML = '';
-      addBubble('system', 'Chat cleared. Provider and model remain unchanged. This text-only browser conversation is separate from any Claude Code terminal session and has no tool executor.');
-      setState('ready');
+      addBubble('system', `Chat cleared. This browser sends to active Claude Code session channel ${{channel}}.`);
+      startChannelStream();
     }});
-    addBubble('system', `Connected to ${{MODEL}}. Messages are sent to /v1/messages on this router as a standalone text-only browser conversation. Claude Code tools and MCP tools are not available here.`);
+    addBubble('system', `Connected to active session bridge for ${{MODEL}}. Messages are queued on channel ${{channel}} and replies stream back from /ca/channel/stream.`);
+    startChannelStream();
     prompt.focus();
   </script>
 </body>
@@ -6873,6 +6841,124 @@ def _channel_mcp_initialize_response(request_id: Any, protocol: str) -> dict[str
     }
 
 
+def _channel_mcp_tool_schemas() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "send_message",
+            "description": (
+                "Send a reply or status message to a Claude Any channel. "
+                "Use this to answer messages delivered through the Claude Any channel inbox, "
+                "including /ca/web/chat browser sessions."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Destination channel id from the incoming message.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Message body to send.",
+                    },
+                    "recipients": {
+                        "description": "Recipient id, 'all', or an array of recipients. Use 'web' for /ca/web/chat replies.",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread/conversation id to continue.",
+                    },
+                    "parent_id": {
+                        "description": "Optional parent message id.",
+                    },
+                    "delivery": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Delivery targets. Use ['web'] for browser-only replies.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Optional message kind, for example 'reply' or 'status'.",
+                    },
+                },
+                "required": ["channel", "message"],
+            },
+        },
+        {
+            "name": "get_messages",
+            "description": "Read recent Claude Any channel messages for a channel/thread.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "after": {"type": "integer", "description": "Only return messages after this id."},
+                    "channel": {"type": "string", "description": "Optional channel filter."},
+                    "recipient": {"type": "string", "description": "Optional recipient visibility filter."},
+                    "limit": {"type": "integer", "description": "Maximum number of messages to return."},
+                },
+            },
+        },
+    ]
+
+
+def _channel_mcp_tool_response(request_id: Any, text: str, is_error: bool = False) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+            "isError": bool(is_error),
+        },
+    }
+
+
+def _channel_mcp_tool_call_response(request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    name = str(params.get("name") or "")
+    args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+    if name == "send_message":
+        channel = str(args.get("channel") or "").strip()
+        message = str(args.get("message") or args.get("text") or "").strip()
+        if not channel or not message:
+            return _channel_mcp_tool_response(request_id, "send_message requires channel and message.", True)
+        meta = args.get("meta") if isinstance(args.get("meta"), dict) else {}
+        saved = append_chat_message(
+            {
+                "channel": channel,
+                "sender_id": args.get("sender_id") or "claude-code",
+                "recipients": args.get("recipients", args.get("recipient_id", "web")),
+                "thread_id": args.get("thread_id"),
+                "parent_id": args.get("parent_id"),
+                "kind": args.get("kind") or "reply",
+                "message": message,
+                "delivery": args.get("delivery", ["web"]),
+                "meta": {"source": "claude-any-router-tool", **meta},
+            }
+        )
+        return _channel_mcp_tool_response(
+            request_id,
+            json.dumps({"ok": True, "message": saved}, ensure_ascii=False, separators=(",", ":")),
+        )
+    if name == "get_messages":
+        try:
+            after = int(args.get("after") or 0)
+        except Exception:
+            after = 0
+        try:
+            limit = max(1, min(100, int(args.get("limit") or 20)))
+        except Exception:
+            limit = 20
+        messages = read_chat_messages(
+            after,
+            str(args.get("channel") or "") or None,
+            str(args.get("recipient") or args.get("recipient_id") or "") or None,
+            limit,
+        )
+        return _channel_mcp_tool_response(
+            request_id,
+            json.dumps({"ok": True, "messages": messages}, ensure_ascii=False, separators=(",", ":")),
+        )
+    return _channel_mcp_tool_response(request_id, f"Unknown claude-any-router tool: {name}", True)
+
+
 def _channel_mcp_write_cursor_locked(last_id: int) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp_path = CHANNEL_MCP_CURSOR_PATH.with_suffix(".json.tmp")
@@ -7092,7 +7178,10 @@ def handle_channel_mcp_post(handler: BaseHTTPRequestHandler, path: str, body: di
         response = _channel_mcp_initialize_response(request_id, protocol)
         router_log("INFO", f"channel_mcp_initialized session={session or '-'} protocol={protocol}")
     elif method == "tools/list":
-        response = {"jsonrpc": "2.0", "id": request_id, "result": {"tools": []}}
+        response = {"jsonrpc": "2.0", "id": request_id, "result": {"tools": _channel_mcp_tool_schemas()}}
+    elif method == "tools/call":
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        response = _channel_mcp_tool_call_response(request_id, params)
     elif method == "ping":
         response = {"jsonrpc": "2.0", "id": request_id, "result": {}}
     elif request_id is not None:
@@ -18604,6 +18693,7 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
         + f" text={json.dumps(body, ensure_ascii=False)}"
         + meta_text
         + ". "
+        + "If this is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']. "
         + "If relevant to current work, respond or act now; otherwise keep working."
     )
 
@@ -18670,7 +18760,8 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
     return (
         f"[claude-any external channel messages] {len(messages)} new messages: "
         + " ; ".join(parts)
-        + ". If relevant to current work, respond or act now; otherwise keep working."
+        + ". If any item is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']. "
+        + "If relevant to current work, respond or act now; otherwise keep working."
     )
 
 
@@ -18720,6 +18811,8 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         "'진행하겠습니다', '착수합니다', '보고하겠습니다', '결과를 공유하겠습니다', "
         "'Let me send...', 'I will reply...', 'I'll respond...'처럼 미래 행동을 약속하는 말만 남기고 턴을 끝내지 마세요. "
         "그런 말을 할 상황이면 같은 턴에서 필요한 조사/도구 호출/채널 보고까지 수행하고, 수행할 수 없으면 구체적 차단 사유를 보고하세요. "
+        "메시지 metadata source가 claude-any-web-chat 이거나 reply_channel/reply_recipient가 있으면, 답변 내용은 반드시 사용 가능한 claude-any-router send_message 계열 도구로 같은 channel/thread_id에 recipients='web', delivery=['web']로 보내세요. "
+        "웹 채팅 요청도 현재 Claude Code 세션의 기존 Read/Bash/Edit/MCP 도구를 사용할 수 있는 실제 작업 요청입니다. "
         "다음 응답에는 사용자가 화면에서 볼 수 있도록 수신 메시지 요약과 수행한 처리 또는 필요한 다음 조치를 간단히 보여주세요. "
         "도구를 호출했다면 tool_result 후속 턴에서 그 결과를 LLM이 다시 검토한 뒤 사용자에게 요약하고, 필요한 경우 후속 답장/작업까지 완료하세요.\n\n"
         + "\n\n".join(parts)
