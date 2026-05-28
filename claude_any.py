@@ -104,6 +104,9 @@ NCP_LOG = HOME / ".config" / "nvd-claude-proxy" / "proxy.log"
 MODEL_CACHE_TTL_SECONDS = 300
 OLLAMA_MODEL_CATALOG_URL = "https://ollama.com/api/tags"
 OLLAMA_MODEL_CATALOG_TTL_SECONDS = 24 * 60 * 60
+ANTHROPIC_MODEL_DOCS_URL = "https://platform.claude.com/docs/en/about-claude/models/overview"
+OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen"
+OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go"
 NCP_PYPI_PACKAGE = "nvd-claude-proxy"
 
 PROVIDER_ALIASES = {
@@ -120,6 +123,15 @@ PROVIDER_ALIASES = {
     "deepseek-com": "deepseek",
     "deepseek-api": "deepseek",
     "ds": "deepseek",
+    "opencode": "opencode",
+    "opencode.ai": "opencode",
+    "opencode-ai": "opencode",
+    "opencode-zen": "opencode",
+    "zen": "opencode",
+    "opencode-go": "opencode-go",
+    "opencode.go": "opencode-go",
+    "opencode_go": "opencode-go",
+    "opencodego": "opencode-go",
     "vllm": "vllm",
     "vllm-local": "vllm",
     "lm-studio": "lm-studio",
@@ -138,10 +150,27 @@ PROVIDER_LABELS = {
     "ollama": "Ollama",
     "ollama-cloud": "Ollama Cloud",
     "deepseek": "DeepSeek.com",
+    "opencode": "OpenCode Zen",
+    "opencode-go": "OpenCode Go",
     "vllm": "vLLM",
     "lm-studio": "LM Studio",
     "nvidia-hosted": "Nvidia Hosted",
     "self-hosted-nim": "Self Hosted NIM",
+}
+
+OPENCODE_PROVIDER_NAMES = ("opencode", "opencode-go")
+OPENCODE_ENDPOINT_ALIASES = {
+    "messages": "anthropic-messages",
+    "anthropic": "anthropic-messages",
+    "anthropic-messages": "anthropic-messages",
+    "chat": "openai-chat",
+    "openai-chat": "openai-chat",
+    "chat-completions": "openai-chat",
+    "responses": "openai-responses",
+    "openai-responses": "openai-responses",
+    "gemini": "google-generative",
+    "google": "google-generative",
+    "google-generative": "google-generative",
 }
 OFFICIAL_CHANNEL_PLUGINS = {
     "telegram": "plugin:telegram@claude-plugins-official",
@@ -1529,6 +1558,40 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "haiku_model": "deepseek-v4-flash",
             "subagent_model": "deepseek-v4-flash",
         },
+        "opencode": {
+            "base_url": OPENCODE_ZEN_BASE_URL,
+            "api_key": "",
+            "current_model": "claude-sonnet-4-6",
+            "advisor_model": "",
+            "custom_models": ["claude-sonnet-4-6"],
+            "native_compat": True,
+            "context_window": 200000,
+            "max_output_tokens": 8192,
+            "context_reserve_tokens": 8192,
+            "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT_MS,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
+            "haiku_model": "claude-haiku-4-5",
+            "subagent_model": "claude-sonnet-4-6",
+            "model_endpoints": {},
+        },
+        "opencode-go": {
+            "base_url": OPENCODE_GO_BASE_URL,
+            "api_key": "",
+            "current_model": "qwen3.6-plus",
+            "advisor_model": "",
+            "custom_models": ["qwen3.6-plus"],
+            "native_compat": True,
+            "context_window": 262144,
+            "max_output_tokens": 8192,
+            "context_reserve_tokens": 8192,
+            "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT_MS,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
+            "haiku_model": "qwen3.5-plus",
+            "subagent_model": "qwen3.6-plus",
+            "model_endpoints": {},
+        },
         "vllm": {
             "base_url": "http://127.0.0.1:8000",
             "api_key": "dummy",
@@ -1862,10 +1925,10 @@ def display_name(provider: str, model_id: str) -> str:
     return f"{label} {cleaned}".title().replace("Vllm", "vLLM").replace("Nvidia", "Nvidia")
 
 
-def model_object(provider: str, model_id: str) -> dict[str, Any]:
+def model_object(provider: str, model_id: str, pcfg: dict[str, Any] | None = None) -> dict[str, Any]:
     model_id = normalize_model_id(provider, model_id)
     alias = alias_for(provider, model_id)
-    return {
+    obj = {
         "id": alias,
         "type": "model",
         "display_name": display_name(provider, model_id),
@@ -1875,6 +1938,11 @@ def model_object(provider: str, model_id: str) -> dict[str, Any]:
         "owned_by": f"claude-any/{provider}",
         "claude_any": {"provider": provider, "upstream_model": model_id},
     }
+    if provider in OPENCODE_PROVIDER_NAMES:
+        endpoint = opencode_endpoint_kind(provider, model_id, pcfg)
+        obj["claude_any"]["opencode_endpoint"] = endpoint
+        obj["claude_any"]["router_supported"] = opencode_model_supported_by_router(provider, model_id, pcfg)
+    return obj
 
 
 def join_url(base: str, path: str) -> str:
@@ -3840,7 +3908,10 @@ def cached_or_configured_model_ids(provider: str, pcfg: dict[str, Any]) -> list[
     cur = normalize_model_id(provider, pcfg.get("current_model") or "")
     if cur and cur not in ids and not cur.startswith(f"claude-any-{provider}-"):
         ids.insert(0, cur)
-    return sorted_model_ids(unique_model_ids(provider, ids))
+    ids = unique_model_ids(provider, ids)
+    if provider == "anthropic":
+        return ids
+    return sorted_model_ids(ids)
 
 
 def model_ids_from_response(data: Any) -> list[str]:
@@ -3870,6 +3941,138 @@ def model_ids_from_response(data: Any) -> list[str]:
     return ids
 
 
+ANTHROPIC_PUBLIC_MODEL_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9_.@:-])"
+    r"(?:"
+    r"claude-(?:opus|sonnet|haiku)-\d+-\d+-\d{8}|"
+    r"claude-(?:opus|sonnet|haiku)-\d+-\d{8}|"
+    r"claude-(?:opus|sonnet|haiku)-\d+-\d+|"
+    r"claude-\d+(?:-\d+)?-(?:opus|sonnet|haiku)-\d{8}"
+    r")"
+    r"(?![A-Za-z0-9_.@:-])"
+)
+
+
+def fetch_text_url(url: str, timeout: float = 8.0) -> str:
+    req = urllib.request.Request(url, headers={"user-agent": f"claude-any/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(5_000_000).decode("utf-8", errors="replace")
+
+
+def anthropic_model_ids_from_docs_text(text: str) -> list[str]:
+    """Extract public Claude API model IDs from Anthropic's models overview page.
+
+    Claude Native usually runs on Claude Code OAuth rather than an API key, so
+    `/v1/models` is not available to claude-any. The public docs are the only
+    unauthenticated source for the current model picker seed.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    for match in ANTHROPIC_PUBLIC_MODEL_ID_RE.finditer(html_lib.unescape(text or "")):
+        mid = match.group(0)
+        key = mid.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        ids.append(mid)
+    return ids
+
+
+def fetch_anthropic_public_model_ids(timeout: float = 8.0) -> list[str]:
+    try:
+        return anthropic_model_ids_from_docs_text(fetch_text_url(ANTHROPIC_MODEL_DOCS_URL, timeout=timeout))
+    except Exception as exc:
+        router_log("WARN", f"anthropic model docs fetch failed: {type(exc).__name__}: {exc}")
+        return []
+
+
+def opencode_zen_endpoint_kind(model_id: str) -> str:
+    """Return the documented OpenCode Zen endpoint family for a model id."""
+    model = strip_claude_context_suffix(model_id).strip().lower()
+    if model.startswith("claude-any-opencode-"):
+        model = model[len("claude-any-opencode-"):]
+    if model.startswith("claude-") or model.startswith("qwen3."):
+        return "anthropic-messages"
+    if model.startswith("gpt-"):
+        return "openai-responses"
+    if model.startswith("gemini-"):
+        return "google-generative"
+    if model.startswith(("minimax-", "glm-", "kimi-", "grok-", "big-pickle", "deepseek-", "mimo-", "nemotron-")):
+        return "openai-chat"
+    return "anthropic-messages"
+
+
+def opencode_zen_model_supported_by_router(model_id: str) -> bool:
+    return opencode_zen_endpoint_kind(model_id) in ("anthropic-messages", "openai-chat")
+
+
+def normalize_opencode_endpoint_kind(value: Any) -> str | None:
+    key = str(value or "").strip().lower().replace("_", "-")
+    return OPENCODE_ENDPOINT_ALIASES.get(key)
+
+
+def opencode_endpoint_override(provider: str, model_id: str, pcfg: dict[str, Any] | None = None) -> str | None:
+    if not pcfg:
+        return None
+    overrides = pcfg.get("model_endpoints")
+    if not isinstance(overrides, dict):
+        return None
+    normalized = normalize_model_id(provider, model_id)
+    candidates = [
+        model_id,
+        normalized,
+        strip_claude_context_suffix(model_id),
+        alias_for(provider, normalized),
+    ]
+    for candidate in candidates:
+        raw = overrides.get(candidate)
+        endpoint = normalize_opencode_endpoint_kind(raw)
+        if endpoint:
+            return endpoint
+    return None
+
+
+def opencode_go_endpoint_kind(model_id: str) -> str:
+    """Return the documented OpenCode Go endpoint family for a model id."""
+    model = strip_claude_context_suffix(model_id).strip().lower()
+    if model.startswith("claude-any-opencode-go-"):
+        model = model[len("claude-any-opencode-go-"):]
+    if model.startswith("qwen3.") or model.startswith("minimax-"):
+        return "anthropic-messages"
+    if model.startswith(("glm-", "kimi-", "deepseek-", "mimo-", "hy3-")):
+        return "openai-chat"
+    return "anthropic-messages"
+
+
+def opencode_endpoint_kind(provider: str, model_id: str, pcfg: dict[str, Any] | None = None) -> str:
+    override = opencode_endpoint_override(provider, model_id, pcfg)
+    if override:
+        return override
+    if provider == "opencode-go":
+        return opencode_go_endpoint_kind(model_id)
+    return opencode_zen_endpoint_kind(model_id)
+
+
+def opencode_model_supported_by_router(provider: str, model_id: str, pcfg: dict[str, Any] | None = None) -> bool:
+    return opencode_endpoint_kind(provider, model_id, pcfg) in ("anthropic-messages", "openai-chat")
+
+
+def opencode_endpoint_display(provider: str, model_id: str, pcfg: dict[str, Any] | None = None) -> str:
+    endpoint = opencode_endpoint_kind(provider, model_id, pcfg)
+    labels = {
+        "anthropic-messages": "messages",
+        "openai-chat": "chat",
+        "openai-responses": "responses",
+        "google-generative": "gemini",
+    }
+    text = labels.get(endpoint, endpoint)
+    if not opencode_model_supported_by_router(provider, model_id, pcfg):
+        text += " unsupported"
+    if opencode_endpoint_override(provider, model_id, pcfg):
+        text += " override"
+    return text
+
+
 def nvidia_hosted_list_headers() -> dict[str, str]:
     headers = {"content-type": "application/json"}
     key = read_env_file(NCP_ENV).get("NVIDIA_API_KEY") or os.environ.get("NVIDIA_API_KEY")
@@ -3881,8 +4084,11 @@ def nvidia_hosted_list_headers() -> dict[str, str]:
 
 def provider_model_list_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
     headers = {"content-type": "application/json"}
+    if provider in OPENCODE_PROVIDER_NAMES:
+        headers["user-agent"] = f"claude-any/{VERSION}"
     key = pcfg.get("api_key")
     if provider == "anthropic" and key:
+        headers["anthropic-version"] = "2023-06-01"
         headers["x-api-key"] = str(key)
     elif meaningful_key(str(key) if key is not None else None):
         headers["authorization"] = f"Bearer {key}"
@@ -4431,12 +4637,14 @@ def ncp_model_id_for_nvidia_hosted(model_id: str) -> str:
 
 def provider_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
     headers = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
+    if provider in OPENCODE_PROVIDER_NAMES:
+        headers["user-agent"] = f"claude-any/{VERSION}"
     key = pcfg.get("api_key") or "not-used"
     if provider == "anthropic":
         if not pcfg.get("api_key"):
             raise RuntimeError("Anthropic API key is missing. Run: claude-anyctl api-key anthropic")
         headers["x-api-key"] = pcfg["api_key"]
-    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek"):
+    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
     elif provider == "lm-studio":
@@ -4468,8 +4676,8 @@ def direct_native_anthropic_enabled(provider: str, pcfg: dict[str, Any]) -> bool
     return native_anthropic_enabled(provider) and not anthropic_routed_enabled(provider, pcfg)
 
 
-def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
-    cached = read_model_list_cache(provider, pcfg)
+def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool = False) -> list[str]:
+    cached = None if force_refresh else read_model_list_cache(provider, pcfg)
     if cached is not None:
         return cached
     if provider == "deepseek":
@@ -4526,9 +4734,21 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
                     continue
     except Exception:
         ids = []
+    if provider == "anthropic" and not ids:
+        ids = fetch_anthropic_public_model_ids()
+        fetched = bool(ids)
     if provider == "ollama-cloud" and not ids:
         ids = ollama_catalog_model_ids(provider)
         fetched = bool(ids)
+    if not fetched and provider in OPENCODE_PROVIDER_NAMES:
+        ids = unique_model_ids(provider, [
+            *(pcfg.get("custom_models", []) or []),
+            pcfg.get("current_model") or "",
+        ])
+        sorted_ids = sorted_model_ids(ids)
+        if sorted_ids:
+            write_model_list_cache(provider, pcfg, sorted_ids)
+        return sorted_ids
     if not fetched:
         return []
     for mid in pcfg.get("custom_models", []) or []:
@@ -4542,7 +4762,9 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
         ids.insert(0, cur)
     if provider == "nvidia-hosted" and cur and cur not in ids:
         ids.insert(0, cur)
-    sorted_ids = sorted_model_ids(unique_model_ids(provider, ids))
+    sorted_ids = unique_model_ids(provider, ids)
+    if provider != "anthropic":
+        sorted_ids = sorted_model_ids(sorted_ids)
     write_model_list_cache(provider, pcfg, sorted_ids)
     return sorted_ids
 
@@ -4885,6 +5107,14 @@ def deepseek_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return provider == "deepseek" and bool(pcfg.get("native_compat", True))
 
 
+def opencode_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return (
+        provider in OPENCODE_PROVIDER_NAMES
+        and bool(pcfg.get("native_compat", True))
+        and opencode_endpoint_kind(provider, str(pcfg.get("current_model") or ""), pcfg) == "anthropic-messages"
+    )
+
+
 def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return (
         vllm_native_compat_enabled(provider, pcfg)
@@ -4892,6 +5122,7 @@ def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
         or nim_native_compat_enabled(provider, pcfg)
         or nvidia_hosted_native_compat_enabled(provider, pcfg)
         or deepseek_native_compat_enabled(provider, pcfg)
+        or opencode_native_compat_enabled(provider, pcfg)
     )
 
 
@@ -4938,7 +5169,7 @@ def resolve_requested_model(provider: str, pcfg: dict[str, Any], requested: str 
 
 
 def list_model_objects(provider: str, pcfg: dict[str, Any]) -> list[dict[str, Any]]:
-    return [model_object(provider, mid) for mid in upstream_model_ids(provider, pcfg)]
+    return [model_object(provider, mid, pcfg) for mid in upstream_model_ids(provider, pcfg)]
 
 
 def provider_upstream_request_base(provider: str, pcfg: dict[str, Any]) -> str:
@@ -11025,6 +11256,37 @@ class RouterHandler(BaseHTTPRequestHandler):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to Ollama-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_ollama_api_chat(self, provider, pcfg, body)
                 return
+            if provider in OPENCODE_PROVIDER_NAMES:
+                upstream_model = resolve_requested_model(provider, pcfg, body.get("model"))
+                endpoint_kind = opencode_endpoint_kind(provider, upstream_model, pcfg)
+                provider_label = PROVIDER_LABELS.get(provider, provider)
+                if endpoint_kind == "openai-chat":
+                    EVENT_BUS.publish(
+                        level="info",
+                        category="upstream.request",
+                        message=f"forwarding to {provider_label} chat-compatible provider",
+                        request_id=request_id,
+                        provider=provider,
+                        model=upstream_model,
+                    )
+                    forward_openai_compatible_chat(self, provider, pcfg, body)
+                    return
+                if endpoint_kind not in ("anthropic-messages",):
+                    write_json(
+                        self,
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "unsupported_model_endpoint",
+                                "message": (
+                                    f"{provider_label} model {upstream_model!r} uses the {endpoint_kind} endpoint family. "
+                                    f"claude-any currently routes {provider_label} /v1/messages and /v1/chat/completions models."
+                                ),
+                            },
+                        },
+                        400,
+                    )
+                    return
             if provider in ("lm-studio", "nvidia-hosted") and not provider_native_compat_enabled(provider, pcfg):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to OpenAI-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_openai_compatible_chat(self, provider, pcfg, body)
@@ -11503,11 +11765,11 @@ def status_lines() -> list[str]:
         *([f"think: {bool(pcfg.get('think', False))}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("ollama", "ollama-cloud") else []),
-        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
-        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek") else []),
-        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
-        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
-        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
+        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go") else []),
+        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go") else []),
+        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go") else []),
+        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go") else []),
+        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go") else []),
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
         f"log_level: {log_level_status()}",
         f"channels: {channel_status_text(cfg)}",
@@ -13352,7 +13614,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print("  claude-any --ca-ollama-option temperature=0.7 --ca-ollama-num-ctx 65536")
 
 
-PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek")
+PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go")
 PROVIDER_SAMPLING_OPTION_PROVIDERS = ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim")
 PROVIDER_SAMPLING_OPTIONS = ("temperature", "top_p", "top_k")
 
@@ -13410,17 +13672,21 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
             if limit is not None:
                 suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unmanaged)"
                 parts.append(f"rpm_used={suffix}")
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
-    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         native_default = True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
+    if provider in OPENCODE_PROVIDER_NAMES:
+        overrides = pcfg.get("model_endpoints")
+        count = len(overrides) if isinstance(overrides, dict) else 0
+        parts.append(f"endpoint_overrides={count}")
     if provider == "anthropic":
         parts.append(f"routed={'on' if anthropic_routed_enabled(provider, pcfg) else 'off'}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go"):
         parts.append(f"stream={'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
         if bool(pcfg.get("stream_word_chunking", False)):
             parts.append("word_chunk=on")
@@ -13463,7 +13729,7 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
         return "million-context"
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
-    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         server_limit = (
             model_context_hint_from_model_id(model)
             if provider == "lm-studio"
@@ -13766,7 +14032,7 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
         if fixed_ctx and fixed_ctx > capacity:
             pcfg["num_ctx"] = capacity
         return messages
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         context_window = positive_int(pcfg.get("context_window"))
         if context_window and context_window > capacity:
             pcfg["context_window"] = capacity
@@ -13863,7 +14129,7 @@ def context_setting_status(provider: str, pcfg: dict[str, Any]) -> str:
     cap_text = format_context_tokens(capacity)
     if provider in ("ollama", "ollama-cloud"):
         return f"model max {cap_text}; {ollama_num_ctx_status(pcfg)}"
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         window = positive_int(pcfg.get("context_window"))
         reserve = positive_int(pcfg.get("context_reserve_tokens"))
         reserve_text = f"; reserve {format_context_tokens(reserve)}" if reserve else ""
@@ -13880,7 +14146,7 @@ def configured_context_window_for_timeout(provider: str, pcfg: dict[str, Any]) -
             or positive_int(pcfg.get("num_ctx"))
             or provider_model_context_capacity(provider, pcfg)
         )
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         return positive_int(pcfg.get("context_window")) or provider_model_context_capacity(provider, pcfg)
     if provider == "anthropic":
         return provider_model_context_capacity(provider, pcfg)
@@ -14015,7 +14281,7 @@ def apply_context_setup_to_provider(provider: str, pcfg: dict[str, Any], mode: s
         pcfg["num_ctx_max"] = window
         pcfg["num_ctx_min"] = min(window, 32768 if window <= 65536 else 65536)
         pcfg.setdefault("ollama_options", {})["num_predict"] = output
-    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         pcfg["context_window"] = window
         pcfg["context_reserve_tokens"] = reserve
         pcfg["max_output_tokens"] = output
@@ -14098,7 +14364,7 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
         if num_ctx and num_ctx <= 32768 and num_predict and num_predict <= 2048:
             return "fast"
         return None
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "anthropic"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "anthropic"):
         max_output = positive_int(pcfg.get("max_output_tokens")) or 0
         context_window = positive_int(pcfg.get("context_window")) or 0
         if bool(pcfg.get("think", False)):
@@ -14952,11 +15218,11 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Rate limit RPM", "rate_limit_rpm", rate_limit_rpm_label(provider, pcfg))
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", False)) else "off")
     else:
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
             add("Context reserve", "context_reserve_tokens", pcfg.get("context_reserve_tokens", "default"))
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
             add("RPM limiter", "rate_limit_enabled", rate_limit_status_label(provider, pcfg))
             add("Rate limit RPM", "rate_limit_rpm", rate_limit_rpm_label(provider, pcfg))
@@ -14964,7 +15230,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
             add("Temperature", "temperature", pcfg.get("temperature", "default"))
             add("Top P", "top_p", pcfg.get("top_p", "default"))
             add("Top K", "top_k", pcfg.get("top_k", "default"))
-            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
+            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
                 add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", True)))
             add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
             if bool(pcfg.get("stream_enabled", True)):
@@ -15102,6 +15368,20 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
 
 
 def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> None:
+    if provider in OPENCODE_PROVIDER_NAMES and token.startswith("endpoint:") and "=" in token:
+        key, raw_value = token.split("=", 1)
+        model_id = key.split(":", 1)[1].strip()
+        endpoint = normalize_opencode_endpoint_kind(raw_value)
+        if not model_id:
+            raise SystemExit("endpoint override requires endpoint:<model-id>=<messages|chat|responses|gemini>")
+        if not endpoint:
+            raise SystemExit("endpoint override must be one of: messages, chat, responses, gemini")
+        endpoints = pcfg.setdefault("model_endpoints", {})
+        if not isinstance(endpoints, dict):
+            endpoints = {}
+            pcfg["model_endpoints"] = endpoints
+        endpoints[normalize_model_id(provider, model_id)] = endpoint
+        return
     if token.startswith("unset:"):
         key = token.split(":", 1)[1].strip()
         if key in ("context_window", "context", "max_model_len"):
@@ -15132,6 +15412,11 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg["stream_enabled"] = True
         elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
             pcfg["stream_word_chunking"] = False
+        elif provider in OPENCODE_PROVIDER_NAMES and key.startswith("endpoint:"):
+            model_id = normalize_model_id(provider, key.split(":", 1)[1].strip())
+            endpoints = pcfg.get("model_endpoints")
+            if isinstance(endpoints, dict):
+                endpoints.pop(model_id, None)
         elif sampling_option_key(key):
             pcfg.pop(sampling_option_key(key), None)
         else:
@@ -15227,7 +15512,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
         except SystemExit:
             pass
     if provider not in PROVIDER_OPTION_PROVIDERS:
-        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, vllm, lm-studio, nvidia-hosted, and self-hosted-nim.")
+        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, vllm, lm-studio, nvidia-hosted, and self-hosted-nim.")
     pcfg = cfg["providers"][provider]
     if values:
         context_changed = any(
@@ -15252,8 +15537,11 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
     print("  max_output_tokens is passed to Claude Code as CLAUDE_CODE_MAX_OUTPUT_TOKENS.")
     print("  context_window is a claude-any/router cap; native mode still cannot raise the real server limit.")
     print("  temperature/top_p/top_k are injected by claude-any router mode when the provider supports them.")
+    if provider in OPENCODE_PROVIDER_NAMES:
+        print("  OpenCode endpoint override: endpoint:<model-id>=messages|chat|responses|gemini")
     print("Examples:")
     print("  claude-anyctl provider-options deepseek max_output_tokens=8192 context_window=1048576")
+    print("  claude-anyctl provider-options opencode-go endpoint:custom-model=chat")
     print("  claude-anyctl provider-options nvidia-hosted max_output_tokens=4096 temperature=0.7 top_p=0.8 timeout=300000 rate_limit_rpm=40")
     print("  claude-anyctl provider-options vllm max_output_tokens=4096 context_window=65536 timeout=300000")
     print("  claude-anyctl provider-options self-hosted-nim native=true max_output_tokens=4096")
@@ -15798,11 +16086,11 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
     alias = current_alias(cfg)
     claude_model = claude_code_context_model_alias(provider, pcfg, alias)
     auth_token = "not-used"
-    if provider == "deepseek" and meaningful_key(pcfg.get("api_key")):
-        # DeepSeek's Claude Code integration expects the DeepSeek key in
+    if provider in ("deepseek", "opencode", "opencode-go") and meaningful_key(pcfg.get("api_key")):
+        # Non-Anthropic native-compatible gateway integrations expect their key in
         # ANTHROPIC_AUTH_TOKEN. Keep ANTHROPIC_API_KEY unset to avoid Claude
         # Code's auth-conflict path, but do not send a dummy token that can
-        # trigger DeepSeek/Claude Code governor authentication failures.
+        # trigger gateway/Claude Code governor authentication failures.
         auth_token = str(pcfg["api_key"])
     return apply_common_claude_env(provider, pcfg, {
         "CLAUDE_ANY_PROVIDER": provider,
@@ -16320,6 +16608,8 @@ def default_base_url(provider: str) -> str:
         "ollama": "http://your-ollama:11434",
         "ollama-cloud": "https://ollama.com",
         "deepseek": "https://api.deepseek.com/anthropic",
+        "opencode": OPENCODE_ZEN_BASE_URL,
+        "opencode-go": OPENCODE_GO_BASE_URL,
         "vllm": "http://your-vllm:8000",
         "lm-studio": "http://127.0.0.1:1234/v1",
         "nvidia-hosted": nvidia_upstream_base_url(),
@@ -16343,6 +16633,9 @@ def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         return "API key: set (Ollama Cloud)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (Ollama Cloud required)"
     if provider == "deepseek":
         return "API key: set (DeepSeek)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (DeepSeek required)"
+    if provider in OPENCODE_PROVIDER_NAMES:
+        label = PROVIDER_LABELS.get(provider, provider)
+        return f"API key: set ({label})" if meaningful_key(pcfg.get("api_key")) else f"API key: missing ({label} required)"
     if meaningful_key(pcfg.get("api_key")):
         return "API key: set"
     if provider == "ollama":
@@ -16363,6 +16656,20 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         return f"Base URL: NVIDIA hosted ({base}); local router {ROUTER_BASE} {state}"
     if provider == "deepseek":
         return f"Base URL: DeepSeek Anthropic API configured ({base})"
+    if provider in OPENCODE_PROVIDER_NAMES:
+        label = PROVIDER_LABELS.get(provider, provider)
+        path = "/v1/models"
+        headers = provider_model_list_headers(provider, pcfg)
+        try:
+            data = http_json(join_url(base, path), headers=headers, timeout=2.5)
+            count = len(model_ids_from_response(data))
+            return f"Base URL: {label} model list reachable ({path}, {count} models)"
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return f"Base URL: {label} reachable, auth rejected ({exc.code})"
+            return f"Base URL: {label} HTTP {exc.code}"
+        except Exception as exc:
+            return f"Base URL: {label} unreachable ({type(exc).__name__})"
     path = "/api/tags" if provider in ("ollama", "ollama-cloud") else "/v1/models"
     headers: dict[str, str] = {}
     key = pcfg.get("api_key")
@@ -16431,6 +16738,9 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
         errors.append("Launch blocked: Ollama Cloud requires an API key.")
     if provider == "deepseek" and not meaningful_key(pcfg.get("api_key")):
         errors.append("Launch blocked: DeepSeek.com requires a DeepSeek API key.")
+    if provider in OPENCODE_PROVIDER_NAMES and not meaningful_key(pcfg.get("api_key")):
+        label = PROVIDER_LABELS.get(provider, provider)
+        errors.append(f"Launch blocked: {label} requires a {label} API key.")
     if anthropic_routed_enabled(provider, pcfg) and not meaningful_key(pcfg.get("api_key")):
         errors.append("Launch blocked: Anthropic routed mode requires an Anthropic API key.")
     if provider == "lm-studio":
@@ -16815,8 +17125,17 @@ def log_level_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     return rows, values
 
 
-def model_panel_rows(provider: str, pcfg: dict[str, Any], fetch: bool = True) -> tuple[list[str], list[str]]:
-    values = unique_model_ids(provider, upstream_model_ids(provider, pcfg) if fetch else cached_or_configured_model_ids(provider, pcfg))
+def model_panel_rows(
+    provider: str,
+    pcfg: dict[str, Any],
+    fetch: bool = True,
+    force_refresh: bool = False,
+) -> tuple[list[str], list[str]]:
+    values = unique_model_ids(
+        provider,
+        upstream_model_ids(provider, pcfg, force_refresh=force_refresh)
+        if fetch else cached_or_configured_model_ids(provider, pcfg),
+    )
     rows: list[str] = []
     current = pcfg.get("current_model")
     seen_aliases: set[str] = set()
@@ -16831,13 +17150,16 @@ def model_panel_rows(provider: str, pcfg: dict[str, Any], fetch: bool = True) ->
             deduped_values.append("__refresh_models__")
     for mid in values:
         alias = alias_for(provider, mid)
+        suffix = ""
+        if provider in OPENCODE_PROVIDER_NAMES:
+            suffix = f"  [{opencode_endpoint_display(provider, mid, pcfg)}]"
         alias_key = alias.casefold()
         if alias_key in seen_aliases:
             continue
         seen_aliases.add(alias_key)
         deduped_values.append(mid)
         mark = "*" if mid == current else " "
-        rows.append(f"{mark} {mid}  {alias}")
+        rows.append(f"{mark} {mid}  {alias}{suffix}")
     rows.append("+ Custom model id...")
     deduped_values.append("__custom__")
     rows.append("Back")
@@ -17462,7 +17784,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         panel_rows, panel_values = ["Refreshing provider model list..."], []
                         first_render = render_prelaunch_screen(main_idx, panel, 0, panel_rows, checks, messages, first_render)
                         try:
-                            panel_rows, panel_values = model_panel_rows(provider, pcfg, fetch=True)
+                            panel_rows, panel_values = model_panel_rows(provider, pcfg, fetch=True, force_refresh=True)
                             messages = [f"Model list refreshed: {max(0, len(panel_values) - 3)} model(s)."]
                         except Exception as exc:
                             messages = [f"Model list refresh failed: {type(exc).__name__}: {exc}"]
@@ -17503,6 +17825,8 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         default_env = {
                             "anthropic": "ANTHROPIC_API_KEY",
                             "deepseek": "DEEPSEEK_API_KEY",
+                            "opencode": "OPENCODE_API_KEY",
+                            "opencode-go": "OPENCODE_API_KEY",
                             "nvidia-hosted": "NVIDIA_API_KEY",
                             "ollama-cloud": "OLLAMA_API_KEY",
                         }.get(provider, "API_KEY")
@@ -20988,7 +21312,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-stop               Stop router/proxy
   claude-any --                      Pass all following args directly to Claude Code
 
-Provider names: anthropic, ollama, ollama-cloud, deepseek, vllm, lm-studio, nvidia-hosted, self-hosted-nim
+Provider names: anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, vllm, lm-studio, nvidia-hosted, self-hosted-nim
 Any other arguments are passed through to claude. Use -- before Claude flags that
 collide with claude-any setup flags."""
 

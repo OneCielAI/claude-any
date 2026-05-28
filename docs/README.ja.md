@@ -757,10 +757,12 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 
 | Provider | Mode | Notes |
 | --- | --- | --- |
-| Anthropic | 既定は Native Claude Code、任意で router | 直接 native mode では Claude login または Anthropic API key を使用。Claude Any router の SSE/channel/observability が必要な場合は `route_through_router` を有効化します。この mode では Anthropic API key が必要です。 |
+| Anthropic | 既定は Native Claude Code、任意で router | 直接 native mode では Claude login または Anthropic API key を使用。モデル picker は API key がある場合 `/v1/models` を使い、API key なしの Claude Native login では Anthropic の公開 Models overview から最新の公開 model ID を補助的に取得します。Claude Any router の SSE/channel/observability が必要な場合は `route_through_router` を有効化します。この mode では Anthropic API key が必要です。 |
 | Ollama | Native 優先、必要時 router | ローカル Ollama は通常 API key 不要。ローカル Ollama で `:cloud` model を使う場合は Ollama host で `ollama signin` が必要。 |
 | Ollama Cloud | Router | `https://ollama.com/api` を直接呼び出し、Ollama API key が必要。 |
 | DeepSeek.com | Router | `https://api.deepseek.com/anthropic` を呼び出します。DeepSeek API key は `ANTHROPIC_AUTH_TOKEN` として渡し、Claude Code auth conflict を避けるため `ANTHROPIC_API_KEY` は未設定にします。 |
+| OpenCode Zen | Router | `https://opencode.ai/zen` を呼び出し、OpenCode Zen API key が必要です。モデル一覧は `/v1/models` から取得し、Claude/Qwen 系は `/v1/messages`、chat 互換モデルは `/v1/chat/completions` にルーティングします。Responses/Gemini 専用 endpoint 系は metadata として表示し、まだ自動ルーティングしません。 |
+| OpenCode Go | Router | `https://opencode.ai/zen/go` を呼び出し、OpenCode Go API key が必要です。モデル一覧は `/v1/models` から取得し、Qwen/MiniMax Go モデルは `/v1/messages`、GLM/Kimi/DeepSeek/MiMo Go モデルは `/v1/chat/completions` にルーティングします。 |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 互換 `/v1/messages` endpoint を使い、モデル系列に合う `--tool-call-parser` を指定。 |
 | NVIDIA hosted | Router | NVIDIA hosted API Catalog を Claude Any local router 経由で使用。 |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM の Anthropic 互換 endpoint を使用。 |

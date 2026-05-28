@@ -69,7 +69,8 @@ Ollama Cloud (glm-5.1) streamed through the claude-any router with SSE word-boun
 ---
 
 Claude Any is a provider selector and compatibility launcher for Claude Code.
-It lets you choose Anthropic, Ollama, Ollama Cloud, DeepSeek.com, LM Studio,
+It lets you choose Anthropic, Ollama, Ollama Cloud, DeepSeek.com, OpenCode Zen,
+OpenCode Go, LM Studio,
 vLLM, NVIDIA hosted models, or self-hosted NIM before Claude Code starts, then
 passes normal Claude Code arguments through unchanged.
 
@@ -528,6 +529,21 @@ steps under that larger model's supervision.
 
 ## Changelog
 
+### Nightly
+
+- **OpenCode Zen and Go providers**: added first-class `opencode` and
+  `opencode-go` providers for `https://opencode.ai/zen` and
+  `https://opencode.ai/zen/go`. The model picker reads the live `/v1/models`
+  catalog for each plan; Anthropic-compatible OpenCode models are routed
+  through `/v1/messages`, and chat-compatible OpenCode models are routed
+  through `/v1/chat/completions`. Zen models that require provider-specific
+  Responses or Gemini endpoints are listed with metadata but are not routed yet.
+  Because OpenCode's model catalog currently returns IDs without endpoint or
+  AI SDK package metadata, Claude Any displays the inferred endpoint family in
+  the model picker, prefers Anthropic-compatible `/v1/messages` for unknown
+  OpenCode model IDs, and supports per-model overrides with
+  `claude-anyctl provider-options opencode-go endpoint:<model-id>=messages|chat|responses|gemini`.
+
 ### 0.1.101
 
 - **DeepSeek.com Claude Code auth hotfix**: routed DeepSeek launches now pass
@@ -981,10 +997,12 @@ steps under that larger model's supervision.
 
 | Provider | Mode | Notes |
 | --- | --- | --- |
-| Anthropic | Native Claude Code by default, optional router | Uses Claude login or Anthropic API key in direct native mode. Enable `route_through_router` when you explicitly want Anthropic requests to pass through the Claude Any router; routed mode requires an Anthropic API key. |
+| Anthropic | Native Claude Code by default, optional router | Uses Claude login or Anthropic API key in direct native mode. The model picker uses `/v1/models` with an API key and falls back to Anthropic's public Models overview for direct Claude Native sessions without one. Enable `route_through_router` when you explicitly want Anthropic requests to pass through the Claude Any router; routed mode requires an Anthropic API key. |
 | Ollama | Native when available, router otherwise | Local Ollama normally needs no API key. Cloud models through local Ollama require `ollama signin` on the Ollama host. |
 | Ollama Cloud | Router | Calls `https://ollama.com/api`; requires an Ollama API key. |
 | DeepSeek.com | Router | Calls `https://api.deepseek.com/anthropic`; requires a DeepSeek API key. Claude Any passes that key as `ANTHROPIC_AUTH_TOKEN` and keeps `ANTHROPIC_API_KEY` unset to avoid Claude Code auth conflicts. |
+| OpenCode Zen | Router | Calls `https://opencode.ai/zen`; requires an OpenCode Zen API key. The model picker reads `/v1/models`; Claude/Qwen Zen models use `/v1/messages`, documented chat-compatible Zen models use `/v1/chat/completions`, and unknown model IDs default to `/v1/messages` unless overridden. |
+| OpenCode Go | Router | Calls `https://opencode.ai/zen/go`; requires an OpenCode Go API key. The model picker reads `/v1/models`; Qwen/MiniMax Go models use `/v1/messages`, documented GLM/Kimi/DeepSeek/MiMo Go models use `/v1/chat/completions`, and unknown model IDs default to `/v1/messages` unless overridden. |
 | vLLM | Native Anthropic-compatible endpoint | Use a vLLM endpoint that exposes Anthropic-compatible `/v1/messages`; match `--tool-call-parser` to the model family. |
 | NVIDIA hosted | Router | Uses the NVIDIA hosted API Catalog through the Claude Any local router. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | Use the self-hosted NIM Anthropic-compatible endpoint. |
@@ -1039,6 +1057,8 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
 
 - Ollama Cloud: [cloud overview](https://ollama.com/cloud), [API key settings](https://ollama.com/settings/keys), [authentication docs](https://docs.ollama.com/api/authentication).
 - Ollama local Anthropic compatibility: [Ollama Anthropic API docs](https://docs.ollama.com/api/anthropic-compatibility).
+- OpenCode Zen: [Zen docs](https://opencode.ai/docs/ko/zen), [model catalog](https://opencode.ai/zen/v1/models).
+- OpenCode Go: [Go docs](https://opencode.ai/docs/ko/go/), [model catalog](https://opencode.ai/zen/go/v1/models).
 - vLLM: [Claude Code integration](https://docs.vllm.ai/en/latest/serving/integrations/claude_code/), [tool calling](https://docs.vllm.ai/en/stable/features/tool_calling/), [project GitHub](https://github.com/vllm-project/vllm).
 - NVIDIA hosted NIM: [NVIDIA API Catalog](https://build.nvidia.com/), [API Catalog quickstart](https://docs.api.nvidia.com/nim/docs/api-quickstart).
 - Self-hosted NVIDIA NIM: [Claude Code with NIM](https://docs.nvidia.com/nim/large-language-models/latest/ai-assistant-integrations/claude-code.html), [NIM for LLMs getting started](https://docs.nvidia.com/nim/large-language-models/1.14.0/getting-started.html), [NGC personal keys](https://org.ngc.nvidia.com/setup/personal-keys).

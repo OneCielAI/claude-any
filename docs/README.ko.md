@@ -69,7 +69,7 @@ Ollama Cloud (glm-5.1) 를 SSE 단어경계 청킹 활성화 상태에서 claude
 ---
 
 Claude Any는 Claude Code 실행 전에 Anthropic, Ollama, Ollama Cloud,
-DeepSeek.com, vLLM, NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의
+DeepSeek.com, OpenCode Zen, OpenCode Go, vLLM, NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의
 일반 인자는 그대로 전달하는 프로바이더 선택 런처입니다.
 
 Credits: One Ciel LLC
@@ -760,10 +760,12 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 | Provider | Mode | Notes |
 | --- | --- | --- |
-| Anthropic | 기본 Native Claude Code, 선택형 router | 직접 native 모드에서는 Claude 로그인 또는 Anthropic API 키를 사용합니다. Claude Any router의 SSE/채널/관측 기능이 필요하면 `route_through_router`를 켜며, 이 모드는 Anthropic API 키가 필요합니다. |
+| Anthropic | 기본 Native Claude Code, 선택형 router | 직접 native 모드에서는 Claude 로그인 또는 Anthropic API 키를 사용합니다. 모델 선택기는 API 키가 있으면 `/v1/models`를 사용하고, API 키 없이 Claude Native 로그인만 쓰는 경우 Anthropic 공개 Models overview에서 최신 공개 모델 ID를 보조로 가져옵니다. Claude Any router의 SSE/채널/관측 기능이 필요하면 `route_through_router`를 켜며, 이 모드는 Anthropic API 키가 필요합니다. |
 | Ollama | Native 우선, 필요 시 router | 로컬 Ollama는 보통 API 키가 필요 없습니다. 로컬 Ollama에서 `:cloud` 모델을 쓰려면 Ollama host에서 `ollama signin`이 필요합니다. |
 | Ollama Cloud | Router | `https://ollama.com/api` 직접 호출. Ollama API 키 필요. |
 | DeepSeek.com | Router | `https://api.deepseek.com/anthropic` 호출. DeepSeek API 키를 `ANTHROPIC_AUTH_TOKEN`으로 전달하고 `ANTHROPIC_API_KEY`는 비워 Claude Code 인증 충돌을 피합니다. |
+| OpenCode Zen | Router | `https://opencode.ai/zen` 호출. OpenCode Zen API 키 필요. 모델 목록은 `/v1/models`에서 가져오며, Claude/Qwen 계열은 `/v1/messages`, chat 호환 모델은 `/v1/chat/completions`로 라우팅합니다. Responses/Gemini 전용 endpoint 계열은 메타데이터로 표시하고 아직 자동 라우팅하지 않습니다. |
+| OpenCode Go | Router | `https://opencode.ai/zen/go` 호출. OpenCode Go API 키 필요. 모델 목록은 `/v1/models`에서 가져오며, Qwen/MiniMax Go 모델은 `/v1/messages`, GLM/Kimi/DeepSeek/MiMo Go 모델은 `/v1/chat/completions`로 라우팅합니다. |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 호환 `/v1/messages`를 제공하는 vLLM endpoint 사용. 모델 계열에 맞는 `--tool-call-parser` 필요. |
 | NVIDIA hosted | Router | NVIDIA hosted API Catalog를 Claude Any local router로 사용. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM Anthropic 호환 endpoint 사용. |

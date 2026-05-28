@@ -94,6 +94,57 @@ class NativeEnvContractTests(unittest.TestCase):
         self.assertTrue(any("Anthropic routed mode requires" in error for error in errors))
 
 
+class NativeModelListTests(unittest.TestCase):
+    def test_public_docs_parser_extracts_current_claude_models_without_footnotes(self):
+        html = """
+        Claude API ID
+        <span>claude-opus-4-7</span><span>claude-sonnet-4-6</span>
+        <span>claude-haiku-4-5-20251001</span>
+        Claude API alias
+        <span>claude-haiku-4-5</span>
+        AWS Bedrock ID <span>anthropic.claude-opus-4-7</span>
+        Vertex AI ID <span>claude-haiku-4-5@20251001</span>
+        footnote artifact <span>claude-opus-4-1-2</span>
+        """
+
+        ids = claude_any.anthropic_model_ids_from_docs_text(html)
+
+        self.assertEqual(
+            ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5"],
+            ids,
+        )
+
+    def test_native_refresh_bypasses_model_cache_and_uses_public_docs_without_api_key(self):
+        pcfg = {"base_url": "https://api.anthropic.com", "api_key": "", "current_model": "claude-sonnet-4-6"}
+
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=["claude-old-cache"]),
+            mock.patch.object(claude_any, "http_json", side_effect=RuntimeError("missing api key")),
+            mock.patch.object(claude_any, "fetch_anthropic_public_model_ids", return_value=["claude-opus-4-7", "claude-sonnet-4-6"]) as docs,
+            mock.patch.object(claude_any, "write_model_list_cache") as write,
+        ):
+            self.assertEqual(["claude-old-cache"], claude_any.upstream_model_ids("anthropic", pcfg))
+            refreshed = claude_any.upstream_model_ids("anthropic", pcfg, force_refresh=True)
+
+        self.assertEqual(["claude-opus-4-7", "claude-sonnet-4-6"], refreshed)
+        docs.assert_called_once()
+        write.assert_called_once_with("anthropic", pcfg, ["claude-opus-4-7", "claude-sonnet-4-6"])
+
+    def test_native_model_panel_force_refresh_shows_latest_public_models(self):
+        pcfg = {"base_url": "https://api.anthropic.com", "api_key": "", "current_model": "claude-sonnet-4-6"}
+
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "http_json", side_effect=RuntimeError("missing api key")),
+            mock.patch.object(claude_any, "fetch_anthropic_public_model_ids", return_value=["claude-opus-4-7", "claude-sonnet-4-6"]),
+            mock.patch.object(claude_any, "write_model_list_cache"),
+        ):
+            rows, values = claude_any.model_panel_rows("anthropic", pcfg, fetch=True, force_refresh=True)
+
+        self.assertIn("claude-opus-4-7", values)
+        self.assertTrue(any("claude-opus-4-7" in row for row in rows))
+
+
 class StopRouterGuaranteeTests(unittest.TestCase):
     def test_returns_false_when_router_already_down(self):
         with (

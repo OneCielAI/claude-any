@@ -132,7 +132,7 @@ The menu appears before Claude Code starts. Use arrow keys to move and Enter to
 edit or select:
 
 - Language: English, Korean, Japanese, Chinese.
-- Provider: Anthropic, Ollama, Ollama Cloud, DeepSeek.com, LM Studio, vLLM, NVIDIA hosted, self-hosted NIM.
+- Provider: Anthropic, Ollama, Ollama Cloud, DeepSeek.com, OpenCode Zen, OpenCode Go, LM Studio, vLLM, NVIDIA hosted, self-hosted NIM.
 - API key: enter only when the selected provider needs one.
 - Base URL: provider-aware default or custom endpoint.
 - Model: provider model picker when available, custom input otherwise.
@@ -175,6 +175,13 @@ context limit from the client.
 
 Anthropic uses native Claude Code behavior by default. You can either log in
 through Claude Code or use an Anthropic API key.
+
+The model picker first uses Anthropic's `/v1/models` endpoint when an Anthropic
+API key is configured. In direct Claude Native mode without an API key, Claude
+Any cannot call that authenticated endpoint, so the refresh action seeds the
+picker from Anthropic's public Models overview page instead. This keeps current
+IDs such as `claude-opus-4-7`, `claude-sonnet-4-6`, and `claude-haiku-4-5`
+visible while still allowing custom model IDs.
 
 If you need Claude Any router-owned behavior for Anthropic too, such as the
 local browser chat UI, router event inspection, or router channel handling,
@@ -248,6 +255,68 @@ Links:
 
 - DeepSeek Claude Code integration: https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code
 - DeepSeek API keys: https://platform.deepseek.com/api_keys
+
+### OpenCode Zen
+
+OpenCode Zen is available as a routed provider through the Zen gateway:
+
+```text
+https://opencode.ai/zen
+```
+
+Choose `OpenCode Zen` in the provider menu, or configure it headlessly:
+
+```sh
+claude-any --ca-provider opencode --ca-model claude-sonnet-4-6
+```
+
+OpenCode Zen requires an OpenCode Zen API key. Claude Any uses
+`https://opencode.ai/zen/v1/models` for the live model picker. Per the Zen
+docs, Claude and Qwen Zen models use `/v1/messages`, while chat-compatible Zen
+models use `/v1/chat/completions`. Models that require provider-specific
+Responses or Gemini endpoints are still listed with metadata, but Claude Any
+does not silently route those endpoint families yet.
+
+Links:
+
+- OpenCode Zen docs: https://opencode.ai/docs/ko/zen
+- OpenCode Zen model catalog: https://opencode.ai/zen/v1/models
+
+### OpenCode Go
+
+OpenCode Go is available as a routed provider through the Go subscription
+gateway:
+
+```text
+https://opencode.ai/zen/go
+```
+
+Choose `OpenCode Go` in the provider menu, or configure it headlessly:
+
+```sh
+claude-any --ca-provider opencode-go --ca-model qwen3.6-plus
+```
+
+OpenCode Go requires an OpenCode Go API key. Claude Any uses
+`https://opencode.ai/zen/go/v1/models` for the live model picker. Per the Go
+docs, Qwen and MiniMax Go models use `/v1/messages`, while GLM, Kimi,
+DeepSeek, and MiMo Go models use `/v1/chat/completions`.
+
+The OpenCode model catalog currently returns model IDs without endpoint or AI
+SDK package metadata. Claude Any therefore shows the inferred endpoint family
+next to OpenCode models in the picker, prefers Anthropic-compatible
+`/v1/messages` for unknown OpenCode model IDs, and supports explicit per-model
+overrides:
+
+```sh
+claude-anyctl provider-options opencode-go endpoint:custom-model=chat
+claude-anyctl provider-options opencode endpoint:custom-model=messages
+```
+
+Links:
+
+- OpenCode Go docs: https://opencode.ai/docs/ko/go/
+- OpenCode Go model catalog: https://opencode.ai/zen/go/v1/models
 
 ### vLLM
 
