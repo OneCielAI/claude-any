@@ -670,6 +670,32 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_stdin_proxy_skipped_noise" in item for item in log_messages))
         self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2,3" in item and "enter=crlf" in item for item in log_messages))
 
+    def test_inject_pending_channel_messages_can_limit_to_web_chat_requests(self):
+        messages = [
+            {"id": 2, "channel": "ai-net", "sender_id": "robert", "message": "hello Sarah", "meta": {"room_id": "ai-net"}},
+            {
+                "id": 3,
+                "channel": "web-chat-session",
+                "sender_id": "web-user",
+                "message": "마지막 작업 요약",
+                "kind": "web_chat",
+                "meta": {"source": "claude-any-web-chat", "reply_channel": "web-chat-session"},
+            },
+        ]
+        with (
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
+            mock.patch.object(claude_any, "_write_fd_all") as write_all,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            last_id = claude_any._inject_pending_channel_messages(99, 0, web_chat_only=True)
+        self.assertEqual(3, last_id)
+        payload = write_all.call_args.args[1]
+        self.assertIn("마지막 작업 요약".encode("utf-8"), payload)
+        self.assertNotIn(b"hello Sarah", payload)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("reason=not_web_chat" in item and "message_id=2" in item for item in log_messages))
+
     def test_inject_pending_channel_messages_skips_direct_llm_owned_messages(self):
         messages = [
             {
@@ -1050,6 +1076,36 @@ class ChannelBridgeTests(unittest.TestCase):
         write_cursor.assert_called_with(3)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("llm_direct_delivered" in item for item in log_messages))
+
+    def test_body_with_pending_channel_messages_skips_stdin_wake_delivered_messages(self):
+        body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
+        messages = [
+            {
+                "id": 3,
+                "channel": "web-chat-session",
+                "sender_id": "web-user",
+                "message": "already typed",
+                "kind": "web_chat",
+                "meta": {"source": "claude-any-web-chat"},
+            }
+        ]
+        claude_any._CHANNEL_STDIN_WAKE_DELIVERED.clear()
+        claude_any._CHANNEL_STDIN_WAKE_DELIVERED.add(3)
+        try:
+            with (
+                mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+                mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
+                mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+                mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                out = claude_any.body_with_pending_channel_messages(body)
+        finally:
+            claude_any._CHANNEL_STDIN_WAKE_DELIVERED.clear()
+        self.assertIs(out, body)
+        write_cursor.assert_called_with(3)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("stdin_wake_delivered" in item for item in log_messages))
 
     def test_body_with_pending_channel_messages_skips_direct_inflight_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}

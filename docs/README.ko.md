@@ -833,6 +833,9 @@ http://127.0.0.1:8799/ca/web/chat
 active Claude Code 세션의 channel inbox로 주입합니다. Claude Code는 기존 Read/Bash/Edit 및 MCP 도구를
 그대로 사용해 처리할 수 있고, 답장은 `claude-any-router`의 `send_message` MCP 도구를 통해 같은
 web chat channel로 돌아옵니다. 브라우저는 `/ca/channel/stream`으로 답장 메시지를 구독합니다.
+router mode에서는 브라우저 메시지만 터미널 wake bridge를 통해 실행 중인 Claude Code 세션에 넣습니다.
+따라서 별도 provider-only `/v1/messages` 대화를 만들지 않습니다. 메시지가 계속 queued 상태로 남으면
+현재 빌드 설치 후 Claude Any를 다시 시작해 활성 터미널이 wake bridge로 감싸지도록 해야 합니다.
 Cloudflare tunnel, public DNS, Tailscale route는 자동 생성하지 않습니다.
 선택된 provider가 Anthropic이고 이 웹 채팅이나 router 기능으로 Anthropic
 트래픽을 처리하려면 Anthropic LLM 옵션의 `route_through_router`를 켜고

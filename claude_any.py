@@ -223,6 +223,8 @@ _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID: int | None = None
 _CHANNEL_LLM_DIRECT_LOCK = threading.Lock()
 _CHANNEL_LLM_DIRECT_INFLIGHT: set[int] = set()
 _CHANNEL_LLM_DIRECT_DELIVERED: set[int] = set()
+_CHANNEL_STDIN_WAKE_LOCK = threading.Lock()
+_CHANNEL_STDIN_WAKE_DELIVERED: set[int] = set()
 _NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
 BUILTIN_CHANNEL_SPEC = "server:claude-any-router"
 _NATIVE_ROUTER_CHANNEL_NAMES = {"claude-any-router", "mcp-claude-any-router"}
@@ -5749,7 +5751,7 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
           <textarea id="prompt" placeholder="Type a message..." autocomplete="off"></textarea>
           <button class="primary" id="sendButton" type="submit">Send</button>
         </div>
-        <div class="hint">Enter sends. Shift+Enter inserts a new line. The active Claude Code session handles the message, so its configured tools and MCP servers remain available.</div>
+        <div class="hint">Enter sends. Shift+Enter inserts a new line. The active Claude Code session handles the message, so its configured tools and MCP servers remain available. If replies stay queued, restart Claude Any so the session wake bridge wraps the terminal.</div>
       </form>
     </main>
   </div>
@@ -5846,7 +5848,7 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
         }}
         const json = await response.json();
         if (json.message) rememberLastId(json.message.id);
-        addBubble('system', 'Message queued for the active Claude Code session. Waiting for a channel reply...');
+        addBubble('system', 'Message queued for the active Claude Code session. Waiting for a channel reply. If this never changes, restart Claude Any so the session wake bridge is active.');
         setState('waiting for session');
       }} catch (err) {{
         const bubble = addBubble('assistant', String(err && err.message ? err.message : err));
@@ -18649,7 +18651,14 @@ def write_mcp_proxy_config(
 
 
 def should_use_channel_stdin_proxy(use_router_mode: bool, passthrough: list[str], cfg: dict[str, Any] | None = None) -> bool:
-    return False
+    if not use_router_mode or native_channel_passthrough_requested(passthrough):
+        return False
+    if has_passthrough_option(passthrough, "-p", "--print"):
+        return False
+    ccfg = (cfg or {}).get("claude_code") if isinstance(cfg, dict) else {}
+    if isinstance(ccfg, dict) and ccfg.get("web_chat_session_bridge") is False:
+        return False
+    return channel_delivery_mode(cfg) == "llm"
 
 
 def should_launch_process_start_channel_sse(
@@ -18952,6 +18961,18 @@ def _mark_channel_payload_direct_llm_pending(payload: dict[str, Any]) -> dict[st
 def _channel_message_is_direct_llm_owned(message: dict[str, Any]) -> bool:
     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
     return bool(meta.get("llm_direct_pending") or meta.get("llm_direct_delivered"))
+
+
+def _channel_message_is_web_chat_request(message: dict[str, Any]) -> bool:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    source = str(meta.get("source") or "").strip().lower()
+    kind = str(message.get("kind") or meta.get("kind") or "").strip().lower()
+    return bool(
+        source == "claude-any-web-chat"
+        or kind == "web_chat"
+        or meta.get("reply_channel")
+        or meta.get("reply_recipient")
+    )
 
 
 def _anthropic_message_text(message: dict[str, Any]) -> str:
@@ -20152,6 +20173,14 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                     f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={reason}",
                 )
                 continue
+            with _CHANNEL_STDIN_WAKE_LOCK:
+                stdin_wake_delivered = message_id in _CHANNEL_STDIN_WAKE_DELIVERED
+            if stdin_wake_delivered:
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason=stdin_wake_delivered",
+                )
+                continue
             pending.append(message)
         if max_seen != last_id:
             _CHANNEL_LLM_CURSOR_LAST_ID = max_seen
@@ -20257,7 +20286,13 @@ def _channel_wake_input_bytes(prompt: str, enter_bytes: bytes | None = None) -> 
     return b"\x15" + prompt.encode("utf-8", errors="replace") + _channel_wake_enter_bytes(enter_bytes)
 
 
-def _inject_pending_channel_messages(master_fd: int, last_id: int, enter_bytes: bytes | None = None) -> int:
+def _inject_pending_channel_messages(
+    master_fd: int,
+    last_id: int,
+    enter_bytes: bytes | None = None,
+    *,
+    web_chat_only: bool = False,
+) -> int:
     pending: list[dict[str, Any]] = []
     for message in read_chat_messages(last_id, None, None, 100):
         try:
@@ -20268,6 +20303,12 @@ def _inject_pending_channel_messages(master_fd: int, last_id: int, enter_bytes: 
             router_log(
                 "INFO",
                 f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
+            )
+            continue
+        if web_chat_only and not _channel_message_is_web_chat_request(message):
+            router_log(
+                "INFO",
+                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=not_web_chat",
             )
             continue
         noise_reason = _channel_wake_message_noise_reason(message)
@@ -20282,6 +20323,15 @@ def _inject_pending_channel_messages(master_fd: int, last_id: int, enter_bytes: 
         prompt = format_channel_wake_batch_prompt(pending)
         submit_bytes = _channel_wake_enter_bytes(enter_bytes)
         _write_fd_all(master_fd, _channel_wake_input_bytes(prompt, submit_bytes))
+        with _CHANNEL_STDIN_WAKE_LOCK:
+            for message in pending:
+                try:
+                    _CHANNEL_STDIN_WAKE_DELIVERED.add(int(message.get("id") or 0))
+                except Exception:
+                    continue
+            if len(_CHANNEL_STDIN_WAKE_DELIVERED) > 1000:
+                for old_id in sorted(_CHANNEL_STDIN_WAKE_DELIVERED)[:500]:
+                    _CHANNEL_STDIN_WAKE_DELIVERED.discard(old_id)
         ids = ",".join(str(message.get("id") or "") for message in pending)
         channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
         router_log(
@@ -20371,6 +20421,7 @@ def subprocess_call_with_channel_wake_proxy(
     inject_channel_messages: bool = True,
     inject_channel_summaries: bool = True,
     print_channel_summaries: bool = False,
+    inject_web_chat_only: bool = False,
 ) -> int:
     if os.name != "posix" or not sys.stdin.isatty() or not sys.stdout.isatty():
         router_log("INFO", "channel_stdin_proxy_unavailable; using direct subprocess call")
@@ -20429,7 +20480,12 @@ def subprocess_call_with_channel_wake_proxy(
                 marker = _chat_messages_file_marker()
                 if inject_channel_messages and marker != last_channel_marker:
                     last_channel_marker = marker
-                    last_id = _inject_pending_channel_messages(master_fd, last_id, channel_enter_bytes)
+                    last_id = _inject_pending_channel_messages(
+                        master_fd,
+                        last_id,
+                        channel_enter_bytes,
+                        web_chat_only=inject_web_chat_only,
+                    )
                 summary_marker = _channel_llm_summary_file_marker()
                 if inject_channel_summaries and summary_marker != last_summary_marker:
                     last_summary_marker = summary_marker
@@ -21386,7 +21442,7 @@ def launch_claude(
     if stdin_channel_proxy or screen_summary_proxy:
         if screen_summary_proxy and not stdin_channel_proxy:
             return subprocess_call_with_channel_screen_summary_proxy(cmd, env)
-        return subprocess_call_with_channel_wake_proxy(cmd, env)
+        return subprocess_call_with_channel_wake_proxy(cmd, env, inject_web_chat_only=llm_channel_delivery)
     if capture_stderr:
         return _subprocess_call_capturing_stderr(cmd, env)
     return subprocess.call(cmd, env=env)

@@ -760,7 +760,13 @@ The page posts browser messages to `/ca/channel/messages`, where they are picked
 up by the active Claude Code session through the Claude Any channel bridge. The
 active session can use its normal Claude Code tools and configured MCP servers.
 Replies are sent back with the built-in `claude-any-router` MCP `send_message`
-tool and streamed to the browser through `/ca/channel/stream`. It is deliberately
+tool and streamed to the browser through `/ca/channel/stream`.
+
+In router mode, the session web chat uses the terminal wake bridge for browser
+messages so requests enter the running Claude Code session instead of creating a
+separate provider-only `/v1/messages` conversation. If messages remain queued,
+restart Claude Any after installing the current build so the active terminal is
+wrapped by that wake bridge. It is deliberately
 local-only by default and does not create
 Cloudflare tunnels, Tailscale routes, DNS records, or public hostnames. If the
 selected provider is Anthropic and the browser chat should use the router, turn

@@ -50,7 +50,7 @@ class ChannelConfigTests(unittest.TestCase):
             os.environ.pop("CLAUDE_ANY_CHANNEL_DELIVERY", None)
             self.assertEqual("llm", claude_any.channel_delivery_mode(cfg))
             self.assertFalse(claude_any.should_use_native_channel_bridge(True, cfg, []))
-            self.assertFalse(claude_any.should_use_channel_stdin_proxy(True, [], cfg))
+            self.assertTrue(claude_any.should_use_channel_stdin_proxy(True, [], cfg))
             self.assertTrue(claude_any.should_use_channel_llm_delivery(True, [], cfg))
 
     def test_channel_specs_always_include_builtin_router(self):
@@ -337,11 +337,13 @@ class ChannelConfigTests(unittest.TestCase):
         auto_start.assert_not_called()
         proxy_config.assert_called_once()
         self.assertEqual([channel_path], proxy_config.call_args.kwargs["extra_config_paths"])
-        proxy.assert_not_called()
-        launch_cmd = call.call_args.args[0]
+        proxy.assert_called_once()
+        self.assertTrue(proxy.call_args.kwargs["inject_web_chat_only"])
+        call.assert_not_called()
+        launch_cmd = proxy.call_args.args[0]
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
         self.assertNotIn("server:claude-any-router", launch_cmd)
-        launch_env = call.call_args.kwargs["env"]
+        launch_env = proxy.call_args.args[1]
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
 
     def test_launch_llm_delivery_uses_cached_probe_source_paths(self):
