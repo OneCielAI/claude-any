@@ -72,6 +72,27 @@ class NativeEnvContractTests(unittest.TestCase):
         env_with_key = claude_any.env_vars(self._cfg(api_key="sk-ant-real"))
         self.assertEqual("sk-ant-real", env_with_key.get("ANTHROPIC_API_KEY"))
 
+    def test_routed_anthropic_env_uses_claude_any_router(self):
+        env = claude_any.env_vars(self._cfg(api_key="sk-ant-real", route_through_router=True))
+
+        self.assertEqual("anthropic", env.get("CLAUDE_ANY_PROVIDER"))
+        self.assertEqual(claude_any.ROUTER_BASE, env.get("ANTHROPIC_BASE_URL"))
+        self.assertEqual("not-used", env.get("ANTHROPIC_AUTH_TOKEN"))
+        self.assertEqual("claude-any-anthropic-claude-sonnet-4-7", env.get("ANTHROPIC_MODEL"))
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+
+    def test_routed_anthropic_reports_router_mode(self):
+        pcfg = self._cfg(route_through_router=True)["providers"]["anthropic"]
+
+        self.assertEqual("anthropic-routed", claude_any.provider_mode_label("anthropic", pcfg))
+        self.assertFalse(claude_any.direct_native_anthropic_enabled("anthropic", pcfg))
+
+    def test_routed_anthropic_requires_api_key_for_launch(self):
+        with mock.patch.object(claude_any, "base_url_status_line", return_value="Base URL: model list reachable"):
+            errors = claude_any.launch_readiness_errors(self._cfg(route_through_router=True, api_key=""))
+
+        self.assertTrue(any("Anthropic routed mode requires" in error for error in errors))
+
 
 class StopRouterGuaranteeTests(unittest.TestCase):
     def test_returns_false_when_router_already_down(self):
@@ -218,6 +239,19 @@ class CleanupNativeAlwaysKillsTests(unittest.TestCase):
             mock.patch.object(claude_any, "stop_ncp_proxy"),
         ):
             claude_any.cleanup_managed_services_for_provider("ollama", {}, cfg, quiet=True)
+        stop.assert_not_called()
+        guarantee.assert_not_called()
+
+    def test_routed_anthropic_respects_managed_services_toggle(self):
+        cfg = {"cleanup": {"managed_services_on_launch": False}}
+        pcfg = {"route_through_router": True}
+        with (
+            mock.patch.object(claude_any, "stop_router_processes") as stop,
+            mock.patch.object(claude_any, "stop_router_with_guarantee") as guarantee,
+            mock.patch.object(claude_any, "stop_ncp_proxy"),
+        ):
+            claude_any.cleanup_managed_services_for_provider("anthropic", pcfg, cfg, quiet=True)
+
         stop.assert_not_called()
         guarantee.assert_not_called()
 

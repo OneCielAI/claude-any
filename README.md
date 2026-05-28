@@ -19,6 +19,7 @@
 > - **Low-cost** — [Ollama Cloud](https://ollama.com/cloud) for GLM, Qwen, DeepSeek, and other open-weight models at a fraction of frontier-model pricing.
 > - **Free + local** — [Ollama](https://ollama.com/), [LM Studio](https://lmstudio.ai/), or [vLLM](https://github.com/vllm-project/vllm) on your own GPU, fully offline.
 > - **Plan Mode + Advisor ready** — Claude Any preserves Claude Code Plan Mode on non-Anthropic providers and adds an optional long-context Advisor model for review.
+> - **Local browser chat** — the router serves `/ca/web/chat`, a local browser UI that talks to the selected provider through the same `/v1/messages` path Claude Code uses.
 > - **Smooth free-model pacing** — Claude Code spends time reading files and running tools, and Claude Any uses that natural gap for RPM pacing so NVIDIA hosted free models feel usable even with strict per-minute limits.
 >
 > Provider, model, base URL, API key, streaming behavior, and LLM options are all selected from a console menu **before** Claude Code starts. Claude Code itself runs untouched with all of its native tooling, slash commands, and workflows.
@@ -29,7 +30,7 @@
 
 1. **DeepSeek.com provider path** — DeepSeek's Anthropic-compatible Claude Code endpoint is available as a first-class provider with model presets and API-key launch checks.
 2. **Safer shared-host router lifecycle** — routed sessions now use a stable per-user router port by default and stale same-user routers are cleaned up before launch, avoiding cross-user session bleed on shared machines.
-3. **AI-Net channel processing hardening** — SSE channel messages can be processed through the router-owned LLM delivery path with MCP `tool_result` round trips and queued visible summaries, without spawning a hidden Claude Code `-p` process for automatic handling.
+3. **Router browser chat and optional Anthropic routing** — `/ca/web/chat` gives the local router a modern browser chat surface, and Anthropic can optionally be routed through Claude Any when you need router-owned SSE, channel, or observability features instead of direct Claude Native behavior.
 
 ### 2026-05-18
 
@@ -972,7 +973,7 @@ steps under that larger model's supervision.
 
 | Provider | Mode | Notes |
 | --- | --- | --- |
-| Anthropic | Native Claude Code | Uses Claude login or Anthropic API key. |
+| Anthropic | Native Claude Code by default, optional router | Uses Claude login or Anthropic API key in direct native mode. Enable `route_through_router` when you explicitly want Anthropic requests to pass through the Claude Any router; routed mode requires an Anthropic API key. |
 | Ollama | Native when available, router otherwise | Local Ollama normally needs no API key. Cloud models through local Ollama require `ollama signin` on the Ollama host. |
 | Ollama Cloud | Router | Calls `https://ollama.com/api`; requires an Ollama API key. |
 | DeepSeek.com | Router | Calls `https://api.deepseek.com/anthropic`; requires a DeepSeek API key. |
@@ -1033,6 +1034,7 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
 - vLLM: [Claude Code integration](https://docs.vllm.ai/en/latest/serving/integrations/claude_code/), [tool calling](https://docs.vllm.ai/en/stable/features/tool_calling/), [project GitHub](https://github.com/vllm-project/vllm).
 - NVIDIA hosted NIM: [NVIDIA API Catalog](https://build.nvidia.com/), [API Catalog quickstart](https://docs.api.nvidia.com/nim/docs/api-quickstart).
 - Self-hosted NVIDIA NIM: [Claude Code with NIM](https://docs.nvidia.com/nim/large-language-models/latest/ai-assistant-integrations/claude-code.html), [NIM for LLMs getting started](https://docs.nvidia.com/nim/large-language-models/1.14.0/getting-started.html), [NGC personal keys](https://org.ngc.nvidia.com/setup/personal-keys).
+- Cloudflare MCP for user-managed external access: [Cloudflare API MCP](https://github.com/cloudflare/mcp), [Cloudflare MCP servers](https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/), [Cloudflare Tunnel setup](https://developers.cloudflare.com/tunnel/setup/).
 
 ## Headless Examples
 
@@ -1072,6 +1074,51 @@ curl -s http://127.0.0.1:8799/ca/plan/artifacts \
   -H 'content-type: application/json' \
   -d '{"title":"handoff","name":"handoff.md","content":"# Plan\n- step 1"}'
 ```
+
+## Local Browser Chat
+
+When the Claude Any router is running, open:
+
+```text
+http://127.0.0.1:8799/ca/web/chat
+```
+
+The page is a local, Teams-style chat surface backed by the same
+Anthropic-compatible `/v1/messages` route that Claude Code uses. It does not
+create tunnels, public DNS names, Cloudflare zones, or Tailscale routes. If the
+selected provider is Anthropic and you want this page or other router features
+to handle Anthropic traffic, enable the Anthropic `route_through_router` LLM
+option and set an Anthropic API key.
+
+## External Web Access
+
+Claude Any intentionally keeps external network publishing outside the core
+launcher. The built-in router and web chat surface bind to a local per-user
+port by default, so multiple Claude Any instances on one host do not fight over
+public DNS names, tunnels, or tailnet policy.
+
+If you want browser access from outside the machine, use a user-managed reverse
+proxy or tunnel in front of the local Claude Any web/chat port. Cloudflare is
+the preferred documented path because it can be configured outside Claude Any
+without giving the launcher long-lived zone-wide credentials.
+
+Recommended Cloudflare MCP-assisted flow:
+
+1. Start Claude Any locally and note the web/chat URL or router base printed by
+   `claude-any status`.
+2. Connect an MCP client to Cloudflare's official API MCP server:
+   `https://mcp.cloudflare.com/mcp`.
+3. Authorize Cloudflare with only the account/zone permissions you are willing
+   to grant.
+4. Ask the MCP client to create or update a Cloudflare Tunnel/public hostname
+   that forwards to the local Claude Any service.
+5. Keep the hostname unique per Claude Any instance and avoid overwriting
+   existing DNS or tunnel routes.
+
+Claude Any does not create Cloudflare tunnels automatically today, and Tailscale
+Funnel/Serve automation is intentionally not included. Users who prefer
+Tailscale, nginx, Caddy, SSH forwarding, or another gateway can still place that
+tool in front of the local web/chat port themselves.
 
 ## Security
 

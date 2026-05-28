@@ -173,8 +173,15 @@ context limit from the client.
 
 ### Anthropic
 
-Anthropic uses native Claude Code behavior. You can either log in through
-Claude Code or use an Anthropic API key.
+Anthropic uses native Claude Code behavior by default. You can either log in
+through Claude Code or use an Anthropic API key.
+
+If you need Claude Any router-owned behavior for Anthropic too, such as the
+local browser chat UI, router event inspection, or router channel handling,
+enable the Anthropic `route_through_router` LLM option and set an Anthropic API
+key. In that mode Claude Code still talks to `http://127.0.0.1:<router-port>`,
+and the router forwards Anthropic-compatible `/v1/messages` requests to the
+configured Anthropic base URL. Direct Claude Native mode remains the default.
 
 - Claude Code docs: https://docs.anthropic.com/en/docs/claude-code
 - Claude Console API keys: https://console.anthropic.com/settings/keys
@@ -669,6 +676,51 @@ curl -s http://127.0.0.1:8799/ca/plan/artifacts \
 
 Artifacts are stored under `~/.config/claude-any/plan-artifacts/`; chat
 messages are stored in `~/.config/claude-any/chat-messages.jsonl`.
+
+## Local Browser Chat
+
+The router serves a local browser chat UI at:
+
+```text
+http://127.0.0.1:8799/ca/web/chat
+```
+
+The page sends messages to the same Anthropic-compatible `/v1/messages` route
+used by Claude Code, so it follows the currently selected provider, model, and
+router settings. It is deliberately local-only by default and does not create
+Cloudflare tunnels, Tailscale routes, DNS records, or public hostnames. If the
+selected provider is Anthropic and the browser chat should use the router, turn
+on the Anthropic `route_through_router` option and configure an Anthropic API
+key.
+
+## External Web Access
+
+Claude Any does not currently automate Cloudflare Tunnel, Tailscale Funnel, or
+other public-network configuration. The launcher should keep router and web
+chat surfaces on local per-user ports by default, then let the operator decide
+how to expose that local service. This avoids cross-instance interference when
+multiple Claude Any sessions run on the same machine.
+
+For Cloudflare users, the supported documentation path is Cloudflare MCP rather
+than built-in tunnel creation:
+
+1. Start Claude Any and find the local router/web-chat base with
+   `claude-any status` or the launch log.
+2. Connect your MCP client to Cloudflare's official API MCP endpoint:
+   `https://mcp.cloudflare.com/mcp`.
+3. Authorize Cloudflare with OAuth or an API token scoped to the account/zone
+   you want to manage.
+4. Use the MCP client to create or update a Cloudflare Tunnel/public hostname
+   that points to the local Claude Any web/chat port.
+5. Use a unique hostname per Claude Any instance, and never overwrite an
+   existing DNS record or tunnel route unless you explicitly intend to.
+
+This keeps Cloudflare credentials and resource ownership outside Claude Any.
+Users can also expose the local port with the Cloudflare dashboard,
+`cloudflared`, nginx, Caddy, SSH forwarding, or another gateway. Tailscale
+automation is intentionally not documented as a built-in Claude Any workflow
+because Serve/Funnel state is machine-wide enough to risk interference between
+concurrent instances.
 
 ## Recommended Uses
 

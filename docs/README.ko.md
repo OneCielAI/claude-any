@@ -19,6 +19,7 @@
 > - **저비용** — [Ollama Cloud](https://ollama.com/cloud) 로 GLM, Qwen, DeepSeek 같은 오픈 가중치 모델을 frontier 모델 대비 매우 낮은 가격에 사용.
 > - **무료 + 로컬** — [Ollama](https://ollama.com/) 또는 [vLLM](https://github.com/vllm-project/vllm) 을 본인 GPU 에서 완전 오프라인으로 사용.
 > - **Plan Mode + Advisor 지원** — non-Anthropic provider 에서도 Claude Code Plan Mode 를 유지하고, 긴 컨텍스트 Advisor 모델로 작업 검토를 받을 수 있습니다.
+> - **로컬 브라우저 채팅** — router가 `/ca/web/chat`을 제공하며, Claude Code와 같은 `/v1/messages` 경로로 현재 선택된 provider와 대화합니다.
 > - **무료 모델 RPM을 부드럽게 사용** — Claude Code 는 파일을 읽고 tool 을 실행하는 시간이 있고, Claude Any 는 그 자연스러운 간격을 RPM pacing 에 활용하므로 NVIDIA hosted 무료 모델의 분당 제한을 덜 체감하며 사용할 수 있습니다.
 >
 > 프로바이더, 모델, Base URL, API 키, 스트리밍 동작, LLM 옵션을 Claude Code 실행 **전에** 콘솔 메뉴에서 모두 선택합니다. Claude Code 본체는 그대로 — 모든 native 툴링, slash command, 워크플로우가 유지됩니다.
@@ -29,7 +30,7 @@
 
 1. **DeepSeek.com 프로바이더 지원** — DeepSeek의 Anthropic 호환 Claude Code 엔드포인트를 정식 프로바이더로 선택할 수 있고, 모델 프리셋과 API 키 설정 흐름을 제공합니다.
 2. **공유 서버에서 더 안전한 라우터 수명주기** — 라우터가 기본적으로 사용자별 안정 포트를 사용하고, 같은 사용자의 stale router를 실행 전에 정리해 Robert/Sarah 같은 다중 세션이 서로 섞이는 문제를 줄였습니다.
-3. **AI-Net 채널 처리 보강** — SSE 채널 메시지를 라우터 소유 LLM 경로에서 즉시 처리하고, MCP `tool_result`를 같은 LLM 대화로 되돌리며, 자동 처리에는 숨은 Claude Code `-p` 프로세스를 띄우지 않습니다.
+3. **Router 브라우저 채팅과 선택형 Anthropic 라우팅** — `/ca/web/chat`으로 로컬 router 채팅 화면을 제공하고, Anthropic도 필요할 때 Claude Any router를 경유해 SSE, 채널, 관측 기능을 사용할 수 있습니다.
 
 ### 2026-05-18
 
@@ -759,7 +760,7 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 | Provider | Mode | Notes |
 | --- | --- | --- |
-| Anthropic | Native Claude Code | Claude 로그인 또는 Anthropic API 키 사용. |
+| Anthropic | 기본 Native Claude Code, 선택형 router | 직접 native 모드에서는 Claude 로그인 또는 Anthropic API 키를 사용합니다. Claude Any router의 SSE/채널/관측 기능이 필요하면 `route_through_router`를 켜며, 이 모드는 Anthropic API 키가 필요합니다. |
 | Ollama | Native 우선, 필요 시 router | 로컬 Ollama는 보통 API 키가 필요 없습니다. 로컬 Ollama에서 `:cloud` 모델을 쓰려면 Ollama host에서 `ollama signin`이 필요합니다. |
 | Ollama Cloud | Router | `https://ollama.com/api` 직접 호출. Ollama API 키 필요. |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 호환 `/v1/messages`를 제공하는 vLLM endpoint 사용. 모델 계열에 맞는 `--tool-call-parser` 필요. |
@@ -817,6 +818,47 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
   --tool-call-parser qwen3_xml
 ```
 
+## 로컬 브라우저 채팅
+
+Claude Any router가 실행 중이면 다음 주소를 열 수 있습니다.
+
+```text
+http://127.0.0.1:8799/ca/web/chat
+```
+
+이 화면은 Teams 스타일의 로컬 채팅 UI이며, Claude Code가 사용하는 것과 같은
+Anthropic 호환 `/v1/messages` 경로로 현재 선택된 provider에 요청을 보냅니다.
+Cloudflare tunnel, public DNS, Tailscale route는 자동 생성하지 않습니다.
+선택된 provider가 Anthropic이고 이 웹 채팅이나 router 기능으로 Anthropic
+트래픽을 처리하려면 Anthropic LLM 옵션의 `route_through_router`를 켜고
+Anthropic API 키를 설정해야 합니다.
+
+## 외부 웹 접속
+
+Claude Any는 Cloudflare 또는 Tailscale 같은 외부 네트워크 공개 기능을 핵심
+런처 안에서 자동 제어하지 않습니다. 기본 원칙은 Claude Any router와 web chat
+화면을 사용자별 local port에만 바인딩하고, 외부 공개는 사용자가 선택한
+gateway가 담당하게 하는 것입니다. 이렇게 해야 한 머신에서 여러 Claude Any
+인스턴스가 동시에 동작해도 DNS, tunnel, tailnet 정책을 서로 덮어쓰지 않습니다.
+
+외부 브라우저에서 접속해야 한다면 Cloudflare MCP를 통한 사용자 주도 설정을
+권장합니다.
+
+1. Claude Any를 로컬에서 실행하고 `claude-any status`에 표시되는 web/chat URL
+   또는 router base를 확인합니다.
+2. MCP 클라이언트에서 Cloudflare 공식 API MCP 서버
+   `https://mcp.cloudflare.com/mcp`를 연결합니다.
+3. Cloudflare OAuth 또는 API token으로 필요한 account/zone 권한만 승인합니다.
+4. MCP 클라이언트에게 Cloudflare Tunnel/public hostname을 만들거나 수정해 로컬
+   Claude Any 서비스로 전달하도록 지시합니다.
+5. Claude Any 인스턴스마다 고유 hostname을 사용하고, 기존 DNS/tunnel route는
+   덮어쓰지 않습니다.
+
+현재 Claude Any는 Cloudflare tunnel을 자동 생성하지 않으며, Tailscale
+Funnel/Serve 자동화도 포함하지 않습니다. 사용자는 필요하면 Cloudflare MCP,
+Cloudflare dashboard, `cloudflared`, nginx, Caddy, SSH forwarding 같은 외부
+도구를 Claude Any의 local web/chat port 앞에 직접 배치하면 됩니다.
+
 ## 링크
 
 - Ollama Cloud: [cloud overview](https://ollama.com/cloud), [API key settings](https://ollama.com/settings/keys), [authentication docs](https://docs.ollama.com/api/authentication).
@@ -824,6 +866,7 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
 - vLLM: [Claude Code integration](https://docs.vllm.ai/en/latest/serving/integrations/claude_code/), [tool calling](https://docs.vllm.ai/en/stable/features/tool_calling/), [GitHub](https://github.com/vllm-project/vllm).
 - NVIDIA hosted NIM: [NVIDIA API Catalog](https://build.nvidia.com/), [quickstart](https://docs.api.nvidia.com/nim/docs/api-quickstart).
 - Self-hosted NVIDIA NIM: [Claude Code with NIM](https://docs.nvidia.com/nim/large-language-models/latest/ai-assistant-integrations/claude-code.html), [getting started](https://docs.nvidia.com/nim/large-language-models/1.14.0/getting-started.html), [NGC keys](https://org.ngc.nvidia.com/setup/personal-keys).
+- Cloudflare MCP/API: [Cloudflare API MCP](https://github.com/cloudflare/mcp), [Cloudflare MCP servers](https://developers.cloudflare.com/agents/model-context-protocol/mcp-servers-for-cloudflare/), [Cloudflare Tunnel setup](https://developers.cloudflare.com/tunnel/setup/).
 
 ## 라이선스
 

@@ -19,6 +19,7 @@
 > - **低成本** — [Ollama Cloud](https://ollama.com/cloud) 提供 GLM、Qwen、DeepSeek 等开源权重模型，价格远低于前沿模型。
 > - **免费 + 本地** — 在自己的 GPU 上使用 [Ollama](https://ollama.com/) 或 [vLLM](https://github.com/vllm-project/vllm)，完全离线。
 > - **支持 Plan Mode + Advisor** — 在 non-Anthropic provider 上保留 Claude Code Plan Mode，并可使用长上下文 Advisor 模型进行工作审查。
+> - **本地浏览器聊天** — router 提供 `/ca/web/chat`，通过与 Claude Code 相同的 `/v1/messages` 路径和当前 provider 对话。
 > - **平滑使用免费模型 RPM** — Claude Code 会花时间读取文件和执行 tool，Claude Any 会利用这些自然间隔进行 RPM pacing，让 NVIDIA hosted 免费模型在严格的每分钟限制下也更容易使用。
 >
 > 在 Claude Code 启动**之前**，通过控制台菜单选择 provider、模型、Base URL、API 密钥、流式行为以及 LLM 选项。Claude Code 本体保持原样运行 —— 所有原生工具、slash 命令和工作流都不受影响。
@@ -29,7 +30,7 @@
 
 1. **支持 DeepSeek.com provider** — 可以把 DeepSeek 的 Anthropic 兼容 Claude Code endpoint 作为正式 provider 选择，并提供模型 preset 和 API key 设置流程。
 2. **共享主机上的 router 生命周期更安全** — router 默认使用按用户分配的稳定端口，并在启动前清理同一用户的 stale router，减少 Robert/Sarah 这类多会话互相串线的问题。
-3. **AI-Net channel 处理强化** — SSE channel message 会通过 router 自有的 LLM 路径即时处理，MCP `tool_result` 会回送到同一个 LLM 对话；自动处理不会启动隐藏的 Claude Code `-p` process。
+3. **Router 浏览器聊天和可选 Anthropic 路由** — `/ca/web/chat` 提供本地 router chat UI；需要 SSE/channel/observability 时，Anthropic 也可以选择走 Claude Any router。
 
 ### 2026-05-15
 
@@ -725,7 +726,7 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 
 | Provider | Mode | Notes |
 | --- | --- | --- |
-| Anthropic | Native Claude Code | 使用 Claude 登录或 Anthropic API key。 |
+| Anthropic | 默认 Native Claude Code，可选 router | 直接 native mode 使用 Claude 登录或 Anthropic API key。需要 Claude Any router 的 SSE/channel/observability 时启用 `route_through_router`；该模式需要 Anthropic API key。 |
 | Ollama | Native 优先，必要时 router | 本地 Ollama 通常不需要 API key；通过本地 Ollama 使用 `:cloud` 模型时，需要在 Ollama host 上 `ollama signin`。 |
 | Ollama Cloud | Router | 直接调用 `https://ollama.com/api`，需要 Ollama API key。 |
 | vLLM | Native Anthropic-compatible endpoint | 使用 Anthropic 兼容 `/v1/messages` endpoint，并让 `--tool-call-parser` 匹配模型系列。 |
@@ -767,6 +768,29 @@ curl -s http://127.0.0.1:8799/ca/plan/artifacts \
 
 消息保存在 `~/.config/claude-any/chat-messages.jsonl`，plan 文件保存在
 `~/.config/claude-any/plan-artifacts/`。
+
+## 本地浏览器聊天
+
+Claude Any router 运行时，可以打开：
+
+```text
+http://127.0.0.1:8799/ca/web/chat
+```
+
+这个页面是本地 chat UI，通过 Claude Code 同样使用的 Anthropic 兼容
+`/v1/messages` 路径向当前 provider 发送请求。它不会自动创建 Cloudflare
+tunnel、public DNS、Tailscale route 或公开 hostname。如果当前 provider 是
+Anthropic，并且希望该页面或其它 router 功能处理 Anthropic 流量，请启用
+Anthropic 的 `route_through_router` 选项并设置 Anthropic API key。
+
+## 外部 Web 访问
+
+Claude Any 不会在 core launcher 中自动控制 Cloudflare Tunnel 或 Tailscale
+Funnel/Serve。需要从外部浏览器访问时，请由用户自己在 local web/chat port
+前面配置 gateway，例如 Cloudflare MCP、Cloudflare dashboard、`cloudflared`、
+nginx、Caddy 或 SSH forwarding。使用 Cloudflare MCP 时，将官方 MCP endpoint
+`https://mcp.cloudflare.com/mcp` 添加到 MCP client，并只授权需要的
+account/zone 权限。
 
 为 Claude Code 启动 Qwen3-Coder vLLM 的示例:
 

@@ -19,6 +19,7 @@
 > - **低コスト** — [Ollama Cloud](https://ollama.com/cloud) で GLM、Qwen、DeepSeek などのオープン重みモデルを、フロンティアモデル比でごく安価に。
 > - **無料 + ローカル** — [Ollama](https://ollama.com/) または [vLLM](https://github.com/vllm-project/vllm) を自分の GPU で完全オフライン実行。
 > - **Plan Mode + Advisor 対応** — non-Anthropic provider でも Claude Code Plan Mode を維持し、長コンテキスト Advisor モデルで作業レビューを受けられます。
+> - **ローカル browser chat** — router が `/ca/web/chat` を提供し、Claude Code と同じ `/v1/messages` 経路で選択中 provider と会話できます。
 > - **無料モデルの RPM をなめらかに利用** — Claude Code はファイル読み取りや tool 実行に時間を使うため、Claude Any はその自然な間隔を RPM pacing に活用し、NVIDIA hosted の無料モデルでも分単位制限を感じにくく使えます。
 >
 > プロバイダー、モデル、Base URL、API キー、ストリーミング動作、LLM オプションを Claude Code 起動 **前** にコンソールメニューで選択します。Claude Code 本体はそのまま — すべてのネイティブツール、slash コマンド、ワークフローが維持されます。
@@ -29,7 +30,7 @@
 
 1. **DeepSeek.com provider 対応** — DeepSeek の Anthropic 互換 Claude Code endpoint を正式 provider として選択でき、モデル preset と API key 設定フローを提供します。
 2. **共有ホストでより安全な router lifecycle** — router は既定でユーザー別の安定ポートを使い、起動前に同一ユーザーの stale router を整理して Robert/Sarah のような複数セッション混線を減らします。
-3. **AI-Net channel 処理の強化** — SSE channel message は router 所有の LLM 経路で即時処理され、MCP `tool_result` は同じ LLM 会話へ戻されます。自動処理では隠れた Claude Code `-p` process を起動しません。
+3. **Router browser chat と選択式 Anthropic routing** — `/ca/web/chat` でローカル router の chat UI を提供し、必要な場合は Anthropic も Claude Any router 経由で SSE/channel/observability を使えます。
 
 ### 2026-05-15
 
@@ -756,7 +757,7 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 
 | Provider | Mode | Notes |
 | --- | --- | --- |
-| Anthropic | Native Claude Code | Claude login または Anthropic API key を使用。 |
+| Anthropic | 既定は Native Claude Code、任意で router | 直接 native mode では Claude login または Anthropic API key を使用。Claude Any router の SSE/channel/observability が必要な場合は `route_through_router` を有効化します。この mode では Anthropic API key が必要です。 |
 | Ollama | Native 優先、必要時 router | ローカル Ollama は通常 API key 不要。ローカル Ollama で `:cloud` model を使う場合は Ollama host で `ollama signin` が必要。 |
 | Ollama Cloud | Router | `https://ollama.com/api` を直接呼び出し、Ollama API key が必要。 |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 互換 `/v1/messages` endpoint を使い、モデル系列に合う `--tool-call-parser` を指定。 |
@@ -801,6 +802,29 @@ curl -s http://127.0.0.1:8799/ca/plan/artifacts \
 
 メッセージは `~/.config/claude-any/chat-messages.jsonl`、plan ファイルは
 `~/.config/claude-any/plan-artifacts/` に保存されます。
+
+## ローカル Browser Chat
+
+Claude Any router が動作している場合、次を開けます。
+
+```text
+http://127.0.0.1:8799/ca/web/chat
+```
+
+この画面はローカルの chat UI で、Claude Code と同じ Anthropic 互換
+`/v1/messages` 経路を使って現在の provider に request を送ります。
+Cloudflare tunnel、public DNS、Tailscale route は自動作成しません。
+Anthropic provider をこの UI や router 機能で扱う場合は Anthropic の
+`route_through_router` option を有効化し、Anthropic API key を設定します。
+
+## 外部 Web Access
+
+Claude Any は Cloudflare Tunnel や Tailscale Funnel/Serve を core launcher
+から自動制御しません。外部 browser から接続する場合は、Cloudflare MCP、
+Cloudflare dashboard、`cloudflared`、nginx、Caddy、SSH forwarding などを
+使って、ユーザーが local web/chat port の前段に gateway を置いてください。
+Cloudflare MCP を使う場合は公式 MCP endpoint `https://mcp.cloudflare.com/mcp`
+を MCP client に登録し、必要な account/zone 権限だけを承認してください。
 
 Qwen3-Coder を Claude Code 用に vLLM で起動する例:
 

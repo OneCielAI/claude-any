@@ -1463,6 +1463,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "current_model": "claude-sonnet-4-6",
             "advisor_model": "",
             "custom_models": [],
+            "route_through_router": False,
         },
         "ollama": {
             "base_url": "http://127.0.0.1:11434",
@@ -4459,6 +4460,14 @@ def native_anthropic_enabled(provider: str) -> bool:
     return provider == "anthropic"
 
 
+def anthropic_routed_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return provider == "anthropic" and parse_bool(pcfg.get("route_through_router"), default=False)
+
+
+def direct_native_anthropic_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return native_anthropic_enabled(provider) and not anthropic_routed_enabled(provider, pcfg)
+
+
 def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
     cached = read_model_list_cache(provider, pcfg)
     if cached is not None:
@@ -5196,6 +5205,7 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
     upstream_text = " · ".join(bit for bit in upstream_bits if bit)
     links = [
         ("Events UI", "/ca/events", "Live router event stream with filters"),
+        ("Web chat", "/ca/web/chat", "Browser chat UI for the current provider"),
         ("Recent events JSON", "/ca/events/recent", "Latest structured event records"),
         ("Events SSE", "/ca/events/stream", "Server-sent events stream"),
         ("Chat health", "/ca/chat/health", "Agent chat component status"),
@@ -5370,6 +5380,292 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
   </script>
 </body>
 </html>"""
+
+
+def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any]) -> str:
+    model = current_alias(cfg)
+    timeout_ms = positive_int(pcfg.get("request_timeout_ms")) or DEFAULT_REQUEST_TIMEOUT_MS
+    max_tokens = (
+        claude_code_output_token_limit(provider, pcfg)
+        or positive_int(pcfg.get("max_output_tokens"))
+        or positive_int(MODEL_PRESETS.get("default", {}).get("max_output_tokens"))
+        or 4096
+    )
+    api_status = api_key_status_line(provider, pcfg)
+    mode = provider_mode_label(provider, pcfg)
+    escaped_model = html_lib.escape(model)
+    escaped_provider = html_lib.escape(provider)
+    escaped_mode = html_lib.escape(mode)
+    escaped_api_status = html_lib.escape(api_status)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Claude Any Web Chat</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif;
+      --bg: #0a0d12;
+      --panel: #111827;
+      --panel-2: #162033;
+      --line: #283548;
+      --text: #eef2f8;
+      --muted: #a9b4c6;
+      --user: #174c6b;
+      --assistant: #243447;
+      --accent: #2f9e8f;
+      --danger: #fca5a5;
+      --ok: #86efac;
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; min-height: 100vh; background: var(--bg); color: var(--text); }}
+    .shell {{ display: grid; grid-template-columns: 280px minmax(0, 1fr); min-height: 100vh; }}
+    aside {{ border-right: 1px solid var(--line); background: #0e1521; padding: 18px; }}
+    .brand {{ font-size: 19px; font-weight: 700; letter-spacing: 0; margin: 0 0 12px; }}
+    .status-card {{ border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 12px; display: grid; gap: 10px; }}
+    .meta-label {{ color: var(--muted); font-size: 11px; text-transform: uppercase; }}
+    .meta-value {{ margin-top: 3px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; word-break: break-word; }}
+    .nav {{ margin-top: 14px; display: grid; gap: 8px; }}
+    .nav a, .ghost {{
+      display: flex; align-items: center; justify-content: center;
+      min-height: 36px; border-radius: 6px; border: 1px solid var(--line);
+      background: #0b111b; color: var(--text); text-decoration: none; cursor: pointer;
+    }}
+    .nav a:hover, .ghost:hover {{ border-color: var(--accent); }}
+    main {{ display: grid; grid-template-rows: auto minmax(0, 1fr) auto; min-width: 0; }}
+    header {{ min-height: 66px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 14px 18px; border-bottom: 1px solid var(--line); background: #0d1420; }}
+    h1 {{ margin: 0; font-size: 18px; letter-spacing: 0; }}
+    .sub {{ color: var(--muted); font-size: 12px; margin-top: 4px; }}
+    .pill {{ border: 1px solid var(--line); border-radius: 999px; padding: 5px 9px; color: var(--muted); font-size: 12px; white-space: nowrap; }}
+    #transcript {{ overflow-y: auto; padding: 18px; display: flex; flex-direction: column; gap: 12px; }}
+    .row {{ display: flex; width: 100%; }}
+    .row.user {{ justify-content: flex-end; }}
+    .bubble {{
+      max-width: min(760px, 86%);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px 12px;
+      line-height: 1.45;
+      white-space: pre-wrap;
+      word-break: break-word;
+      box-shadow: 0 1px 0 rgba(255,255,255,.03) inset;
+    }}
+    .row.user .bubble {{ background: var(--user); border-color: #276a8d; }}
+    .row.assistant .bubble {{ background: var(--assistant); }}
+    .row.system .bubble {{ background: #191f2b; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }}
+    .composer {{ border-top: 1px solid var(--line); padding: 12px 18px; background: #0d1420; }}
+    .composer-inner {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end; }}
+    textarea {{
+      width: 100%; min-height: 54px; max-height: 180px; resize: vertical;
+      border: 1px solid var(--line); border-radius: 8px; background: #080d14; color: var(--text);
+      padding: 10px 12px; line-height: 1.4; font: inherit;
+    }}
+    button.primary {{
+      width: 86px; min-height: 54px; border: 1px solid #37b7a4; border-radius: 8px;
+      background: #127668; color: white; font-weight: 700; cursor: pointer;
+    }}
+    button.primary:disabled {{ opacity: .55; cursor: not-allowed; }}
+    .hint {{ margin-top: 7px; color: var(--muted); font-size: 12px; }}
+    .error {{ color: var(--danger); }}
+    .ok {{ color: var(--ok); }}
+    code {{ color: #bfdbfe; }}
+    @media (max-width: 820px) {{
+      .shell {{ grid-template-columns: 1fr; }}
+      aside {{ display: none; }}
+      .bubble {{ max-width: 94%; }}
+      header {{ align-items: flex-start; flex-direction: column; }}
+      .pill {{ white-space: normal; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside>
+      <div class="brand">Claude Any</div>
+      <div class="status-card">
+        <div><div class="meta-label">Provider</div><div class="meta-value">{escaped_provider}</div></div>
+        <div><div class="meta-label">Mode</div><div class="meta-value">{escaped_mode}</div></div>
+        <div><div class="meta-label">Model</div><div class="meta-value">{escaped_model}</div></div>
+        <div><div class="meta-label">API</div><div class="meta-value">{escaped_api_status}</div></div>
+        <div><div class="meta-label">Timeout</div><div class="meta-value">{timeout_ms:,} ms</div></div>
+      </div>
+      <div class="nav">
+        <a href="/">Router Home</a>
+        <a href="/ca/events">Events</a>
+        <a href="/health">Health JSON</a>
+        <button class="ghost" id="clearButton" type="button">Clear Chat</button>
+      </div>
+    </aside>
+    <main>
+      <header>
+        <div>
+          <h1>Web Chat</h1>
+          <div class="sub">Talk to the currently selected Claude Any provider through <code>/v1/messages</code>.</div>
+        </div>
+        <div class="pill" id="statePill">ready</div>
+      </header>
+      <section id="transcript" aria-live="polite"></section>
+      <form class="composer" id="composer">
+        <div class="composer-inner">
+          <textarea id="prompt" placeholder="Type a message..." autocomplete="off"></textarea>
+          <button class="primary" id="sendButton" type="submit">Send</button>
+        </div>
+        <div class="hint">Enter sends. Shift+Enter inserts a new line. This page stays local to the router unless you expose it yourself.</div>
+      </form>
+    </main>
+  </div>
+  <script>
+    const MODEL = {json.dumps(model)};
+    const MAX_TOKENS = {int(max_tokens)};
+    const transcript = document.getElementById('transcript');
+    const composer = document.getElementById('composer');
+    const prompt = document.getElementById('prompt');
+    const sendButton = document.getElementById('sendButton');
+    const clearButton = document.getElementById('clearButton');
+    const statePill = document.getElementById('statePill');
+    const history = [];
+    function setState(text, cls = '') {{
+      statePill.textContent = text;
+      statePill.className = 'pill ' + cls;
+    }}
+    function addBubble(role, text) {{
+      const row = document.createElement('div');
+      row.className = 'row ' + role;
+      const bubble = document.createElement('div');
+      bubble.className = 'bubble';
+      bubble.textContent = text;
+      row.appendChild(bubble);
+      transcript.appendChild(row);
+      transcript.scrollTop = transcript.scrollHeight;
+      return bubble;
+    }}
+    function extractTextFromContent(content) {{
+      if (typeof content === 'string') return content;
+      if (!Array.isArray(content)) return '';
+      return content.map(block => {{
+        if (typeof block === 'string') return block;
+        if (!block || typeof block !== 'object') return '';
+        if (block.type === 'text') return block.text || '';
+        if (block.type === 'tool_use') return `[tool_use ${{block.name || block.id || ''}}]`;
+        return block.text || '';
+      }}).filter(Boolean).join('\\n');
+    }}
+    async function readStream(response, bubble) {{
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+      let text = '';
+      while (true) {{
+        const chunk = await reader.read();
+        if (chunk.done) break;
+        buffer += decoder.decode(chunk.value, {{stream: true}});
+        let sep;
+        while ((sep = buffer.indexOf('\\n\\n')) >= 0) {{
+          const packet = buffer.slice(0, sep);
+          buffer = buffer.slice(sep + 2);
+          for (const line of packet.split('\\n')) {{
+            if (!line.startsWith('data:')) continue;
+            const raw = line.slice(5).trim();
+            if (!raw || raw === '[DONE]') continue;
+            let event;
+            try {{ event = JSON.parse(raw); }} catch {{ continue; }}
+            if (event.type === 'content_block_delta' && event.delta && event.delta.type === 'text_delta') {{
+              text += event.delta.text || '';
+              bubble.textContent = text;
+            }} else if (event.type === 'content_block_start' && event.content_block && event.content_block.type === 'text') {{
+              text += event.content_block.text || '';
+              bubble.textContent = text;
+            }} else if (event.type === 'message_delta' && event.delta && event.delta.stop_reason) {{
+              setState(event.delta.stop_reason);
+            }} else if (event.type === 'error') {{
+              throw new Error(event.error && event.error.message ? event.error.message : 'stream error');
+            }}
+          }}
+          transcript.scrollTop = transcript.scrollHeight;
+        }}
+      }}
+      return text;
+    }}
+    async function sendMessage(text) {{
+      history.push({{role: 'user', content: text}});
+      addBubble('user', text);
+      const bubble = addBubble('assistant', '');
+      setState('thinking');
+      sendButton.disabled = true;
+      try {{
+        const response = await fetch('/v1/messages', {{
+          method: 'POST',
+          headers: {{'content-type': 'application/json', 'accept': 'text/event-stream, application/json'}},
+          body: JSON.stringify({{
+            model: MODEL,
+            max_tokens: MAX_TOKENS,
+            stream: true,
+            messages: history
+          }})
+        }});
+        if (!response.ok) {{
+          const fallback = await response.text();
+          throw new Error(fallback || `HTTP ${{response.status}}`);
+        }}
+        let assistantText = '';
+        const contentType = response.headers.get('content-type') || '';
+        if (response.body && contentType.includes('text/event-stream')) {{
+          assistantText = await readStream(response, bubble);
+        }} else {{
+          const json = await response.json();
+          assistantText = extractTextFromContent(json.content);
+          bubble.textContent = assistantText || JSON.stringify(json, null, 2);
+        }}
+        if (!assistantText.trim()) {{
+          bubble.textContent = '(empty response)';
+        }}
+        history.push({{role: 'assistant', content: bubble.textContent}});
+        setState('ready', 'ok');
+      }} catch (err) {{
+        bubble.textContent = String(err && err.message ? err.message : err);
+        bubble.classList.add('error');
+        history.pop();
+        setState('error', 'error');
+      }} finally {{
+        sendButton.disabled = false;
+        prompt.focus();
+      }}
+    }}
+    composer.addEventListener('submit', ev => {{
+      ev.preventDefault();
+      const text = prompt.value.trim();
+      if (!text) return;
+      prompt.value = '';
+      sendMessage(text);
+    }});
+    prompt.addEventListener('keydown', ev => {{
+      if (ev.key === 'Enter' && !ev.shiftKey) {{
+        ev.preventDefault();
+        composer.requestSubmit();
+      }}
+    }});
+    clearButton.addEventListener('click', () => {{
+      history.length = 0;
+      transcript.innerHTML = '';
+      addBubble('system', 'Chat cleared. Provider and model remain unchanged.');
+      setState('ready');
+    }});
+    addBubble('system', `Connected to ${{MODEL}}. Messages are sent to /v1/messages on this router.`);
+    prompt.focus();
+  </script>
+</body>
+</html>"""
+
+
+def handle_web_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
+    if path not in ("/ca/web/chat", "/ca/web/chat/"):
+        return False
+    cfg = load_config()
+    provider, pcfg = get_current_provider(cfg)
+    write_text_response(handler, render_web_chat_html(cfg, provider, pcfg), content_type="text/html; charset=utf-8")
+    return True
 
 
 def parse_json_body(raw: bytes) -> dict[str, Any]:
@@ -10627,6 +10923,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             return
         if handle_channel_mcp_get(self, path):
             return
+        if handle_web_get(self, path):
+            return
         if handle_chat_get(self, path) or handle_plan_get(self, path):
             return
         provider, pcfg = get_current_provider(cfg)
@@ -10647,6 +10945,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                     "router_port": ROUTER_PORT,
                     "provider": provider,
                     "model": current_alias(cfg),
+                    "web_chat": "/ca/web/chat",
                     "chat": "/ca/chat/health",
                     "plan": "/ca/plan/artifacts",
                     "events": "/ca/events",
@@ -11180,8 +11479,10 @@ def cmd_ollama_catalog(args: argparse.Namespace) -> None:
 
 
 def provider_mode_label(provider: str, pcfg: dict[str, Any]) -> str:
-    if native_anthropic_enabled(provider):
+    if direct_native_anthropic_enabled(provider, pcfg):
         return "anthropic-native"
+    if anthropic_routed_enabled(provider, pcfg):
+        return "anthropic-routed"
     return "claude-any-router"
 
 
@@ -11189,7 +11490,7 @@ def status_lines() -> list[str]:
     cfg = load_config()
     provider, pcfg = get_current_provider(cfg)
     mode = provider_mode_label(provider, pcfg)
-    direct_native = mode != "claude-any-router"
+    direct_native = direct_native_anthropic_enabled(provider, pcfg)
     return [
         f"provider: {provider}",
         f"language: {cfg.get('language', 'en')}",
@@ -13115,6 +13416,8 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
         native_default = True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
+    if provider == "anthropic":
+        parts.append(f"routed={'on' if anthropic_routed_enabled(provider, pcfg) else 'off'}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek"):
@@ -13142,7 +13445,8 @@ def llm_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     if provider == "anthropic":
         return (
             f"max_output_tokens={pcfg.get('max_output_tokens', 'Claude Code default')}, "
-            f"timeout={pcfg.get('request_timeout_ms', 'Claude Code default')}ms"
+            f"timeout={pcfg.get('request_timeout_ms', 'Claude Code default')}ms, "
+            f"routed={'on' if anthropic_routed_enabled(provider, pcfg) else 'off'}"
         )
     if provider in PROVIDER_OPTION_PROVIDERS:
         return provider_options_status(provider, pcfg)
@@ -14509,6 +14813,12 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ja": "デバッグ用にルーター UI/API を外部クライアントへ公開します。off では外部リクエストを拒否し、次回起動時は環境変数がなければローカルのみで bind します。",
         "zh": "为了调试向外部客户端暴露路由器 UI/API。关闭时会拒绝外部请求；下次启动在没有环境变量覆盖时仅绑定本地。",
     },
+    "route_through_router": {
+        "en": "Route Anthropic through the local claude-any router. This enables router features such as LLM channel injection, but requires an Anthropic API key and does not use Claude Code OAuth.",
+        "ko": "Anthropic을 로컬 claude-any 라우터로 경유합니다. LLM 채널 주입 같은 라우터 기능을 쓸 수 있지만 Anthropic API 키가 필요하고 Claude Code OAuth는 사용하지 않습니다.",
+        "ja": "Anthropic をローカル claude-any ルーター経由にします。LLM channel injection などのルーター機能を使えますが、Anthropic API key が必要で Claude Code OAuth は使いません。",
+        "zh": "通过本地 claude-any 路由器转发 Anthropic。可使用 LLM channel injection 等路由器功能，但需要 Anthropic API key，且不使用 Claude Code OAuth。",
+    },
     "router_debug_message_preview_chars": {
         "en": "When greater than 0, include the first N characters of the latest user message in router event data for debugging. Keep 0 for privacy.",
         "ko": "0보다 크면 디버깅용 이벤트 data에 최근 사용자 메시지 앞 N자를 포함합니다. 개인정보 보호를 위해 기본값은 0입니다.",
@@ -14573,6 +14883,7 @@ LLM_OPTION_TOGGLE_KEYS = {
     "rate_limit_enabled",
     "rate_limit_status",
     "router_debug_external_access",
+    "route_through_router",
 }
 
 
@@ -14592,6 +14903,8 @@ def llm_option_current_bool(provider: str, pcfg: dict[str, Any], key: str) -> bo
         return bool(pcfg.get("rate_limit_status", False))
     if key == "router_debug_external_access":
         return router_debug_external_access_enabled()
+    if key == "route_through_router":
+        return anthropic_routed_enabled(provider, pcfg)
     return bool(pcfg.get(key, False))
 
 
@@ -14658,6 +14971,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
                 add("Stream idle timeout ms", "stream_idle_timeout_ms", pcfg.get("stream_idle_timeout_ms", "auto"))
                 add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
         elif provider == "anthropic":
+            add("Route through router", "route_through_router", "on" if anthropic_routed_enabled(provider, pcfg) else "off")
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
 
     rows.append(ui_text("back", lang))
@@ -14668,6 +14982,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
 def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> str:
     if key == "router_debug_external_access":
         return "true" if router_debug_external_access_enabled() else "false"
+    if key == "route_through_router":
+        return "true" if anthropic_routed_enabled(provider, pcfg) else "false"
     if key == "router_debug_message_preview_chars":
         return str(router_debug_message_preview_chars())
     if key == "stream_enabled":
@@ -14708,6 +15024,12 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
         cfg["router_debug_message_preview_chars"] = min(fixed, 4000)
         save_config(cfg)
         return ["Router event message preview updated.", f"preview chars: {cfg['router_debug_message_preview_chars']}"]
+    if key == "route_through_router":
+        pcfg["route_through_router"] = parse_bool(value, default=False)
+        save_config(cfg)
+        clear_model_cache()
+        mode = "routed through claude-any router" if pcfg["route_through_router"] else "direct Claude Native"
+        return ["Anthropic routing mode updated.", f"mode: {mode}"]
     if key == "rate_limit_enabled":
         enabled = parse_bool(value, default=False)
         if enabled:
@@ -14763,7 +15085,9 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
     if provider in ("ollama", "ollama-cloud"):
         apply_ollama_option(pcfg, token)
     elif provider == "anthropic":
-        if key in ("max_output_tokens", "max_tokens", "maxtoken", "max_token"):
+        if key in ("route", "routed", "route_through_router", "router"):
+            pcfg["route_through_router"] = parse_bool(value, default=False)
+        elif key in ("max_output_tokens", "max_tokens", "maxtoken", "max_token"):
             apply_provider_option(provider, pcfg, token)
         elif key in ("timeout", "timeout_ms", "request_timeout", "request_timeout_ms"):
             apply_provider_option(provider, pcfg, token)
@@ -14802,6 +15126,8 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
                     "Use self-hosted-nim or vLLM for native /v1/messages."
                 )
             pcfg["native_compat"] = True
+        elif key in ("route", "routed", "route_through_router", "router"):
+            pcfg["route_through_router"] = False
         elif key in ("stream", "stream_enabled"):
             pcfg["stream_enabled"] = True
         elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
@@ -14863,6 +15189,11 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
                 "Use self-hosted-nim or vLLM for native /v1/messages."
             )
         pcfg["native_compat"] = bool(value)
+        return
+    if key in ("route", "routed", "route_through_router", "router"):
+        if provider != "anthropic":
+            raise SystemExit("route_through_router is only available for the Anthropic provider")
+        pcfg["route_through_router"] = parse_bool(value, default=False)
         return
     if key in ("stream", "stream_enabled"):
         pcfg["stream_enabled"] = parse_bool(value, default=True)
@@ -15459,7 +15790,7 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
     """
     cfg = cfg or load_config()
     provider, pcfg = get_current_provider(cfg)
-    if native_anthropic_enabled(provider):
+    if direct_native_anthropic_enabled(provider, pcfg):
         env = {"CLAUDE_ANY_PROVIDER": provider}
         if meaningful_key(pcfg.get("api_key")):
             env["ANTHROPIC_API_KEY"] = str(pcfg["api_key"])
@@ -15960,7 +16291,7 @@ def stop_router_with_guarantee(reason: str, max_wait_seconds: float = 5.0, quiet
 
 
 def cleanup_managed_services_for_provider(provider: str, pcfg: dict[str, Any], cfg: dict[str, Any], quiet: bool = False) -> None:
-    if native_anthropic_enabled(provider):
+    if direct_native_anthropic_enabled(provider, pcfg):
         # Claude Native mode: hard guarantee that the router is not alive when
         # the subsequent `claude` is spawned. Ignore the
         # `cleanup.managed_services_on_launch` opt-out: a stale router process
@@ -15998,6 +16329,8 @@ def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         key = nvidia_api_key()
         return "API key: set (NVIDIA)" if meaningful_key(key) else "API key: missing (NVIDIA required)"
     if provider == "anthropic":
+        if anthropic_routed_enabled(provider, pcfg):
+            return "API key: set (Anthropic routed)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (Anthropic routed requires an API key)"
         return "API key: set (Anthropic)" if meaningful_key(pcfg.get("api_key")) else "API key: not set (use API key or Claude login)"
     if provider == "ollama-cloud":
         return "API key: set (Ollama Cloud)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (Ollama Cloud required)"
@@ -16091,6 +16424,8 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
         errors.append("Launch blocked: Ollama Cloud requires an API key.")
     if provider == "deepseek" and not meaningful_key(pcfg.get("api_key")):
         errors.append("Launch blocked: DeepSeek.com requires a DeepSeek API key.")
+    if anthropic_routed_enabled(provider, pcfg) and not meaningful_key(pcfg.get("api_key")):
+        errors.append("Launch blocked: Anthropic routed mode requires an Anthropic API key.")
     if provider == "lm-studio":
         try:
             ensure_lm_studio_model_loaded_for_context(pcfg, timeout=1.5)
@@ -20308,7 +20643,7 @@ def launch_claude(
         for line in blockers:
             print(f"- {line}", flush=True)
         return 2
-    use_native_anthropic = native_anthropic_enabled(provider)
+    use_native_anthropic = direct_native_anthropic_enabled(provider, pcfg)
     use_router_mode = not use_native_anthropic
     cleanup_managed_services_for_provider(provider, pcfg, cfg, quiet=True)
     env = os.environ.copy()
@@ -20353,6 +20688,11 @@ def launch_claude(
         router_log(
             "INFO",
             "claude_native_launch model=<defer-to-claude-code> advisor=off backend=<default-anthropic>",
+        )
+    elif anthropic_routed_enabled(provider, pcfg):
+        router_log(
+            "INFO",
+            "claude_anthropic_routed_launch backend=claude-any-router upstream=anthropic",
         )
     env.update(launch_env)
     if not use_native_anthropic:

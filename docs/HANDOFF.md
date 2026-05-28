@@ -15,12 +15,14 @@ The latest production path is:
 - `0.1.100` promotes the current `nightly` line to stable.
 - DeepSeek.com is a first-class routed provider using `https://api.deepseek.com/anthropic`.
 - Non-Claude-Native providers route through claude-any; Claude Native suppresses routing env vars and stops the router before launch.
+- Anthropic still defaults to direct Claude Native, but can opt into `route_through_router` when router-owned SSE/channel/web-chat/observability is required; routed Anthropic requires an Anthropic API key.
 - Routed sessions default to a stable per-user router port (`CLAUDE_ANY_ROUTER_PORT`, otherwise `8799 + uid % 1000` on POSIX).
 - Stale same-user routers are cleared by port/PID/procfs fallbacks before spawn.
 - Channel delivery choices are hidden from normal routed-provider launch flow; routed sessions use the `llm` channel delivery path.
 - MCP notification events are persisted into `chat-messages.jsonl`.
 - AI-Net/SSE notifications can trigger immediate direct LLM handling, use MCP tools, and receive tool-result follow-up context.
 - Direct channel handling no longer spawns hidden Claude Code `-p`; it uses the routed `/v1/messages` path, executes MCP tools over the initialized SSE connection, forwards `tool_result` blocks back to the same LLM turn, queues summaries durably, and injects those summaries into the next visible routed request.
+- The router now has a local browser chat UI at `/ca/web/chat`. It uses the same `/v1/messages` path as Claude Code and deliberately does not create Cloudflare/Tailscale/public-network resources.
 
 The previous stable `0.1.99` included automatic MCP channel capability probing through timeout/error classification. `0.1.100` adds DeepSeek.com, shared-host router isolation, automatic API-key setup routing, unique nightly versions, router cleanup hardening, and LLM channel direct handling diagnostics.
 
