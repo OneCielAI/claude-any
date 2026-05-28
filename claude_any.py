@@ -5686,13 +5686,31 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
       border-radius: 8px;
       padding: 10px 12px;
       line-height: 1.45;
-      white-space: pre-wrap;
+      white-space: normal;
       word-break: break-word;
       box-shadow: 0 1px 0 rgba(255,255,255,.03) inset;
     }}
     .row.user .bubble {{ background: var(--user); border-color: #276a8d; }}
     .row.assistant .bubble {{ background: var(--assistant); }}
-    .row.system .bubble {{ background: #191f2b; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }}
+    .row.system .bubble {{ background: #191f2b; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; white-space: pre-wrap; }}
+    .markdown > :first-child {{ margin-top: 0; }}
+    .markdown > :last-child {{ margin-bottom: 0; }}
+    .markdown p {{ margin: 0 0 10px; }}
+    .markdown h1, .markdown h2, .markdown h3, .markdown h4 {{ margin: 12px 0 8px; line-height: 1.2; }}
+    .markdown h1 {{ font-size: 1.35rem; }}
+    .markdown h2 {{ font-size: 1.2rem; }}
+    .markdown h3 {{ font-size: 1.08rem; }}
+    .markdown ul, .markdown ol {{ margin: 0 0 10px 20px; padding: 0; }}
+    .markdown li {{ margin: 3px 0; }}
+    .markdown blockquote {{ margin: 0 0 10px; padding-left: 12px; border-left: 3px solid #4b6585; color: var(--muted); }}
+    .markdown pre {{ margin: 0 0 10px; padding: 10px; overflow-x: auto; border: 1px solid #33445b; border-radius: 6px; background: #0b111b; white-space: pre; }}
+    .markdown code {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .92em; }}
+    .markdown :not(pre) > code {{ padding: 1px 4px; border-radius: 4px; background: rgba(191, 219, 254, .12); }}
+    .markdown a {{ color: #8bd7ff; text-decoration: underline; text-underline-offset: 2px; }}
+    .markdown table {{ width: 100%; border-collapse: collapse; margin: 0 0 10px; display: block; overflow-x: auto; }}
+    .markdown th, .markdown td {{ border: 1px solid #3a4b63; padding: 6px 8px; text-align: left; vertical-align: top; }}
+    .markdown th {{ background: rgba(255,255,255,.06); font-weight: 700; }}
+    .markdown hr {{ border: 0; border-top: 1px solid var(--line); margin: 12px 0; }}
     .composer {{ border-top: 1px solid var(--line); padding: 12px 18px; background: #0d1420; }}
     .composer-inner {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end; }}
     textarea {{
@@ -5774,12 +5792,179 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
       statePill.textContent = text;
       statePill.className = 'pill ' + cls;
     }}
+    function escapeHtml(value) {{
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({{
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }}[ch]));
+    }}
+    function safeHref(value) {{
+      const href = String(value || '').trim();
+      if (/^(https?:|mailto:)/i.test(href)) return escapeHtml(href);
+      return '#';
+    }}
+    function renderInlineMarkdown(value) {{
+      const codeBlocks = [];
+      const linkBlocks = [];
+      let raw = String(value ?? '').replace(/`([^`\\n]+)`/g, (_match, code) => {{
+        const token = '\\u0000CODE' + codeBlocks.length + '\\u0000';
+        codeBlocks.push('<code>' + escapeHtml(code) + '</code>');
+        return token;
+      }});
+      raw = raw.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g, (_match, label, href) => {{
+        const token = '\\u0000LINK' + linkBlocks.length + '\\u0000';
+        linkBlocks.push('<a href="' + safeHref(href) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(label) + '</a>');
+        return token;
+      }});
+      let html = escapeHtml(raw);
+      html = html.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+      html = html.replace(/(^|[\\s(])\\*([^*\\n]+)\\*/g, '$1<em>$2</em>');
+      html = html.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+      linkBlocks.forEach((link, index) => {{
+        html = html.replace('\\u0000LINK' + index + '\\u0000', link);
+      }});
+      codeBlocks.forEach((code, index) => {{
+        html = html.replace('\\u0000CODE' + index + '\\u0000', code);
+      }});
+      return html;
+    }}
+    function splitMarkdownTableRow(line) {{
+      let row = String(line || '').trim();
+      if (row.startsWith('|')) row = row.slice(1);
+      if (row.endsWith('|')) row = row.slice(0, -1);
+      return row.split('|').map(cell => cell.trim());
+    }}
+    function isMarkdownDelimiterCell(cell) {{
+      const compact = String(cell || '').replace(/\\s+/g, '');
+      const core = compact.replace(/^:/, '').replace(/:$/, '');
+      return core.length >= 3 && /^-+$/.test(core);
+    }}
+    function isMarkdownTableDelimiter(line) {{
+      const cells = splitMarkdownTableRow(line);
+      return cells.length > 1 && cells.every(isMarkdownDelimiterCell);
+    }}
+    function isMarkdownTableStart(lines, index) {{
+      return index + 1 < lines.length
+        && String(lines[index] || '').includes('|')
+        && splitMarkdownTableRow(lines[index]).length > 1
+        && isMarkdownTableDelimiter(lines[index + 1]);
+    }}
+    function isMarkdownBlockStart(lines, index) {{
+      const line = String(lines[index] || '');
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      return trimmed.startsWith('```')
+        || isMarkdownTableStart(lines, index)
+        || /^(####|###|##|#)\\s+/.test(trimmed)
+        || /^([-*+]\\s+|\\d+[.)]\\s+|>\\s?)/.test(trimmed)
+        || /^(---+|\\*\\*\\*+|___+)$/.test(trimmed);
+    }}
+    function renderMarkdownTable(lines, startIndex) {{
+      const headers = splitMarkdownTableRow(lines[startIndex]);
+      const rows = [];
+      let index = startIndex + 2;
+      while (index < lines.length && String(lines[index] || '').trim() && String(lines[index] || '').includes('|')) {{
+        rows.push(splitMarkdownTableRow(lines[index]));
+        index += 1;
+      }}
+      const head = '<thead><tr>' + headers.map(cell => '<th>' + renderInlineMarkdown(cell) + '</th>').join('') + '</tr></thead>';
+      const body = '<tbody>' + rows.map(row => {{
+        const cells = headers.map((_header, cellIndex) => '<td>' + renderInlineMarkdown(row[cellIndex] || '') + '</td>').join('');
+        return '<tr>' + cells + '</tr>';
+      }}).join('') + '</tbody>';
+      return {{ html: '<table>' + head + body + '</table>', nextIndex: index }};
+    }}
+    function renderMarkdown(text) {{
+      const lines = String(text ?? '').replace(/\\r\\n?/g, '\\n').split('\\n');
+      const blocks = [];
+      let index = 0;
+      while (index < lines.length) {{
+        const line = lines[index];
+        const trimmed = String(line || '').trim();
+        if (!trimmed) {{
+          index += 1;
+          continue;
+        }}
+        if (trimmed.startsWith('```')) {{
+          const code = [];
+          index += 1;
+          while (index < lines.length && !String(lines[index] || '').trim().startsWith('```')) {{
+            code.push(lines[index]);
+            index += 1;
+          }}
+          if (index < lines.length) index += 1;
+          blocks.push('<pre><code>' + escapeHtml(code.join('\\n')) + '</code></pre>');
+          continue;
+        }}
+        if (isMarkdownTableStart(lines, index)) {{
+          const table = renderMarkdownTable(lines, index);
+          blocks.push(table.html);
+          index = table.nextIndex;
+          continue;
+        }}
+        const heading = trimmed.match(/^(####|###|##|#)\\s+(.+)$/);
+        if (heading) {{
+          const level = Math.min(4, heading[1].length);
+          blocks.push('<h' + level + '>' + renderInlineMarkdown(heading[2]) + '</h' + level + '>');
+          index += 1;
+          continue;
+        }}
+        if (/^(---+|\\*\\*\\*+|___+)$/.test(trimmed)) {{
+          blocks.push('<hr>');
+          index += 1;
+          continue;
+        }}
+        if (/^[-*+]\\s+/.test(trimmed)) {{
+          const items = [];
+          while (index < lines.length && /^[-*+]\\s+/.test(String(lines[index] || '').trim())) {{
+            items.push(String(lines[index] || '').trim().replace(/^[-*+]\\s+/, ''));
+            index += 1;
+          }}
+          blocks.push('<ul>' + items.map(item => '<li>' + renderInlineMarkdown(item) + '</li>').join('') + '</ul>');
+          continue;
+        }}
+        if (/^\\d+[.)]\\s+/.test(trimmed)) {{
+          const items = [];
+          while (index < lines.length && /^\\d+[.)]\\s+/.test(String(lines[index] || '').trim())) {{
+            items.push(String(lines[index] || '').trim().replace(/^\\d+[.)]\\s+/, ''));
+            index += 1;
+          }}
+          blocks.push('<ol>' + items.map(item => '<li>' + renderInlineMarkdown(item) + '</li>').join('') + '</ol>');
+          continue;
+        }}
+        if (/^>\\s?/.test(trimmed)) {{
+          const quotes = [];
+          while (index < lines.length && /^>\\s?/.test(String(lines[index] || '').trim())) {{
+            quotes.push(String(lines[index] || '').trim().replace(/^>\\s?/, ''));
+            index += 1;
+          }}
+          blocks.push('<blockquote>' + renderInlineMarkdown(quotes.join('\\n')) + '</blockquote>');
+          continue;
+        }}
+        const paragraph = [trimmed];
+        index += 1;
+        while (index < lines.length && !isMarkdownBlockStart(lines, index)) {{
+          paragraph.push(String(lines[index] || '').trim());
+          index += 1;
+        }}
+        blocks.push('<p>' + renderInlineMarkdown(paragraph.join(' ')) + '</p>');
+      }}
+      return blocks.join('');
+    }}
     function addBubble(role, text) {{
       const row = document.createElement('div');
       row.className = 'row ' + role;
       const bubble = document.createElement('div');
       bubble.className = 'bubble';
-      bubble.textContent = text;
+      if (role === 'system') {{
+        bubble.textContent = text;
+      }} else {{
+        bubble.classList.add('markdown');
+        bubble.innerHTML = renderMarkdown(text);
+      }}
       row.appendChild(bubble);
       transcript.appendChild(row);
       transcript.scrollTop = transcript.scrollHeight;

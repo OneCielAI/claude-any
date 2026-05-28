@@ -41,6 +41,27 @@ class WebChatUiTests(unittest.TestCase):
         self.assertIn(model, html)
         self.assertIn(".bubble", html)
         self.assertIn("bubble.className = 'bubble'", html)
+        self.assertIn("function renderMarkdown(text)", html)
+        self.assertIn("function renderMarkdownTable(lines, startIndex)", html)
+        self.assertIn(".markdown table", html)
+        self.assertIn("bubble.innerHTML = renderMarkdown(text)", html)
+        self.assertIn("bubble.textContent = text", html)
+
+    def test_web_chat_markdown_renderer_sanitizes_and_supports_tables(self):
+        cfg = self._cfg()
+        provider, pcfg = claude_any.get_current_provider(cfg)
+
+        html = claude_any.render_web_chat_html(cfg, provider, pcfg)
+
+        self.assertIn("escapeHtml(value)", html)
+        self.assertIn("safeHref(value)", html)
+        self.assertIn("isMarkdownTableDelimiter(line)", html)
+        self.assertIn("<table>", html)
+        self.assertIn("<thead><tr>", html)
+        self.assertIn("<tbody>", html)
+        self.assertIn("rel=\"noopener noreferrer\"", html)
+        self.assertNotIn("marked.min.js", html)
+        self.assertNotIn("cdn.jsdelivr", html)
 
     def test_web_chat_reports_anthropic_routed_mode(self):
         cfg = self._cfg("anthropic")
