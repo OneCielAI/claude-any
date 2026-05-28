@@ -17168,9 +17168,9 @@ def model_panel_rows(
 
 
 def advisor_model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
-    values = unique_model_ids(provider, [m for m in DEFAULT_ADVISOR_MODELS if m] + upstream_model_ids(provider, pcfg))
+    current = normalize_model_id(provider, pcfg.get("advisor_model", ""))
+    values = unique_model_ids(provider, upstream_model_ids(provider, pcfg) + ([current] if current else []))
     rows: list[str] = []
-    current = pcfg.get("advisor_model", "")
     rows.append(("* Disable Advisor Model" if not current else "  Disable Advisor Model"))
     deduped_values = [""]
     seen: set[str] = set()

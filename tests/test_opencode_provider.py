@@ -139,6 +139,27 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertIn("deepseek-v4-pro", models)
         write_cache.assert_called_once()
 
+    def test_zen_advisor_panel_does_not_inject_global_deepseek_recommendation(self):
+        pcfg = self.opencode_cfg(api_key="sk-opencode-test")["providers"]["opencode"]
+        with mock.patch.object(
+            claude_any,
+            "upstream_model_ids",
+            return_value=["claude-sonnet-4-6", "deepseek-v4-flash-free", "glm-5.1"],
+        ):
+            rows, values = claude_any.advisor_model_panel_rows("opencode", pcfg)
+
+        self.assertNotIn("deepseek-v4-pro", values)
+        self.assertFalse(any("deepseek-v4-pro" in row for row in rows))
+        self.assertIn("deepseek-v4-flash-free", values)
+
+    def test_advisor_panel_keeps_preconfigured_custom_advisor_visible(self):
+        pcfg = self.opencode_cfg(api_key="sk-opencode-test", advisor_model="custom-advisor")["providers"]["opencode"]
+        with mock.patch.object(claude_any, "upstream_model_ids", return_value=["claude-sonnet-4-6"]):
+            rows, values = claude_any.advisor_model_panel_rows("opencode", pcfg)
+
+        self.assertIn("custom-advisor", values)
+        self.assertTrue(any("custom-advisor" in row for row in rows))
+
     def test_model_list_falls_back_to_config_when_zen_unreachable(self):
         pcfg = self.opencode_cfg(
             current_model="glm-5.1",
