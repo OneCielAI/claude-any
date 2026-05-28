@@ -152,6 +152,30 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertNotIn("deepseek-v4-pro", values)
         self.assertFalse(any("deepseek-v4-pro" in row for row in rows))
         self.assertIn("deepseek-v4-flash-free", values)
+        self.assertIn("__refresh_models__", values)
+
+    def test_model_panel_keeps_refresh_action_after_fetch(self):
+        pcfg = self.opencode_cfg(api_key="sk-opencode-test")["providers"]["opencode"]
+        with mock.patch.object(claude_any, "upstream_model_ids", return_value=["claude-sonnet-4-6"]):
+            rows, values = claude_any.model_panel_rows("opencode", pcfg, fetch=True, force_refresh=True)
+
+        self.assertEqual("__refresh_models__", values[0])
+        self.assertTrue(any("Refresh provider model list" in row for row in rows))
+
+    def test_advisor_panel_can_force_refresh_provider_models(self):
+        pcfg = self.opencode_go_cfg(api_key="sk-opencode-test")["providers"]["opencode-go"]
+        with mock.patch.object(claude_any, "upstream_model_ids", return_value=["deepseek-v4-pro"]) as upstream:
+            rows, values = claude_any.advisor_model_panel_rows(
+                "opencode-go",
+                pcfg,
+                fetch=True,
+                force_refresh=True,
+            )
+
+        upstream.assert_called_once_with("opencode-go", pcfg, force_refresh=True)
+        self.assertIn("__refresh_models__", values)
+        self.assertIn("deepseek-v4-pro", values)
+        self.assertTrue(any("Refresh provider model list" in row for row in rows))
 
     def test_advisor_panel_keeps_preconfigured_custom_advisor_visible(self):
         pcfg = self.opencode_cfg(api_key="sk-opencode-test", advisor_model="custom-advisor")["providers"]["opencode"]

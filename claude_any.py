@@ -17273,14 +17273,9 @@ def model_panel_rows(
     current = pcfg.get("current_model")
     seen_aliases: set[str] = set()
     deduped_values: list[str] = []
-    if not fetch:
-        cache = read_model_list_cache(provider, pcfg)
-        if cache is None:
-            rows.append("Refresh provider model list...")
-            deduped_values.append("__refresh_models__")
-        else:
-            rows.append("Refresh provider model list")
-            deduped_values.append("__refresh_models__")
+    cache = read_model_list_cache(provider, pcfg)
+    rows.append("Refresh provider model list..." if cache is None else "Refresh provider model list")
+    deduped_values.append("__refresh_models__")
     for mid in values:
         alias = alias_for(provider, mid)
         suffix = ""
@@ -17300,12 +17295,27 @@ def model_panel_rows(
     return rows, deduped_values
 
 
-def advisor_model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
+def advisor_model_panel_rows(
+    provider: str,
+    pcfg: dict[str, Any],
+    fetch: bool = True,
+    force_refresh: bool = False,
+) -> tuple[list[str], list[str]]:
     current = normalize_model_id(provider, pcfg.get("advisor_model", ""))
-    values = unique_model_ids(provider, upstream_model_ids(provider, pcfg) + ([current] if current else []))
+    values = unique_model_ids(
+        provider,
+        (
+            upstream_model_ids(provider, pcfg, force_refresh=force_refresh)
+            if fetch else cached_or_configured_model_ids(provider, pcfg)
+        )
+        + ([current] if current else []),
+    )
     rows: list[str] = []
     rows.append(("* Disable Advisor Model" if not current else "  Disable Advisor Model"))
     deduped_values = [""]
+    cache = read_model_list_cache(provider, pcfg)
+    rows.append("Refresh provider model list..." if cache is None else "Refresh provider model list")
+    deduped_values.append("__refresh_models__")
     seen: set[str] = set()
     for mid in values:
         if not mid or mid in seen:
@@ -17793,7 +17803,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                 panel_rows, panel_values = [f"Model list failed: {type(exc).__name__}: {exc}", "+ Custom model id..."], []
         elif name == "advisor-model":
             try:
-                panel_rows, panel_values = advisor_model_panel_rows(provider, pcfg)
+                panel_rows, panel_values = advisor_model_panel_rows(provider, pcfg, fetch=False)
             except Exception as exc:
                 panel_rows, panel_values = [f"Advisor model list failed: {type(exc).__name__}: {exc}", "+ Custom advisor model id..."], []
         elif name == "test":
@@ -17937,6 +17947,19 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                 elif panel == "advisor-model":
                     if value == "back":
                         close_panel()
+                        continue
+                    if value == "__refresh_models__":
+                        panel_rows, panel_values = ["Refreshing provider model list..."], []
+                        first_render = render_prelaunch_screen(main_idx, panel, 0, panel_rows, checks, messages, first_render)
+                        try:
+                            panel_rows, panel_values = advisor_model_panel_rows(provider, pcfg, fetch=True, force_refresh=True)
+                            messages = [f"Model list refreshed: {max(0, len(panel_values) - 4)} advisor model(s)."]
+                        except Exception as exc:
+                            messages = [f"Model list refresh failed: {type(exc).__name__}: {exc}"]
+                            panel_rows, panel_values = advisor_model_panel_rows(provider, pcfg, fetch=False)
+                        panel_idx = 0
+                        panel_last_idx["advisor-model"] = 0
+                        refresh_checks()
                         continue
                     if value == "__custom__" or panel_idx >= len(panel_values):
                         advisor_value = prompt_menu_value("Advisor model id", "deepseek-v4-pro", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
