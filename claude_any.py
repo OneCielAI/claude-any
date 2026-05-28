@@ -20286,6 +20286,24 @@ def _channel_wake_input_bytes(prompt: str, enter_bytes: bytes | None = None) -> 
     return b"\x15" + prompt.encode("utf-8", errors="replace") + _channel_wake_enter_bytes(enter_bytes)
 
 
+def _channel_wake_submit_delay_seconds() -> float:
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_SUBMIT_DELAY_MS")
+    if raw is None:
+        return 0.08
+    try:
+        return max(0.0, min(2.0, float(raw) / 1000.0))
+    except Exception:
+        return 0.08
+
+
+def _write_channel_wake_prompt(master_fd: int, prompt: str, enter_bytes: bytes | None = None) -> None:
+    _write_fd_all(master_fd, b"\x15" + prompt.encode("utf-8", errors="replace"))
+    delay = _channel_wake_submit_delay_seconds()
+    if delay > 0:
+        time.sleep(delay)
+    _write_fd_all(master_fd, _channel_wake_enter_bytes(enter_bytes))
+
+
 def _inject_pending_channel_messages(
     master_fd: int,
     last_id: int,
@@ -20322,7 +20340,7 @@ def _inject_pending_channel_messages(
     if pending:
         prompt = format_channel_wake_batch_prompt(pending)
         submit_bytes = _channel_wake_enter_bytes(enter_bytes)
-        _write_fd_all(master_fd, _channel_wake_input_bytes(prompt, submit_bytes))
+        _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
         with _CHANNEL_STDIN_WAKE_LOCK:
             for message in pending:
                 try:
@@ -20361,7 +20379,7 @@ def _inject_pending_channel_summaries(master_fd: int, enter_bytes: bytes | None 
             router_log("WARN", f"channel_stdin_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
     prompt = format_channel_llm_summary_prompt(records)
     submit_bytes = _channel_wake_enter_bytes(enter_bytes)
-    _write_fd_all(master_fd, _channel_wake_input_bytes(prompt, submit_bytes))
+    _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
     ids = ",".join(str(item.get("message_id") or "") for item in records)
     router_log(
         "INFO",

@@ -631,21 +631,24 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
+            mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
             mock.patch.object(claude_any, "router_log"),
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 1)
         self.assertEqual(2, last_id)
-        self.assertIn(b"wake up", write_all.call_args.args[1])
-        self.assertTrue(write_all.call_args.args[1].startswith(b"\x15"))
-        self.assertTrue(write_all.call_args.args[1].endswith(b"\r\n"))
+        self.assertEqual(2, write_all.call_count)
+        self.assertIn(b"wake up", write_all.call_args_list[0].args[1])
+        self.assertTrue(write_all.call_args_list[0].args[1].startswith(b"\x15"))
+        self.assertEqual(b"\r\n", write_all.call_args_list[1].args[1])
 
         with (
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_write_fd_all") as write_all_cr,
+            mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
             mock.patch.object(claude_any, "router_log"),
         ):
             claude_any._inject_pending_channel_messages(99, 1, b"\r")
-        self.assertTrue(write_all_cr.call_args.args[1].endswith(b"\r"))
+        self.assertEqual(b"\r", write_all_cr.call_args_list[1].args[1])
 
     def test_inject_pending_channel_messages_batches_and_ignores_connection_noise(self):
         messages = [
@@ -657,11 +660,12 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
+            mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0)
         self.assertEqual(3, last_id)
-        payload = write_all.call_args.args[1]
+        payload = write_all.call_args_list[0].args[1]
         self.assertIn(b"external channel messages", payload)
         self.assertIn(b"hello Sarah", payload)
         self.assertIn(b"status please", payload)
@@ -686,11 +690,12 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
+            mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0, web_chat_only=True)
         self.assertEqual(3, last_id)
-        payload = write_all.call_args.args[1]
+        payload = write_all.call_args_list[0].args[1]
         self.assertIn("마지막 작업 요약".encode("utf-8"), payload)
         self.assertNotIn(b"hello Sarah", payload)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
@@ -744,6 +749,7 @@ class ChannelBridgeTests(unittest.TestCase):
                     mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_QUEUE_PATH", queue_path),
                     mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_CURSOR_PATH", cursor_path),
                     mock.patch.object(claude_any, "_write_fd_all") as write_all,
+                    mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
                     mock.patch.object(claude_any, "router_log") as router_log,
                 ):
                     last_id = claude_any._inject_pending_channel_summaries(99, b"\r\n")
@@ -753,11 +759,12 @@ class ChannelBridgeTests(unittest.TestCase):
 
         self.assertEqual(12, last_id)
         self.assertEqual({"last_id": 12}, cursor_payload)
-        payload = write_all.call_args.args[1]
+        self.assertEqual(2, write_all.call_count)
+        payload = write_all.call_args_list[0].args[1]
         self.assertIn("channel direct handling summaries".encode("utf-8"), payload)
         self.assertIn("Sarah".encode("utf-8"), payload)
         self.assertTrue(payload.startswith(b"\x15"))
-        self.assertTrue(payload.endswith(b"\r\n"))
+        self.assertEqual(b"\r\n", write_all.call_args_list[1].args[1])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_stdin_summary_injected" in item and "message_ids=12" in item for item in log_messages))
 
