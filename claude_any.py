@@ -2933,6 +2933,17 @@ def normalize_thinking_for_non_anthropic_provider(provider: str, pcfg: dict[str,
         return body
     if preserves_anthropic_thinking_contract(provider, pcfg):
         return body
+    if openai_chat_reasoning_passback_enabled_for_body(provider, pcfg, body):
+        if not thinking_requested:
+            return body
+        out = dict(body)
+        out.pop("thinking", None)
+        router_log(
+            "INFO",
+            "removed top-level Anthropic thinking request but preserved thinking blocks "
+            f"for OpenAI-chat reasoning passback provider={provider} thinking_blocks={thinking_blocks}",
+        )
+        return out
     synthetic_tool = has_claude_any_synthetic_tool_use(body)
     continuation_blocks = anthropic_tool_continuation_block_count(body)
     assistant_history = anthropic_assistant_history_count(body)
@@ -8036,7 +8047,14 @@ def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
         if role == "assistant" and isinstance(content, list):
             text_blocks: list[Any] = []
             tool_calls: list[dict[str, Any]] = []
+            reasoning_seen = False
+            reasoning_parts: list[str] = []
             for block in content:
+                if isinstance(block, dict) and block.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES:
+                    reasoning_seen = True
+                    if block.get("type") == "thinking":
+                        reasoning_parts.append(str(block.get("thinking") or ""))
+                    continue
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     tool_id = str(block.get("id") or f"call_{len(tool_calls) + 1}")
                     name = str(block.get("name") or "tool")
@@ -8055,6 +8073,8 @@ def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
                 else:
                     text_blocks.append(block)
             out: dict[str, Any] = {"role": "assistant", "content": compact_message_text_for_prompt(anthropic_content_to_text(text_blocks))}
+            if reasoning_seen:
+                out["reasoning_content"] = "\n".join(reasoning_parts)
             if tool_calls:
                 out["tool_calls"] = tool_calls
             messages.append(out)
@@ -8117,16 +8137,47 @@ def anthropic_tool_choice_to_openai(tool_choice: Any) -> Any:
     return tool_choice
 
 
+def opencode_model_id_hint(provider: str, pcfg: dict[str, Any], model: str | None) -> str:
+    requested = strip_claude_context_suffix(model).strip()
+    fallback = normalize_model_id(provider, pcfg.get("current_model") or "")
+    prefix = f"claude-any-{provider}-"
+    if requested.startswith(prefix):
+        return requested[len(prefix):]
+    if requested.startswith("claude-any-"):
+        return fallback
+    return normalize_model_id(provider, requested or fallback)
+
+
+def openai_chat_reasoning_passback_enabled(provider: str, model: str | None, pcfg: dict[str, Any]) -> bool:
+    if provider not in OPENCODE_PROVIDER_NAMES:
+        return False
+    model_id = opencode_model_id_hint(provider, pcfg, model).strip().lower()
+    if not model_id.startswith("deepseek-"):
+        return False
+    return opencode_endpoint_kind(provider, model_id, pcfg) == "openai-chat"
+
+
+def openai_chat_reasoning_passback_enabled_for_body(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> bool:
+    return openai_chat_reasoning_passback_enabled(provider, str(body.get("model") or ""), pcfg)
+
+
+def openai_reasoning_to_anthropic_thinking_block(reasoning_content: Any) -> dict[str, Any] | None:
+    reasoning = str(reasoning_content or "")
+    if not reasoning:
+        return None
+    digest = hashlib.sha256(reasoning.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return {
+        "type": "thinking",
+        "thinking": reasoning,
+        "signature": f"claude-any-openai-reasoning-{digest}",
+    }
+
+
 def should_omit_openai_chat_tool_choice(provider: str, model: str, body: dict[str, Any], pcfg: dict[str, Any]) -> bool:
     """Return true when an OpenAI-chat backend should receive tools without a forced tool_choice."""
     if body.get("tool_choice") is None:
         return False
-    if provider not in OPENCODE_PROVIDER_NAMES:
-        return False
-    model_id = strip_claude_context_suffix(model).strip().lower()
-    if not model_id.startswith("deepseek-"):
-        return False
-    return opencode_endpoint_kind(provider, model, pcfg) == "openai-chat"
+    return openai_chat_reasoning_passback_enabled(provider, model, pcfg)
 
 
 def positive_int(value: Any) -> int | None:
@@ -10497,7 +10548,16 @@ def openai_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     wrapped["prompt_eval_count"] = positive_int(usage.get("prompt_tokens")) or (estimate_tokens(source_body) if isinstance(source_body, dict) else 0)
     wrapped["eval_count"] = positive_int(usage.get("completion_tokens")) or 0
-    return ollama_chat_to_anthropic(wrapped, model, source_body=source_body)
+    out = ollama_chat_to_anthropic(wrapped, model, source_body=source_body)
+    thinking_block = openai_reasoning_to_anthropic_thinking_block(message.get("reasoning_content"))
+    if thinking_block is None:
+        return out
+    content = out.get("content")
+    if not isinstance(content, list):
+        content = [{"type": "text", "text": anthropic_content_to_text(content)}]
+    out = dict(out)
+    out["content"] = [thinking_block] + content
+    return out
 
 
 def stream_openai_chat_to_anthropic_sse(
@@ -10520,6 +10580,10 @@ def stream_openai_chat_to_anthropic_sse(
     pseudo_mode = False
     text_buffer = ""
     text_stopped = False
+    reasoning_started = False
+    reasoning_stopped = False
+    reasoning_index: int | None = None
+    reasoning_so_far = ""
     tool_fragments: dict[int, dict[str, Any]] = {}
     output_tokens = 0
     finish_reason = "stop"
@@ -10543,6 +10607,52 @@ def stream_openai_chat_to_anthropic_sse(
             {"type": "content_block_start", "index": text_index, "content_block": {"type": "text", "text": ""}},
         )
         return text_index
+
+    def ensure_reasoning_started() -> int:
+        nonlocal reasoning_started, reasoning_index, next_content_index, reasoning_stopped
+        if reasoning_started and reasoning_index is not None:
+            return reasoning_index
+        reasoning_started = True
+        reasoning_stopped = False
+        reasoning_index = next_content_index
+        next_content_index += 1
+        emit(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": reasoning_index,
+                "content_block": {"type": "thinking", "thinking": ""},
+            },
+        )
+        return reasoning_index
+
+    def emit_reasoning_delta(text: str) -> None:
+        if not text:
+            return
+        idx = ensure_reasoning_started()
+        emit(
+            "content_block_delta",
+            {"type": "content_block_delta", "index": idx, "delta": {"type": "thinking_delta", "thinking": text}},
+        )
+
+    def close_reasoning_block() -> None:
+        nonlocal reasoning_stopped
+        if not reasoning_started or reasoning_index is None or reasoning_stopped:
+            return
+        digest = hashlib.sha256(reasoning_so_far.encode("utf-8", errors="replace")).hexdigest()[:24]
+        emit(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": reasoning_index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": f"claude-any-openai-reasoning-{digest}",
+                },
+            },
+        )
+        emit("content_block_stop", {"type": "content_block_stop", "index": reasoning_index})
+        reasoning_stopped = True
 
     def emit_text_delta(text: str) -> None:
         if not text:
@@ -10597,8 +10707,14 @@ def stream_openai_chat_to_anthropic_sse(
             if choice.get("finish_reason"):
                 finish_reason = str(choice.get("finish_reason"))
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            reasoning_chunk = delta.get("reasoning_content") or ""
+            if reasoning_chunk:
+                reasoning_so_far += str(reasoning_chunk)
+                emit_reasoning_delta(str(reasoning_chunk))
+                update_stream_activity()
             text_chunk = delta.get("content") or ""
             if text_chunk:
+                close_reasoning_block()
                 if pseudo_mode or PSEUDO_TOOL_START in text_chunk:
                     before, sep, after = text_chunk.partition(PSEUDO_TOOL_START)
                     if before and not pseudo_mode:
@@ -10658,6 +10774,7 @@ def stream_openai_chat_to_anthropic_sse(
         if word_chunking and text_buffer:
             to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
             emit_text_delta(to_flush)
+        close_reasoning_block()
 
         tool_calls: list[dict[str, Any]] = []
         _, pseudo_tool_calls = parse_pseudo_tool_calls(pseudo_text)

@@ -1,4 +1,5 @@
 import copy
+import io
 import unittest
 from unittest import mock
 
@@ -291,6 +292,106 @@ class OpenCodeProviderTests(unittest.TestCase):
             {"type": "function", "function": {"name": claude_any.COMPAT_TOOL_NAME}},
             request.get("tool_choice"),
         )
+
+    def test_zen_deepseek_roundtrips_reasoning_content(self):
+        pcfg = self.opencode_cfg(
+            api_key="sk-opencode-test",
+            current_model="deepseek-v4-flash-free",
+        )["providers"]["opencode"]
+        data = {
+            "choices": [
+                {
+                    "message": {
+                        "reasoning_content": "private chain",
+                        "content": "visible answer",
+                        "tool_calls": [
+                            {
+                                "id": "call_1",
+                                "type": "function",
+                                "function": {"name": "Bash", "arguments": "{\"command\":\"echo hi\"}"},
+                            }
+                        ],
+                    },
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+        }
+
+        message = claude_any.openai_chat_to_anthropic(data, "deepseek-v4-flash-free")
+        self.assertEqual("thinking", message["content"][0]["type"])
+        self.assertEqual("private chain", message["content"][0]["thinking"])
+
+        body = {
+            "model": "claude-any-opencode-deepseek-v4-flash-free",
+            "thinking": {"type": "enabled"},
+            "messages": [{"role": "assistant", "content": message["content"]}],
+        }
+        normalized = claude_any.normalize_thinking_for_non_anthropic_provider("opencode", pcfg, body)
+        self.assertNotIn("thinking", normalized)
+        self.assertEqual("thinking", normalized["messages"][0]["content"][0]["type"])
+
+        converted = claude_any.anthropic_messages_to_openai(normalized)
+        assistant = [item for item in converted if item.get("role") == "assistant"][-1]
+        self.assertEqual("private chain", assistant["reasoning_content"])
+        self.assertEqual("visible answer", assistant["content"])
+        self.assertEqual("Bash", assistant["tool_calls"][0]["function"]["name"])
+
+    def test_non_deepseek_openai_chat_still_strips_anthropic_thinking(self):
+        pcfg = self.opencode_cfg(api_key="sk-opencode-test", current_model="glm-5.1")["providers"]["opencode"]
+        body = {
+            "model": "claude-any-opencode-glm-5-1",
+            "thinking": {"type": "enabled"},
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "thinking", "thinking": "private", "signature": "sig"},
+                        {"type": "text", "text": "visible"},
+                    ],
+                }
+            ],
+        }
+
+        normalized = claude_any.normalize_thinking_for_non_anthropic_provider("opencode", pcfg, body)
+
+        self.assertNotIn("thinking", normalized)
+        self.assertEqual([{"type": "text", "text": "visible"}], normalized["messages"][0]["content"])
+
+    def test_zen_deepseek_stream_emits_reasoning_block(self):
+        class FakeHandler:
+            def __init__(self):
+                self.wfile = io.BytesIO()
+
+        def sse(payload):
+            return f"data: {claude_any.json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+        chunks = [
+            sse({"choices": [{"delta": {"reasoning_content": "private "}}]}),
+            sse({"choices": [{"delta": {"reasoning_content": "chain"}}]}),
+            sse({"choices": [{"delta": {"content": "visible"}}]}),
+            sse({"choices": [{"finish_reason": "stop", "delta": {}}], "usage": {"completion_tokens": 4}}),
+            b"data: [DONE]\n\n",
+        ]
+        handler = FakeHandler()
+
+        ok = claude_any.stream_openai_chat_to_anthropic_sse(
+            handler,
+            io.BytesIO(b"".join(chunks)),
+            "deepseek-v4-flash-free",
+            "opencode",
+            source_body={"messages": [{"role": "user", "content": "hello"}]},
+        )
+
+        self.assertTrue(ok)
+        output = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn('"type": "thinking"', output)
+        self.assertIn('"type": "thinking_delta"', output)
+        self.assertIn("private ", output)
+        self.assertIn("chain", output)
+        self.assertIn('"type": "signature_delta"', output)
+        self.assertIn('"type": "text_delta"', output)
+        self.assertIn("visible", output)
 
 
 if __name__ == "__main__":
