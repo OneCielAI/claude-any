@@ -245,6 +245,53 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("openai-chat", obj["claude_any"]["opencode_endpoint"])
         self.assertTrue(obj["claude_any"]["router_supported"])
 
+    def test_zen_deepseek_chat_omits_forced_tool_choice(self):
+        pcfg = self.opencode_cfg(api_key="sk-opencode-test")["providers"]["opencode"]
+        body = claude_any.compatibility_tool_request("deepseek-v4-flash-free")
+
+        request = claude_any.openai_compatible_chat_request(
+            "opencode",
+            "deepseek-v4-flash-free",
+            body,
+            pcfg,
+            stream=False,
+        )
+
+        self.assertIn("tools", request)
+        self.assertNotIn("tool_choice", request)
+
+    def test_go_deepseek_chat_omits_forced_tool_choice(self):
+        pcfg = self.opencode_go_cfg(api_key="sk-opencode-test")["providers"]["opencode-go"]
+        body = claude_any.compatibility_tool_request("deepseek-v4-pro")
+
+        request = claude_any.openai_compatible_chat_request(
+            "opencode-go",
+            "deepseek-v4-pro",
+            body,
+            pcfg,
+            stream=False,
+        )
+
+        self.assertIn("tools", request)
+        self.assertNotIn("tool_choice", request)
+
+    def test_non_deepseek_chat_preserves_forced_tool_choice(self):
+        pcfg = self.opencode_cfg(api_key="sk-opencode-test")["providers"]["opencode"]
+        body = claude_any.compatibility_tool_request("glm-5.1")
+
+        request = claude_any.openai_compatible_chat_request(
+            "opencode",
+            "glm-5.1",
+            body,
+            pcfg,
+            stream=False,
+        )
+
+        self.assertEqual(
+            {"type": "function", "function": {"name": claude_any.COMPAT_TOOL_NAME}},
+            request.get("tool_choice"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

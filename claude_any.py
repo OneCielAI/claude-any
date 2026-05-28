@@ -8117,6 +8117,18 @@ def anthropic_tool_choice_to_openai(tool_choice: Any) -> Any:
     return tool_choice
 
 
+def should_omit_openai_chat_tool_choice(provider: str, model: str, body: dict[str, Any], pcfg: dict[str, Any]) -> bool:
+    """Return true when an OpenAI-chat backend should receive tools without a forced tool_choice."""
+    if body.get("tool_choice") is None:
+        return False
+    if provider not in OPENCODE_PROVIDER_NAMES:
+        return False
+    model_id = strip_claude_context_suffix(model).strip().lower()
+    if not model_id.startswith("deepseek-"):
+        return False
+    return opencode_endpoint_kind(provider, model, pcfg) == "openai-chat"
+
+
 def positive_int(value: Any) -> int | None:
     try:
         out = int(value)
@@ -8520,7 +8532,7 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
     }
     if tools:
         req["tools"] = tools
-    if body.get("tool_choice") is not None:
+    if body.get("tool_choice") is not None and not should_omit_openai_chat_tool_choice(provider, model, body, pcfg):
         req["tool_choice"] = anthropic_tool_choice_to_openai(body.get("tool_choice"))
     max_tokens = configured_output_tokens(pcfg, body)
     if max_tokens:
