@@ -170,6 +170,30 @@ Apply settings only, without launching Claude Code:
 claude-any --ca-provider ollama-cloud --ca-model deepseek-v4-flash --ca-context-window 1048576 --ca-request-timeout-ms 300000 --ca-no-launch
 ```
 
+New routed providers can also be configured entirely with `--ca-*` flags. For
+DeepSeek.com:
+
+```sh
+claude-any --ca-provider deepseek --ca-base-url https://api.deepseek.com/anthropic --ca-model deepseek-v4-pro --ca-api-key-env DEEPSEEK_API_KEY --ca-no-launch
+```
+
+For OpenCode Zen:
+
+```sh
+claude-any --ca-provider opencode --ca-base-url https://opencode.ai/zen --ca-model claude-sonnet-4-6 --ca-api-key-env OPENCODE_ZEN_API_KEY --ca-no-launch
+```
+
+For OpenCode Go:
+
+```sh
+claude-any --ca-provider opencode-go --ca-base-url https://opencode.ai/zen/go --ca-model qwen3.6-plus --ca-api-key-env OPENCODE_GO_API_KEY --ca-provider-option endpoint:custom-model=chat --ca-no-launch
+```
+
+`--ca-provider-option KEY=VALUE` applies a provider option to the current
+provider; use `--ca-set-provider-option PROVIDER KEY=VALUE` when a script needs
+to configure a provider other than the current one. OpenCode endpoint overrides
+use `endpoint:<model-id>=messages|chat|responses|gemini`.
+
 Apply the recommended LLM options for the saved provider/model, then exit:
 
 ```sh
@@ -492,7 +516,8 @@ steps under that larger model's supervision.
 - Router mode for providers that need request/response adaptation.
 - DuckDuckGo and fetch MCP wiring for non-native providers.
 - Headless setup flags such as `--ca-provider`, `--ca-model`, `--ca-base-url`,
-  `--ca-api-key-env`, `--ca-ollama-option`, and `--ca-max-output-tokens`.
+  `--ca-api-key-env`, `--ca-provider-option`, `--ca-ollama-option`, and
+  `--ca-max-output-tokens`.
 - Claude Code Plan Mode support on router-backed non-Anthropic providers,
   including local handling for `EnterPlanMode` and plan artifacts.
 - Optional `/advisor` slash command that routes the current task state to a
@@ -558,7 +583,10 @@ steps under that larger model's supervision.
   AI SDK package metadata, Claude Any displays the inferred endpoint family in
   the model picker, prefers Anthropic-compatible `/v1/messages` for unknown
   OpenCode model IDs, and supports per-model overrides with
-  `claude-anyctl provider-options opencode-go endpoint:<model-id>=messages|chat|responses|gemini`.
+  `claude-anyctl provider-options opencode-go endpoint:<model-id>=messages|chat|responses|gemini`
+  or the headless
+  `--ca-provider-option endpoint:<model-id>=messages|chat|responses|gemini`
+  flag.
 
 ### 0.1.101
 

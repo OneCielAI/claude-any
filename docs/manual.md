@@ -250,6 +250,12 @@ Choose `DeepSeek.com` in the provider menu, or configure it headlessly:
 claude-any --ca-provider deepseek --ca-model deepseek-v4-pro
 ```
 
+Full one-shot setup:
+
+```sh
+claude-any --ca-provider deepseek --ca-base-url https://api.deepseek.com/anthropic --ca-model deepseek-v4-pro --ca-api-key-env DEEPSEEK_API_KEY --ca-no-launch
+```
+
 DeepSeek requires a DeepSeek API key. If launch is blocked because no key is
 configured, Claude Any opens the API-key setup path so you can enter or select
 the environment variable without restarting the launcher.
@@ -280,6 +286,12 @@ Choose `OpenCode Zen` in the provider menu, or configure it headlessly:
 claude-any --ca-provider opencode --ca-model claude-sonnet-4-6
 ```
 
+Full one-shot setup:
+
+```sh
+claude-any --ca-provider opencode --ca-base-url https://opencode.ai/zen --ca-model claude-sonnet-4-6 --ca-api-key-env OPENCODE_ZEN_API_KEY --ca-no-launch
+```
+
 OpenCode Zen requires an OpenCode Zen API key. Claude Any uses
 `https://opencode.ai/zen/v1/models` for the live model picker. Per the Zen
 docs, Claude and Qwen Zen models use `/v1/messages`, while chat-compatible Zen
@@ -307,6 +319,12 @@ Choose `OpenCode Go` in the provider menu, or configure it headlessly:
 claude-any --ca-provider opencode-go --ca-model qwen3.6-plus
 ```
 
+Full one-shot setup:
+
+```sh
+claude-any --ca-provider opencode-go --ca-base-url https://opencode.ai/zen/go --ca-model qwen3.6-plus --ca-api-key-env OPENCODE_GO_API_KEY --ca-no-launch
+```
+
 OpenCode Go requires an OpenCode Go API key. Claude Any uses
 `https://opencode.ai/zen/go/v1/models` for the live model picker. Per the Go
 docs, Qwen and MiniMax Go models use `/v1/messages`, while GLM, Kimi,
@@ -321,6 +339,8 @@ overrides:
 ```sh
 claude-anyctl provider-options opencode-go endpoint:custom-model=chat
 claude-anyctl provider-options opencode endpoint:custom-model=messages
+claude-any --ca-provider opencode-go --ca-provider-option endpoint:custom-model=chat --ca-no-launch
+claude-any --ca-set-provider-option opencode endpoint:custom-model=messages --ca-no-launch
 ```
 
 Links:
@@ -642,6 +662,8 @@ Common Claude Any setup flags:
 | `--ca-api-key-env ENVVAR` | Store the current provider API key from an environment variable. |
 | `--ca-set-api-key PROVIDER KEY` | Store a key for a specific provider. |
 | `--ca-set-api-key-env PROVIDER ENVVAR` | Store a provider key from an environment variable. |
+| `--ca-provider-option KEY=VALUE` | Set a provider option for the current provider. OpenCode endpoint overrides use `endpoint:<model-id>=messages|chat|responses|gemini`. |
+| `--ca-set-provider-option PROVIDER KEY=VALUE` | Set a provider option for a specific provider without switching the current provider first. |
 | `--ca-max-output-tokens VALUE` | Set provider output-token cap. |
 | `--ca-context-window VALUE` | Set provider/router context-window cap where supported. |
 | `--ca-request-timeout-ms VALUE` | Set upstream request timeout in milliseconds. |

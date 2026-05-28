@@ -185,9 +185,29 @@ claude-any --ca-env-file .env.claude-any -p "Reply with OK only." --output-forma
 헤드리스 지원 범위: provider, base URL, model, Advisor model, API key 또는
 API-key 환경변수, max output, context window, request timeout, RPM limit,
 RPM status 표시, streaming, web search, web fetch, Claude skills, update check,
-language, Ollama context/options, 일반 Claude Code passthrough 인자를 모두 메뉴
-없이 설정할 수 있습니다. API key는 `--ca-api-key`로 직접 전달할 수 있지만,
-스크립트에서는 shell history에 비밀값이 남지 않는 `--ca-api-key-env`를 권장합니다.
+language, Ollama context/options, provider-specific option, 일반 Claude Code
+passthrough 인자를 모두 메뉴 없이 설정할 수 있습니다. API key는
+`--ca-api-key`로 직접 전달할 수 있지만, 스크립트에서는 shell history에
+비밀값이 남지 않는 `--ca-api-key-env`를 권장합니다.
+
+최근 추가된 provider도 같은 방식으로 한 번에 설정할 수 있습니다:
+
+```sh
+claude-any --ca-provider deepseek --ca-base-url https://api.deepseek.com/anthropic --ca-model deepseek-v4-pro --ca-api-key-env DEEPSEEK_API_KEY --ca-no-launch
+```
+
+```sh
+claude-any --ca-provider opencode --ca-base-url https://opencode.ai/zen --ca-model claude-sonnet-4-6 --ca-api-key-env OPENCODE_ZEN_API_KEY --ca-no-launch
+```
+
+```sh
+claude-any --ca-provider opencode-go --ca-base-url https://opencode.ai/zen/go --ca-model qwen3.6-plus --ca-api-key-env OPENCODE_GO_API_KEY --ca-provider-option endpoint:custom-model=chat --ca-no-launch
+```
+
+`--ca-provider-option KEY=VALUE`는 현재 provider에 옵션을 적용하고,
+`--ca-set-provider-option PROVIDER KEY=VALUE`는 현재 provider를 바꾸지 않고
+특정 provider 옵션을 저장합니다. OpenCode endpoint override는
+`endpoint:<model-id>=messages|chat|responses|gemini` 형식입니다.
 
 더 많은 예시는 [헤드리스 예제](#헤드리스-에이전트-채팅)와
 [전체 manual](manual.md#headless-usage)을 참고하세요.

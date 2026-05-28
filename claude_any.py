@@ -22582,6 +22582,10 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-api-key-env ENVVAR Set current provider API key from env, then launch
   claude-any --ca-set-api-key PROVIDER KEY
   claude-any --ca-set-api-key-env PROVIDER ENVVAR
+  claude-any --ca-provider-option KEY=VALUE
+                                      Set a provider option for the current provider
+  claude-any --ca-set-provider-option PROVIDER KEY=VALUE
+                                      Set a provider option for a specific provider
   claude-any --ca-ollama-num-ctx VALUE
   claude-any --ca-ollama-ctx-range MIN MAX
   claude-any --ca-ollama-option KEY=VALUE
@@ -22991,6 +22995,25 @@ def run_cli(argv: list[str]) -> int:
             if not value:
                 raise SystemExit(f"Environment variable {argv[i + 2]} is empty or not set")
             cmd_set_api_key(argparse.Namespace(provider=argv[i + 1], key=value))
+            skip_menu = True
+            i += 3
+        elif arg in ("--ca-provider-option", "--ca-provider-options") or arg.startswith(
+            ("--ca-provider-option=", "--ca-provider-options=")
+        ):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing KEY=VALUE for --ca-provider-option")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            cmd_provider_options(argparse.Namespace(values=[value]))
+            skip_menu = True
+        elif arg == "--ca-set-provider-option":
+            if i + 2 >= len(argv):
+                raise SystemExit("Usage: --ca-set-provider-option PROVIDER KEY=VALUE")
+            cmd_provider_options(argparse.Namespace(values=[argv[i + 1], argv[i + 2]]))
             skip_menu = True
             i += 3
         elif arg == "--ca-ollama-num-ctx" or arg.startswith("--ca-ollama-num-ctx="):

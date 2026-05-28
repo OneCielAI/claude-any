@@ -135,6 +135,69 @@ class HeadlessUpdateCheckTests(unittest.TestCase):
         model.assert_called_once()
         launch.assert_not_called()
 
+    def test_configure_only_accepts_new_provider_flags(self):
+        cases = (
+            ("deepseek", "deepseek-v4-pro", "https://api.deepseek.com/anthropic"),
+            ("opencode", "claude-sonnet-4-6", "https://opencode.ai/zen"),
+            ("opencode-go", "qwen3.6-plus", "https://opencode.ai/zen/go"),
+        )
+        for provider_name, model_name, base_url in cases:
+            with self.subTest(provider=provider_name):
+                with (
+                    patch("claude_any.apply_headless_env_config", return_value=(False, None, None, None, False)),
+                    patch("claude_any.cmd_provider") as provider,
+                    patch("claude_any.cmd_model") as model,
+                    patch("claude_any.cmd_base_url") as base,
+                    patch("claude_any.cmd_set_api_key") as api_key,
+                    patch("claude_any.launch_claude") as launch,
+                ):
+                    rc = claude_any.run_cli(
+                        [
+                            "--ca-provider",
+                            provider_name,
+                            "--ca-base-url",
+                            base_url,
+                            "--ca-model",
+                            model_name,
+                            "--ca-api-key",
+                            "sk-test",
+                            "--ca-no-launch",
+                        ]
+                    )
+
+                self.assertEqual(0, rc)
+                self.assertEqual(provider_name, provider.call_args.args[0].name)
+                self.assertEqual([model_name], model.call_args.args[0].value)
+                self.assertEqual(base_url, base.call_args.args[0].url)
+                self.assertEqual("sk-test", api_key.call_args.args[0].key)
+                launch.assert_not_called()
+
+    def test_provider_option_headless_applies_current_provider_option(self):
+        with (
+            patch("claude_any.apply_headless_env_config", return_value=(False, None, None, None, False)),
+            patch("claude_any.cmd_provider_options") as provider_options,
+            patch("claude_any.launch_claude") as launch,
+        ):
+            rc = claude_any.run_cli(["--ca-provider-option", "endpoint:custom-model=chat", "--ca-no-launch"])
+
+        self.assertEqual(0, rc)
+        self.assertEqual(["endpoint:custom-model=chat"], provider_options.call_args.args[0].values)
+        launch.assert_not_called()
+
+    def test_provider_option_headless_supports_explicit_provider(self):
+        with (
+            patch("claude_any.apply_headless_env_config", return_value=(False, None, None, None, False)),
+            patch("claude_any.cmd_provider_options") as provider_options,
+            patch("claude_any.launch_claude") as launch,
+        ):
+            rc = claude_any.run_cli(
+                ["--ca-set-provider-option", "opencode-go", "endpoint:custom-model=chat", "--ca-no-launch"]
+            )
+
+        self.assertEqual(0, rc)
+        self.assertEqual(["opencode-go", "endpoint:custom-model=chat"], provider_options.call_args.args[0].values)
+        launch.assert_not_called()
+
     def test_configure_only_aliases_are_recognized(self):
         for flag in ("--ca-configure-only", "--ca-setup-only"):
             with self.subTest(flag=flag):
