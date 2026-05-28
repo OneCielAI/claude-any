@@ -5447,7 +5447,7 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
     upstream_text = " · ".join(bit for bit in upstream_bits if bit)
     links = [
         ("Events UI", "/ca/events", "Live router event stream with filters"),
-        ("Provider web chat", "/ca/web/chat", "Standalone browser chat for the current provider"),
+        ("Provider web chat", "/ca/web/chat", "Standalone text-only chat for the current provider"),
         ("Recent events JSON", "/ca/events/recent", "Latest structured event records"),
         ("Events SSE", "/ca/events/stream", "Server-sent events stream"),
         ("Chat health", "/ca/chat/health", "Agent chat component status"),
@@ -5744,7 +5744,7 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
       <header>
         <div>
           <h1>Provider Web Chat</h1>
-          <div class="sub">Standalone browser chat for the selected provider through <code>/v1/messages</code>; it is not attached to an existing Claude Code terminal session.</div>
+          <div class="sub">Standalone text-only browser chat for the selected provider through <code>/v1/messages</code>; it is not attached to an existing Claude Code terminal session or tool executor.</div>
         </div>
         <div class="pill" id="statePill">ready</div>
       </header>
@@ -5754,7 +5754,7 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
           <textarea id="prompt" placeholder="Type a message..." autocomplete="off"></textarea>
           <button class="primary" id="sendButton" type="submit">Send</button>
         </div>
-        <div class="hint">Enter sends. Shift+Enter inserts a new line. This page starts a separate browser conversation and stays local to the router unless you expose it yourself.</div>
+        <div class="hint">Enter sends. Shift+Enter inserts a new line. This page starts a separate text-only browser conversation. Claude Code tools, MCP tools, shell, and filesystem access are not available here.</div>
       </form>
     </main>
   </div>
@@ -5768,6 +5768,13 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
     const clearButton = document.getElementById('clearButton');
     const statePill = document.getElementById('statePill');
     const history = [];
+    const TEXT_ONLY_SYSTEM_PROMPT = [
+      'You are running inside Claude Any Provider Web Chat.',
+      'This standalone browser chat is text-only and is not attached to an existing Claude Code terminal session.',
+      'You do not have Claude Code tools, MCP tools, shell access, filesystem access, browser automation, or the user\\'s active terminal transcript in this interface.',
+      'Do not claim that you inspected files, listed folders, ran commands, opened URLs, or called tools.',
+      'If the user asks for tool-backed work, explain that this Web Chat cannot execute tools and ask them to use the Claude Code terminal session or paste the relevant data.'
+    ].join(' ');
     function setState(text, cls = '') {{
       statePill.textContent = text;
       statePill.className = 'pill ' + cls;
@@ -5790,7 +5797,7 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
         if (typeof block === 'string') return block;
         if (!block || typeof block !== 'object') return '';
         if (block.type === 'text') return block.text || '';
-        if (block.type === 'tool_use') return `[tool_use ${{block.name || block.id || ''}}]`;
+        if (block.type === 'tool_use') return `[tool_use ${{block.name || block.id || ''}} requested, but Provider Web Chat has no tool executor]`;
         return block.text || '';
       }}).filter(Boolean).join('\\n');
     }}
@@ -5819,6 +5826,12 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
             }} else if (event.type === 'content_block_start' && event.content_block && event.content_block.type === 'text') {{
               text += event.content_block.text || '';
               bubble.textContent = text;
+            }} else if (event.type === 'content_block_start' && event.content_block && event.content_block.type === 'tool_use') {{
+              const toolName = event.content_block.name || event.content_block.id || 'tool';
+              text += `${{text ? '\\n' : ''}}[tool_use ${{toolName}} requested, but Provider Web Chat has no tool executor]`;
+              bubble.textContent = text;
+              bubble.classList.add('error');
+              setState('tool unavailable', 'error');
             }} else if (event.type === 'message_delta' && event.delta && event.delta.stop_reason) {{
               setState(event.delta.stop_reason);
             }} else if (event.type === 'error') {{
@@ -5843,6 +5856,7 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
           body: JSON.stringify({{
             model: MODEL,
             max_tokens: MAX_TOKENS,
+            system: TEXT_ONLY_SYSTEM_PROMPT,
             stream: true,
             messages: history
           }})
@@ -5891,10 +5905,10 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
     clearButton.addEventListener('click', () => {{
       history.length = 0;
       transcript.innerHTML = '';
-      addBubble('system', 'Chat cleared. Provider and model remain unchanged. This browser conversation is separate from any Claude Code terminal session.');
+      addBubble('system', 'Chat cleared. Provider and model remain unchanged. This text-only browser conversation is separate from any Claude Code terminal session and has no tool executor.');
       setState('ready');
     }});
-    addBubble('system', `Connected to ${{MODEL}}. Messages are sent to /v1/messages on this router as a standalone browser conversation.`);
+    addBubble('system', `Connected to ${{MODEL}}. Messages are sent to /v1/messages on this router as a standalone text-only browser conversation. Claude Code tools and MCP tools are not available here.`);
     prompt.focus();
   </script>
 </body>
