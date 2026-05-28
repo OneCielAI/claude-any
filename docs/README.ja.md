@@ -19,7 +19,7 @@
 > - **低コスト** — [Ollama Cloud](https://ollama.com/cloud) で GLM、Qwen、DeepSeek などのオープン重みモデルを、フロンティアモデル比でごく安価に。
 > - **無料 + ローカル** — [Ollama](https://ollama.com/) または [vLLM](https://github.com/vllm-project/vllm) を自分の GPU で完全オフライン実行。
 > - **Plan Mode + Advisor 対応** — non-Anthropic provider でも Claude Code Plan Mode を維持し、長コンテキスト Advisor モデルで作業レビューを受けられます。
-> - **ローカル browser chat** — router が `/ca/web/chat` を提供し、Claude Code と同じ `/v1/messages` 経路で選択中 provider と会話できます。
+> - **ローカル provider browser chat** — router が `/ca/web/chat` を提供し、Claude Code と同じ `/v1/messages` 経路で選択中 provider に独立したブラウザ会話を送ります。実行中の Claude Code 端末セッションには接続されません。
 > - **無料モデルの RPM をなめらかに利用** — Claude Code はファイル読み取りや tool 実行に時間を使うため、Claude Any はその自然な間隔を RPM pacing に活用し、NVIDIA hosted の無料モデルでも分単位制限を感じにくく使えます。
 >
 > プロバイダー、モデル、Base URL、API キー、ストリーミング動作、LLM オプションを Claude Code 起動 **前** にコンソールメニューで選択します。Claude Code 本体はそのまま — すべてのネイティブツール、slash コマンド、ワークフローが維持されます。
@@ -30,7 +30,7 @@
 
 1. **DeepSeek.com provider 対応** — DeepSeek の Anthropic 互換 Claude Code endpoint を正式 provider として選択でき、モデル preset と API key 設定フローを提供します。
 2. **共有ホストでより安全な router lifecycle** — router は既定でユーザー別の安定ポートを使い、起動前に同一ユーザーの stale router を整理して Robert/Sarah のような複数セッション混線を減らします。
-3. **Router browser chat と選択式 Anthropic routing** — `/ca/web/chat` でローカル router の chat UI を提供し、必要な場合は Anthropic も Claude Any router 経由で SSE/channel/observability を使えます。
+3. **Router provider browser chat と選択式 Anthropic routing** — `/ca/web/chat` で現在の provider に独立した `/v1/messages` 会話を送るローカル router chat UI を提供し、必要な場合は Anthropic も Claude Any router 経由で SSE/channel/observability を使えます。
 
 ### 2026-05-15
 
@@ -814,8 +814,10 @@ Claude Any router が動作している場合、次を開けます。
 http://127.0.0.1:8799/ca/web/chat
 ```
 
-この画面はローカルの chat UI で、Claude Code と同じ Anthropic 互換
-`/v1/messages` 経路を使って現在の provider に request を送ります。
+この画面はローカルの provider test chat UI で、Claude Code と同じ Anthropic 互換
+`/v1/messages` 経路を使って現在の provider に独立した会話 request を送ります。
+ブラウザは別の会話履歴を保持するため、実行中の Claude Code 端末 transcript や
+作業状態には自動接続されません。
 Cloudflare tunnel、public DNS、Tailscale route は自動作成しません。
 Anthropic provider をこの UI や router 機能で扱う場合は Anthropic の
 `route_through_router` option を有効化し、Anthropic API key を設定します。

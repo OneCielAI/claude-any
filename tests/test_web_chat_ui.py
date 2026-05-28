@@ -20,7 +20,7 @@ class WebChatUiTests(unittest.TestCase):
         html = claude_any.render_router_home_html(cfg, provider, pcfg)
 
         self.assertIn("/ca/web/chat", html)
-        self.assertIn("Browser chat UI", html)
+        self.assertIn("Standalone browser chat", html)
 
     def test_web_chat_posts_to_router_messages_endpoint(self):
         cfg = self._cfg()
@@ -29,8 +29,10 @@ class WebChatUiTests(unittest.TestCase):
 
         html = claude_any.render_web_chat_html(cfg, provider, pcfg)
 
-        self.assertIn("Web Chat", html)
+        self.assertIn("Provider Web Chat", html)
         self.assertIn("/v1/messages", html)
+        self.assertIn("not attached to an existing Claude Code terminal session", html)
+        self.assertIn("standalone browser conversation", html)
         self.assertIn("text/event-stream", html)
         self.assertIn(model, html)
         self.assertIn(".bubble", html)

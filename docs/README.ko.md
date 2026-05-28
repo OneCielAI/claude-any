@@ -19,7 +19,7 @@
 > - **저비용** — [Ollama Cloud](https://ollama.com/cloud) 로 GLM, Qwen, DeepSeek 같은 오픈 가중치 모델을 frontier 모델 대비 매우 낮은 가격에 사용.
 > - **무료 + 로컬** — [Ollama](https://ollama.com/) 또는 [vLLM](https://github.com/vllm-project/vllm) 을 본인 GPU 에서 완전 오프라인으로 사용.
 > - **Plan Mode + Advisor 지원** — non-Anthropic provider 에서도 Claude Code Plan Mode 를 유지하고, 긴 컨텍스트 Advisor 모델로 작업 검토를 받을 수 있습니다.
-> - **로컬 브라우저 채팅** — router가 `/ca/web/chat`을 제공하며, Claude Code와 같은 `/v1/messages` 경로로 현재 선택된 provider와 대화합니다.
+> - **로컬 provider 브라우저 채팅** — router가 `/ca/web/chat`을 제공하며, Claude Code와 같은 `/v1/messages` 경로로 현재 선택된 provider에 독립 브라우저 대화를 보냅니다. 실행 중인 Claude Code 터미널 세션에 붙는 UI는 아닙니다.
 > - **무료 모델 RPM을 부드럽게 사용** — Claude Code 는 파일을 읽고 tool 을 실행하는 시간이 있고, Claude Any 는 그 자연스러운 간격을 RPM pacing 에 활용하므로 NVIDIA hosted 무료 모델의 분당 제한을 덜 체감하며 사용할 수 있습니다.
 >
 > 프로바이더, 모델, Base URL, API 키, 스트리밍 동작, LLM 옵션을 Claude Code 실행 **전에** 콘솔 메뉴에서 모두 선택합니다. Claude Code 본체는 그대로 — 모든 native 툴링, slash command, 워크플로우가 유지됩니다.
@@ -30,7 +30,7 @@
 
 1. **DeepSeek.com 프로바이더 지원** — DeepSeek의 Anthropic 호환 Claude Code 엔드포인트를 정식 프로바이더로 선택할 수 있고, 모델 프리셋과 API 키 설정 흐름을 제공합니다.
 2. **공유 서버에서 더 안전한 라우터 수명주기** — 라우터가 기본적으로 사용자별 안정 포트를 사용하고, 같은 사용자의 stale router를 실행 전에 정리해 Robert/Sarah 같은 다중 세션이 서로 섞이는 문제를 줄였습니다.
-3. **Router 브라우저 채팅과 선택형 Anthropic 라우팅** — `/ca/web/chat`으로 로컬 router 채팅 화면을 제공하고, Anthropic도 필요할 때 Claude Any router를 경유해 SSE, 채널, 관측 기능을 사용할 수 있습니다.
+3. **Router provider 브라우저 채팅과 선택형 Anthropic 라우팅** — `/ca/web/chat`으로 현재 provider에 독립 `/v1/messages` 대화를 보내는 로컬 router 채팅 화면을 제공하고, Anthropic도 필요할 때 Claude Any router를 경유해 SSE, 채널, 관측 기능을 사용할 수 있습니다.
 
 ### 2026-05-18
 
@@ -829,8 +829,10 @@ Claude Any router가 실행 중이면 다음 주소를 열 수 있습니다.
 http://127.0.0.1:8799/ca/web/chat
 ```
 
-이 화면은 Teams 스타일의 로컬 채팅 UI이며, Claude Code가 사용하는 것과 같은
-Anthropic 호환 `/v1/messages` 경로로 현재 선택된 provider에 요청을 보냅니다.
+이 화면은 Teams 스타일의 로컬 provider 테스트 채팅 UI이며, Claude Code가 사용하는 것과 같은
+Anthropic 호환 `/v1/messages` 경로로 현재 선택된 provider에 독립 대화 요청을 보냅니다.
+브라우저가 별도의 대화 히스토리를 유지하므로 실행 중인 Claude Code 터미널 세션의
+transcript나 작업 상태에는 자동으로 연결되지 않습니다.
 Cloudflare tunnel, public DNS, Tailscale route는 자동 생성하지 않습니다.
 선택된 provider가 Anthropic이고 이 웹 채팅이나 router 기능으로 Anthropic
 트래픽을 처리하려면 Anthropic LLM 옵션의 `route_through_router`를 켜고

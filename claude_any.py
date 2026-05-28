@@ -5447,7 +5447,7 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
     upstream_text = " · ".join(bit for bit in upstream_bits if bit)
     links = [
         ("Events UI", "/ca/events", "Live router event stream with filters"),
-        ("Web chat", "/ca/web/chat", "Browser chat UI for the current provider"),
+        ("Provider web chat", "/ca/web/chat", "Standalone browser chat for the current provider"),
         ("Recent events JSON", "/ca/events/recent", "Latest structured event records"),
         ("Events SSE", "/ca/events/stream", "Server-sent events stream"),
         ("Chat health", "/ca/chat/health", "Agent chat component status"),
@@ -5743,8 +5743,8 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
     <main>
       <header>
         <div>
-          <h1>Web Chat</h1>
-          <div class="sub">Talk to the currently selected Claude Any provider through <code>/v1/messages</code>.</div>
+          <h1>Provider Web Chat</h1>
+          <div class="sub">Standalone browser chat for the selected provider through <code>/v1/messages</code>; it is not attached to an existing Claude Code terminal session.</div>
         </div>
         <div class="pill" id="statePill">ready</div>
       </header>
@@ -5754,7 +5754,7 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
           <textarea id="prompt" placeholder="Type a message..." autocomplete="off"></textarea>
           <button class="primary" id="sendButton" type="submit">Send</button>
         </div>
-        <div class="hint">Enter sends. Shift+Enter inserts a new line. This page stays local to the router unless you expose it yourself.</div>
+        <div class="hint">Enter sends. Shift+Enter inserts a new line. This page starts a separate browser conversation and stays local to the router unless you expose it yourself.</div>
       </form>
     </main>
   </div>
@@ -5891,10 +5891,10 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
     clearButton.addEventListener('click', () => {{
       history.length = 0;
       transcript.innerHTML = '';
-      addBubble('system', 'Chat cleared. Provider and model remain unchanged.');
+      addBubble('system', 'Chat cleared. Provider and model remain unchanged. This browser conversation is separate from any Claude Code terminal session.');
       setState('ready');
     }});
-    addBubble('system', `Connected to ${{MODEL}}. Messages are sent to /v1/messages on this router.`);
+    addBubble('system', `Connected to ${{MODEL}}. Messages are sent to /v1/messages on this router as a standalone browser conversation.`);
     prompt.focus();
   </script>
 </body>
