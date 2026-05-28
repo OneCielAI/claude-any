@@ -38,9 +38,8 @@ class DeepSeekProviderTests(unittest.TestCase):
         env = claude_any.env_vars(cfg)
         self.assertEqual("deepseek", env["CLAUDE_ANY_PROVIDER"])
         self.assertEqual(claude_any.ROUTER_BASE, env["ANTHROPIC_BASE_URL"])
-        self.assertEqual("not-used", env["ANTHROPIC_AUTH_TOKEN"])
+        self.assertEqual("sk-deepseek-test", env["ANTHROPIC_AUTH_TOKEN"])
         self.assertNotIn("ANTHROPIC_API_KEY", env)
-        self.assertNotIn("sk-deepseek-test", env.values())
         expected_model = claude_any.claude_code_context_model_alias("deepseek", pcfg, claude_any.current_alias(cfg))
         self.assertEqual(expected_model, env["ANTHROPIC_MODEL"])
         self.assertEqual(expected_model, env["ANTHROPIC_DEFAULT_OPUS_MODEL"])
@@ -84,7 +83,7 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertEqual(0, rc)
         launch_env = call.call_args.kwargs["env"]
         self.assertEqual(claude_any.ROUTER_BASE, launch_env["ANTHROPIC_BASE_URL"])
-        self.assertEqual("not-used", launch_env["ANTHROPIC_AUTH_TOKEN"])
+        self.assertEqual("sk-deepseek-test", launch_env["ANTHROPIC_AUTH_TOKEN"])
         self.assertNotIn("ANTHROPIC_API_KEY", launch_env)
 
     def test_deepseek_base_status_does_not_probe_model_list(self):

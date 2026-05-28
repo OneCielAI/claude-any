@@ -729,6 +729,7 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 | Anthropic | 默认 Native Claude Code，可选 router | 直接 native mode 使用 Claude 登录或 Anthropic API key。需要 Claude Any router 的 SSE/channel/observability 时启用 `route_through_router`；该模式需要 Anthropic API key。 |
 | Ollama | Native 优先，必要时 router | 本地 Ollama 通常不需要 API key；通过本地 Ollama 使用 `:cloud` 模型时，需要在 Ollama host 上 `ollama signin`。 |
 | Ollama Cloud | Router | 直接调用 `https://ollama.com/api`，需要 Ollama API key。 |
+| DeepSeek.com | Router | 调用 `https://api.deepseek.com/anthropic`。DeepSeek API key 会作为 `ANTHROPIC_AUTH_TOKEN` 传入，并保持 `ANTHROPIC_API_KEY` 未设置以避免 Claude Code 认证冲突。 |
 | vLLM | Native Anthropic-compatible endpoint | 使用 Anthropic 兼容 `/v1/messages` endpoint，并让 `--tool-call-parser` 匹配模型系列。 |
 | NVIDIA hosted | Router | 通过 Claude Any local router 使用 NVIDIA hosted API Catalog。 |
 | self-hosted NIM | Native Anthropic-compatible endpoint | 使用 self-hosted NIM 的 Anthropic 兼容 endpoint。 |

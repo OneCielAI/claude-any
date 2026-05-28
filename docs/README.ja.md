@@ -760,6 +760,7 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 | Anthropic | 既定は Native Claude Code、任意で router | 直接 native mode では Claude login または Anthropic API key を使用。Claude Any router の SSE/channel/observability が必要な場合は `route_through_router` を有効化します。この mode では Anthropic API key が必要です。 |
 | Ollama | Native 優先、必要時 router | ローカル Ollama は通常 API key 不要。ローカル Ollama で `:cloud` model を使う場合は Ollama host で `ollama signin` が必要。 |
 | Ollama Cloud | Router | `https://ollama.com/api` を直接呼び出し、Ollama API key が必要。 |
+| DeepSeek.com | Router | `https://api.deepseek.com/anthropic` を呼び出します。DeepSeek API key は `ANTHROPIC_AUTH_TOKEN` として渡し、Claude Code auth conflict を避けるため `ANTHROPIC_API_KEY` は未設定にします。 |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 互換 `/v1/messages` endpoint を使い、モデル系列に合う `--tool-call-parser` を指定。 |
 | NVIDIA hosted | Router | NVIDIA hosted API Catalog を Claude Any local router 経由で使用。 |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM の Anthropic 互換 endpoint を使用。 |

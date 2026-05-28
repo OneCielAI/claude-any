@@ -15797,10 +15797,17 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         return env
     alias = current_alias(cfg)
     claude_model = claude_code_context_model_alias(provider, pcfg, alias)
+    auth_token = "not-used"
+    if provider == "deepseek" and meaningful_key(pcfg.get("api_key")):
+        # DeepSeek's Claude Code integration expects the DeepSeek key in
+        # ANTHROPIC_AUTH_TOKEN. Keep ANTHROPIC_API_KEY unset to avoid Claude
+        # Code's auth-conflict path, but do not send a dummy token that can
+        # trigger DeepSeek/Claude Code governor authentication failures.
+        auth_token = str(pcfg["api_key"])
     return apply_common_claude_env(provider, pcfg, {
         "CLAUDE_ANY_PROVIDER": provider,
         "ANTHROPIC_BASE_URL": ROUTER_BASE,
-        "ANTHROPIC_AUTH_TOKEN": "not-used",
+        "ANTHROPIC_AUTH_TOKEN": auth_token,
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",

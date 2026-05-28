@@ -976,7 +976,7 @@ steps under that larger model's supervision.
 | Anthropic | Native Claude Code by default, optional router | Uses Claude login or Anthropic API key in direct native mode. Enable `route_through_router` when you explicitly want Anthropic requests to pass through the Claude Any router; routed mode requires an Anthropic API key. |
 | Ollama | Native when available, router otherwise | Local Ollama normally needs no API key. Cloud models through local Ollama require `ollama signin` on the Ollama host. |
 | Ollama Cloud | Router | Calls `https://ollama.com/api`; requires an Ollama API key. |
-| DeepSeek.com | Router | Calls `https://api.deepseek.com/anthropic`; requires a DeepSeek API key. |
+| DeepSeek.com | Router | Calls `https://api.deepseek.com/anthropic`; requires a DeepSeek API key. Claude Any passes that key as `ANTHROPIC_AUTH_TOKEN` and keeps `ANTHROPIC_API_KEY` unset to avoid Claude Code auth conflicts. |
 | vLLM | Native Anthropic-compatible endpoint | Use a vLLM endpoint that exposes Anthropic-compatible `/v1/messages`; match `--tool-call-parser` to the model family. |
 | NVIDIA hosted | Router | Uses the NVIDIA hosted API Catalog through the Claude Any local router. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | Use the self-hosted NIM Anthropic-compatible endpoint. |

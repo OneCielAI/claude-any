@@ -238,9 +238,11 @@ configured, Claude Any opens the API-key setup path so you can enter or select
 the environment variable without restarting the launcher.
 
 The DeepSeek provider is intentionally routed through Claude Any, which sets
-the Anthropic-compatible base URL and model alias for Claude Code. Avoid
-setting both `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` manually in your
-shell; let Claude Any prepare the auth environment for the selected provider.
+the Anthropic-compatible base URL and model alias for Claude Code. Claude Any
+passes the DeepSeek API key as `ANTHROPIC_AUTH_TOKEN`, matching DeepSeek's
+Claude Code integration, and keeps `ANTHROPIC_API_KEY` unset to avoid Claude
+Code's auth-conflict path. Avoid setting both variables manually in your shell;
+let Claude Any prepare the auth environment for the selected provider.
 
 Links:
 
