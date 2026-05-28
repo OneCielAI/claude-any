@@ -75,7 +75,7 @@ passes normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.100`
+Current version: `0.1.101`
 
 ## Why This Exists
 
@@ -527,6 +527,14 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.101
+
+- **DeepSeek.com Claude Code auth hotfix**: routed DeepSeek launches now pass
+  the configured DeepSeek API key through `ANTHROPIC_AUTH_TOKEN` while leaving
+  `ANTHROPIC_API_KEY` unset, matching DeepSeek's Claude Code integration path
+  and avoiding Claude Code governor 401 failures after a successful
+  `claude-any test`.
 
 ### 0.1.100
 

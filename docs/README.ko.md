@@ -74,7 +74,7 @@ DeepSeek.com, vLLM, NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code�
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.100`
+현재 버전: `0.1.101`
 
 ## 왜 만들었나
 

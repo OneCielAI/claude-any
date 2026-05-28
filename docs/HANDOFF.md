@@ -1,7 +1,7 @@
 # claude-any handoff
 
 Date: 2026-05-25
-Stable release being promoted: `@oneciel-ai/claude-any@0.1.100`
+Stable release being promoted: `@oneciel-ai/claude-any@0.1.101`
 Latest tested nightly: `@oneciel-ai/claude-any@0.1.100-nightly.20260525-080725.2424094`
 Current branch: `nightly`
 Current pushed commit: `2424094` (`Show direct channel handling in terminal`)
@@ -12,6 +12,10 @@ Current pushed commit: `2424094` (`Show direct channel handling in terminal`)
 
 The latest production path is:
 
+- `0.1.101` is a stable hotfix for routed DeepSeek.com Claude Code launches:
+  it passes the configured DeepSeek API key through `ANTHROPIC_AUTH_TOKEN`
+  while keeping `ANTHROPIC_API_KEY` unset, avoiding Claude Code governor 401
+  failures after `claude-any test` succeeds.
 - `0.1.100` promotes the current `nightly` line to stable.
 - DeepSeek.com is a first-class routed provider using `https://api.deepseek.com/anthropic`.
 - Non-Claude-Native providers route through claude-any; Claude Native suppresses routing env vars and stops the router before launch.
