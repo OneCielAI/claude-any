@@ -176,6 +176,23 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(1, len(found))
         self.assertEqual("hello", found[0]["message"])
 
+    def test_read_channel_history_before_returns_latest_matching_page(self):
+        messages = [
+            {"id": 1, "channel": "web-chat-a", "recipients": ["all"], "sender_id": "web-user", "message": "one", "meta": {}},
+            {"id": 2, "channel": "other", "recipients": ["all"], "sender_id": "web-user", "message": "skip", "meta": {}},
+            {"id": 3, "channel": "web-chat-a", "recipients": ["web"], "sender_id": "assistant", "message": "three", "meta": {}},
+            {"id": 4, "channel": "web-chat-a", "recipients": ["web"], "sender_id": "assistant", "message": "four", "meta": {}},
+            {"id": 5, "channel": "web-chat-a", "recipients": ["internal"], "sender_id": "assistant", "message": "hidden", "meta": {}},
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "chat-messages.jsonl"
+            path.write_text("\n".join(__import__("json").dumps(item) for item in messages), encoding="utf-8")
+            with mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path):
+                latest = claude_any.read_chat_messages_before(0, "web-chat-a", "web", 2)
+                older = claude_any.read_chat_messages_before(4, "web-chat-a", "web", 10)
+        self.assertEqual(["three", "four"], [item["message"] for item in latest])
+        self.assertEqual(["one", "three"], [item["message"] for item in older])
+
     def test_mcp_endpoint_event_initializes_sse_session(self):
         name = "unit-mcp"
         original = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
@@ -916,6 +933,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("진행하겠습니다", prompt)
         self.assertIn("같은 턴에서 필요한 조사/도구 호출/채널 보고까지 수행", prompt)
         self.assertIn("단순 온보딩/인사/중복 테스트 메시지", prompt)
+        self.assertNotIn("NO_REPLY", prompt)
         self.assertIn("Sarah, 추가 매크로 분석 보고서를 보내주세요.", prompt)
         self.assertIn('to=["agent_n3wy9gfjmcil"]', prompt)
 
@@ -976,6 +994,9 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("mcp__ai-net-sse__send_dm", injected)
         self.assertIn("Sarah", injected)
         self.assertIn("Robert 리드님, 준비 완료입니다.", injected)
+        second = claude_any.body_with_channel_tool_result_context(followup_body)
+        self.assertIs(second, followup_body)
+        self.assertEqual({}, claude_any._CHANNEL_LLM_TOOL_CONTEXT)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_tool_context_stored" in item and "toolu_channel_1" in item for item in log_messages))
         self.assertTrue(any("channel_llm_tool_result_context_injected" in item and "toolu_channel_1" in item for item in log_messages))
@@ -1866,6 +1887,128 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(["mcp__ai-net-sse__send_dm"], [tool["name"] for tool in calls[3]["tools"]])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_deferred_action_retry" in item and "reason=reply_required" in item for item in log_messages))
+
+    def test_channel_direct_router_response_replaces_internal_fallback_text(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) == 1:
+                return {
+                    "content": [{"type": "text", "text": "I reviewed the notification."}],
+                    "stop_reason": "end_turn",
+                }
+            if len(calls) == 2:
+                return {
+                    "content": [{"type": "text", "text": "Acknowledged."}],
+                    "stop_reason": "end_turn",
+                }
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "I've been scrolling through the room history extensively. Let me acknowledge Joy's mention and provide a status update.",
+                    }
+                ],
+                "stop_reason": "end_turn",
+            }
+
+        with (
+            mock.patch.object(
+                claude_any,
+                "_channel_direct_tool_schemas",
+                return_value=[{"name": "mcp__ai-net-sse__get_messages"}, {"name": "mcp__ai-net-sse__send_message"}],
+            ),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool", return_value=("message sent", False)) as execute_tool,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                26,
+                "수신 메시지를 처리하세요",
+                {
+                    "id": 26,
+                    "channel": "room_generic",
+                    "message": "Joy @mentioned you",
+                    "meta": {"sse_source": "mcp-ai-net-sse", "message_id": "msg_joy", "mentioned_by": "Joy"},
+                },
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("fallback_reply_sent", stop_reason)
+        self.assertEqual(1, tool_turns)
+        sent_content = execute_tool.call_args_list[-1].args[0]["input"]["content"]
+        self.assertIn("Joy", sent_content)
+        self.assertNotIn("I've been scrolling", sent_content)
+        self.assertNotIn("Let me acknowledge", sent_content)
+
+    def test_channel_direct_router_response_does_not_send_diagnostic_fallback_text(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) == 1:
+                return {
+                    "content": [{"type": "text", "text": "I reviewed the notification."}],
+                    "stop_reason": "end_turn",
+                }
+            if len(calls) == 2:
+                return {
+                    "content": [{"type": "text", "text": "Acknowledged."}],
+                    "stop_reason": "end_turn",
+                }
+            return {
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "[claude-any] Upstream model returned an empty end_turn with no text or tool call. No work was performed.",
+                    }
+                ],
+                "stop_reason": "end_turn",
+            }
+
+        with (
+            mock.patch.object(
+                claude_any,
+                "_channel_direct_tool_schemas",
+                return_value=[{"name": "mcp__ai-net-sse__get_messages"}, {"name": "mcp__ai-net-sse__send_message"}],
+            ),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool") as execute_tool,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                27,
+                "수신 메시지를 처리하세요",
+                {
+                    "id": 27,
+                    "channel": "room_generic",
+                    "message": "Joy @mentioned you",
+                    "meta": {"sse_source": "mcp-ai-net-sse", "message_id": "msg_joy", "mentioned_by": "Joy"},
+                },
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("reply_required_unfulfilled", stop_reason)
+        self.assertEqual(0, tool_turns)
+        self.assertIn("실제 회신하지 않았습니다", text)
+        execute_tool.assert_not_called()
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_fallback_reply_unsafe_not_sent" in item for item in log_messages))
+
+    def test_channel_direct_fallback_reply_text_does_not_reuse_internal_notice(self):
+        text = claude_any._channel_direct_fallback_reply_text(
+            {"message": "New message from Sarah", "meta": {"author_name": "Sarah"}},
+            "[claude-any] Upstream model returned an empty end_turn with no text or tool call. No work was performed.",
+        )
+
+        self.assertIn("Sarah", text)
+        self.assertNotIn("Upstream model", text)
+        self.assertNotIn("[claude-any]", text)
 
     def test_channel_direct_router_response_allows_explicit_no_reply_marker(self):
         calls: list[dict[str, object]] = []

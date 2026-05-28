@@ -5752,6 +5752,7 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
         <a href="/">Router Home</a>
         <a href="/ca/events">Events</a>
         <a href="/health">Health JSON</a>
+        <button class="ghost" id="shareButton" type="button">Copy Chat Link</button>
         <button class="ghost" id="clearButton" type="button">Clear Chat</button>
       </div>
     </aside>
@@ -5779,14 +5780,32 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
     const composer = document.getElementById('composer');
     const prompt = document.getElementById('prompt');
     const sendButton = document.getElementById('sendButton');
+    const shareButton = document.getElementById('shareButton');
     const clearButton = document.getElementById('clearButton');
     const statePill = document.getElementById('statePill');
     const SESSION_KEY = 'claude-any-web-chat-session';
     const LAST_ID_KEY = 'claude-any-web-chat-last-id';
-    const sessionId = localStorage.getItem(SESSION_KEY) || (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(16).slice(2));
+    const HISTORY_PAGE_SIZE = 80;
+    const renderedIds = new Set();
+    let oldestId = 0;
+    let historyLoading = false;
+    let historyExhausted = false;
+    function cleanSessionId(value) {{
+      return String(value || '').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 128);
+    }}
+    const urlParams = new URLSearchParams(location.search);
+    const urlSessionId = cleanSessionId(urlParams.get('session') || urlParams.get('s') || '');
+    const storedSessionId = cleanSessionId(localStorage.getItem(SESSION_KEY) || '');
+    const sessionId = urlSessionId || storedSessionId || (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(16).slice(2));
     localStorage.setItem(SESSION_KEY, sessionId);
+    if (!urlSessionId) {{
+      urlParams.set('session', sessionId);
+      const nextUrl = location.pathname + '?' + urlParams.toString() + location.hash;
+      history.replaceState(null, '', nextUrl);
+    }}
     const channel = 'web-chat-' + sessionId;
-    let lastId = Number(localStorage.getItem(LAST_ID_KEY) || '0') || 0;
+    const scopedLastIdKey = LAST_ID_KEY + ':' + sessionId;
+    let lastId = Number(localStorage.getItem(scopedLastIdKey) || '0') || 0;
     let eventSource = null;
     function setState(text, cls = '') {{
       statePill.textContent = text;
@@ -5954,7 +5973,12 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
       }}
       return blocks.join('');
     }}
-    function addBubble(role, text) {{
+    function addBubble(role, text, mode = 'append', id = null) {{
+      if (id !== null && id !== undefined) {{
+        const key = String(id);
+        if (renderedIds.has(key)) return null;
+        renderedIds.add(key);
+      }}
       const row = document.createElement('div');
       row.className = 'row ' + role;
       const bubble = document.createElement('div');
@@ -5966,24 +5990,84 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
         bubble.innerHTML = renderMarkdown(text);
       }}
       row.appendChild(bubble);
-      transcript.appendChild(row);
-      transcript.scrollTop = transcript.scrollHeight;
+      if (mode === 'prepend') {{
+        transcript.insertBefore(row, transcript.firstChild);
+      }} else {{
+        transcript.appendChild(row);
+        transcript.scrollTop = transcript.scrollHeight;
+      }}
       return bubble;
     }}
     function rememberLastId(id) {{
       const numeric = Number(id || 0) || 0;
       if (numeric > lastId) {{
         lastId = numeric;
-        localStorage.setItem(LAST_ID_KEY, String(lastId));
+        localStorage.setItem(scopedLastIdKey, String(lastId));
       }}
     }}
-    function renderIncomingMessage(message) {{
-      rememberLastId(message.id);
-      if (message.sender_id === 'web-user') return;
+    function roleForMessage(message) {{
+      return message.sender_id === 'web-user' ? 'user' : 'assistant';
+    }}
+    function renderIncomingMessage(message, mode = 'append') {{
+      if (mode !== 'prepend') rememberLastId(message.id);
       const text = message.message || '';
       if (!text.trim()) return;
-      addBubble('assistant', text);
-      setState('reply received', 'ok');
+      addBubble(roleForMessage(message), text, mode, message.id);
+      if (mode !== 'prepend' && message.sender_id !== 'web-user') setState('reply received', 'ok');
+    }}
+    function updateHistoryBounds(messages) {{
+      if (!Array.isArray(messages) || messages.length === 0) return;
+      const ids = messages.map(message => Number(message.id || 0)).filter(id => id > 0);
+      if (!ids.length) return;
+      const minId = Math.min(...ids);
+      const maxId = Math.max(...ids);
+      oldestId = oldestId ? Math.min(oldestId, minId) : minId;
+      rememberLastId(maxId);
+    }}
+    async function fetchMessagePage(params) {{
+      const query = new URLSearchParams({{
+        channel,
+        recipient: 'web',
+        limit: String(HISTORY_PAGE_SIZE),
+        ...params
+      }});
+      const response = await fetch('/ca/channel/messages?' + query.toString(), {{headers: {{'accept': 'application/json'}}}});
+      if (!response.ok) throw new Error(await response.text() || `HTTP ${{response.status}}`);
+      return await response.json();
+    }}
+    async function loadInitialHistory() {{
+      try {{
+        const json = await fetchMessagePage({{latest: '1'}});
+        const messages = Array.isArray(json.messages) ? json.messages : [];
+        messages.forEach(message => renderIncomingMessage(message, 'append'));
+        updateHistoryBounds(messages);
+        historyExhausted = messages.length < HISTORY_PAGE_SIZE;
+      }} catch (err) {{
+        addBubble('system', 'Could not load chat history: ' + String(err && err.message ? err.message : err));
+      }}
+    }}
+    async function loadOlderHistory() {{
+      if (historyLoading || historyExhausted || !oldestId) return;
+      historyLoading = true;
+      const previousHeight = transcript.scrollHeight;
+      try {{
+        const json = await fetchMessagePage({{before: String(oldestId)}});
+        const messages = Array.isArray(json.messages) ? json.messages : [];
+        if (!messages.length) {{
+          historyExhausted = true;
+          return;
+        }}
+        for (let i = messages.length - 1; i >= 0; i -= 1) {{
+          renderIncomingMessage(messages[i], 'prepend');
+        }}
+        updateHistoryBounds(messages);
+        historyExhausted = messages.length < HISTORY_PAGE_SIZE;
+        transcript.scrollTop = transcript.scrollHeight - previousHeight;
+      }} catch (err) {{
+        addBubble('system', 'Could not load older history: ' + String(err && err.message ? err.message : err));
+      }} finally {{
+        historyLoading = false;
+      }}
     }}
     function startChannelStream() {{
       if (eventSource) eventSource.close();
@@ -6059,11 +6143,30 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
     }});
     clearButton.addEventListener('click', () => {{
       transcript.innerHTML = '';
+      renderedIds.clear();
+      oldestId = 0;
+      historyExhausted = false;
       addBubble('system', `Chat cleared. This browser sends to active Claude Code session channel ${{channel}}.`);
       startChannelStream();
     }});
+    shareButton.addEventListener('click', async () => {{
+      const url = new URL(location.href);
+      url.searchParams.set('session', sessionId);
+      try {{
+        await navigator.clipboard.writeText(url.toString());
+        setState('link copied', 'ok');
+      }} catch {{
+        prompt.value = url.toString();
+        prompt.focus();
+        prompt.select();
+        setState('copy manually');
+      }}
+    }});
+    transcript.addEventListener('scroll', () => {{
+      if (transcript.scrollTop < 48) loadOlderHistory();
+    }});
     addBubble('system', `Connected to active session bridge for ${{MODEL}}. Messages are queued on channel ${{channel}} and replies stream back from /ca/channel/stream.`);
-    startChannelStream();
+    loadInitialHistory().finally(startChannelStream);
     prompt.focus();
   </script>
 </body>
@@ -6205,6 +6308,20 @@ def _message_visible_to(message: dict[str, Any], recipient: str | None) -> bool:
     return recipient in recipients or recipient == str(message.get("sender_id") or "")
 
 
+def _chat_message_matches(message: dict[str, Any], channel: str | None = None, recipient: str | None = None) -> bool:
+    if channel:
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        aliases = {
+            str(message.get("channel") or ""),
+            str(meta.get("room_id") or ""),
+            str(meta.get("room") or ""),
+            str(meta.get("channel") or ""),
+        }
+        if channel not in aliases:
+            return False
+    return _message_visible_to(message, recipient)
+
+
 def read_chat_messages(after_id: int = 0, channel: str | None = None, recipient: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     try:
@@ -6221,23 +6338,37 @@ def read_chat_messages(after_id: int = 0, channel: str | None = None, recipient:
                         continue
                 except Exception:
                     continue
-                if channel:
-                    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-                    aliases = {
-                        str(item.get("channel") or ""),
-                        str(meta.get("room_id") or ""),
-                        str(meta.get("room") or ""),
-                        str(meta.get("channel") or ""),
-                    }
-                    if channel not in aliases:
-                        continue
-                if not _message_visible_to(item, recipient):
+                if not _chat_message_matches(item, channel, recipient):
                     continue
                 messages.append(item)
                 if len(messages) >= limit:
                     break
     except Exception as exc:
         router_log("WARN", f"chat read failed: {exc}")
+    return messages
+
+
+def read_chat_messages_before(before_id: int = 0, channel: str | None = None, recipient: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    try:
+        if not CHAT_MESSAGES_PATH.exists():
+            return []
+        with CHAT_MESSAGES_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                    item_id = int(item.get("id") or 0)
+                except Exception:
+                    continue
+                if before_id > 0 and item_id >= before_id:
+                    continue
+                if not _chat_message_matches(item, channel, recipient):
+                    continue
+                messages.append(item)
+                if len(messages) > limit:
+                    messages = messages[-limit:]
+    except Exception as exc:
+        router_log("WARN", f"chat read before failed: {exc}")
     return messages
 
 
@@ -7427,17 +7558,29 @@ def handle_chat_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
     if path in ("/ca/chat/messages", "/ca/chat/wait"):
         params = _query_params(handler)
         after = int(_first_param(params, "after", "0") or 0)
+        before = int(_first_param(params, "before", "0") or 0)
         limit = max(1, min(500, int(_first_param(params, "limit", "100") or 100)))
         channel = _first_param(params, "channel", "") or None
         recipient = _first_param(params, "recipient", "") or _first_param(params, "recipient_id", "") or None
+        latest = _first_param(params, "latest", "") or _first_param(params, "history", "")
         timeout = 0.0 if path.endswith("/messages") else max(0.0, min(300.0, float(_first_param(params, "timeout", "60") or 60)))
         deadline = time.time() + timeout
-        messages = read_chat_messages(after, channel, recipient, limit)
+        history_mode = path.endswith("/messages") and (before > 0 or latest.lower() in {"1", "true", "yes", "on"})
+        messages = read_chat_messages_before(before, channel, recipient, limit) if history_mode else read_chat_messages(after, channel, recipient, limit)
         while not messages and timeout > 0 and time.time() < deadline:
             with _CHAT_CONDITION:
                 _CHAT_CONDITION.wait(timeout=min(5.0, max(0.0, deadline - time.time())))
             messages = read_chat_messages(after, channel, recipient, limit)
-        write_json(handler, {"ok": True, "messages": messages, "last_id": messages[-1]["id"] if messages else after})
+        write_json(
+            handler,
+            {
+                "ok": True,
+                "messages": messages,
+                "last_id": messages[-1]["id"] if messages else after,
+                "oldest_id": messages[0]["id"] if messages else None,
+                "has_more": bool(messages and (before > 0 or len(messages) >= limit)),
+            },
+        )
         return True
     if path == "/ca/chat/stream":
         params = _query_params(handler)
@@ -19012,7 +19155,8 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         "room name, DM label, 또는 'New message from ...' 같은 짧은 알림만 보고 현재 에이전트가 수신자가 아니라고 결론내리지 마세요. "
         "수신자 정체성이 애매하면 안전한 read/profile 도구로 실제 메시지와 현재 에이전트 정보를 확인한 뒤 판단하세요. "
         "이 턴은 외부 채널 수신함을 처리하는 자율 처리 턴입니다. "
-        "자동 회신 루프를 만들지 마세요. 단순 수신 확인, 감사, 준비 완료/대기 중, 진행상황 공유처럼 새 질문이나 새 업무 지시가 없는 메시지는 같은 내용으로 다시 예의상 답장하지 말고 NO_REPLY로 끝내세요. "
+        "자동 회신 루프를 만들지 마세요. 단순 수신 확인, 감사, 준비 완료/대기 중, 진행상황 공유처럼 새 질문이나 새 업무 지시가 없는 메시지는 같은 내용으로 다시 예의상 답장하지 마세요. "
+        "그 경우에는 회신 도구를 호출하지 말고 화면에는 새로 보낼 답장이 없다는 짧은 처리 요약만 남기세요. "
         "이전 자동 답장에서 이미 차단 사유나 대기 요청을 전달했다면, 반복 업데이트를 보내지 말고 로컬 요약만 남기세요. "
         "sender/from, recipients/to, room/channel, text를 기준으로 누가 누구에게 보낸 DM/그룹 메시지인지 먼저 판단하세요. "
         "알림 본문이 'New message...' 같은 짧은 통지이고 room/message id가 있으면 먼저 사용 가능한 read/get_messages 계열 도구로 실제 메시지를 조회하세요. "
@@ -19037,6 +19181,7 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
 _CHANNEL_LLM_TOOL_CONTEXT_LOCK = threading.Lock()
 _CHANNEL_LLM_TOOL_CONTEXT: dict[str, dict[str, Any]] = {}
 _CHANNEL_LLM_TOOL_CONTEXT_LIMIT = 200
+_CHANNEL_LLM_TOOL_CONTEXT_MAX_INJECT = 8
 _CHANNEL_LLM_TOOL_CONTEXT_PROMPT_LIMIT = 4000
 
 
@@ -19090,7 +19235,7 @@ def remember_channel_injected_tool_uses(source_body: dict[str, Any] | None, mess
         )
 
 
-def _channel_tool_result_contexts_for_body(body: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+def _take_channel_tool_result_contexts_for_body(body: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     found: list[tuple[str, dict[str, Any]]] = []
     with _CHANNEL_LLM_TOOL_CONTEXT_LOCK:
         for message in body.get("messages") or []:
@@ -19100,9 +19245,11 @@ def _channel_tool_result_contexts_for_body(body: dict[str, Any]) -> list[tuple[s
                 if not isinstance(block, dict) or block.get("type") != "tool_result":
                     continue
                 tool_use_id = str(block.get("tool_use_id") or "")
-                context = _CHANNEL_LLM_TOOL_CONTEXT.get(tool_use_id)
+                context = _CHANNEL_LLM_TOOL_CONTEXT.pop(tool_use_id, None)
                 if context:
                     found.append((tool_use_id, dict(context)))
+                    if len(found) >= _CHANNEL_LLM_TOOL_CONTEXT_MAX_INJECT:
+                        return found
     return found
 
 
@@ -19112,7 +19259,7 @@ def body_with_channel_tool_result_context(body: dict[str, Any]) -> dict[str, Any
         return body
     if metadata.get("claude_any_channel_tool_result_followup"):
         return body
-    contexts = _channel_tool_result_contexts_for_body(body)
+    contexts = _take_channel_tool_result_contexts_for_body(body)
     if not contexts:
         return body
     parts = [
@@ -19724,7 +19871,13 @@ def _channel_direct_generate_fallback_reply_text(
 def _channel_direct_fallback_reply_text(message: dict[str, Any], last_text: str) -> str:
     author = _channel_direct_message_actor(message)
     prior = re.sub(r"\s+", " ", str(last_text or "")).strip()
-    if prior and not _channel_direct_text_is_deferred_action(prior):
+    if (
+        prior
+        and prior.lower().strip(" .!。") not in {"acknowledged", "ok", "okay", "understood", "noted", "확인했습니다", "알겠습니다"}
+        and not _channel_direct_text_declines_reply(prior)
+        and not _channel_direct_text_is_deferred_action(prior)
+        and not _channel_direct_fallback_text_is_internal_action(prior)
+    ):
         return truncate_for_prompt(prior, 1200)
     return (
         f"{author}, 메시지 확인했습니다. 현재 채널 컨텍스트를 확인했고 필요한 조치를 이어서 진행하겠습니다. "
@@ -19737,9 +19890,44 @@ def _channel_direct_fallback_text_is_internal_action(text: str) -> bool:
     if not body:
         return False
     lowered = body.lower()
+    if _channel_direct_fallback_text_is_diagnostic_failure(text):
+        return True
     if re.match(r"^(?:right[,. ]*)?(?:let me|i should|i need to|i will|i'll|now let me)\b", lowered):
         return True
+    if re.search(
+        r"\b(?:let me|i should|i need to|i will|i'll|now let me)\s+"
+        r"(?:check|fetch|read|send|reply|respond|acknowledge|provide|post|create|look|investigate|try|assess|confirm|share|continue|do)\b",
+        lowered,
+    ):
+        return True
+    if re.match(r"^(?:i have been|i've been|i am|i'm)\s+(?:scrolling|checking|looking|reading|trying|fetching)\b", lowered):
+        return True
+    if re.match(r"^(?:i cannot|i can't|unable to|could not)\s+(?:fetch|read|retrieve|access)\b", lowered):
+        return True
+    if "messages i've retrieved" in lowered or "messages i have retrieved" in lowered:
+        return True
+    if "notification-only event" in lowered or "hasn't appeared in the messages" in lowered:
+        return True
     return bool(re.match(r"^(?:이제|먼저|다음으로)\b.{0,120}(?:보내|답장|회신|조회|확인|조사|처리).{0,80}(?:하겠습니다|하겠다|합니다)", body))
+
+
+def _channel_direct_fallback_text_is_diagnostic_failure(text: str) -> bool:
+    body = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not body:
+        return False
+    lowered = body.lower()
+    internal_markers = (
+        "[claude-any]",
+        "upstream model",
+        "empty end_turn",
+        "no work was performed",
+        "retry or ask me to continue",
+        "internal routing",
+        "fallback handling",
+        "reply/send tool",
+        "tool_result",
+    )
+    return any(marker in lowered for marker in internal_markers)
 
 
 def _channel_direct_send_same_channel_fallback_reply(
@@ -19940,7 +20128,13 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
                     )
                     if _channel_direct_text_declines_reply(fallback_text):
                         return fallback_text, "end_turn", tool_turns
-                    if not fallback_text.strip() or _channel_direct_fallback_text_is_internal_action(fallback_text):
+                    if _channel_direct_fallback_text_is_diagnostic_failure(fallback_text):
+                        router_log(
+                            "WARN",
+                            f"channel_llm_fallback_reply_unsafe_not_sent message_id={message_id} chars={len(fallback_text)}",
+                        )
+                        return _channel_direct_reply_required_summary(message, text or last_text, tool_turns), "reply_required_unfulfilled", tool_turns
+                    if _channel_direct_fallback_text_is_internal_action(fallback_text) or not fallback_text.strip():
                         fallback_text = _channel_direct_fallback_reply_text(message, text or last_text)
                     fallback_result, fallback_sent = _channel_direct_send_same_channel_fallback_reply(
                         message_id,
@@ -20012,7 +20206,13 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
             )
             if _channel_direct_text_declines_reply(fallback_text):
                 return fallback_text, "end_turn", tool_turns
-            if not fallback_text.strip() or _channel_direct_fallback_text_is_internal_action(fallback_text):
+            if _channel_direct_fallback_text_is_diagnostic_failure(fallback_text):
+                router_log(
+                    "WARN",
+                    f"channel_llm_fallback_reply_unsafe_not_sent message_id={message_id} chars={len(fallback_text)} reason=max_turns",
+                )
+                return _channel_direct_reply_required_summary(message, last_text, tool_turns), "reply_required_unfulfilled", tool_turns
+            if _channel_direct_fallback_text_is_internal_action(fallback_text) or not fallback_text.strip():
                 fallback_text = _channel_direct_fallback_reply_text(message, last_text)
             fallback_result, fallback_sent = _channel_direct_send_same_channel_fallback_reply(
                 message_id,

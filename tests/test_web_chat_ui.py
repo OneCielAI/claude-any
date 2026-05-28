@@ -43,9 +43,16 @@ class WebChatUiTests(unittest.TestCase):
         self.assertIn("bubble.className = 'bubble'", html)
         self.assertIn("function renderMarkdown(text)", html)
         self.assertIn("function renderMarkdownTable(lines, startIndex)", html)
+        self.assertIn("new URLSearchParams(location.search)", html)
+        self.assertIn("urlParams.set('session', sessionId)", html)
+        self.assertIn("function loadInitialHistory()", html)
+        self.assertIn("function loadOlderHistory()", html)
+        self.assertIn("before: String(oldestId)", html)
+        self.assertIn("mode === 'prepend'", html)
         self.assertIn(".markdown table", html)
         self.assertIn("bubble.innerHTML = renderMarkdown(text)", html)
         self.assertIn("bubble.textContent = text", html)
+        self.assertIn("Copy Chat Link", html)
 
     def test_web_chat_markdown_renderer_sanitizes_and_supports_tables(self):
         cfg = self._cfg()
