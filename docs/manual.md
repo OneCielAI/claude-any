@@ -180,8 +180,18 @@ The model picker first uses Anthropic's `/v1/models` endpoint when an Anthropic
 API key is configured. In direct Claude Native mode without an API key, Claude
 Any cannot call that authenticated endpoint, so the refresh action seeds the
 picker from Anthropic's public Models overview page instead. This keeps current
-IDs such as `claude-opus-4-7`, `claude-sonnet-4-6`, and `claude-haiku-4-5`
+IDs such as `claude-opus-4-8`, `claude-sonnet-4-6`, and `claude-haiku-4-5`
 visible while still allowing custom model IDs.
+
+Claude Any stores refreshed Claude models in
+`~/.config/claude-any/model-registry.json` with per-model recommendation
+metadata. The registry separates conservative CLI defaults from provider hard
+limits; for example, Claude Opus 4.8 is recorded with 1M context and 128K max
+output limit metadata while the interactive preset remains a smaller balanced
+default. The registry also records runtime hints from the Claude Opus 4.8
+release, including Claude Code's default `high` effort, `xhigh` support,
+adaptive thinking, fast-mode availability, and the sampling parameters that
+Opus 4.8 rejects when set away from defaults.
 
 If you need Claude Any router-owned behavior for Anthropic too, such as the
 local browser chat UI, router event inspection, or router channel handling,
@@ -761,6 +771,18 @@ up by the active Claude Code session through the Claude Any channel bridge. The
 active session can use its normal Claude Code tools and configured MCP servers.
 Replies are sent back with the built-in `claude-any-router` MCP `send_message`
 tool and streamed to the browser through `/ca/channel/stream`.
+
+The web composer also supports file attachments. Attached files are uploaded to
+`/ca/channel/files`, stored under `~/.config/claude-any/chat-files/`, and added
+to the browser message as router file URLs. The active Claude Code session can
+then fetch or inspect those files with its usual tools instead of switching to a
+separate provider-only chat.
+
+The reverse direction uses the built-in `claude-any-router` MCP server. Claude
+Code can call `send_file` with either a local `path` or inline `content` to copy
+the file into the same chat file store and publish a browser-visible attachment
+message on the web-chat channel. Use `recipients: "web"` and `delivery: ["web"]`
+when the attachment should only appear in the browser session.
 
 In router mode, the session web chat uses the terminal wake bridge for browser
 messages so requests enter the running Claude Code session instead of creating a

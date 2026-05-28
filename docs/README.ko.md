@@ -833,6 +833,13 @@ http://127.0.0.1:8799/ca/web/chat
 active Claude Code 세션의 channel inbox로 주입합니다. Claude Code는 기존 Read/Bash/Edit 및 MCP 도구를
 그대로 사용해 처리할 수 있고, 답장은 `claude-any-router`의 `send_message` MCP 도구를 통해 같은
 web chat channel로 돌아옵니다. 브라우저는 `/ca/channel/stream`으로 답장 메시지를 구독합니다.
+웹 채팅 composer는 파일 첨부도 지원합니다. 첨부 파일은 `/ca/channel/files`로 업로드되어
+`~/.config/claude-any/chat-files/`에 저장되고, 같은 web-chat 메시지에 router 파일 URL로 포함됩니다.
+따라서 active Claude Code 세션은 별도 provider-only 대화로 빠지지 않고 기존 도구로 파일을 가져와
+확인할 수 있습니다.
+반대 방향도 지원합니다. Claude Code는 내장 `claude-any-router` MCP 서버의 `send_file` 도구를 호출해
+로컬 `path` 또는 inline `content`를 같은 파일 저장소에 복사하고, 브라우저 세션에는 web-visible
+attachment 메시지로 보낼 수 있습니다.
 router mode에서는 브라우저 메시지만 터미널 wake bridge를 통해 실행 중인 Claude Code 세션에 넣습니다.
 따라서 별도 provider-only `/v1/messages` 대화를 만들지 않습니다. 메시지가 계속 queued 상태로 남으면
 현재 빌드 설치 후 Claude Any를 다시 시작해 활성 터미널이 wake bridge로 감싸지도록 해야 합니다.

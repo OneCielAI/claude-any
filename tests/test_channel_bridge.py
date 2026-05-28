@@ -594,6 +594,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("channel=web-chat-session", prompt)
         self.assertIn("thread=thread-1", prompt)
         self.assertIn("send_message", prompt)
+        self.assertIn("send_file", prompt)
         self.assertNotIn("metadata=", prompt)
         self.assertNotIn("reply_instruction", prompt)
         self.assertNotIn("\n", prompt)
@@ -634,10 +635,15 @@ class ChannelBridgeTests(unittest.TestCase):
         names = [tool.get("name") for tool in tools]
 
         self.assertIn("send_message", names)
+        self.assertIn("send_file", names)
         self.assertIn("get_messages", names)
         send_schema = next(tool for tool in tools if tool.get("name") == "send_message")
         self.assertIn("channel", send_schema["inputSchema"]["required"])
         self.assertIn("message", send_schema["inputSchema"]["required"])
+        file_schema = next(tool for tool in tools if tool.get("name") == "send_file")
+        self.assertIn("channel", file_schema["inputSchema"]["required"])
+        self.assertIn("path", file_schema["inputSchema"]["properties"])
+        self.assertIn("content", file_schema["inputSchema"]["properties"])
 
     def test_builtin_channel_mcp_send_message_appends_web_delivery_reply(self):
         with mock.patch.object(claude_any, "append_chat_message", return_value={"id": 44, "message": "done"}) as append:
@@ -661,6 +667,73 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(["web"], payload["delivery"])
         self.assertEqual("web", payload["recipients"])
         self.assertEqual("claude-code", payload["sender_id"])
+
+    def test_builtin_channel_mcp_send_file_appends_web_attachment_reply(self):
+        upload = {
+            "name": "stored-report.md",
+            "original_name": "report.md",
+            "url": "http://127.0.0.1:8799/ca/chat/files/stored-report.md",
+            "path": "/ca/chat/files/stored-report.md",
+            "bytes": 12,
+            "content_type": "text/markdown",
+        }
+        with (
+            mock.patch.object(claude_any, "store_chat_file_from_path", return_value=upload) as store,
+            mock.patch.object(claude_any, "append_chat_message", return_value={"id": 45, "message": "file"}) as append,
+        ):
+            response = claude_any._channel_mcp_tool_call_response(
+                8,
+                {
+                    "name": "send_file",
+                    "arguments": {
+                        "channel": "web-chat-session",
+                        "path": "report.md",
+                        "message": "검토 결과 파일입니다.",
+                        "thread_id": "session",
+                    },
+                },
+            )
+
+        self.assertEqual(8, response["id"])
+        self.assertFalse(response["result"]["isError"])
+        store.assert_called_once()
+        payload = append.call_args.args[0]
+        self.assertEqual("web-chat-session", payload["channel"])
+        self.assertEqual("file", payload["kind"])
+        self.assertEqual(["web"], payload["delivery"])
+        self.assertEqual("web", payload["recipients"])
+        self.assertIn("검토 결과 파일입니다.", payload["message"])
+        self.assertIn("[report.md]", payload["message"])
+        self.assertEqual([upload], payload["meta"]["attachments"])
+
+    def test_builtin_channel_mcp_send_file_accepts_inline_content(self):
+        with (
+            mock.patch.object(claude_any, "store_chat_file_upload", return_value={
+                "name": "stored.txt",
+                "original_name": "answer.txt",
+                "url": "http://127.0.0.1:8799/ca/chat/files/stored.txt",
+                "path": "/ca/chat/files/stored.txt",
+                "bytes": 5,
+                "content_type": "text/plain",
+            }) as store,
+            mock.patch.object(claude_any, "append_chat_message", return_value={"id": 46, "message": "file"}),
+        ):
+            response = claude_any._channel_mcp_tool_call_response(
+                9,
+                {
+                    "name": "send_file",
+                    "arguments": {
+                        "channel": "web-chat-session",
+                        "name": "answer.txt",
+                        "content": "hello",
+                    },
+                },
+            )
+
+        self.assertFalse(response["result"]["isError"])
+        store.assert_called_once()
+        self.assertEqual("answer.txt", store.call_args.args[0]["name"])
+        self.assertEqual("hello", store.call_args.args[0]["content"])
 
     def test_inject_pending_channel_messages_writes_prompt_to_child_stdin(self):
         messages = [

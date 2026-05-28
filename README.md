@@ -535,7 +535,18 @@ steps under that larger model's supervision.
   prefers the official Claude model documentation before falling back to API
   model-list endpoints, stores the refreshed list in a provider-scoped
   `model-registry.json`, and records per-model recommended presets plus
-  conservative CLI parameters separately from provider hard limits.
+  conservative CLI parameters separately from provider hard limits and runtime
+  hints. The refreshed registry includes the May 28 Claude Code / Claude model
+  update: Claude Code `2.1.154`, Claude Opus 4.8 (`claude-opus-4-8`), Opus 4.8
+  1M context metadata, the current Opus 4.8 128K output limit, Claude Code's
+  default `high` effort, `xhigh` support, adaptive thinking, and fast-mode
+  availability.
+- **Session web chat file transfer**: `/ca/web/chat` now supports browser file
+  attachments through `/ca/channel/files`, stores uploads in the local chat file
+  store, and includes downloadable router URLs in the active session message.
+  The built-in `claude-any-router` MCP server also exposes `send_file`, so
+  Claude Code can send local files or inline content back to the same browser
+  session without leaving the active Claude Code tool/MCP context.
 - **OpenCode Zen and Go providers**: added first-class `opencode` and
   `opencode-go` providers for `https://opencode.ai/zen` and
   `https://opencode.ai/zen/go`. The model picker reads the live `/v1/models`
@@ -1116,12 +1127,21 @@ When the Claude Any router is running, open:
 http://127.0.0.1:8799/ca/web/chat
 ```
 
-The page is a local, Teams-style chat surface backed by the same
-Anthropic-compatible `/v1/messages` route that Claude Code uses. It does not
-create tunnels, public DNS names, Cloudflare zones, or Tailscale routes. If the
-selected provider is Anthropic and you want this page or other router features
-to handle Anthropic traffic, enable the Anthropic `route_through_router` LLM
-option and set an Anthropic API key.
+The page is a local, Teams-style chat surface that posts browser messages into
+`/ca/channel/messages`; the active Claude Code session consumes those messages
+through the Claude Any channel bridge with its normal tools and MCP servers.
+The composer also supports file attachments. Files are uploaded to
+`/ca/channel/files`, stored under the local chat file store, and included in
+the web-chat message as downloadable router URLs so the active session can fetch
+or inspect them with its usual tools. The reverse direction is available through
+the built-in `claude-any-router` MCP server: Claude Code can call `send_file`
+with a local `path` or inline `content`, and the router publishes the stored
+file back to the browser session as a web-visible attachment.
+
+The page does not create tunnels, public DNS names, Cloudflare zones, or
+Tailscale routes. If the selected provider is Anthropic and you want this page
+or other router features to handle Anthropic traffic, enable the Anthropic
+`route_through_router` LLM option and set an Anthropic API key.
 
 ## External Web Access
 

@@ -9,6 +9,7 @@ import html as html_lib
 import importlib.util
 import json
 import math
+import mimetypes
 import os
 import queue
 import re
@@ -1461,6 +1462,7 @@ PROVIDER_NOTES = {
 
 DEFAULT_ADVISOR_MODELS: tuple[str, ...] = (
     "",
+    "claude-opus-4-8",
     "deepseek-v4-pro",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
@@ -3886,7 +3888,7 @@ def model_cache_key(provider: str, pcfg: dict[str, Any]) -> str:
             "base_url": pcfg.get("base_url", ""),
             "api": api_state,
             "custom": pcfg.get("custom_models", []),
-            "schema": 4,
+            "schema": 5,
         },
         sort_keys=True,
     )
@@ -3905,7 +3907,7 @@ def anthropic_model_limit_hints(model_id: str) -> dict[str, Any]:
     family = anthropic_model_family_from_id(model)
     # Keep provider limits as metadata, not launch defaults. The CLI default
     # max_output_tokens below is intentionally lower for interactive safety.
-    if family == "opus" and re.search(r"(?:^|-)opus-4-[67](?:-|$)", model):
+    if family == "opus" and re.search(r"(?:^|-)opus-4-[678](?:-|$)", model):
         return {
             "context_window": 1048576,
             "max_output_tokens": 128000,
@@ -3927,6 +3929,23 @@ def anthropic_model_limit_hints(model_id: str) -> dict[str, Any]:
         "context_window": 200000,
         "source": "anthropic-default-compatibility",
     }
+
+
+def anthropic_model_runtime_hints(model_id: str) -> dict[str, Any]:
+    model = (model_id or "").strip().lower()
+    if re.search(r"(?:^|-)opus-4-8(?:-|$)", model):
+        return {
+            "claude_code_default_effort": "high",
+            "claude_code_max_effort": "xhigh",
+            "thinking_mode": "adaptive",
+            "fast_mode": {
+                "available": True,
+                "preview": True,
+            },
+            "unsupported_sampling_parameters": ["temperature", "top_p", "top_k"],
+            "source": "anthropic-opus-4-8-launch-notes",
+        }
+    return {}
 
 
 def anthropic_recommended_preset_for_model(model_id: str) -> str:
@@ -3952,6 +3971,7 @@ def model_registry_recommendations(provider: str, models: list[str]) -> dict[str
                 "stream_idle_timeout_ms": timeout_profile_idle_ms(timeout_ms),
             },
             "limits": anthropic_model_limit_hints(model_id),
+            "runtime": anthropic_model_runtime_hints(model_id),
             "notes": [
                 "Native Claude Code manages the real context window; claude-any stores context limits as model metadata only.",
                 "Recommended max_output_tokens is intentionally lower than the provider hard limit for interactive CLI use.",
@@ -5898,6 +5918,26 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
       background: #127668; color: white; font-weight: 700; cursor: pointer;
     }}
     button.primary:disabled {{ opacity: .55; cursor: not-allowed; }}
+    .composer-actions {{ display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }}
+    .attach-button {{
+      min-height: 34px; border: 1px solid var(--line); border-radius: 6px;
+      background: #0b111b; color: var(--text); padding: 0 12px; cursor: pointer;
+    }}
+    .attach-button:hover {{ border-color: var(--accent); }}
+    .attach-button:disabled {{ opacity: .55; cursor: not-allowed; }}
+    #fileInput {{ display: none; }}
+    .attachment-tray {{ display: flex; gap: 7px; flex-wrap: wrap; min-height: 0; }}
+    .attachment-chip {{
+      display: inline-flex; align-items: center; gap: 7px; max-width: min(360px, 100%);
+      border: 1px solid #33445b; border-radius: 999px; background: #121b2a;
+      padding: 5px 8px; color: var(--muted); font-size: 12px;
+    }}
+    .attachment-chip span {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .attachment-chip button {{
+      width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center;
+      border: 0; border-radius: 999px; background: #243447; color: var(--text); cursor: pointer;
+    }}
+    .drop-active textarea {{ border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47, 158, 143, .18); }}
     .hint {{ margin-top: 7px; color: var(--muted); font-size: 12px; }}
     .error {{ color: var(--danger); }}
     .ok {{ color: var(--ok); }}
@@ -5945,6 +5985,11 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
           <textarea id="prompt" placeholder="Type a message..." autocomplete="off"></textarea>
           <button class="primary" id="sendButton" type="submit">Send</button>
         </div>
+        <div class="composer-actions">
+          <button class="attach-button" id="attachButton" type="button">Attach files</button>
+          <input id="fileInput" type="file" multiple>
+          <div class="attachment-tray" id="attachmentTray" aria-live="polite"></div>
+        </div>
         <div class="hint">Enter sends. Shift+Enter inserts a new line. The active Claude Code session handles the message, so its configured tools and MCP servers remain available. If replies stay queued, restart Claude Any so the session wake bridge wraps the terminal.</div>
       </form>
     </main>
@@ -5955,6 +6000,9 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
     const composer = document.getElementById('composer');
     const prompt = document.getElementById('prompt');
     const sendButton = document.getElementById('sendButton');
+    const attachButton = document.getElementById('attachButton');
+    const fileInput = document.getElementById('fileInput');
+    const attachmentTray = document.getElementById('attachmentTray');
     const shareButton = document.getElementById('shareButton');
     const clearButton = document.getElementById('clearButton');
     const statePill = document.getElementById('statePill');
@@ -5982,6 +6030,7 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
     const scopedLastIdKey = LAST_ID_KEY + ':' + sessionId;
     let lastId = Number(localStorage.getItem(scopedLastIdKey) || '0') || 0;
     let eventSource = null;
+    let selectedFiles = [];
     function setState(text, cls = '') {{
       statePill.textContent = text;
       statePill.className = 'pill ' + cls;
@@ -6190,6 +6239,108 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
       addBubble(roleForMessage(message), text, mode, message.id);
       if (mode !== 'prepend' && message.sender_id !== 'web-user') setState('reply received', 'ok');
     }}
+    function formatBytes(bytes) {{
+      const value = Number(bytes || 0);
+      if (value < 1024) return value + ' B';
+      if (value < 1024 * 1024) return (value / 1024).toFixed(1).replace(/\\.0$/, '') + ' KB';
+      return (value / (1024 * 1024)).toFixed(1).replace(/\\.0$/, '') + ' MB';
+    }}
+    function renderAttachmentTray() {{
+      attachmentTray.innerHTML = '';
+      selectedFiles.forEach((file, index) => {{
+        const chip = document.createElement('div');
+        chip.className = 'attachment-chip';
+        const label = document.createElement('span');
+        label.textContent = file.name + ' (' + formatBytes(file.size) + ')';
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.setAttribute('aria-label', 'Remove ' + file.name);
+        remove.textContent = 'x';
+        remove.addEventListener('click', () => {{
+          selectedFiles.splice(index, 1);
+          renderAttachmentTray();
+        }});
+        chip.appendChild(label);
+        chip.appendChild(remove);
+        attachmentTray.appendChild(chip);
+      }});
+    }}
+    function addSelectedFiles(fileList) {{
+      const incoming = Array.from(fileList || []);
+      if (!incoming.length) return;
+      selectedFiles = selectedFiles.concat(incoming);
+      renderAttachmentTray();
+      setState(selectedFiles.length + ' file(s) ready', 'ok');
+    }}
+    function fileToBase64(file) {{
+      return new Promise((resolve, reject) => {{
+        const reader = new FileReader();
+        reader.onload = () => {{
+          const dataUrl = String(reader.result || '');
+          const comma = dataUrl.indexOf(',');
+          resolve(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl);
+        }};
+        reader.onerror = () => reject(reader.error || new Error('Could not read file'));
+        reader.readAsDataURL(file);
+      }});
+    }}
+    async function uploadAttachment(file) {{
+      const content = await fileToBase64(file);
+      const response = await fetch('/ca/channel/files', {{
+        method: 'POST',
+        headers: {{'content-type': 'application/json', 'accept': 'application/json'}},
+        body: JSON.stringify({{
+          channel,
+          sender_id: 'web-user',
+          recipients: ['all'],
+          thread_id: sessionId,
+          announce: false,
+          name: file.name,
+          content_type: file.type || 'application/octet-stream',
+          encoding: 'base64',
+          content
+        }})
+      }});
+      const text = await response.text();
+      let json = {{}};
+      try {{ json = text ? JSON.parse(text) : {{}}; }} catch {{}}
+      if (!response.ok || !json.ok) {{
+        throw new Error(json.error || text || `Upload failed with HTTP ${{response.status}}`);
+      }}
+      return {{
+        name: json.name,
+        original_name: json.original_name || file.name,
+        url: json.url,
+        path: json.path,
+        bytes: json.bytes,
+        content_type: json.content_type || file.type || 'application/octet-stream'
+      }};
+    }}
+    async function uploadAttachments(files) {{
+      const uploads = [];
+      for (const file of files) {{
+        setState('uploading ' + file.name);
+        uploads.push(await uploadAttachment(file));
+      }}
+      return uploads;
+    }}
+    function attachmentSummary(uploads) {{
+      if (!uploads.length) return '';
+      const lines = uploads.map(file => {{
+        const label = file.original_name || file.name || 'file';
+        const size = formatBytes(file.bytes);
+        const type = file.content_type || 'application/octet-stream';
+        const url = file.url || file.path || '';
+        return '- [' + label + '](' + url + ') (' + size + ', ' + type + ') - router URL: ' + url;
+      }});
+      return 'Attached files:\\n' + lines.join('\\n');
+    }}
+    function buildOutboundText(text, uploads) {{
+      const trimmed = String(text || '').trim();
+      const summary = attachmentSummary(uploads);
+      if (trimmed && summary) return trimmed + '\\n\\n' + summary;
+      return trimmed || summary;
+    }}
     function updateHistoryBounds(messages) {{
       if (!Array.isArray(messages) || messages.length === 0) return;
       const ids = messages.map(message => Number(message.id || 0)).filter(id => id > 0);
@@ -6261,11 +6412,14 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
         setTimeout(startChannelStream, 1200);
       }};
     }}
-    async function sendMessage(text) {{
-      addBubble('user', text);
+    async function sendMessage(text, files = []) {{
       setState('queued');
       sendButton.disabled = true;
+      attachButton.disabled = true;
       try {{
+        const uploads = await uploadAttachments(files);
+        const outboundText = buildOutboundText(text, uploads);
+        addBubble('user', outboundText);
         const response = await fetch('/ca/channel/messages', {{
           method: 'POST',
           headers: {{'content-type': 'application/json', 'accept': 'application/json'}},
@@ -6276,13 +6430,14 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
             delivery: ['llm', 'native'],
             thread_id: sessionId,
             kind: 'web_chat',
-            message: text,
+            message: outboundText,
             meta: {{
               source: 'claude-any-web-chat',
               web_chat_session: sessionId,
               reply_channel: channel,
               reply_recipient: 'web',
-              reply_instruction: 'Use the claude-any-router send_message tool to answer this browser chat on the same channel/thread_id with recipients web and delivery web.'
+              reply_instruction: 'Use the claude-any-router send_message tool to answer this browser chat on the same channel/thread_id with recipients web and delivery web. Use send_file when returning a file attachment to this browser chat.',
+              attachments: uploads
             }}
           }})
         }});
@@ -6300,15 +6455,19 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
         setState('error', 'error');
       }} finally {{
         sendButton.disabled = false;
+        attachButton.disabled = false;
         prompt.focus();
       }}
     }}
     composer.addEventListener('submit', ev => {{
       ev.preventDefault();
       const text = prompt.value.trim();
-      if (!text) return;
+      const files = selectedFiles.slice();
+      if (!text && !files.length) return;
       prompt.value = '';
-      sendMessage(text);
+      selectedFiles = [];
+      renderAttachmentTray();
+      sendMessage(text, files);
     }});
     prompt.addEventListener('keydown', ev => {{
       if (ev.key === 'Enter' && !ev.shiftKey) {{
@@ -6316,11 +6475,30 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
         composer.requestSubmit();
       }}
     }});
+    attachButton.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {{
+      addSelectedFiles(fileInput.files);
+      fileInput.value = '';
+    }});
+    composer.addEventListener('dragover', ev => {{
+      if (!ev.dataTransfer || !ev.dataTransfer.files || !ev.dataTransfer.files.length) return;
+      ev.preventDefault();
+      composer.classList.add('drop-active');
+    }});
+    composer.addEventListener('dragleave', () => composer.classList.remove('drop-active'));
+    composer.addEventListener('drop', ev => {{
+      if (!ev.dataTransfer || !ev.dataTransfer.files || !ev.dataTransfer.files.length) return;
+      ev.preventDefault();
+      composer.classList.remove('drop-active');
+      addSelectedFiles(ev.dataTransfer.files);
+    }});
     clearButton.addEventListener('click', () => {{
       transcript.innerHTML = '';
       renderedIds.clear();
       oldestId = 0;
       historyExhausted = false;
+      selectedFiles = [];
+      renderAttachmentTray();
       addBubble('system', `Chat cleared. This browser sends to active Claude Code session channel ${{channel}}.`);
       startChannelStream();
     }});
@@ -6427,6 +6605,97 @@ def handle_events_get(handler: BaseHTTPRequestHandler, path: str, query: dict[st
 def _safe_segment(value: str, fallback: str = "item") -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", (value or "").strip()).strip(".-")
     return text[:120] or fallback
+
+
+def chat_file_max_bytes() -> int:
+    raw = str(os.environ.get("CLAUDE_ANY_CHAT_FILE_MAX_BYTES") or "").strip()
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return 25 * 1024 * 1024
+
+
+def store_chat_file_upload(body: dict[str, Any]) -> dict[str, Any]:
+    CHAT_FILES_DIR.mkdir(parents=True, exist_ok=True)
+    raw_name = str(body.get("name") or f"file-{int(time.time())}.txt").strip() or "file"
+    content = body.get("content", "")
+    encoding = str(body.get("encoding") or "utf-8").strip().lower()
+    if encoding == "base64":
+        try:
+            data = base64.b64decode(str(content).encode("ascii"), validate=True)
+        except Exception as exc:
+            raise ValueError("invalid base64 file content") from exc
+    elif encoding in {"", "text", "utf-8", "utf8"}:
+        data = str(content).encode("utf-8")
+    else:
+        raise ValueError(f"unsupported file encoding: {encoding}")
+    max_bytes = chat_file_max_bytes()
+    if len(data) > max_bytes:
+        raise OverflowError(f"file too large: {len(data)} bytes exceeds {max_bytes} bytes")
+    name = f"{time.time_ns()}-{_safe_segment(raw_name, 'file')}"
+    target = CHAT_FILES_DIR / name
+    target.write_bytes(data)
+    path = f"/ca/chat/files/{urllib.parse.quote(name)}"
+    content_type = str(body.get("content_type") or body.get("mime_type") or "application/octet-stream").strip()
+    return {
+        "name": name,
+        "original_name": raw_name,
+        "url": f"{ROUTER_BASE}{path}",
+        "path": path,
+        "bytes": len(data),
+        "content_type": content_type[:200] or "application/octet-stream",
+    }
+
+
+def store_chat_file_from_path(path_value: Any, name: str | None = None, content_type: str | None = None) -> dict[str, Any]:
+    raw_path = str(path_value or "").strip()
+    if not raw_path:
+        raise ValueError("file path is required")
+    source = Path(raw_path).expanduser()
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"file not found: {raw_path}")
+    data = source.read_bytes()
+    max_bytes = chat_file_max_bytes()
+    if len(data) > max_bytes:
+        raise OverflowError(f"file too large: {len(data)} bytes exceeds {max_bytes} bytes")
+    guessed_type = content_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+    return store_chat_file_upload(
+        {
+            "name": name or source.name,
+            "encoding": "base64",
+            "content": base64.b64encode(data).decode("ascii"),
+            "content_type": guessed_type,
+        }
+    )
+
+
+def chat_file_markdown_lines(uploads: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for upload in uploads:
+        label = str(upload.get("original_name") or upload.get("name") or "file")
+        url = str(upload.get("url") or upload.get("path") or "")
+        byte_count = upload.get("bytes")
+        ctype = str(upload.get("content_type") or "application/octet-stream")
+        detail_parts = []
+        if isinstance(byte_count, int):
+            detail_parts.append(f"{byte_count} bytes")
+        if ctype:
+            detail_parts.append(ctype)
+        detail = f" ({', '.join(detail_parts)})" if detail_parts else ""
+        lines.append(f"- [{label}]({url}){detail}")
+    return lines
+
+
+def chat_file_message_text(message: str, uploads: list[dict[str, Any]]) -> str:
+    body = str(message or "").strip()
+    lines = chat_file_markdown_lines(uploads)
+    if not lines:
+        return body
+    attachment_text = "Attached files:\n" + "\n".join(lines)
+    return f"{body}\n\n{attachment_text}" if body else attachment_text
 
 
 def _as_string_list(value: Any) -> list[str]:
@@ -7378,6 +7647,63 @@ def _channel_mcp_tool_schemas() -> list[dict[str, Any]]:
             },
         },
         {
+            "name": "send_file",
+            "description": (
+                "Send a file attachment to a Claude Any channel. "
+                "Use this to return files to /ca/web/chat browser sessions. "
+                "Provide either path for an existing local file, or content with encoding='text' or encoding='base64'."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Destination channel id from the incoming message.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional local file path to attach.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Optional inline file content when path is not used.",
+                    },
+                    "encoding": {
+                        "type": "string",
+                        "description": "Inline content encoding: text or base64.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Display filename. Defaults to the source path basename or file.txt.",
+                    },
+                    "content_type": {
+                        "type": "string",
+                        "description": "Optional MIME type.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Optional message body to show with the file link.",
+                    },
+                    "recipients": {
+                        "description": "Recipient id, 'all', or an array of recipients. Use 'web' for /ca/web/chat replies.",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread/conversation id to continue.",
+                    },
+                    "parent_id": {
+                        "description": "Optional parent message id.",
+                    },
+                    "delivery": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Delivery targets. Use ['web'] for browser-only replies.",
+                    },
+                },
+                "required": ["channel"],
+            },
+        },
+        {
             "name": "get_messages",
             "description": "Read recent Claude Any channel messages for a channel/thread.",
             "inputSchema": {
@@ -7429,6 +7755,50 @@ def _channel_mcp_tool_call_response(request_id: Any, params: dict[str, Any]) -> 
         return _channel_mcp_tool_response(
             request_id,
             json.dumps({"ok": True, "message": saved}, ensure_ascii=False, separators=(",", ":")),
+        )
+    if name == "send_file":
+        channel = str(args.get("channel") or "").strip()
+        if not channel:
+            return _channel_mcp_tool_response(request_id, "send_file requires channel.", True)
+        try:
+            if args.get("path"):
+                upload = store_chat_file_from_path(
+                    args.get("path"),
+                    str(args.get("name") or "").strip() or None,
+                    str(args.get("content_type") or args.get("mime_type") or "").strip() or None,
+                )
+            else:
+                inline_body = {
+                    "name": str(args.get("name") or "file.txt"),
+                    "encoding": str(args.get("encoding") or "text"),
+                    "content": args.get("content", ""),
+                    "content_type": str(args.get("content_type") or args.get("mime_type") or "text/plain"),
+                }
+                upload = store_chat_file_upload(inline_body)
+        except FileNotFoundError as exc:
+            return _channel_mcp_tool_response(request_id, str(exc), True)
+        except OverflowError as exc:
+            return _channel_mcp_tool_response(request_id, str(exc), True)
+        except ValueError as exc:
+            return _channel_mcp_tool_response(request_id, str(exc), True)
+        meta = args.get("meta") if isinstance(args.get("meta"), dict) else {}
+        uploads = [upload]
+        saved = append_chat_message(
+            {
+                "channel": channel,
+                "sender_id": args.get("sender_id") or "claude-code",
+                "recipients": args.get("recipients", args.get("recipient_id", "web")),
+                "thread_id": args.get("thread_id"),
+                "parent_id": args.get("parent_id"),
+                "kind": args.get("kind") or "file",
+                "message": chat_file_message_text(str(args.get("message") or ""), uploads),
+                "delivery": args.get("delivery", ["web"]),
+                "meta": {"source": "claude-any-router-tool", "attachments": uploads, **meta},
+            }
+        )
+        return _channel_mcp_tool_response(
+            request_id,
+            json.dumps({"ok": True, "file": upload, "message": saved}, ensure_ascii=False, separators=(",", ":")),
         )
     if name == "get_messages":
         try:
@@ -7797,6 +8167,7 @@ def handle_chat_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
         data = target.read_bytes()
         handler.send_response(200)
         handler.send_header("content-type", "application/octet-stream")
+        handler.send_header("content-disposition", f"attachment; filename={json.dumps(name)}")
         handler.send_header("content-length", str(len(data)))
         handler.end_headers()
         handler.wfile.write(data)
@@ -7843,18 +8214,16 @@ def handle_chat_post(handler: BaseHTTPRequestHandler, path: str, body: dict[str,
         write_json(handler, {"ok": True, "message": message})
         return True
     if path == "/ca/chat/files":
-        CHAT_FILES_DIR.mkdir(parents=True, exist_ok=True)
-        raw_name = str(body.get("name") or f"file-{int(time.time())}.txt")
-        name = f"{int(time.time())}-{_safe_segment(raw_name, 'file')}"
-        content = body.get("content", "")
-        if body.get("encoding") == "base64":
-            data = base64.b64decode(str(content).encode("ascii"))
-        else:
-            data = str(content).encode("utf-8")
-        target = CHAT_FILES_DIR / name
-        target.write_bytes(data)
-        url = f"{ROUTER_BASE}/ca/chat/files/{urllib.parse.quote(name)}"
+        try:
+            upload = store_chat_file_upload(body)
+        except OverflowError as exc:
+            write_json(handler, {"ok": False, "error": str(exc)}, 413)
+            return True
+        except ValueError as exc:
+            write_json(handler, {"ok": False, "error": str(exc)}, 400)
+            return True
         if body.get("announce", True):
+            attachments = [upload]
             append_chat_message({
                 "channel": body.get("channel", "default"),
                 "sender_id": body.get("sender_id", "system"),
@@ -7862,10 +8231,10 @@ def handle_chat_post(handler: BaseHTTPRequestHandler, path: str, body: dict[str,
                 "thread_id": body.get("thread_id"),
                 "parent_id": body.get("parent_id"),
                 "kind": "file",
-                "message": url,
-                "meta": {"name": raw_name, "url": url},
+                "message": str(body.get("message") or upload["url"]),
+                "meta": {"attachments": attachments, "name": upload["original_name"], "url": upload["url"]},
             })
-        write_json(handler, {"ok": True, "name": name, "url": url, "bytes": len(data)})
+        write_json(handler, {"ok": True, **upload})
         return True
     return False
 
@@ -19213,7 +19582,7 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
         + f" text={json.dumps(body, ensure_ascii=False)}"
         + meta_text
         + ". "
-        + "If this is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']. "
+        + "If this is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']; use send_file when returning a file attachment. "
         + "If relevant to current work, respond or act now; otherwise keep working."
     )
 
@@ -19235,7 +19604,7 @@ def format_channel_web_chat_wake_batch_prompt(messages: list[dict[str, Any]]) ->
     return (
         f"[claude-any web chat] {count} browser message(s): {items}. "
         "Answer in the active Claude Code session. Use current context and tools/MCP if useful. "
-        "Reply to the browser with claude-any-router send_message on the listed channel/thread_id, recipients='web', delivery=['web']."
+        "Reply to the browser with claude-any-router send_message on the listed channel/thread_id, recipients='web', delivery=['web']; use send_file when returning a file attachment."
     )
 
 
