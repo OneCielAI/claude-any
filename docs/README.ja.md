@@ -19,7 +19,7 @@
 > - **低コスト** — [Ollama Cloud](https://ollama.com/cloud) で GLM、Qwen、DeepSeek などのオープン重みモデルを、フロンティアモデル比でごく安価に。
 > - **無料 + ローカル** — [Ollama](https://ollama.com/) または [vLLM](https://github.com/vllm-project/vllm) を自分の GPU で完全オフライン実行。
 > - **Plan Mode + Advisor 対応** — non-Anthropic provider でも Claude Code Plan Mode を維持し、長コンテキスト Advisor モデルで作業レビューを受けられます。
-> - **ローカル browser chat** — router が `/ca/web/chat` を提供し、Claude Code と同じ `/v1/messages` 経路で選択中 provider と会話できます。
+> - **セッション browser chat** — router が `/ca/web/chat` を提供し、ブラウザメッセージを active Claude Code session の channel inbox に注入し、同じ channel stream で返信を受け取ります。active session の Claude Code tools と MCP tools をそのまま使えます。
 > - **無料モデルの RPM をなめらかに利用** — Claude Code はファイル読み取りや tool 実行に時間を使うため、Claude Any はその自然な間隔を RPM pacing に活用し、NVIDIA hosted の無料モデルでも分単位制限を感じにくく使えます。
 >
 > プロバイダー、モデル、Base URL、API キー、ストリーミング動作、LLM オプションを Claude Code 起動 **前** にコンソールメニューで選択します。Claude Code 本体はそのまま — すべてのネイティブツール、slash コマンド、ワークフローが維持されます。
@@ -30,7 +30,7 @@
 
 1. **DeepSeek.com provider 対応** — DeepSeek の Anthropic 互換 Claude Code endpoint を正式 provider として選択でき、モデル preset と API key 設定フローを提供します。
 2. **共有ホストでより安全な router lifecycle** — router は既定でユーザー別の安定ポートを使い、起動前に同一ユーザーの stale router を整理して Robert/Sarah のような複数セッション混線を減らします。
-3. **Router browser chat と選択式 Anthropic routing** — `/ca/web/chat` でローカル router の chat UI を提供し、必要な場合は Anthropic も Claude Any router 経由で SSE/channel/observability を使えます。
+3. **Router セッション browser chat と選択式 Anthropic routing** — `/ca/web/chat` で active Claude Code session にメッセージを注入し channel stream で返信を受け取るローカル router chat UI を提供し、必要な場合は Anthropic も Claude Any router 経由で SSE/channel/observability を使えます。
 
 ### 2026-05-15
 
@@ -68,7 +68,7 @@ vLLM、NVIDIA hosted、self-hosted NIM を選択し、通常の Claude Code 引�
 
 Credits: One Ciel LLC
 
-現在のバージョン: `0.1.101`
+現在のバージョン: `0.1.102`
 
 ## 作られた理由
 
@@ -757,10 +757,12 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 
 | Provider | Mode | Notes |
 | --- | --- | --- |
-| Anthropic | 既定は Native Claude Code、任意で router | 直接 native mode では Claude login または Anthropic API key を使用。Claude Any router の SSE/channel/observability が必要な場合は `route_through_router` を有効化します。この mode では Anthropic API key が必要です。 |
+| Anthropic | 既定は Native Claude Code、任意で router | 直接 native mode では Claude login または Anthropic API key を使用。モデル picker は API key がある場合 `/v1/models` を使い、API key なしの Claude Native login では Anthropic の公開 Models overview から最新の公開 model ID を補助的に取得します。Claude Any router の SSE/channel/observability が必要な場合は `route_through_router` を有効化します。この mode では Anthropic API key が必要です。 |
 | Ollama | Native 優先、必要時 router | ローカル Ollama は通常 API key 不要。ローカル Ollama で `:cloud` model を使う場合は Ollama host で `ollama signin` が必要。 |
 | Ollama Cloud | Router | `https://ollama.com/api` を直接呼び出し、Ollama API key が必要。 |
 | DeepSeek.com | Router | `https://api.deepseek.com/anthropic` を呼び出します。DeepSeek API key は `ANTHROPIC_AUTH_TOKEN` として渡し、Claude Code auth conflict を避けるため `ANTHROPIC_API_KEY` は未設定にします。 |
+| OpenCode Zen | Router | `https://opencode.ai/zen` を呼び出し、OpenCode Zen API key が必要です。モデル一覧は `/v1/models` から取得し、Claude/Qwen 系は `/v1/messages`、chat 互換モデルは `/v1/chat/completions` にルーティングします。Responses/Gemini 専用 endpoint 系は metadata として表示し、まだ自動ルーティングしません。 |
+| OpenCode Go | Router | `https://opencode.ai/zen/go` を呼び出し、OpenCode Go API key が必要です。モデル一覧は `/v1/models` から取得し、Qwen/MiniMax Go モデルは `/v1/messages`、GLM/Kimi/DeepSeek/MiMo Go モデルは `/v1/chat/completions` にルーティングします。 |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 互換 `/v1/messages` endpoint を使い、モデル系列に合う `--tool-call-parser` を指定。 |
 | NVIDIA hosted | Router | NVIDIA hosted API Catalog を Claude Any local router 経由で使用。 |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM の Anthropic 互換 endpoint を使用。 |
@@ -812,8 +814,11 @@ Claude Any router が動作している場合、次を開けます。
 http://127.0.0.1:8799/ca/web/chat
 ```
 
-この画面はローカルの chat UI で、Claude Code と同じ Anthropic 互換
-`/v1/messages` 経路を使って現在の provider に request を送ります。
+この画面はローカルの session chat UI です。ブラウザメッセージは `/ca/channel/messages`
+に保存され、active Claude Code session が channel bridge 経由で処理します。Claude Code は
+通常の Read/Bash/Edit と MCP tools を使えます。返信は組み込み `claude-any-router`
+MCP `send_message` tool で同じ web chat channel に戻り、ブラウザは `/ca/channel/stream`
+で購読します。
 Cloudflare tunnel、public DNS、Tailscale route は自動作成しません。
 Anthropic provider をこの UI や router 機能で扱う場合は Anthropic の
 `route_through_router` option を有効化し、Anthropic API key を設定します。

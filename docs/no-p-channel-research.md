@@ -215,11 +215,13 @@ This branch implements the no-hidden-`-p` direction:
 ## Follow-up Surface: Router Web Chat
 
 The no-hidden-`-p` direction also benefits from a first-party browser surface.
-The router now serves `/ca/web/chat`, which posts to the same `/v1/messages`
-route as Claude Code. This gives operators a local browser chat without relying
-on Claude Code's experimental `--channels` flags. External exposure remains
-user-managed; Claude Any documents Cloudflare MCP as an optional setup aid but
-does not create tunnels, Tailscale routes, DNS records, or public hostnames.
+The router now serves `/ca/web/chat`, which posts browser messages into
+`/ca/channel/messages` for the active Claude Code session to consume through the
+channel bridge. The active session keeps its normal Claude Code tools and MCP
+tools, and browser replies are sent back through the built-in `claude-any-router`
+MCP `send_message` tool and `/ca/channel/stream`. External exposure remains
+user-managed; Claude Any documents Cloudflare MCP as an optional setup aid but does not create
+tunnels, Tailscale routes, DNS records, or public hostnames.
 
 Anthropic remains direct Claude Native by default. When an operator needs the
 router-owned web chat, channel handling, or observability for Anthropic itself,

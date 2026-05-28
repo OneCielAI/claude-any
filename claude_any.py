@@ -9,6 +9,7 @@ import html as html_lib
 import importlib.util
 import json
 import math
+import mimetypes
 import os
 import queue
 import re
@@ -83,6 +84,7 @@ MENU_KEY_DEBUG_PATH = CONFIG_DIR / "ca-key-debug.log"
 PLAN_ARTIFACTS_DIR = CONFIG_DIR / "plan-artifacts"
 PID_PATH = CONFIG_DIR / "router.pid"
 MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
+MODEL_REGISTRY_PATH = CONFIG_DIR / "model-registry.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
@@ -104,6 +106,13 @@ NCP_LOG = HOME / ".config" / "nvd-claude-proxy" / "proxy.log"
 MODEL_CACHE_TTL_SECONDS = 300
 OLLAMA_MODEL_CATALOG_URL = "https://ollama.com/api/tags"
 OLLAMA_MODEL_CATALOG_TTL_SECONDS = 24 * 60 * 60
+ANTHROPIC_MODEL_DOCS_URL = "https://docs.anthropic.com/en/docs/about-claude/models/overview"
+ANTHROPIC_MODEL_DOCS_URLS = (
+    ANTHROPIC_MODEL_DOCS_URL,
+    "https://platform.claude.com/docs/en/about-claude/models/overview",
+)
+OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen"
+OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go"
 NCP_PYPI_PACKAGE = "nvd-claude-proxy"
 
 PROVIDER_ALIASES = {
@@ -120,6 +129,15 @@ PROVIDER_ALIASES = {
     "deepseek-com": "deepseek",
     "deepseek-api": "deepseek",
     "ds": "deepseek",
+    "opencode": "opencode",
+    "opencode.ai": "opencode",
+    "opencode-ai": "opencode",
+    "opencode-zen": "opencode",
+    "zen": "opencode",
+    "opencode-go": "opencode-go",
+    "opencode.go": "opencode-go",
+    "opencode_go": "opencode-go",
+    "opencodego": "opencode-go",
     "vllm": "vllm",
     "vllm-local": "vllm",
     "lm-studio": "lm-studio",
@@ -138,10 +156,27 @@ PROVIDER_LABELS = {
     "ollama": "Ollama",
     "ollama-cloud": "Ollama Cloud",
     "deepseek": "DeepSeek.com",
+    "opencode": "OpenCode Zen",
+    "opencode-go": "OpenCode Go",
     "vllm": "vLLM",
     "lm-studio": "LM Studio",
     "nvidia-hosted": "Nvidia Hosted",
     "self-hosted-nim": "Self Hosted NIM",
+}
+
+OPENCODE_PROVIDER_NAMES = ("opencode", "opencode-go")
+OPENCODE_ENDPOINT_ALIASES = {
+    "messages": "anthropic-messages",
+    "anthropic": "anthropic-messages",
+    "anthropic-messages": "anthropic-messages",
+    "chat": "openai-chat",
+    "openai-chat": "openai-chat",
+    "chat-completions": "openai-chat",
+    "responses": "openai-responses",
+    "openai-responses": "openai-responses",
+    "gemini": "google-generative",
+    "google": "google-generative",
+    "google-generative": "google-generative",
 }
 OFFICIAL_CHANNEL_PLUGINS = {
     "telegram": "plugin:telegram@claude-plugins-official",
@@ -150,7 +185,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.101"
+VERSION = "0.1.102"
 
 
 def claude_any_source_fingerprint() -> str:
@@ -194,6 +229,8 @@ _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID: int | None = None
 _CHANNEL_LLM_DIRECT_LOCK = threading.Lock()
 _CHANNEL_LLM_DIRECT_INFLIGHT: set[int] = set()
 _CHANNEL_LLM_DIRECT_DELIVERED: set[int] = set()
+_CHANNEL_STDIN_WAKE_LOCK = threading.Lock()
+_CHANNEL_STDIN_WAKE_DELIVERED: set[int] = set()
 _NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
 BUILTIN_CHANNEL_SPEC = "server:claude-any-router"
 _NATIVE_ROUTER_CHANNEL_NAMES = {"claude-any-router", "mcp-claude-any-router"}
@@ -1425,6 +1462,7 @@ PROVIDER_NOTES = {
 
 DEFAULT_ADVISOR_MODELS: tuple[str, ...] = (
     "",
+    "claude-opus-4-8",
     "deepseek-v4-pro",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
@@ -1528,6 +1566,40 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "effort_level": "max",
             "haiku_model": "deepseek-v4-flash",
             "subagent_model": "deepseek-v4-flash",
+        },
+        "opencode": {
+            "base_url": OPENCODE_ZEN_BASE_URL,
+            "api_key": "",
+            "current_model": "claude-sonnet-4-6",
+            "advisor_model": "",
+            "custom_models": ["claude-sonnet-4-6"],
+            "native_compat": True,
+            "context_window": 200000,
+            "max_output_tokens": 8192,
+            "context_reserve_tokens": 8192,
+            "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT_MS,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
+            "haiku_model": "claude-haiku-4-5",
+            "subagent_model": "claude-sonnet-4-6",
+            "model_endpoints": {},
+        },
+        "opencode-go": {
+            "base_url": OPENCODE_GO_BASE_URL,
+            "api_key": "",
+            "current_model": "qwen3.6-plus",
+            "advisor_model": "",
+            "custom_models": ["qwen3.6-plus"],
+            "native_compat": True,
+            "context_window": 262144,
+            "max_output_tokens": 8192,
+            "context_reserve_tokens": 8192,
+            "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT_MS,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
+            "haiku_model": "qwen3.5-plus",
+            "subagent_model": "qwen3.6-plus",
+            "model_endpoints": {},
         },
         "vllm": {
             "base_url": "http://127.0.0.1:8000",
@@ -1785,6 +1857,10 @@ def clear_model_cache() -> None:
         MODEL_LIST_CACHE_PATH.unlink()
     except FileNotFoundError:
         pass
+    try:
+        MODEL_REGISTRY_PATH.unlink()
+    except FileNotFoundError:
+        pass
 
 
 def normalize_provider(name: str) -> str:
@@ -1862,10 +1938,10 @@ def display_name(provider: str, model_id: str) -> str:
     return f"{label} {cleaned}".title().replace("Vllm", "vLLM").replace("Nvidia", "Nvidia")
 
 
-def model_object(provider: str, model_id: str) -> dict[str, Any]:
+def model_object(provider: str, model_id: str, pcfg: dict[str, Any] | None = None) -> dict[str, Any]:
     model_id = normalize_model_id(provider, model_id)
     alias = alias_for(provider, model_id)
-    return {
+    obj = {
         "id": alias,
         "type": "model",
         "display_name": display_name(provider, model_id),
@@ -1875,6 +1951,11 @@ def model_object(provider: str, model_id: str) -> dict[str, Any]:
         "owned_by": f"claude-any/{provider}",
         "claude_any": {"provider": provider, "upstream_model": model_id},
     }
+    if provider in OPENCODE_PROVIDER_NAMES:
+        endpoint = opencode_endpoint_kind(provider, model_id, pcfg)
+        obj["claude_any"]["opencode_endpoint"] = endpoint
+        obj["claude_any"]["router_supported"] = opencode_model_supported_by_router(provider, model_id, pcfg)
+    return obj
 
 
 def join_url(base: str, path: str) -> str:
@@ -2865,6 +2946,17 @@ def normalize_thinking_for_non_anthropic_provider(provider: str, pcfg: dict[str,
         return body
     if preserves_anthropic_thinking_contract(provider, pcfg):
         return body
+    if openai_chat_reasoning_passback_enabled_for_body(provider, pcfg, body):
+        if not thinking_requested:
+            return body
+        out = dict(body)
+        out.pop("thinking", None)
+        router_log(
+            "INFO",
+            "removed top-level Anthropic thinking request but preserved thinking blocks "
+            f"for OpenAI-chat reasoning passback provider={provider} thinking_blocks={thinking_blocks}",
+        )
+        return out
     synthetic_tool = has_claude_any_synthetic_tool_use(body)
     continuation_blocks = anthropic_tool_continuation_block_count(body)
     assistant_history = anthropic_assistant_history_count(body)
@@ -3796,23 +3888,173 @@ def model_cache_key(provider: str, pcfg: dict[str, Any]) -> str:
             "base_url": pcfg.get("base_url", ""),
             "api": api_state,
             "custom": pcfg.get("custom_models", []),
-            "schema": 4,
+            "schema": 5,
         },
         sort_keys=True,
     )
+
+
+def anthropic_model_family_from_id(model_id: str) -> str:
+    model = (model_id or "").strip().lower()
+    for family in ("opus", "sonnet", "haiku"):
+        if re.search(rf"(?:^|-)claude-(?:\d+(?:-\d+){{0,2}}-)?{family}(?:-|$)", model) or f"-{family}-" in model:
+            return family
+    return "claude"
+
+
+def anthropic_model_limit_hints(model_id: str) -> dict[str, Any]:
+    model = (model_id or "").strip().lower()
+    family = anthropic_model_family_from_id(model)
+    # Keep provider limits as metadata, not launch defaults. The CLI default
+    # max_output_tokens below is intentionally lower for interactive safety.
+    if family == "opus" and re.search(r"(?:^|-)opus-4-[678](?:-|$)", model):
+        return {
+            "context_window": 1048576,
+            "max_output_tokens": 128000,
+            "source": "anthropic-models-overview-current-table",
+        }
+    if family == "sonnet" and re.search(r"(?:^|-)sonnet-4-6(?:-|$)", model):
+        return {
+            "context_window": 1048576,
+            "max_output_tokens": 64000,
+            "source": "anthropic-models-overview-current-table",
+        }
+    if family == "haiku" and re.search(r"(?:^|-)haiku-4-5(?:-|$)", model):
+        return {
+            "context_window": 200000,
+            "max_output_tokens": 64000,
+            "source": "anthropic-models-overview-current-table",
+        }
+    return {
+        "context_window": 200000,
+        "source": "anthropic-default-compatibility",
+    }
+
+
+def anthropic_model_runtime_hints(model_id: str) -> dict[str, Any]:
+    model = (model_id or "").strip().lower()
+    if re.search(r"(?:^|-)opus-4-8(?:-|$)", model):
+        return {
+            "claude_code_default_effort": "high",
+            "claude_code_max_effort": "xhigh",
+            "thinking_mode": "adaptive",
+            "fast_mode": {
+                "available": True,
+                "preview": True,
+            },
+            "unsupported_sampling_parameters": ["temperature", "top_p", "top_k"],
+            "source": "anthropic-opus-4-8-launch-notes",
+        }
+    return {}
+
+
+def anthropic_recommended_preset_for_model(model_id: str) -> str:
+    if anthropic_model_family_from_id(model_id) == "haiku":
+        return "fast"
+    return "balanced"
+
+
+def model_registry_recommendations(provider: str, models: list[str]) -> dict[str, Any]:
+    recommendations: dict[str, Any] = {}
+    for model_id in unique_model_ids(provider, models):
+        if provider != "anthropic":
+            continue
+        preset_id = anthropic_recommended_preset_for_model(model_id)
+        timeout_ms = llm_preset_timeout_ms(preset_id)
+        recommendations[model_id] = {
+            "schema": 1,
+            "model_family": anthropic_model_family_from_id(model_id),
+            "recommended_preset": preset_id,
+            "parameters": {
+                "max_output_tokens": 2048 if preset_id == "fast" else 4096,
+                "request_timeout_ms": timeout_ms,
+                "stream_idle_timeout_ms": timeout_profile_idle_ms(timeout_ms),
+            },
+            "limits": anthropic_model_limit_hints(model_id),
+            "runtime": anthropic_model_runtime_hints(model_id),
+            "notes": [
+                "Native Claude Code manages the real context window; claude-any stores context limits as model metadata only.",
+                "Recommended max_output_tokens is intentionally lower than the provider hard limit for interactive CLI use.",
+            ],
+        }
+    return recommendations
+
+
+def read_model_registry(provider: str, pcfg: dict[str, Any], max_age_seconds: float = MODEL_CACHE_TTL_SECONDS) -> dict[str, Any] | None:
+    try:
+        data = json.loads(MODEL_REGISTRY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        return None
+    entry = providers.get(provider)
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("key") != model_cache_key(provider, pcfg):
+        return None
+    try:
+        if max_age_seconds > 0 and time.time() - float(entry.get("time", 0)) > max_age_seconds:
+            return None
+    except Exception:
+        return None
+    models = entry.get("models")
+    if not isinstance(models, list):
+        return None
+    return entry
+
+
+def write_model_registry(provider: str, pcfg: dict[str, Any], models: list[str], source: str = "provider", metadata: dict[str, Any] | None = None) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(MODEL_REGISTRY_PATH.read_text(encoding="utf-8")) if MODEL_REGISTRY_PATH.exists() else {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    providers[provider] = {
+        "time": time.time(),
+        "key": model_cache_key(provider, pcfg),
+        "source": source,
+        "models": unique_model_ids(provider, models),
+        "recommendations": model_registry_recommendations(provider, models),
+        "metadata": metadata or {},
+    }
+    data["schema"] = 1
+    data["providers"] = providers
+    try:
+        MODEL_REGISTRY_PATH.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(MODEL_REGISTRY_PATH, 0o600)
+    except Exception:
+        pass
 
 
 def read_model_list_cache(provider: str, pcfg: dict[str, Any]) -> list[str] | None:
     try:
         data = json.loads(MODEL_LIST_CACHE_PATH.read_text())
     except Exception:
-        return None
+        entry = read_model_registry(provider, pcfg)
+        if not entry:
+            return None
+        models = entry.get("models")
+        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
     if not isinstance(data, dict):
-        return None
+        entry = read_model_registry(provider, pcfg)
+        models = entry.get("models") if entry else None
+        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
     if data.get("key") != model_cache_key(provider, pcfg):
-        return None
+        entry = read_model_registry(provider, pcfg)
+        models = entry.get("models") if entry else None
+        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
     if time.time() - float(data.get("time", 0)) > MODEL_CACHE_TTL_SECONDS:
-        return None
+        entry = read_model_registry(provider, pcfg)
+        models = entry.get("models") if entry else None
+        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
     models = data.get("models")
     if not isinstance(models, list):
         return None
@@ -3827,6 +4069,7 @@ def write_model_list_cache(provider: str, pcfg: dict[str, Any], models: list[str
         os.chmod(MODEL_LIST_CACHE_PATH, 0o600)
     except Exception:
         pass
+    write_model_registry(provider, pcfg, models, "provider")
 
 
 def cached_or_configured_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
@@ -3840,7 +4083,10 @@ def cached_or_configured_model_ids(provider: str, pcfg: dict[str, Any]) -> list[
     cur = normalize_model_id(provider, pcfg.get("current_model") or "")
     if cur and cur not in ids and not cur.startswith(f"claude-any-{provider}-"):
         ids.insert(0, cur)
-    return sorted_model_ids(unique_model_ids(provider, ids))
+    ids = unique_model_ids(provider, ids)
+    if provider == "anthropic":
+        return ids
+    return sorted_model_ids(ids)
 
 
 def model_ids_from_response(data: Any) -> list[str]:
@@ -3870,6 +4116,147 @@ def model_ids_from_response(data: Any) -> list[str]:
     return ids
 
 
+ANTHROPIC_PUBLIC_MODEL_ID_RE = re.compile(
+    r"(?<![A-Za-z0-9_.@:-])"
+    r"(?:"
+    r"claude-(?:opus|sonnet|haiku)-\d+-\d+-\d{8}|"
+    r"claude-(?:opus|sonnet|haiku)-\d+-\d{8}|"
+    r"claude-(?:opus|sonnet|haiku)-\d+-\d+|"
+    r"claude-(?:opus|sonnet|haiku)-\d+(?:-\d+)?-latest|"
+    r"claude-\d+(?:-\d+){0,2}-(?:opus|sonnet|haiku)-(?:\d{8}|latest)"
+    r")"
+    r"(?![A-Za-z0-9_.@:-])"
+)
+
+
+def fetch_text_url(url: str, timeout: float = 8.0) -> str:
+    req = urllib.request.Request(url, headers={"user-agent": f"claude-any/{VERSION}"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read(5_000_000).decode("utf-8", errors="replace")
+
+
+def anthropic_model_ids_from_docs_text(text: str) -> list[str]:
+    """Extract public Claude API model IDs from Anthropic's models overview page.
+
+    Claude Native usually runs on Claude Code OAuth rather than an API key, so
+    `/v1/models` is not available to claude-any. The public docs are the only
+    unauthenticated source for the current model picker seed.
+    """
+    ids: list[str] = []
+    seen: set[str] = set()
+    for match in ANTHROPIC_PUBLIC_MODEL_ID_RE.finditer(html_lib.unescape(text or "")):
+        mid = match.group(0)
+        key = mid.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        ids.append(mid)
+    return ids
+
+
+def fetch_anthropic_public_model_ids(timeout: float = 8.0) -> list[str]:
+    ids: list[str] = []
+    errors: list[str] = []
+    for url in ANTHROPIC_MODEL_DOCS_URLS:
+        try:
+            ids.extend(anthropic_model_ids_from_docs_text(fetch_text_url(url, timeout=timeout)))
+        except Exception as exc:
+            errors.append(f"{url}: {type(exc).__name__}: {exc}")
+    out = unique_model_ids("anthropic", ids)
+    if out:
+        return out
+    if errors:
+        router_log("WARN", "anthropic model docs fetch failed: " + " ; ".join(errors))
+    return []
+
+
+def opencode_zen_endpoint_kind(model_id: str) -> str:
+    """Return the documented OpenCode Zen endpoint family for a model id."""
+    model = strip_claude_context_suffix(model_id).strip().lower()
+    if model.startswith("claude-any-opencode-"):
+        model = model[len("claude-any-opencode-"):]
+    if model.startswith("claude-") or model.startswith("qwen3."):
+        return "anthropic-messages"
+    if model.startswith("gpt-"):
+        return "openai-responses"
+    if model.startswith("gemini-"):
+        return "google-generative"
+    if model.startswith(("minimax-", "glm-", "kimi-", "grok-", "big-pickle", "deepseek-", "mimo-", "nemotron-")):
+        return "openai-chat"
+    return "anthropic-messages"
+
+
+def opencode_zen_model_supported_by_router(model_id: str) -> bool:
+    return opencode_zen_endpoint_kind(model_id) in ("anthropic-messages", "openai-chat")
+
+
+def normalize_opencode_endpoint_kind(value: Any) -> str | None:
+    key = str(value or "").strip().lower().replace("_", "-")
+    return OPENCODE_ENDPOINT_ALIASES.get(key)
+
+
+def opencode_endpoint_override(provider: str, model_id: str, pcfg: dict[str, Any] | None = None) -> str | None:
+    if not pcfg:
+        return None
+    overrides = pcfg.get("model_endpoints")
+    if not isinstance(overrides, dict):
+        return None
+    normalized = normalize_model_id(provider, model_id)
+    candidates = [
+        model_id,
+        normalized,
+        strip_claude_context_suffix(model_id),
+        alias_for(provider, normalized),
+    ]
+    for candidate in candidates:
+        raw = overrides.get(candidate)
+        endpoint = normalize_opencode_endpoint_kind(raw)
+        if endpoint:
+            return endpoint
+    return None
+
+
+def opencode_go_endpoint_kind(model_id: str) -> str:
+    """Return the documented OpenCode Go endpoint family for a model id."""
+    model = strip_claude_context_suffix(model_id).strip().lower()
+    if model.startswith("claude-any-opencode-go-"):
+        model = model[len("claude-any-opencode-go-"):]
+    if model.startswith("qwen3.") or model.startswith("minimax-"):
+        return "anthropic-messages"
+    if model.startswith(("glm-", "kimi-", "deepseek-", "mimo-", "hy3-")):
+        return "openai-chat"
+    return "anthropic-messages"
+
+
+def opencode_endpoint_kind(provider: str, model_id: str, pcfg: dict[str, Any] | None = None) -> str:
+    override = opencode_endpoint_override(provider, model_id, pcfg)
+    if override:
+        return override
+    if provider == "opencode-go":
+        return opencode_go_endpoint_kind(model_id)
+    return opencode_zen_endpoint_kind(model_id)
+
+
+def opencode_model_supported_by_router(provider: str, model_id: str, pcfg: dict[str, Any] | None = None) -> bool:
+    return opencode_endpoint_kind(provider, model_id, pcfg) in ("anthropic-messages", "openai-chat")
+
+
+def opencode_endpoint_display(provider: str, model_id: str, pcfg: dict[str, Any] | None = None) -> str:
+    endpoint = opencode_endpoint_kind(provider, model_id, pcfg)
+    labels = {
+        "anthropic-messages": "messages",
+        "openai-chat": "chat",
+        "openai-responses": "responses",
+        "google-generative": "gemini",
+    }
+    text = labels.get(endpoint, endpoint)
+    if not opencode_model_supported_by_router(provider, model_id, pcfg):
+        text += " unsupported"
+    if opencode_endpoint_override(provider, model_id, pcfg):
+        text += " override"
+    return text
+
+
 def nvidia_hosted_list_headers() -> dict[str, str]:
     headers = {"content-type": "application/json"}
     key = read_env_file(NCP_ENV).get("NVIDIA_API_KEY") or os.environ.get("NVIDIA_API_KEY")
@@ -3881,8 +4268,11 @@ def nvidia_hosted_list_headers() -> dict[str, str]:
 
 def provider_model_list_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
     headers = {"content-type": "application/json"}
+    if provider in OPENCODE_PROVIDER_NAMES:
+        headers["user-agent"] = f"claude-any/{VERSION}"
     key = pcfg.get("api_key")
     if provider == "anthropic" and key:
+        headers["anthropic-version"] = "2023-06-01"
         headers["x-api-key"] = str(key)
     elif meaningful_key(str(key) if key is not None else None):
         headers["authorization"] = f"Bearer {key}"
@@ -4431,12 +4821,14 @@ def ncp_model_id_for_nvidia_hosted(model_id: str) -> str:
 
 def provider_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
     headers = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
+    if provider in OPENCODE_PROVIDER_NAMES:
+        headers["user-agent"] = f"claude-any/{VERSION}"
     key = pcfg.get("api_key") or "not-used"
     if provider == "anthropic":
         if not pcfg.get("api_key"):
             raise RuntimeError("Anthropic API key is missing. Run: claude-anyctl api-key anthropic")
         headers["x-api-key"] = pcfg["api_key"]
-    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek"):
+    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
     elif provider == "lm-studio":
@@ -4468,8 +4860,8 @@ def direct_native_anthropic_enabled(provider: str, pcfg: dict[str, Any]) -> bool
     return native_anthropic_enabled(provider) and not anthropic_routed_enabled(provider, pcfg)
 
 
-def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
-    cached = read_model_list_cache(provider, pcfg)
+def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool = False) -> list[str]:
+    cached = None if force_refresh else read_model_list_cache(provider, pcfg)
     if cached is not None:
         return cached
     if provider == "deepseek":
@@ -4481,6 +4873,33 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
         ])
         sorted_ids = sorted_model_ids(ids)
         write_model_list_cache(provider, pcfg, sorted_ids)
+        return sorted_ids
+    if provider == "anthropic":
+        ids = fetch_anthropic_public_model_ids()
+        source = "anthropic-docs"
+        if not ids:
+            base = provider_upstream_request_base(provider, pcfg)
+            for path in ("/v1/models", "/models"):
+                try:
+                    data = http_json(join_url(base, path), headers=provider_model_list_headers(provider, pcfg), timeout=6.0)
+                    ids = model_ids_from_response(data)
+                    source = f"api:{path}"
+                    if ids:
+                        break
+                except Exception:
+                    continue
+        if not ids:
+            return []
+        for mid in pcfg.get("custom_models", []) or []:
+            mid = normalize_model_id(provider, mid)
+            if mid and mid not in ids:
+                ids.append(mid)
+        cur = normalize_model_id(provider, pcfg.get("current_model") or "")
+        if cur and cur not in ids:
+            ids.insert(0, cur)
+        sorted_ids = unique_model_ids(provider, ids)
+        write_model_list_cache(provider, pcfg, sorted_ids)
+        write_model_registry(provider, pcfg, sorted_ids, source, {"urls": list(ANTHROPIC_MODEL_DOCS_URLS) if source == "anthropic-docs" else []})
         return sorted_ids
     if provider == "nvidia-hosted":
         base = (pcfg.get("base_url") or nvidia_upstream_base_url()).rstrip("/")
@@ -4529,6 +4948,15 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
     if provider == "ollama-cloud" and not ids:
         ids = ollama_catalog_model_ids(provider)
         fetched = bool(ids)
+    if not fetched and provider in OPENCODE_PROVIDER_NAMES:
+        ids = unique_model_ids(provider, [
+            *(pcfg.get("custom_models", []) or []),
+            pcfg.get("current_model") or "",
+        ])
+        sorted_ids = sorted_model_ids(ids)
+        if sorted_ids:
+            write_model_list_cache(provider, pcfg, sorted_ids)
+        return sorted_ids
     if not fetched:
         return []
     for mid in pcfg.get("custom_models", []) or []:
@@ -4542,7 +4970,9 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
         ids.insert(0, cur)
     if provider == "nvidia-hosted" and cur and cur not in ids:
         ids.insert(0, cur)
-    sorted_ids = sorted_model_ids(unique_model_ids(provider, ids))
+    sorted_ids = unique_model_ids(provider, ids)
+    if provider != "anthropic":
+        sorted_ids = sorted_model_ids(sorted_ids)
     write_model_list_cache(provider, pcfg, sorted_ids)
     return sorted_ids
 
@@ -4885,6 +5315,14 @@ def deepseek_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return provider == "deepseek" and bool(pcfg.get("native_compat", True))
 
 
+def opencode_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return (
+        provider in OPENCODE_PROVIDER_NAMES
+        and bool(pcfg.get("native_compat", True))
+        and opencode_endpoint_kind(provider, str(pcfg.get("current_model") or ""), pcfg) == "anthropic-messages"
+    )
+
+
 def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return (
         vllm_native_compat_enabled(provider, pcfg)
@@ -4892,6 +5330,7 @@ def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
         or nim_native_compat_enabled(provider, pcfg)
         or nvidia_hosted_native_compat_enabled(provider, pcfg)
         or deepseek_native_compat_enabled(provider, pcfg)
+        or opencode_native_compat_enabled(provider, pcfg)
     )
 
 
@@ -4938,7 +5377,7 @@ def resolve_requested_model(provider: str, pcfg: dict[str, Any], requested: str 
 
 
 def list_model_objects(provider: str, pcfg: dict[str, Any]) -> list[dict[str, Any]]:
-    return [model_object(provider, mid) for mid in upstream_model_ids(provider, pcfg)]
+    return [model_object(provider, mid, pcfg) for mid in upstream_model_ids(provider, pcfg)]
 
 
 def provider_upstream_request_base(provider: str, pcfg: dict[str, Any]) -> str:
@@ -5205,7 +5644,7 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
     upstream_text = " · ".join(bit for bit in upstream_bits if bit)
     links = [
         ("Events UI", "/ca/events", "Live router event stream with filters"),
-        ("Web chat", "/ca/web/chat", "Browser chat UI for the current provider"),
+        ("Session web chat", "/ca/web/chat", "Bridge messages into the active Claude Code session"),
         ("Recent events JSON", "/ca/events/recent", "Latest structured event records"),
         ("Events SSE", "/ca/events/stream", "Server-sent events stream"),
         ("Chat health", "/ca/chat/health", "Agent chat component status"),
@@ -5385,12 +5824,6 @@ def render_router_home_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, 
 def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any]) -> str:
     model = current_alias(cfg)
     timeout_ms = positive_int(pcfg.get("request_timeout_ms")) or DEFAULT_REQUEST_TIMEOUT_MS
-    max_tokens = (
-        claude_code_output_token_limit(provider, pcfg)
-        or positive_int(pcfg.get("max_output_tokens"))
-        or positive_int(MODEL_PRESETS.get("default", {}).get("max_output_tokens"))
-        or 4096
-    )
     api_status = api_key_status_line(provider, pcfg)
     mode = provider_mode_label(provider, pcfg)
     escaped_model = html_lib.escape(model)
@@ -5448,13 +5881,31 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
       border-radius: 8px;
       padding: 10px 12px;
       line-height: 1.45;
-      white-space: pre-wrap;
+      white-space: normal;
       word-break: break-word;
       box-shadow: 0 1px 0 rgba(255,255,255,.03) inset;
     }}
     .row.user .bubble {{ background: var(--user); border-color: #276a8d; }}
     .row.assistant .bubble {{ background: var(--assistant); }}
-    .row.system .bubble {{ background: #191f2b; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }}
+    .row.system .bubble {{ background: #191f2b; color: var(--muted); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; white-space: pre-wrap; }}
+    .markdown > :first-child {{ margin-top: 0; }}
+    .markdown > :last-child {{ margin-bottom: 0; }}
+    .markdown p {{ margin: 0 0 10px; }}
+    .markdown h1, .markdown h2, .markdown h3, .markdown h4 {{ margin: 12px 0 8px; line-height: 1.2; }}
+    .markdown h1 {{ font-size: 1.35rem; }}
+    .markdown h2 {{ font-size: 1.2rem; }}
+    .markdown h3 {{ font-size: 1.08rem; }}
+    .markdown ul, .markdown ol {{ margin: 0 0 10px 20px; padding: 0; }}
+    .markdown li {{ margin: 3px 0; }}
+    .markdown blockquote {{ margin: 0 0 10px; padding-left: 12px; border-left: 3px solid #4b6585; color: var(--muted); }}
+    .markdown pre {{ margin: 0 0 10px; padding: 10px; overflow-x: auto; border: 1px solid #33445b; border-radius: 6px; background: #0b111b; white-space: pre; }}
+    .markdown code {{ font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: .92em; }}
+    .markdown :not(pre) > code {{ padding: 1px 4px; border-radius: 4px; background: rgba(191, 219, 254, .12); }}
+    .markdown a {{ color: #8bd7ff; text-decoration: underline; text-underline-offset: 2px; }}
+    .markdown table {{ width: 100%; border-collapse: collapse; margin: 0 0 10px; display: block; overflow-x: auto; }}
+    .markdown th, .markdown td {{ border: 1px solid #3a4b63; padding: 6px 8px; text-align: left; vertical-align: top; }}
+    .markdown th {{ background: rgba(255,255,255,.06); font-weight: 700; }}
+    .markdown hr {{ border: 0; border-top: 1px solid var(--line); margin: 12px 0; }}
     .composer {{ border-top: 1px solid var(--line); padding: 12px 18px; background: #0d1420; }}
     .composer-inner {{ display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: end; }}
     textarea {{
@@ -5467,6 +5918,26 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
       background: #127668; color: white; font-weight: 700; cursor: pointer;
     }}
     button.primary:disabled {{ opacity: .55; cursor: not-allowed; }}
+    .composer-actions {{ display: flex; gap: 8px; align-items: center; margin-top: 8px; flex-wrap: wrap; }}
+    .attach-button {{
+      min-height: 34px; border: 1px solid var(--line); border-radius: 6px;
+      background: #0b111b; color: var(--text); padding: 0 12px; cursor: pointer;
+    }}
+    .attach-button:hover {{ border-color: var(--accent); }}
+    .attach-button:disabled {{ opacity: .55; cursor: not-allowed; }}
+    #fileInput {{ display: none; }}
+    .attachment-tray {{ display: flex; gap: 7px; flex-wrap: wrap; min-height: 0; }}
+    .attachment-chip {{
+      display: inline-flex; align-items: center; gap: 7px; max-width: min(360px, 100%);
+      border: 1px solid #33445b; border-radius: 999px; background: #121b2a;
+      padding: 5px 8px; color: var(--muted); font-size: 12px;
+    }}
+    .attachment-chip span {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .attachment-chip button {{
+      width: 18px; height: 18px; display: inline-flex; align-items: center; justify-content: center;
+      border: 0; border-radius: 999px; background: #243447; color: var(--text); cursor: pointer;
+    }}
+    .drop-active textarea {{ border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47, 158, 143, .18); }}
     .hint {{ margin-top: 7px; color: var(--muted); font-size: 12px; }}
     .error {{ color: var(--danger); }}
     .ok {{ color: var(--ok); }}
@@ -5490,19 +5961,21 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
         <div><div class="meta-label">Model</div><div class="meta-value">{escaped_model}</div></div>
         <div><div class="meta-label">API</div><div class="meta-value">{escaped_api_status}</div></div>
         <div><div class="meta-label">Timeout</div><div class="meta-value">{timeout_ms:,} ms</div></div>
+        <div><div class="meta-label">Bridge</div><div class="meta-value">active session channel</div></div>
       </div>
       <div class="nav">
         <a href="/">Router Home</a>
         <a href="/ca/events">Events</a>
         <a href="/health">Health JSON</a>
+        <button class="ghost" id="shareButton" type="button">Copy Chat Link</button>
         <button class="ghost" id="clearButton" type="button">Clear Chat</button>
       </div>
     </aside>
     <main>
       <header>
         <div>
-          <h1>Web Chat</h1>
-          <div class="sub">Talk to the currently selected Claude Any provider through <code>/v1/messages</code>.</div>
+          <h1>Session Web Chat</h1>
+          <div class="sub">Send messages into the active Claude Code session through the Claude Any channel bridge and stream replies from the same channel.</div>
         </div>
         <div class="pill" id="statePill">ready</div>
       </header>
@@ -5512,133 +5985,489 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
           <textarea id="prompt" placeholder="Type a message..." autocomplete="off"></textarea>
           <button class="primary" id="sendButton" type="submit">Send</button>
         </div>
-        <div class="hint">Enter sends. Shift+Enter inserts a new line. This page stays local to the router unless you expose it yourself.</div>
+        <div class="composer-actions">
+          <button class="attach-button" id="attachButton" type="button">Attach files</button>
+          <input id="fileInput" type="file" multiple>
+          <div class="attachment-tray" id="attachmentTray" aria-live="polite"></div>
+        </div>
+        <div class="hint">Enter sends. Shift+Enter inserts a new line. The active Claude Code session handles the message, so its configured tools and MCP servers remain available. If replies stay queued, restart Claude Any so the session wake bridge wraps the terminal.</div>
       </form>
     </main>
   </div>
   <script>
     const MODEL = {json.dumps(model)};
-    const MAX_TOKENS = {int(max_tokens)};
     const transcript = document.getElementById('transcript');
     const composer = document.getElementById('composer');
     const prompt = document.getElementById('prompt');
     const sendButton = document.getElementById('sendButton');
+    const attachButton = document.getElementById('attachButton');
+    const fileInput = document.getElementById('fileInput');
+    const attachmentTray = document.getElementById('attachmentTray');
+    const shareButton = document.getElementById('shareButton');
     const clearButton = document.getElementById('clearButton');
     const statePill = document.getElementById('statePill');
-    const history = [];
+    const SESSION_KEY = 'claude-any-web-chat-session';
+    const LAST_ID_KEY = 'claude-any-web-chat-last-id';
+    const HISTORY_PAGE_SIZE = 80;
+    const renderedIds = new Set();
+    let oldestId = 0;
+    let historyLoading = false;
+    let historyExhausted = false;
+    function cleanSessionId(value) {{
+      return String(value || '').replace(/[^a-zA-Z0-9_.:-]/g, '').slice(0, 128);
+    }}
+    const urlParams = new URLSearchParams(location.search);
+    const urlSessionId = cleanSessionId(urlParams.get('session') || urlParams.get('s') || '');
+    const storedSessionId = cleanSessionId(localStorage.getItem(SESSION_KEY) || '');
+    const sessionId = urlSessionId || storedSessionId || (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + '-' + Math.random().toString(16).slice(2));
+    localStorage.setItem(SESSION_KEY, sessionId);
+    if (!urlSessionId) {{
+      urlParams.set('session', sessionId);
+      const nextUrl = location.pathname + '?' + urlParams.toString() + location.hash;
+      history.replaceState(null, '', nextUrl);
+    }}
+    const channel = 'web-chat-' + sessionId;
+    const scopedLastIdKey = LAST_ID_KEY + ':' + sessionId;
+    let lastId = Number(localStorage.getItem(scopedLastIdKey) || '0') || 0;
+    let eventSource = null;
+    let selectedFiles = [];
     function setState(text, cls = '') {{
       statePill.textContent = text;
       statePill.className = 'pill ' + cls;
     }}
-    function addBubble(role, text) {{
+    function escapeHtml(value) {{
+      return String(value ?? '').replace(/[&<>"']/g, ch => ({{
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+      }}[ch]));
+    }}
+    function safeHref(value) {{
+      const href = String(value || '').trim();
+      if (/^(https?:|mailto:)/i.test(href)) return escapeHtml(href);
+      return '#';
+    }}
+    function renderInlineMarkdown(value) {{
+      const codeBlocks = [];
+      const linkBlocks = [];
+      let raw = String(value ?? '').replace(/`([^`\\n]+)`/g, (_match, code) => {{
+        const token = '\\u0000CODE' + codeBlocks.length + '\\u0000';
+        codeBlocks.push('<code>' + escapeHtml(code) + '</code>');
+        return token;
+      }});
+      raw = raw.replace(/\\[([^\\]]+)\\]\\(([^)\\s]+)\\)/g, (_match, label, href) => {{
+        const token = '\\u0000LINK' + linkBlocks.length + '\\u0000';
+        linkBlocks.push('<a href="' + safeHref(href) + '" target="_blank" rel="noopener noreferrer">' + escapeHtml(label) + '</a>');
+        return token;
+      }});
+      let html = escapeHtml(raw);
+      html = html.replace(/\\*\\*([^*]+)\\*\\*/g, '<strong>$1</strong>');
+      html = html.replace(/(^|[\\s(])\\*([^*\\n]+)\\*/g, '$1<em>$2</em>');
+      html = html.replace(/~~([^~]+)~~/g, '<del>$1</del>');
+      linkBlocks.forEach((link, index) => {{
+        html = html.replace('\\u0000LINK' + index + '\\u0000', link);
+      }});
+      codeBlocks.forEach((code, index) => {{
+        html = html.replace('\\u0000CODE' + index + '\\u0000', code);
+      }});
+      return html;
+    }}
+    function splitMarkdownTableRow(line) {{
+      let row = String(line || '').trim();
+      if (row.startsWith('|')) row = row.slice(1);
+      if (row.endsWith('|')) row = row.slice(0, -1);
+      return row.split('|').map(cell => cell.trim());
+    }}
+    function isMarkdownDelimiterCell(cell) {{
+      const compact = String(cell || '').replace(/\\s+/g, '');
+      const core = compact.replace(/^:/, '').replace(/:$/, '');
+      return core.length >= 3 && /^-+$/.test(core);
+    }}
+    function isMarkdownTableDelimiter(line) {{
+      const cells = splitMarkdownTableRow(line);
+      return cells.length > 1 && cells.every(isMarkdownDelimiterCell);
+    }}
+    function isMarkdownTableStart(lines, index) {{
+      return index + 1 < lines.length
+        && String(lines[index] || '').includes('|')
+        && splitMarkdownTableRow(lines[index]).length > 1
+        && isMarkdownTableDelimiter(lines[index + 1]);
+    }}
+    function isMarkdownBlockStart(lines, index) {{
+      const line = String(lines[index] || '');
+      const trimmed = line.trim();
+      if (!trimmed) return true;
+      return trimmed.startsWith('```')
+        || isMarkdownTableStart(lines, index)
+        || /^(####|###|##|#)\\s+/.test(trimmed)
+        || /^([-*+]\\s+|\\d+[.)]\\s+|>\\s?)/.test(trimmed)
+        || /^(---+|\\*\\*\\*+|___+)$/.test(trimmed);
+    }}
+    function renderMarkdownTable(lines, startIndex) {{
+      const headers = splitMarkdownTableRow(lines[startIndex]);
+      const rows = [];
+      let index = startIndex + 2;
+      while (index < lines.length && String(lines[index] || '').trim() && String(lines[index] || '').includes('|')) {{
+        rows.push(splitMarkdownTableRow(lines[index]));
+        index += 1;
+      }}
+      const head = '<thead><tr>' + headers.map(cell => '<th>' + renderInlineMarkdown(cell) + '</th>').join('') + '</tr></thead>';
+      const body = '<tbody>' + rows.map(row => {{
+        const cells = headers.map((_header, cellIndex) => '<td>' + renderInlineMarkdown(row[cellIndex] || '') + '</td>').join('');
+        return '<tr>' + cells + '</tr>';
+      }}).join('') + '</tbody>';
+      return {{ html: '<table>' + head + body + '</table>', nextIndex: index }};
+    }}
+    function renderMarkdown(text) {{
+      const lines = String(text ?? '').replace(/\\r\\n?/g, '\\n').split('\\n');
+      const blocks = [];
+      let index = 0;
+      while (index < lines.length) {{
+        const line = lines[index];
+        const trimmed = String(line || '').trim();
+        if (!trimmed) {{
+          index += 1;
+          continue;
+        }}
+        if (trimmed.startsWith('```')) {{
+          const code = [];
+          index += 1;
+          while (index < lines.length && !String(lines[index] || '').trim().startsWith('```')) {{
+            code.push(lines[index]);
+            index += 1;
+          }}
+          if (index < lines.length) index += 1;
+          blocks.push('<pre><code>' + escapeHtml(code.join('\\n')) + '</code></pre>');
+          continue;
+        }}
+        if (isMarkdownTableStart(lines, index)) {{
+          const table = renderMarkdownTable(lines, index);
+          blocks.push(table.html);
+          index = table.nextIndex;
+          continue;
+        }}
+        const heading = trimmed.match(/^(####|###|##|#)\\s+(.+)$/);
+        if (heading) {{
+          const level = Math.min(4, heading[1].length);
+          blocks.push('<h' + level + '>' + renderInlineMarkdown(heading[2]) + '</h' + level + '>');
+          index += 1;
+          continue;
+        }}
+        if (/^(---+|\\*\\*\\*+|___+)$/.test(trimmed)) {{
+          blocks.push('<hr>');
+          index += 1;
+          continue;
+        }}
+        if (/^[-*+]\\s+/.test(trimmed)) {{
+          const items = [];
+          while (index < lines.length && /^[-*+]\\s+/.test(String(lines[index] || '').trim())) {{
+            items.push(String(lines[index] || '').trim().replace(/^[-*+]\\s+/, ''));
+            index += 1;
+          }}
+          blocks.push('<ul>' + items.map(item => '<li>' + renderInlineMarkdown(item) + '</li>').join('') + '</ul>');
+          continue;
+        }}
+        if (/^\\d+[.)]\\s+/.test(trimmed)) {{
+          const items = [];
+          while (index < lines.length && /^\\d+[.)]\\s+/.test(String(lines[index] || '').trim())) {{
+            items.push(String(lines[index] || '').trim().replace(/^\\d+[.)]\\s+/, ''));
+            index += 1;
+          }}
+          blocks.push('<ol>' + items.map(item => '<li>' + renderInlineMarkdown(item) + '</li>').join('') + '</ol>');
+          continue;
+        }}
+        if (/^>\\s?/.test(trimmed)) {{
+          const quotes = [];
+          while (index < lines.length && /^>\\s?/.test(String(lines[index] || '').trim())) {{
+            quotes.push(String(lines[index] || '').trim().replace(/^>\\s?/, ''));
+            index += 1;
+          }}
+          blocks.push('<blockquote>' + renderInlineMarkdown(quotes.join('\\n')) + '</blockquote>');
+          continue;
+        }}
+        const paragraph = [trimmed];
+        index += 1;
+        while (index < lines.length && !isMarkdownBlockStart(lines, index)) {{
+          paragraph.push(String(lines[index] || '').trim());
+          index += 1;
+        }}
+        blocks.push('<p>' + renderInlineMarkdown(paragraph.join(' ')) + '</p>');
+      }}
+      return blocks.join('');
+    }}
+    function addBubble(role, text, mode = 'append', id = null) {{
+      if (id !== null && id !== undefined) {{
+        const key = String(id);
+        if (renderedIds.has(key)) return null;
+        renderedIds.add(key);
+      }}
       const row = document.createElement('div');
       row.className = 'row ' + role;
       const bubble = document.createElement('div');
       bubble.className = 'bubble';
-      bubble.textContent = text;
+      if (role === 'system') {{
+        bubble.textContent = text;
+      }} else {{
+        bubble.classList.add('markdown');
+        bubble.innerHTML = renderMarkdown(text);
+      }}
       row.appendChild(bubble);
-      transcript.appendChild(row);
-      transcript.scrollTop = transcript.scrollHeight;
+      if (mode === 'prepend') {{
+        transcript.insertBefore(row, transcript.firstChild);
+      }} else {{
+        transcript.appendChild(row);
+        transcript.scrollTop = transcript.scrollHeight;
+      }}
       return bubble;
     }}
-    function extractTextFromContent(content) {{
-      if (typeof content === 'string') return content;
-      if (!Array.isArray(content)) return '';
-      return content.map(block => {{
-        if (typeof block === 'string') return block;
-        if (!block || typeof block !== 'object') return '';
-        if (block.type === 'text') return block.text || '';
-        if (block.type === 'tool_use') return `[tool_use ${{block.name || block.id || ''}}]`;
-        return block.text || '';
-      }}).filter(Boolean).join('\\n');
-    }}
-    async function readStream(response, bubble) {{
-      const reader = response.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-      let text = '';
-      while (true) {{
-        const chunk = await reader.read();
-        if (chunk.done) break;
-        buffer += decoder.decode(chunk.value, {{stream: true}});
-        let sep;
-        while ((sep = buffer.indexOf('\\n\\n')) >= 0) {{
-          const packet = buffer.slice(0, sep);
-          buffer = buffer.slice(sep + 2);
-          for (const line of packet.split('\\n')) {{
-            if (!line.startsWith('data:')) continue;
-            const raw = line.slice(5).trim();
-            if (!raw || raw === '[DONE]') continue;
-            let event;
-            try {{ event = JSON.parse(raw); }} catch {{ continue; }}
-            if (event.type === 'content_block_delta' && event.delta && event.delta.type === 'text_delta') {{
-              text += event.delta.text || '';
-              bubble.textContent = text;
-            }} else if (event.type === 'content_block_start' && event.content_block && event.content_block.type === 'text') {{
-              text += event.content_block.text || '';
-              bubble.textContent = text;
-            }} else if (event.type === 'message_delta' && event.delta && event.delta.stop_reason) {{
-              setState(event.delta.stop_reason);
-            }} else if (event.type === 'error') {{
-              throw new Error(event.error && event.error.message ? event.error.message : 'stream error');
-            }}
-          }}
-          transcript.scrollTop = transcript.scrollHeight;
-        }}
+    function rememberLastId(id) {{
+      const numeric = Number(id || 0) || 0;
+      if (numeric > lastId) {{
+        lastId = numeric;
+        localStorage.setItem(scopedLastIdKey, String(lastId));
       }}
-      return text;
     }}
-    async function sendMessage(text) {{
-      history.push({{role: 'user', content: text}});
-      addBubble('user', text);
-      const bubble = addBubble('assistant', '');
-      setState('thinking');
-      sendButton.disabled = true;
+    function roleForMessage(message) {{
+      return message.sender_id === 'web-user' ? 'user' : 'assistant';
+    }}
+    function renderIncomingMessage(message, mode = 'append') {{
+      if (mode !== 'prepend') rememberLastId(message.id);
+      const text = message.message || '';
+      if (!text.trim()) return;
+      addBubble(roleForMessage(message), text, mode, message.id);
+      if (mode !== 'prepend' && message.sender_id !== 'web-user') setState('reply received', 'ok');
+    }}
+    function formatBytes(bytes) {{
+      const value = Number(bytes || 0);
+      if (value < 1024) return value + ' B';
+      if (value < 1024 * 1024) return (value / 1024).toFixed(1).replace(/\\.0$/, '') + ' KB';
+      return (value / (1024 * 1024)).toFixed(1).replace(/\\.0$/, '') + ' MB';
+    }}
+    function renderAttachmentTray() {{
+      attachmentTray.innerHTML = '';
+      selectedFiles.forEach((file, index) => {{
+        const chip = document.createElement('div');
+        chip.className = 'attachment-chip';
+        const label = document.createElement('span');
+        label.textContent = file.name + ' (' + formatBytes(file.size) + ')';
+        const remove = document.createElement('button');
+        remove.type = 'button';
+        remove.setAttribute('aria-label', 'Remove ' + file.name);
+        remove.textContent = 'x';
+        remove.addEventListener('click', () => {{
+          selectedFiles.splice(index, 1);
+          renderAttachmentTray();
+        }});
+        chip.appendChild(label);
+        chip.appendChild(remove);
+        attachmentTray.appendChild(chip);
+      }});
+    }}
+    function addSelectedFiles(fileList) {{
+      const incoming = Array.from(fileList || []);
+      if (!incoming.length) return;
+      selectedFiles = selectedFiles.concat(incoming);
+      renderAttachmentTray();
+      setState(selectedFiles.length + ' file(s) ready', 'ok');
+    }}
+    function fileToBase64(file) {{
+      return new Promise((resolve, reject) => {{
+        const reader = new FileReader();
+        reader.onload = () => {{
+          const dataUrl = String(reader.result || '');
+          const comma = dataUrl.indexOf(',');
+          resolve(comma >= 0 ? dataUrl.slice(comma + 1) : dataUrl);
+        }};
+        reader.onerror = () => reject(reader.error || new Error('Could not read file'));
+        reader.readAsDataURL(file);
+      }});
+    }}
+    async function uploadAttachment(file) {{
+      const content = await fileToBase64(file);
+      const response = await fetch('/ca/channel/files', {{
+        method: 'POST',
+        headers: {{'content-type': 'application/json', 'accept': 'application/json'}},
+        body: JSON.stringify({{
+          channel,
+          sender_id: 'web-user',
+          recipients: ['all'],
+          thread_id: sessionId,
+          announce: false,
+          name: file.name,
+          content_type: file.type || 'application/octet-stream',
+          encoding: 'base64',
+          content
+        }})
+      }});
+      const text = await response.text();
+      let json = {{}};
+      try {{ json = text ? JSON.parse(text) : {{}}; }} catch {{}}
+      if (!response.ok || !json.ok) {{
+        throw new Error(json.error || text || `Upload failed with HTTP ${{response.status}}`);
+      }}
+      return {{
+        name: json.name,
+        original_name: json.original_name || file.name,
+        url: json.url,
+        path: json.path,
+        bytes: json.bytes,
+        content_type: json.content_type || file.type || 'application/octet-stream'
+      }};
+    }}
+    async function uploadAttachments(files) {{
+      const uploads = [];
+      for (const file of files) {{
+        setState('uploading ' + file.name);
+        uploads.push(await uploadAttachment(file));
+      }}
+      return uploads;
+    }}
+    function attachmentSummary(uploads) {{
+      if (!uploads.length) return '';
+      const lines = uploads.map(file => {{
+        const label = file.original_name || file.name || 'file';
+        const size = formatBytes(file.bytes);
+        const type = file.content_type || 'application/octet-stream';
+        const url = file.url || file.path || '';
+        return '- [' + label + '](' + url + ') (' + size + ', ' + type + ') - router URL: ' + url;
+      }});
+      return 'Attached files:\\n' + lines.join('\\n');
+    }}
+    function buildOutboundText(text, uploads) {{
+      const trimmed = String(text || '').trim();
+      const summary = attachmentSummary(uploads);
+      if (trimmed && summary) return trimmed + '\\n\\n' + summary;
+      return trimmed || summary;
+    }}
+    function updateHistoryBounds(messages) {{
+      if (!Array.isArray(messages) || messages.length === 0) return;
+      const ids = messages.map(message => Number(message.id || 0)).filter(id => id > 0);
+      if (!ids.length) return;
+      const minId = Math.min(...ids);
+      const maxId = Math.max(...ids);
+      oldestId = oldestId ? Math.min(oldestId, minId) : minId;
+      rememberLastId(maxId);
+    }}
+    async function fetchMessagePage(params) {{
+      const query = new URLSearchParams({{
+        channel,
+        recipient: 'web',
+        limit: String(HISTORY_PAGE_SIZE),
+        ...params
+      }});
+      const response = await fetch('/ca/channel/messages?' + query.toString(), {{headers: {{'accept': 'application/json'}}}});
+      if (!response.ok) throw new Error(await response.text() || `HTTP ${{response.status}}`);
+      return await response.json();
+    }}
+    async function loadInitialHistory() {{
       try {{
-        const response = await fetch('/v1/messages', {{
+        const json = await fetchMessagePage({{latest: '1'}});
+        const messages = Array.isArray(json.messages) ? json.messages : [];
+        messages.forEach(message => renderIncomingMessage(message, 'append'));
+        updateHistoryBounds(messages);
+        historyExhausted = messages.length < HISTORY_PAGE_SIZE;
+      }} catch (err) {{
+        addBubble('system', 'Could not load chat history: ' + String(err && err.message ? err.message : err));
+      }}
+    }}
+    async function loadOlderHistory() {{
+      if (historyLoading || historyExhausted || !oldestId) return;
+      historyLoading = true;
+      const previousHeight = transcript.scrollHeight;
+      try {{
+        const json = await fetchMessagePage({{before: String(oldestId)}});
+        const messages = Array.isArray(json.messages) ? json.messages : [];
+        if (!messages.length) {{
+          historyExhausted = true;
+          return;
+        }}
+        for (let i = messages.length - 1; i >= 0; i -= 1) {{
+          renderIncomingMessage(messages[i], 'prepend');
+        }}
+        updateHistoryBounds(messages);
+        historyExhausted = messages.length < HISTORY_PAGE_SIZE;
+        transcript.scrollTop = transcript.scrollHeight - previousHeight;
+      }} catch (err) {{
+        addBubble('system', 'Could not load older history: ' + String(err && err.message ? err.message : err));
+      }} finally {{
+        historyLoading = false;
+      }}
+    }}
+    function startChannelStream() {{
+      if (eventSource) eventSource.close();
+      const url = `/ca/channel/stream?channel=${{encodeURIComponent(channel)}}&recipient=web&after=${{lastId}}&timeout=3600`;
+      eventSource = new EventSource(url);
+      eventSource.onopen = () => setState('listening', 'ok');
+      eventSource.onmessage = ev => {{
+        try {{
+          const message = JSON.parse(ev.data);
+          renderIncomingMessage(message);
+        }} catch {{}}
+      }};
+      eventSource.onerror = () => {{
+        if (eventSource) eventSource.close();
+        setState('reconnecting');
+        setTimeout(startChannelStream, 1200);
+      }};
+    }}
+    async function sendMessage(text, files = []) {{
+      setState('queued');
+      sendButton.disabled = true;
+      attachButton.disabled = true;
+      try {{
+        const uploads = await uploadAttachments(files);
+        const outboundText = buildOutboundText(text, uploads);
+        addBubble('user', outboundText);
+        const response = await fetch('/ca/channel/messages', {{
           method: 'POST',
-          headers: {{'content-type': 'application/json', 'accept': 'text/event-stream, application/json'}},
+          headers: {{'content-type': 'application/json', 'accept': 'application/json'}},
           body: JSON.stringify({{
-            model: MODEL,
-            max_tokens: MAX_TOKENS,
-            stream: true,
-            messages: history
+            channel,
+            sender_id: 'web-user',
+            recipients: ['all'],
+            delivery: ['llm', 'native'],
+            thread_id: sessionId,
+            kind: 'web_chat',
+            message: outboundText,
+            meta: {{
+              source: 'claude-any-web-chat',
+              web_chat_session: sessionId,
+              reply_channel: channel,
+              reply_recipient: 'web',
+              reply_instruction: 'Use the claude-any-router send_message tool to answer this browser chat on the same channel/thread_id with recipients web and delivery web. Use send_file when returning a file attachment to this browser chat.',
+              attachments: uploads
+            }}
           }})
         }});
         if (!response.ok) {{
           const fallback = await response.text();
           throw new Error(fallback || `HTTP ${{response.status}}`);
         }}
-        let assistantText = '';
-        const contentType = response.headers.get('content-type') || '';
-        if (response.body && contentType.includes('text/event-stream')) {{
-          assistantText = await readStream(response, bubble);
-        }} else {{
-          const json = await response.json();
-          assistantText = extractTextFromContent(json.content);
-          bubble.textContent = assistantText || JSON.stringify(json, null, 2);
-        }}
-        if (!assistantText.trim()) {{
-          bubble.textContent = '(empty response)';
-        }}
-        history.push({{role: 'assistant', content: bubble.textContent}});
-        setState('ready', 'ok');
+        const json = await response.json();
+        if (json.message) rememberLastId(json.message.id);
+        addBubble('system', 'Message queued for the active Claude Code session. Waiting for a channel reply. If this never changes, restart Claude Any so the session wake bridge is active.');
+        setState('waiting for session');
       }} catch (err) {{
-        bubble.textContent = String(err && err.message ? err.message : err);
+        const bubble = addBubble('assistant', String(err && err.message ? err.message : err));
         bubble.classList.add('error');
-        history.pop();
         setState('error', 'error');
       }} finally {{
         sendButton.disabled = false;
+        attachButton.disabled = false;
         prompt.focus();
       }}
     }}
     composer.addEventListener('submit', ev => {{
       ev.preventDefault();
       const text = prompt.value.trim();
-      if (!text) return;
+      const files = selectedFiles.slice();
+      if (!text && !files.length) return;
       prompt.value = '';
-      sendMessage(text);
+      selectedFiles = [];
+      renderAttachmentTray();
+      sendMessage(text, files);
     }});
     prompt.addEventListener('keydown', ev => {{
       if (ev.key === 'Enter' && !ev.shiftKey) {{
@@ -5646,13 +6475,51 @@ def render_web_chat_html(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any
         composer.requestSubmit();
       }}
     }});
-    clearButton.addEventListener('click', () => {{
-      history.length = 0;
-      transcript.innerHTML = '';
-      addBubble('system', 'Chat cleared. Provider and model remain unchanged.');
-      setState('ready');
+    attachButton.addEventListener('click', () => fileInput.click());
+    fileInput.addEventListener('change', () => {{
+      addSelectedFiles(fileInput.files);
+      fileInput.value = '';
     }});
-    addBubble('system', `Connected to ${{MODEL}}. Messages are sent to /v1/messages on this router.`);
+    composer.addEventListener('dragover', ev => {{
+      if (!ev.dataTransfer || !ev.dataTransfer.files || !ev.dataTransfer.files.length) return;
+      ev.preventDefault();
+      composer.classList.add('drop-active');
+    }});
+    composer.addEventListener('dragleave', () => composer.classList.remove('drop-active'));
+    composer.addEventListener('drop', ev => {{
+      if (!ev.dataTransfer || !ev.dataTransfer.files || !ev.dataTransfer.files.length) return;
+      ev.preventDefault();
+      composer.classList.remove('drop-active');
+      addSelectedFiles(ev.dataTransfer.files);
+    }});
+    clearButton.addEventListener('click', () => {{
+      transcript.innerHTML = '';
+      renderedIds.clear();
+      oldestId = 0;
+      historyExhausted = false;
+      selectedFiles = [];
+      renderAttachmentTray();
+      addBubble('system', `Chat cleared. This browser sends to active Claude Code session channel ${{channel}}.`);
+      startChannelStream();
+    }});
+    shareButton.addEventListener('click', async () => {{
+      const url = new URL(location.href);
+      url.searchParams.set('session', sessionId);
+      try {{
+        await navigator.clipboard.writeText(url.toString());
+        setState('link copied', 'ok');
+      }} catch {{
+        prompt.value = url.toString();
+        prompt.focus();
+        prompt.select();
+        setState('copy manually');
+      }}
+    }});
+    transcript.addEventListener('scroll', () => {{
+      if (transcript.scrollTop < 48) loadOlderHistory();
+    }});
+    addBubble('system', `Connected to active session bridge for ${{MODEL}}. Messages are queued on channel ${{channel}} and replies stream back from /ca/channel/stream.`);
+    loadInitialHistory().finally(startChannelStream);
     prompt.focus();
   </script>
 </body>
@@ -5740,6 +6607,97 @@ def _safe_segment(value: str, fallback: str = "item") -> str:
     return text[:120] or fallback
 
 
+def chat_file_max_bytes() -> int:
+    raw = str(os.environ.get("CLAUDE_ANY_CHAT_FILE_MAX_BYTES") or "").strip()
+    try:
+        value = int(raw)
+        if value > 0:
+            return value
+    except Exception:
+        pass
+    return 25 * 1024 * 1024
+
+
+def store_chat_file_upload(body: dict[str, Any]) -> dict[str, Any]:
+    CHAT_FILES_DIR.mkdir(parents=True, exist_ok=True)
+    raw_name = str(body.get("name") or f"file-{int(time.time())}.txt").strip() or "file"
+    content = body.get("content", "")
+    encoding = str(body.get("encoding") or "utf-8").strip().lower()
+    if encoding == "base64":
+        try:
+            data = base64.b64decode(str(content).encode("ascii"), validate=True)
+        except Exception as exc:
+            raise ValueError("invalid base64 file content") from exc
+    elif encoding in {"", "text", "utf-8", "utf8"}:
+        data = str(content).encode("utf-8")
+    else:
+        raise ValueError(f"unsupported file encoding: {encoding}")
+    max_bytes = chat_file_max_bytes()
+    if len(data) > max_bytes:
+        raise OverflowError(f"file too large: {len(data)} bytes exceeds {max_bytes} bytes")
+    name = f"{time.time_ns()}-{_safe_segment(raw_name, 'file')}"
+    target = CHAT_FILES_DIR / name
+    target.write_bytes(data)
+    path = f"/ca/chat/files/{urllib.parse.quote(name)}"
+    content_type = str(body.get("content_type") or body.get("mime_type") or "application/octet-stream").strip()
+    return {
+        "name": name,
+        "original_name": raw_name,
+        "url": f"{ROUTER_BASE}{path}",
+        "path": path,
+        "bytes": len(data),
+        "content_type": content_type[:200] or "application/octet-stream",
+    }
+
+
+def store_chat_file_from_path(path_value: Any, name: str | None = None, content_type: str | None = None) -> dict[str, Any]:
+    raw_path = str(path_value or "").strip()
+    if not raw_path:
+        raise ValueError("file path is required")
+    source = Path(raw_path).expanduser()
+    if not source.exists() or not source.is_file():
+        raise FileNotFoundError(f"file not found: {raw_path}")
+    data = source.read_bytes()
+    max_bytes = chat_file_max_bytes()
+    if len(data) > max_bytes:
+        raise OverflowError(f"file too large: {len(data)} bytes exceeds {max_bytes} bytes")
+    guessed_type = content_type or mimetypes.guess_type(source.name)[0] or "application/octet-stream"
+    return store_chat_file_upload(
+        {
+            "name": name or source.name,
+            "encoding": "base64",
+            "content": base64.b64encode(data).decode("ascii"),
+            "content_type": guessed_type,
+        }
+    )
+
+
+def chat_file_markdown_lines(uploads: list[dict[str, Any]]) -> list[str]:
+    lines: list[str] = []
+    for upload in uploads:
+        label = str(upload.get("original_name") or upload.get("name") or "file")
+        url = str(upload.get("url") or upload.get("path") or "")
+        byte_count = upload.get("bytes")
+        ctype = str(upload.get("content_type") or "application/octet-stream")
+        detail_parts = []
+        if isinstance(byte_count, int):
+            detail_parts.append(f"{byte_count} bytes")
+        if ctype:
+            detail_parts.append(ctype)
+        detail = f" ({', '.join(detail_parts)})" if detail_parts else ""
+        lines.append(f"- [{label}]({url}){detail}")
+    return lines
+
+
+def chat_file_message_text(message: str, uploads: list[dict[str, Any]]) -> str:
+    body = str(message or "").strip()
+    lines = chat_file_markdown_lines(uploads)
+    if not lines:
+        return body
+    attachment_text = "Attached files:\n" + "\n".join(lines)
+    return f"{body}\n\n{attachment_text}" if body else attachment_text
+
+
 def _as_string_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -5794,6 +6752,20 @@ def _message_visible_to(message: dict[str, Any], recipient: str | None) -> bool:
     return recipient in recipients or recipient == str(message.get("sender_id") or "")
 
 
+def _chat_message_matches(message: dict[str, Any], channel: str | None = None, recipient: str | None = None) -> bool:
+    if channel:
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        aliases = {
+            str(message.get("channel") or ""),
+            str(meta.get("room_id") or ""),
+            str(meta.get("room") or ""),
+            str(meta.get("channel") or ""),
+        }
+        if channel not in aliases:
+            return False
+    return _message_visible_to(message, recipient)
+
+
 def read_chat_messages(after_id: int = 0, channel: str | None = None, recipient: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     try:
@@ -5810,23 +6782,37 @@ def read_chat_messages(after_id: int = 0, channel: str | None = None, recipient:
                         continue
                 except Exception:
                     continue
-                if channel:
-                    meta = item.get("meta") if isinstance(item.get("meta"), dict) else {}
-                    aliases = {
-                        str(item.get("channel") or ""),
-                        str(meta.get("room_id") or ""),
-                        str(meta.get("room") or ""),
-                        str(meta.get("channel") or ""),
-                    }
-                    if channel not in aliases:
-                        continue
-                if not _message_visible_to(item, recipient):
+                if not _chat_message_matches(item, channel, recipient):
                     continue
                 messages.append(item)
                 if len(messages) >= limit:
                     break
     except Exception as exc:
         router_log("WARN", f"chat read failed: {exc}")
+    return messages
+
+
+def read_chat_messages_before(before_id: int = 0, channel: str | None = None, recipient: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    try:
+        if not CHAT_MESSAGES_PATH.exists():
+            return []
+        with CHAT_MESSAGES_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                    item_id = int(item.get("id") or 0)
+                except Exception:
+                    continue
+                if before_id > 0 and item_id >= before_id:
+                    continue
+                if not _chat_message_matches(item, channel, recipient):
+                    continue
+                messages.append(item)
+                if len(messages) > limit:
+                    messages = messages[-limit:]
+    except Exception as exc:
+        router_log("WARN", f"chat read before failed: {exc}")
     return messages
 
 
@@ -6617,6 +7603,225 @@ def _channel_mcp_initialize_response(request_id: Any, protocol: str) -> dict[str
     }
 
 
+def _channel_mcp_tool_schemas() -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "send_message",
+            "description": (
+                "Send a reply or status message to a Claude Any channel. "
+                "Use this to answer messages delivered through the Claude Any channel inbox, "
+                "including /ca/web/chat browser sessions."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Destination channel id from the incoming message.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Message body to send.",
+                    },
+                    "recipients": {
+                        "description": "Recipient id, 'all', or an array of recipients. Use 'web' for /ca/web/chat replies.",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread/conversation id to continue.",
+                    },
+                    "parent_id": {
+                        "description": "Optional parent message id.",
+                    },
+                    "delivery": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Delivery targets. Use ['web'] for browser-only replies.",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Optional message kind, for example 'reply' or 'status'.",
+                    },
+                },
+                "required": ["channel", "message"],
+            },
+        },
+        {
+            "name": "send_file",
+            "description": (
+                "Send a file attachment to a Claude Any channel. "
+                "Use this to return files to /ca/web/chat browser sessions. "
+                "Provide either path for an existing local file, or content with encoding='text' or encoding='base64'."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "channel": {
+                        "type": "string",
+                        "description": "Destination channel id from the incoming message.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Optional local file path to attach.",
+                    },
+                    "content": {
+                        "type": "string",
+                        "description": "Optional inline file content when path is not used.",
+                    },
+                    "encoding": {
+                        "type": "string",
+                        "description": "Inline content encoding: text or base64.",
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Display filename. Defaults to the source path basename or file.txt.",
+                    },
+                    "content_type": {
+                        "type": "string",
+                        "description": "Optional MIME type.",
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Optional message body to show with the file link.",
+                    },
+                    "recipients": {
+                        "description": "Recipient id, 'all', or an array of recipients. Use 'web' for /ca/web/chat replies.",
+                    },
+                    "thread_id": {
+                        "type": "string",
+                        "description": "Thread/conversation id to continue.",
+                    },
+                    "parent_id": {
+                        "description": "Optional parent message id.",
+                    },
+                    "delivery": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Delivery targets. Use ['web'] for browser-only replies.",
+                    },
+                },
+                "required": ["channel"],
+            },
+        },
+        {
+            "name": "get_messages",
+            "description": "Read recent Claude Any channel messages for a channel/thread.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "after": {"type": "integer", "description": "Only return messages after this id."},
+                    "channel": {"type": "string", "description": "Optional channel filter."},
+                    "recipient": {"type": "string", "description": "Optional recipient visibility filter."},
+                    "limit": {"type": "integer", "description": "Maximum number of messages to return."},
+                },
+            },
+        },
+    ]
+
+
+def _channel_mcp_tool_response(request_id: Any, text: str, is_error: bool = False) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [{"type": "text", "text": text}],
+            "isError": bool(is_error),
+        },
+    }
+
+
+def _channel_mcp_tool_call_response(request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    name = str(params.get("name") or "")
+    args = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+    if name == "send_message":
+        channel = str(args.get("channel") or "").strip()
+        message = str(args.get("message") or args.get("text") or "").strip()
+        if not channel or not message:
+            return _channel_mcp_tool_response(request_id, "send_message requires channel and message.", True)
+        meta = args.get("meta") if isinstance(args.get("meta"), dict) else {}
+        saved = append_chat_message(
+            {
+                "channel": channel,
+                "sender_id": args.get("sender_id") or "claude-code",
+                "recipients": args.get("recipients", args.get("recipient_id", "web")),
+                "thread_id": args.get("thread_id"),
+                "parent_id": args.get("parent_id"),
+                "kind": args.get("kind") or "reply",
+                "message": message,
+                "delivery": args.get("delivery", ["web"]),
+                "meta": {"source": "claude-any-router-tool", **meta},
+            }
+        )
+        return _channel_mcp_tool_response(
+            request_id,
+            json.dumps({"ok": True, "message": saved}, ensure_ascii=False, separators=(",", ":")),
+        )
+    if name == "send_file":
+        channel = str(args.get("channel") or "").strip()
+        if not channel:
+            return _channel_mcp_tool_response(request_id, "send_file requires channel.", True)
+        try:
+            if args.get("path"):
+                upload = store_chat_file_from_path(
+                    args.get("path"),
+                    str(args.get("name") or "").strip() or None,
+                    str(args.get("content_type") or args.get("mime_type") or "").strip() or None,
+                )
+            else:
+                inline_body = {
+                    "name": str(args.get("name") or "file.txt"),
+                    "encoding": str(args.get("encoding") or "text"),
+                    "content": args.get("content", ""),
+                    "content_type": str(args.get("content_type") or args.get("mime_type") or "text/plain"),
+                }
+                upload = store_chat_file_upload(inline_body)
+        except FileNotFoundError as exc:
+            return _channel_mcp_tool_response(request_id, str(exc), True)
+        except OverflowError as exc:
+            return _channel_mcp_tool_response(request_id, str(exc), True)
+        except ValueError as exc:
+            return _channel_mcp_tool_response(request_id, str(exc), True)
+        meta = args.get("meta") if isinstance(args.get("meta"), dict) else {}
+        uploads = [upload]
+        saved = append_chat_message(
+            {
+                "channel": channel,
+                "sender_id": args.get("sender_id") or "claude-code",
+                "recipients": args.get("recipients", args.get("recipient_id", "web")),
+                "thread_id": args.get("thread_id"),
+                "parent_id": args.get("parent_id"),
+                "kind": args.get("kind") or "file",
+                "message": chat_file_message_text(str(args.get("message") or ""), uploads),
+                "delivery": args.get("delivery", ["web"]),
+                "meta": {"source": "claude-any-router-tool", "attachments": uploads, **meta},
+            }
+        )
+        return _channel_mcp_tool_response(
+            request_id,
+            json.dumps({"ok": True, "file": upload, "message": saved}, ensure_ascii=False, separators=(",", ":")),
+        )
+    if name == "get_messages":
+        try:
+            after = int(args.get("after") or 0)
+        except Exception:
+            after = 0
+        try:
+            limit = max(1, min(100, int(args.get("limit") or 20)))
+        except Exception:
+            limit = 20
+        messages = read_chat_messages(
+            after,
+            str(args.get("channel") or "") or None,
+            str(args.get("recipient") or args.get("recipient_id") or "") or None,
+            limit,
+        )
+        return _channel_mcp_tool_response(
+            request_id,
+            json.dumps({"ok": True, "messages": messages}, ensure_ascii=False, separators=(",", ":")),
+        )
+    return _channel_mcp_tool_response(request_id, f"Unknown claude-any-router tool: {name}", True)
+
+
 def _channel_mcp_write_cursor_locked(last_id: int) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     tmp_path = CHANNEL_MCP_CURSOR_PATH.with_suffix(".json.tmp")
@@ -6836,7 +8041,10 @@ def handle_channel_mcp_post(handler: BaseHTTPRequestHandler, path: str, body: di
         response = _channel_mcp_initialize_response(request_id, protocol)
         router_log("INFO", f"channel_mcp_initialized session={session or '-'} protocol={protocol}")
     elif method == "tools/list":
-        response = {"jsonrpc": "2.0", "id": request_id, "result": {"tools": []}}
+        response = {"jsonrpc": "2.0", "id": request_id, "result": {"tools": _channel_mcp_tool_schemas()}}
+    elif method == "tools/call":
+        params = body.get("params") if isinstance(body.get("params"), dict) else {}
+        response = _channel_mcp_tool_call_response(request_id, params)
     elif method == "ping":
         response = {"jsonrpc": "2.0", "id": request_id, "result": {}}
     elif request_id is not None:
@@ -6895,17 +8103,29 @@ def handle_chat_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
     if path in ("/ca/chat/messages", "/ca/chat/wait"):
         params = _query_params(handler)
         after = int(_first_param(params, "after", "0") or 0)
+        before = int(_first_param(params, "before", "0") or 0)
         limit = max(1, min(500, int(_first_param(params, "limit", "100") or 100)))
         channel = _first_param(params, "channel", "") or None
         recipient = _first_param(params, "recipient", "") or _first_param(params, "recipient_id", "") or None
+        latest = _first_param(params, "latest", "") or _first_param(params, "history", "")
         timeout = 0.0 if path.endswith("/messages") else max(0.0, min(300.0, float(_first_param(params, "timeout", "60") or 60)))
         deadline = time.time() + timeout
-        messages = read_chat_messages(after, channel, recipient, limit)
+        history_mode = path.endswith("/messages") and (before > 0 or latest.lower() in {"1", "true", "yes", "on"})
+        messages = read_chat_messages_before(before, channel, recipient, limit) if history_mode else read_chat_messages(after, channel, recipient, limit)
         while not messages and timeout > 0 and time.time() < deadline:
             with _CHAT_CONDITION:
                 _CHAT_CONDITION.wait(timeout=min(5.0, max(0.0, deadline - time.time())))
             messages = read_chat_messages(after, channel, recipient, limit)
-        write_json(handler, {"ok": True, "messages": messages, "last_id": messages[-1]["id"] if messages else after})
+        write_json(
+            handler,
+            {
+                "ok": True,
+                "messages": messages,
+                "last_id": messages[-1]["id"] if messages else after,
+                "oldest_id": messages[0]["id"] if messages else None,
+                "has_more": bool(messages and (before > 0 or len(messages) >= limit)),
+            },
+        )
         return True
     if path == "/ca/chat/stream":
         params = _query_params(handler)
@@ -6947,6 +8167,7 @@ def handle_chat_get(handler: BaseHTTPRequestHandler, path: str) -> bool:
         data = target.read_bytes()
         handler.send_response(200)
         handler.send_header("content-type", "application/octet-stream")
+        handler.send_header("content-disposition", f"attachment; filename={json.dumps(name)}")
         handler.send_header("content-length", str(len(data)))
         handler.end_headers()
         handler.wfile.write(data)
@@ -6993,18 +8214,16 @@ def handle_chat_post(handler: BaseHTTPRequestHandler, path: str, body: dict[str,
         write_json(handler, {"ok": True, "message": message})
         return True
     if path == "/ca/chat/files":
-        CHAT_FILES_DIR.mkdir(parents=True, exist_ok=True)
-        raw_name = str(body.get("name") or f"file-{int(time.time())}.txt")
-        name = f"{int(time.time())}-{_safe_segment(raw_name, 'file')}"
-        content = body.get("content", "")
-        if body.get("encoding") == "base64":
-            data = base64.b64decode(str(content).encode("ascii"))
-        else:
-            data = str(content).encode("utf-8")
-        target = CHAT_FILES_DIR / name
-        target.write_bytes(data)
-        url = f"{ROUTER_BASE}/ca/chat/files/{urllib.parse.quote(name)}"
+        try:
+            upload = store_chat_file_upload(body)
+        except OverflowError as exc:
+            write_json(handler, {"ok": False, "error": str(exc)}, 413)
+            return True
+        except ValueError as exc:
+            write_json(handler, {"ok": False, "error": str(exc)}, 400)
+            return True
         if body.get("announce", True):
+            attachments = [upload]
             append_chat_message({
                 "channel": body.get("channel", "default"),
                 "sender_id": body.get("sender_id", "system"),
@@ -7012,10 +8231,10 @@ def handle_chat_post(handler: BaseHTTPRequestHandler, path: str, body: dict[str,
                 "thread_id": body.get("thread_id"),
                 "parent_id": body.get("parent_id"),
                 "kind": "file",
-                "message": url,
-                "meta": {"name": raw_name, "url": url},
+                "message": str(body.get("message") or upload["url"]),
+                "meta": {"attachments": attachments, "name": upload["original_name"], "url": upload["url"]},
             })
-        write_json(handler, {"ok": True, "name": name, "url": url, "bytes": len(data)})
+        write_json(handler, {"ok": True, **upload})
         return True
     return False
 
@@ -7785,7 +9004,7 @@ def anthropic_tools_to_ollama(tools: Any) -> list[dict[str, Any]]:
     return out
 
 
-def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
+def anthropic_messages_to_openai(body: dict[str, Any], reasoning_passback: bool = False) -> list[dict[str, Any]]:
     messages = anthropic_system_to_ollama_messages(body.get("system"))
     messages.append(ollama_claude_code_reminder())
     messages.extend(claude_code_state_messages(body))
@@ -7805,7 +9024,14 @@ def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
         if role == "assistant" and isinstance(content, list):
             text_blocks: list[Any] = []
             tool_calls: list[dict[str, Any]] = []
+            reasoning_seen = False
+            reasoning_parts: list[str] = []
             for block in content:
+                if isinstance(block, dict) and block.get("type") in ANTHROPIC_THINKING_BLOCK_TYPES:
+                    reasoning_seen = True
+                    if block.get("type") == "thinking":
+                        reasoning_parts.append(str(block.get("thinking") or ""))
+                    continue
                 if isinstance(block, dict) and block.get("type") == "tool_use":
                     tool_id = str(block.get("id") or f"call_{len(tool_calls) + 1}")
                     name = str(block.get("name") or "tool")
@@ -7824,6 +9050,8 @@ def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
                 else:
                     text_blocks.append(block)
             out: dict[str, Any] = {"role": "assistant", "content": compact_message_text_for_prompt(anthropic_content_to_text(text_blocks))}
+            if reasoning_seen or reasoning_passback:
+                out["reasoning_content"] = "\n".join(reasoning_parts)
             if tool_calls:
                 out["tool_calls"] = tool_calls
             messages.append(out)
@@ -7869,7 +9097,10 @@ def anthropic_messages_to_openai(body: dict[str, Any]) -> list[dict[str, Any]]:
             if text:
                 messages.append({"role": "user", "content": compact_message_text_for_prompt(text)})
             continue
-        messages.append({"role": role, "content": compact_message_text_for_prompt(anthropic_content_to_text(content))})
+        out = {"role": role, "content": compact_message_text_for_prompt(anthropic_content_to_text(content))}
+        if role == "assistant" and reasoning_passback:
+            out["reasoning_content"] = ""
+        messages.append(out)
     return messages
 
 
@@ -7884,6 +9115,49 @@ def anthropic_tool_choice_to_openai(tool_choice: Any) -> Any:
     if choice_type == "auto":
         return "auto"
     return tool_choice
+
+
+def opencode_model_id_hint(provider: str, pcfg: dict[str, Any], model: str | None) -> str:
+    requested = strip_claude_context_suffix(model).strip()
+    fallback = normalize_model_id(provider, pcfg.get("current_model") or "")
+    prefix = f"claude-any-{provider}-"
+    if requested.startswith(prefix):
+        return requested[len(prefix):]
+    if requested.startswith("claude-any-"):
+        return fallback
+    return normalize_model_id(provider, requested or fallback)
+
+
+def openai_chat_reasoning_passback_enabled(provider: str, model: str | None, pcfg: dict[str, Any]) -> bool:
+    if provider not in OPENCODE_PROVIDER_NAMES:
+        return False
+    model_id = opencode_model_id_hint(provider, pcfg, model).strip().lower()
+    if not model_id.startswith("deepseek-"):
+        return False
+    return opencode_endpoint_kind(provider, model_id, pcfg) == "openai-chat"
+
+
+def openai_chat_reasoning_passback_enabled_for_body(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> bool:
+    return openai_chat_reasoning_passback_enabled(provider, str(body.get("model") or ""), pcfg)
+
+
+def openai_reasoning_to_anthropic_thinking_block(reasoning_content: Any) -> dict[str, Any] | None:
+    reasoning = str(reasoning_content or "")
+    if not reasoning:
+        return None
+    digest = hashlib.sha256(reasoning.encode("utf-8", errors="replace")).hexdigest()[:24]
+    return {
+        "type": "thinking",
+        "thinking": reasoning,
+        "signature": f"claude-any-openai-reasoning-{digest}",
+    }
+
+
+def should_omit_openai_chat_tool_choice(provider: str, model: str, body: dict[str, Any], pcfg: dict[str, Any]) -> bool:
+    """Return true when an OpenAI-chat backend should receive tools without a forced tool_choice."""
+    if body.get("tool_choice") is None:
+        return False
+    return openai_chat_reasoning_passback_enabled(provider, model, pcfg)
 
 
 def positive_int(value: Any) -> int | None:
@@ -8275,7 +9549,8 @@ def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], 
 
 
 def openai_compatible_chat_request(provider: str, model: str, body: dict[str, Any], pcfg: dict[str, Any], stream: bool = False) -> dict[str, Any]:
-    messages = anthropic_messages_to_openai(body)
+    reasoning_passback = openai_chat_reasoning_passback_enabled(provider, model, pcfg)
+    messages = anthropic_messages_to_openai(body, reasoning_passback=reasoning_passback)
     tools = anthropic_tools_to_ollama(body.get("tools"))
     context_limit = openai_context_limit_for_budget(provider, pcfg)
     configured = configured_output_tokens(pcfg, body)
@@ -8289,7 +9564,7 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
     }
     if tools:
         req["tools"] = tools
-    if body.get("tool_choice") is not None:
+    if body.get("tool_choice") is not None and not should_omit_openai_chat_tool_choice(provider, model, body, pcfg):
         req["tool_choice"] = anthropic_tool_choice_to_openai(body.get("tool_choice"))
     max_tokens = configured_output_tokens(pcfg, body)
     if max_tokens:
@@ -10254,7 +11529,16 @@ def openai_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
     wrapped["prompt_eval_count"] = positive_int(usage.get("prompt_tokens")) or (estimate_tokens(source_body) if isinstance(source_body, dict) else 0)
     wrapped["eval_count"] = positive_int(usage.get("completion_tokens")) or 0
-    return ollama_chat_to_anthropic(wrapped, model, source_body=source_body)
+    out = ollama_chat_to_anthropic(wrapped, model, source_body=source_body)
+    thinking_block = openai_reasoning_to_anthropic_thinking_block(message.get("reasoning_content"))
+    if thinking_block is None:
+        return out
+    content = out.get("content")
+    if not isinstance(content, list):
+        content = [{"type": "text", "text": anthropic_content_to_text(content)}]
+    out = dict(out)
+    out["content"] = [thinking_block] + content
+    return out
 
 
 def stream_openai_chat_to_anthropic_sse(
@@ -10277,6 +11561,10 @@ def stream_openai_chat_to_anthropic_sse(
     pseudo_mode = False
     text_buffer = ""
     text_stopped = False
+    reasoning_started = False
+    reasoning_stopped = False
+    reasoning_index: int | None = None
+    reasoning_so_far = ""
     tool_fragments: dict[int, dict[str, Any]] = {}
     output_tokens = 0
     finish_reason = "stop"
@@ -10300,6 +11588,52 @@ def stream_openai_chat_to_anthropic_sse(
             {"type": "content_block_start", "index": text_index, "content_block": {"type": "text", "text": ""}},
         )
         return text_index
+
+    def ensure_reasoning_started() -> int:
+        nonlocal reasoning_started, reasoning_index, next_content_index, reasoning_stopped
+        if reasoning_started and reasoning_index is not None:
+            return reasoning_index
+        reasoning_started = True
+        reasoning_stopped = False
+        reasoning_index = next_content_index
+        next_content_index += 1
+        emit(
+            "content_block_start",
+            {
+                "type": "content_block_start",
+                "index": reasoning_index,
+                "content_block": {"type": "thinking", "thinking": ""},
+            },
+        )
+        return reasoning_index
+
+    def emit_reasoning_delta(text: str) -> None:
+        if not text:
+            return
+        idx = ensure_reasoning_started()
+        emit(
+            "content_block_delta",
+            {"type": "content_block_delta", "index": idx, "delta": {"type": "thinking_delta", "thinking": text}},
+        )
+
+    def close_reasoning_block() -> None:
+        nonlocal reasoning_stopped
+        if not reasoning_started or reasoning_index is None or reasoning_stopped:
+            return
+        digest = hashlib.sha256(reasoning_so_far.encode("utf-8", errors="replace")).hexdigest()[:24]
+        emit(
+            "content_block_delta",
+            {
+                "type": "content_block_delta",
+                "index": reasoning_index,
+                "delta": {
+                    "type": "signature_delta",
+                    "signature": f"claude-any-openai-reasoning-{digest}",
+                },
+            },
+        )
+        emit("content_block_stop", {"type": "content_block_stop", "index": reasoning_index})
+        reasoning_stopped = True
 
     def emit_text_delta(text: str) -> None:
         if not text:
@@ -10354,8 +11688,14 @@ def stream_openai_chat_to_anthropic_sse(
             if choice.get("finish_reason"):
                 finish_reason = str(choice.get("finish_reason"))
             delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            reasoning_chunk = delta.get("reasoning_content") or ""
+            if reasoning_chunk:
+                reasoning_so_far += str(reasoning_chunk)
+                emit_reasoning_delta(str(reasoning_chunk))
+                update_stream_activity()
             text_chunk = delta.get("content") or ""
             if text_chunk:
+                close_reasoning_block()
                 if pseudo_mode or PSEUDO_TOOL_START in text_chunk:
                     before, sep, after = text_chunk.partition(PSEUDO_TOOL_START)
                     if before and not pseudo_mode:
@@ -10415,6 +11755,7 @@ def stream_openai_chat_to_anthropic_sse(
         if word_chunking and text_buffer:
             to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
             emit_text_delta(to_flush)
+        close_reasoning_block()
 
         tool_calls: list[dict[str, Any]] = []
         _, pseudo_tool_calls = parse_pseudo_tool_calls(pseudo_text)
@@ -11025,6 +12366,37 @@ class RouterHandler(BaseHTTPRequestHandler):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to Ollama-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_ollama_api_chat(self, provider, pcfg, body)
                 return
+            if provider in OPENCODE_PROVIDER_NAMES:
+                upstream_model = resolve_requested_model(provider, pcfg, body.get("model"))
+                endpoint_kind = opencode_endpoint_kind(provider, upstream_model, pcfg)
+                provider_label = PROVIDER_LABELS.get(provider, provider)
+                if endpoint_kind == "openai-chat":
+                    EVENT_BUS.publish(
+                        level="info",
+                        category="upstream.request",
+                        message=f"forwarding to {provider_label} chat-compatible provider",
+                        request_id=request_id,
+                        provider=provider,
+                        model=upstream_model,
+                    )
+                    forward_openai_compatible_chat(self, provider, pcfg, body)
+                    return
+                if endpoint_kind not in ("anthropic-messages",):
+                    write_json(
+                        self,
+                        {
+                            "type": "error",
+                            "error": {
+                                "type": "unsupported_model_endpoint",
+                                "message": (
+                                    f"{provider_label} model {upstream_model!r} uses the {endpoint_kind} endpoint family. "
+                                    f"claude-any currently routes {provider_label} /v1/messages and /v1/chat/completions models."
+                                ),
+                            },
+                        },
+                        400,
+                    )
+                    return
             if provider in ("lm-studio", "nvidia-hosted") and not provider_native_compat_enabled(provider, pcfg):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to OpenAI-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_openai_compatible_chat(self, provider, pcfg, body)
@@ -11503,11 +12875,11 @@ def status_lines() -> list[str]:
         *([f"think: {bool(pcfg.get('think', False))}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("ollama", "ollama-cloud") else []),
-        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
-        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek") else []),
-        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
-        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
-        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek") else []),
+        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go") else []),
+        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go") else []),
+        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go") else []),
+        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go") else []),
+        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go") else []),
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
         f"log_level: {log_level_status()}",
         f"channels: {channel_status_text(cfg)}",
@@ -13352,7 +14724,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print("  claude-any --ca-ollama-option temperature=0.7 --ca-ollama-num-ctx 65536")
 
 
-PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek")
+PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go")
 PROVIDER_SAMPLING_OPTION_PROVIDERS = ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim")
 PROVIDER_SAMPLING_OPTIONS = ("temperature", "top_p", "top_k")
 
@@ -13410,17 +14782,21 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
             if limit is not None:
                 suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unmanaged)"
                 parts.append(f"rpm_used={suffix}")
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
-    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         native_default = True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
+    if provider in OPENCODE_PROVIDER_NAMES:
+        overrides = pcfg.get("model_endpoints")
+        count = len(overrides) if isinstance(overrides, dict) else 0
+        parts.append(f"endpoint_overrides={count}")
     if provider == "anthropic":
         parts.append(f"routed={'on' if anthropic_routed_enabled(provider, pcfg) else 'off'}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go"):
         parts.append(f"stream={'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
         if bool(pcfg.get("stream_word_chunking", False)):
             parts.append("word_chunk=on")
@@ -13463,7 +14839,7 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
         return "million-context"
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
-    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         server_limit = (
             model_context_hint_from_model_id(model)
             if provider == "lm-studio"
@@ -13766,7 +15142,7 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
         if fixed_ctx and fixed_ctx > capacity:
             pcfg["num_ctx"] = capacity
         return messages
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         context_window = positive_int(pcfg.get("context_window"))
         if context_window and context_window > capacity:
             pcfg["context_window"] = capacity
@@ -13863,7 +15239,7 @@ def context_setting_status(provider: str, pcfg: dict[str, Any]) -> str:
     cap_text = format_context_tokens(capacity)
     if provider in ("ollama", "ollama-cloud"):
         return f"model max {cap_text}; {ollama_num_ctx_status(pcfg)}"
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         window = positive_int(pcfg.get("context_window"))
         reserve = positive_int(pcfg.get("context_reserve_tokens"))
         reserve_text = f"; reserve {format_context_tokens(reserve)}" if reserve else ""
@@ -13880,7 +15256,7 @@ def configured_context_window_for_timeout(provider: str, pcfg: dict[str, Any]) -
             or positive_int(pcfg.get("num_ctx"))
             or provider_model_context_capacity(provider, pcfg)
         )
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         return positive_int(pcfg.get("context_window")) or provider_model_context_capacity(provider, pcfg)
     if provider == "anthropic":
         return provider_model_context_capacity(provider, pcfg)
@@ -14015,7 +15391,7 @@ def apply_context_setup_to_provider(provider: str, pcfg: dict[str, Any], mode: s
         pcfg["num_ctx_max"] = window
         pcfg["num_ctx_min"] = min(window, 32768 if window <= 65536 else 65536)
         pcfg.setdefault("ollama_options", {})["num_predict"] = output
-    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         pcfg["context_window"] = window
         pcfg["context_reserve_tokens"] = reserve
         pcfg["max_output_tokens"] = output
@@ -14098,7 +15474,7 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
         if num_ctx and num_ctx <= 32768 and num_predict and num_predict <= 2048:
             return "fast"
         return None
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "anthropic"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "anthropic"):
         max_output = positive_int(pcfg.get("max_output_tokens")) or 0
         context_window = positive_int(pcfg.get("context_window")) or 0
         if bool(pcfg.get("think", False)):
@@ -14952,11 +16328,11 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Rate limit RPM", "rate_limit_rpm", rate_limit_rpm_label(provider, pcfg))
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", False)) else "off")
     else:
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
             add("Context reserve", "context_reserve_tokens", pcfg.get("context_reserve_tokens", "default"))
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
             add("RPM limiter", "rate_limit_enabled", rate_limit_status_label(provider, pcfg))
             add("Rate limit RPM", "rate_limit_rpm", rate_limit_rpm_label(provider, pcfg))
@@ -14964,7 +16340,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
             add("Temperature", "temperature", pcfg.get("temperature", "default"))
             add("Top P", "top_p", pcfg.get("top_p", "default"))
             add("Top K", "top_k", pcfg.get("top_k", "default"))
-            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek"):
+            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
                 add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", True)))
             add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
             if bool(pcfg.get("stream_enabled", True)):
@@ -15102,6 +16478,20 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
 
 
 def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> None:
+    if provider in OPENCODE_PROVIDER_NAMES and token.startswith("endpoint:") and "=" in token:
+        key, raw_value = token.split("=", 1)
+        model_id = key.split(":", 1)[1].strip()
+        endpoint = normalize_opencode_endpoint_kind(raw_value)
+        if not model_id:
+            raise SystemExit("endpoint override requires endpoint:<model-id>=<messages|chat|responses|gemini>")
+        if not endpoint:
+            raise SystemExit("endpoint override must be one of: messages, chat, responses, gemini")
+        endpoints = pcfg.setdefault("model_endpoints", {})
+        if not isinstance(endpoints, dict):
+            endpoints = {}
+            pcfg["model_endpoints"] = endpoints
+        endpoints[normalize_model_id(provider, model_id)] = endpoint
+        return
     if token.startswith("unset:"):
         key = token.split(":", 1)[1].strip()
         if key in ("context_window", "context", "max_model_len"):
@@ -15132,6 +16522,11 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg["stream_enabled"] = True
         elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
             pcfg["stream_word_chunking"] = False
+        elif provider in OPENCODE_PROVIDER_NAMES and key.startswith("endpoint:"):
+            model_id = normalize_model_id(provider, key.split(":", 1)[1].strip())
+            endpoints = pcfg.get("model_endpoints")
+            if isinstance(endpoints, dict):
+                endpoints.pop(model_id, None)
         elif sampling_option_key(key):
             pcfg.pop(sampling_option_key(key), None)
         else:
@@ -15227,7 +16622,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
         except SystemExit:
             pass
     if provider not in PROVIDER_OPTION_PROVIDERS:
-        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, vllm, lm-studio, nvidia-hosted, and self-hosted-nim.")
+        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, vllm, lm-studio, nvidia-hosted, and self-hosted-nim.")
     pcfg = cfg["providers"][provider]
     if values:
         context_changed = any(
@@ -15252,8 +16647,11 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
     print("  max_output_tokens is passed to Claude Code as CLAUDE_CODE_MAX_OUTPUT_TOKENS.")
     print("  context_window is a claude-any/router cap; native mode still cannot raise the real server limit.")
     print("  temperature/top_p/top_k are injected by claude-any router mode when the provider supports them.")
+    if provider in OPENCODE_PROVIDER_NAMES:
+        print("  OpenCode endpoint override: endpoint:<model-id>=messages|chat|responses|gemini")
     print("Examples:")
     print("  claude-anyctl provider-options deepseek max_output_tokens=8192 context_window=1048576")
+    print("  claude-anyctl provider-options opencode-go endpoint:custom-model=chat")
     print("  claude-anyctl provider-options nvidia-hosted max_output_tokens=4096 temperature=0.7 top_p=0.8 timeout=300000 rate_limit_rpm=40")
     print("  claude-anyctl provider-options vllm max_output_tokens=4096 context_window=65536 timeout=300000")
     print("  claude-anyctl provider-options self-hosted-nim native=true max_output_tokens=4096")
@@ -15798,11 +17196,11 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
     alias = current_alias(cfg)
     claude_model = claude_code_context_model_alias(provider, pcfg, alias)
     auth_token = "not-used"
-    if provider == "deepseek" and meaningful_key(pcfg.get("api_key")):
-        # DeepSeek's Claude Code integration expects the DeepSeek key in
+    if provider in ("deepseek", "opencode", "opencode-go") and meaningful_key(pcfg.get("api_key")):
+        # Non-Anthropic native-compatible gateway integrations expect their key in
         # ANTHROPIC_AUTH_TOKEN. Keep ANTHROPIC_API_KEY unset to avoid Claude
         # Code's auth-conflict path, but do not send a dummy token that can
-        # trigger DeepSeek/Claude Code governor authentication failures.
+        # trigger gateway/Claude Code governor authentication failures.
         auth_token = str(pcfg["api_key"])
     return apply_common_claude_env(provider, pcfg, {
         "CLAUDE_ANY_PROVIDER": provider,
@@ -16320,6 +17718,8 @@ def default_base_url(provider: str) -> str:
         "ollama": "http://your-ollama:11434",
         "ollama-cloud": "https://ollama.com",
         "deepseek": "https://api.deepseek.com/anthropic",
+        "opencode": OPENCODE_ZEN_BASE_URL,
+        "opencode-go": OPENCODE_GO_BASE_URL,
         "vllm": "http://your-vllm:8000",
         "lm-studio": "http://127.0.0.1:1234/v1",
         "nvidia-hosted": nvidia_upstream_base_url(),
@@ -16343,6 +17743,9 @@ def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         return "API key: set (Ollama Cloud)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (Ollama Cloud required)"
     if provider == "deepseek":
         return "API key: set (DeepSeek)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (DeepSeek required)"
+    if provider in OPENCODE_PROVIDER_NAMES:
+        label = PROVIDER_LABELS.get(provider, provider)
+        return f"API key: set ({label})" if meaningful_key(pcfg.get("api_key")) else f"API key: missing ({label} required)"
     if meaningful_key(pcfg.get("api_key")):
         return "API key: set"
     if provider == "ollama":
@@ -16363,6 +17766,20 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         return f"Base URL: NVIDIA hosted ({base}); local router {ROUTER_BASE} {state}"
     if provider == "deepseek":
         return f"Base URL: DeepSeek Anthropic API configured ({base})"
+    if provider in OPENCODE_PROVIDER_NAMES:
+        label = PROVIDER_LABELS.get(provider, provider)
+        path = "/v1/models"
+        headers = provider_model_list_headers(provider, pcfg)
+        try:
+            data = http_json(join_url(base, path), headers=headers, timeout=2.5)
+            count = len(model_ids_from_response(data))
+            return f"Base URL: {label} model list reachable ({path}, {count} models)"
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return f"Base URL: {label} reachable, auth rejected ({exc.code})"
+            return f"Base URL: {label} HTTP {exc.code}"
+        except Exception as exc:
+            return f"Base URL: {label} unreachable ({type(exc).__name__})"
     path = "/api/tags" if provider in ("ollama", "ollama-cloud") else "/v1/models"
     headers: dict[str, str] = {}
     key = pcfg.get("api_key")
@@ -16431,6 +17848,9 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
         errors.append("Launch blocked: Ollama Cloud requires an API key.")
     if provider == "deepseek" and not meaningful_key(pcfg.get("api_key")):
         errors.append("Launch blocked: DeepSeek.com requires a DeepSeek API key.")
+    if provider in OPENCODE_PROVIDER_NAMES and not meaningful_key(pcfg.get("api_key")):
+        label = PROVIDER_LABELS.get(provider, provider)
+        errors.append(f"Launch blocked: {label} requires a {label} API key.")
     if anthropic_routed_enabled(provider, pcfg) and not meaningful_key(pcfg.get("api_key")):
         errors.append("Launch blocked: Anthropic routed mode requires an Anthropic API key.")
     if provider == "lm-studio":
@@ -16815,29 +18235,36 @@ def log_level_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     return rows, values
 
 
-def model_panel_rows(provider: str, pcfg: dict[str, Any], fetch: bool = True) -> tuple[list[str], list[str]]:
-    values = unique_model_ids(provider, upstream_model_ids(provider, pcfg) if fetch else cached_or_configured_model_ids(provider, pcfg))
+def model_panel_rows(
+    provider: str,
+    pcfg: dict[str, Any],
+    fetch: bool = True,
+    force_refresh: bool = False,
+) -> tuple[list[str], list[str]]:
+    values = unique_model_ids(
+        provider,
+        upstream_model_ids(provider, pcfg, force_refresh=force_refresh)
+        if fetch else cached_or_configured_model_ids(provider, pcfg),
+    )
     rows: list[str] = []
     current = pcfg.get("current_model")
     seen_aliases: set[str] = set()
     deduped_values: list[str] = []
-    if not fetch:
-        cache = read_model_list_cache(provider, pcfg)
-        if cache is None:
-            rows.append("Refresh provider model list...")
-            deduped_values.append("__refresh_models__")
-        else:
-            rows.append("Refresh provider model list")
-            deduped_values.append("__refresh_models__")
+    cache = read_model_list_cache(provider, pcfg)
+    rows.append("Refresh provider model list..." if cache is None else "Refresh provider model list")
+    deduped_values.append("__refresh_models__")
     for mid in values:
         alias = alias_for(provider, mid)
+        suffix = ""
+        if provider in OPENCODE_PROVIDER_NAMES:
+            suffix = f"  [{opencode_endpoint_display(provider, mid, pcfg)}]"
         alias_key = alias.casefold()
         if alias_key in seen_aliases:
             continue
         seen_aliases.add(alias_key)
         deduped_values.append(mid)
         mark = "*" if mid == current else " "
-        rows.append(f"{mark} {mid}  {alias}")
+        rows.append(f"{mark} {mid}  {alias}{suffix}")
     rows.append("+ Custom model id...")
     deduped_values.append("__custom__")
     rows.append("Back")
@@ -16845,12 +18272,27 @@ def model_panel_rows(provider: str, pcfg: dict[str, Any], fetch: bool = True) ->
     return rows, deduped_values
 
 
-def advisor_model_panel_rows(provider: str, pcfg: dict[str, Any]) -> tuple[list[str], list[str]]:
-    values = unique_model_ids(provider, [m for m in DEFAULT_ADVISOR_MODELS if m] + upstream_model_ids(provider, pcfg))
+def advisor_model_panel_rows(
+    provider: str,
+    pcfg: dict[str, Any],
+    fetch: bool = True,
+    force_refresh: bool = False,
+) -> tuple[list[str], list[str]]:
+    current = normalize_model_id(provider, pcfg.get("advisor_model", ""))
+    values = unique_model_ids(
+        provider,
+        (
+            upstream_model_ids(provider, pcfg, force_refresh=force_refresh)
+            if fetch else cached_or_configured_model_ids(provider, pcfg)
+        )
+        + ([current] if current else []),
+    )
     rows: list[str] = []
-    current = pcfg.get("advisor_model", "")
     rows.append(("* Disable Advisor Model" if not current else "  Disable Advisor Model"))
     deduped_values = [""]
+    cache = read_model_list_cache(provider, pcfg)
+    rows.append("Refresh provider model list..." if cache is None else "Refresh provider model list")
+    deduped_values.append("__refresh_models__")
     seen: set[str] = set()
     for mid in values:
         if not mid or mid in seen:
@@ -17333,12 +18775,20 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
             panel_rows, panel_values = base_url_panel_rows(provider, pcfg)
         elif name == "model":
             try:
-                panel_rows, panel_values = model_panel_rows(provider, pcfg, fetch=False)
+                panel_rows, panel_values = model_panel_rows(
+                    provider,
+                    pcfg,
+                    fetch=provider == "anthropic" and read_model_list_cache(provider, pcfg) is None,
+                )
             except Exception as exc:
                 panel_rows, panel_values = [f"Model list failed: {type(exc).__name__}: {exc}", "+ Custom model id..."], []
         elif name == "advisor-model":
             try:
-                panel_rows, panel_values = advisor_model_panel_rows(provider, pcfg)
+                panel_rows, panel_values = advisor_model_panel_rows(
+                    provider,
+                    pcfg,
+                    fetch=provider == "anthropic" and read_model_list_cache(provider, pcfg) is None,
+                )
             except Exception as exc:
                 panel_rows, panel_values = [f"Advisor model list failed: {type(exc).__name__}: {exc}", "+ Custom advisor model id..."], []
         elif name == "test":
@@ -17462,7 +18912,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         panel_rows, panel_values = ["Refreshing provider model list..."], []
                         first_render = render_prelaunch_screen(main_idx, panel, 0, panel_rows, checks, messages, first_render)
                         try:
-                            panel_rows, panel_values = model_panel_rows(provider, pcfg, fetch=True)
+                            panel_rows, panel_values = model_panel_rows(provider, pcfg, fetch=True, force_refresh=True)
                             messages = [f"Model list refreshed: {max(0, len(panel_values) - 3)} model(s)."]
                         except Exception as exc:
                             messages = [f"Model list refresh failed: {type(exc).__name__}: {exc}"]
@@ -17482,6 +18932,19 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                 elif panel == "advisor-model":
                     if value == "back":
                         close_panel()
+                        continue
+                    if value == "__refresh_models__":
+                        panel_rows, panel_values = ["Refreshing provider model list..."], []
+                        first_render = render_prelaunch_screen(main_idx, panel, 0, panel_rows, checks, messages, first_render)
+                        try:
+                            panel_rows, panel_values = advisor_model_panel_rows(provider, pcfg, fetch=True, force_refresh=True)
+                            messages = [f"Model list refreshed: {max(0, len(panel_values) - 4)} advisor model(s)."]
+                        except Exception as exc:
+                            messages = [f"Model list refresh failed: {type(exc).__name__}: {exc}"]
+                            panel_rows, panel_values = advisor_model_panel_rows(provider, pcfg, fetch=False)
+                        panel_idx = 0
+                        panel_last_idx["advisor-model"] = 0
+                        refresh_checks()
                         continue
                     if value == "__custom__" or panel_idx >= len(panel_values):
                         advisor_value = prompt_menu_value("Advisor model id", "deepseek-v4-pro", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
@@ -17503,6 +18966,8 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         default_env = {
                             "anthropic": "ANTHROPIC_API_KEY",
                             "deepseek": "DEEPSEEK_API_KEY",
+                            "opencode": "OPENCODE_API_KEY",
+                            "opencode-go": "OPENCODE_API_KEY",
                             "nvidia-hosted": "NVIDIA_API_KEY",
                             "ollama-cloud": "OLLAMA_API_KEY",
                         }.get(provider, "API_KEY")
@@ -18066,7 +19531,14 @@ def write_mcp_proxy_config(
 
 
 def should_use_channel_stdin_proxy(use_router_mode: bool, passthrough: list[str], cfg: dict[str, Any] | None = None) -> bool:
-    return False
+    if not use_router_mode or native_channel_passthrough_requested(passthrough):
+        return False
+    if has_passthrough_option(passthrough, "-p", "--print"):
+        return False
+    ccfg = (cfg or {}).get("claude_code") if isinstance(cfg, dict) else {}
+    if isinstance(ccfg, dict) and ccfg.get("web_chat_session_bridge") is False:
+        return False
+    return channel_delivery_mode(cfg) == "llm"
 
 
 def should_launch_process_start_channel_sse(
@@ -18110,7 +19582,29 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
         + f" text={json.dumps(body, ensure_ascii=False)}"
         + meta_text
         + ". "
+        + "If this is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']; use send_file when returning a file attachment. "
         + "If relevant to current work, respond or act now; otherwise keep working."
+    )
+
+
+def _format_channel_web_chat_wake_item(message: dict[str, Any]) -> str:
+    channel = str(message.get("channel") or "default")
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    reply_channel = str(meta.get("reply_channel") or channel)
+    thread = str(message.get("thread_id") or meta.get("thread_id") or reply_channel)
+    mid = str(message.get("id") or "")
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
+    fields = [f"id={mid}", f"channel={reply_channel}", f"thread={thread}"]
+    return " ".join(field for field in fields if not field.endswith("=")) + f" user={json.dumps(body, ensure_ascii=False)}"
+
+
+def format_channel_web_chat_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
+    items = " ; ".join(_format_channel_web_chat_wake_item(message) for message in messages)
+    count = len(messages)
+    return (
+        f"[claude-any web chat] {count} browser message(s): {items}. "
+        "Answer in the active Claude Code session. Use current context and tools/MCP if useful. "
+        "Reply to the browser with claude-any-router send_message on the listed channel/thread_id, recipients='web', delivery=['web']; use send_file when returning a file attachment."
     )
 
 
@@ -18176,7 +19670,8 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
     return (
         f"[claude-any external channel messages] {len(messages)} new messages: "
         + " ; ".join(parts)
-        + ". If relevant to current work, respond or act now; otherwise keep working."
+        + ". If any item is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']. "
+        + "If relevant to current work, respond or act now; otherwise keep working."
     )
 
 
@@ -18212,7 +19707,8 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         "room name, DM label, 또는 'New message from ...' 같은 짧은 알림만 보고 현재 에이전트가 수신자가 아니라고 결론내리지 마세요. "
         "수신자 정체성이 애매하면 안전한 read/profile 도구로 실제 메시지와 현재 에이전트 정보를 확인한 뒤 판단하세요. "
         "이 턴은 외부 채널 수신함을 처리하는 자율 처리 턴입니다. "
-        "자동 회신 루프를 만들지 마세요. 단순 수신 확인, 감사, 준비 완료/대기 중, 진행상황 공유처럼 새 질문이나 새 업무 지시가 없는 메시지는 같은 내용으로 다시 예의상 답장하지 말고 NO_REPLY로 끝내세요. "
+        "자동 회신 루프를 만들지 마세요. 단순 수신 확인, 감사, 준비 완료/대기 중, 진행상황 공유처럼 새 질문이나 새 업무 지시가 없는 메시지는 같은 내용으로 다시 예의상 답장하지 마세요. "
+        "그 경우에는 회신 도구를 호출하지 말고 화면에는 새로 보낼 답장이 없다는 짧은 처리 요약만 남기세요. "
         "이전 자동 답장에서 이미 차단 사유나 대기 요청을 전달했다면, 반복 업데이트를 보내지 말고 로컬 요약만 남기세요. "
         "sender/from, recipients/to, room/channel, text를 기준으로 누가 누구에게 보낸 DM/그룹 메시지인지 먼저 판단하세요. "
         "알림 본문이 'New message...' 같은 짧은 통지이고 room/message id가 있으면 먼저 사용 가능한 read/get_messages 계열 도구로 실제 메시지를 조회하세요. "
@@ -18226,6 +19722,8 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         "'진행하겠습니다', '착수합니다', '보고하겠습니다', '결과를 공유하겠습니다', "
         "'Let me send...', 'I will reply...', 'I'll respond...'처럼 미래 행동을 약속하는 말만 남기고 턴을 끝내지 마세요. "
         "그런 말을 할 상황이면 같은 턴에서 필요한 조사/도구 호출/채널 보고까지 수행하고, 수행할 수 없으면 구체적 차단 사유를 보고하세요. "
+        "메시지 metadata source가 claude-any-web-chat 이거나 reply_channel/reply_recipient가 있으면, 답변 내용은 반드시 사용 가능한 claude-any-router send_message 계열 도구로 같은 channel/thread_id에 recipients='web', delivery=['web']로 보내세요. "
+        "웹 채팅 요청도 현재 Claude Code 세션의 기존 Read/Bash/Edit/MCP 도구를 사용할 수 있는 실제 작업 요청입니다. "
         "다음 응답에는 사용자가 화면에서 볼 수 있도록 수신 메시지 요약과 수행한 처리 또는 필요한 다음 조치를 간단히 보여주세요. "
         "도구를 호출했다면 tool_result 후속 턴에서 그 결과를 LLM이 다시 검토한 뒤 사용자에게 요약하고, 필요한 경우 후속 답장/작업까지 완료하세요.\n\n"
         + "\n\n".join(parts)
@@ -18235,6 +19733,7 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
 _CHANNEL_LLM_TOOL_CONTEXT_LOCK = threading.Lock()
 _CHANNEL_LLM_TOOL_CONTEXT: dict[str, dict[str, Any]] = {}
 _CHANNEL_LLM_TOOL_CONTEXT_LIMIT = 200
+_CHANNEL_LLM_TOOL_CONTEXT_MAX_INJECT = 8
 _CHANNEL_LLM_TOOL_CONTEXT_PROMPT_LIMIT = 4000
 
 
@@ -18288,7 +19787,7 @@ def remember_channel_injected_tool_uses(source_body: dict[str, Any] | None, mess
         )
 
 
-def _channel_tool_result_contexts_for_body(body: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
+def _take_channel_tool_result_contexts_for_body(body: dict[str, Any]) -> list[tuple[str, dict[str, Any]]]:
     found: list[tuple[str, dict[str, Any]]] = []
     with _CHANNEL_LLM_TOOL_CONTEXT_LOCK:
         for message in body.get("messages") or []:
@@ -18298,9 +19797,11 @@ def _channel_tool_result_contexts_for_body(body: dict[str, Any]) -> list[tuple[s
                 if not isinstance(block, dict) or block.get("type") != "tool_result":
                     continue
                 tool_use_id = str(block.get("tool_use_id") or "")
-                context = _CHANNEL_LLM_TOOL_CONTEXT.get(tool_use_id)
+                context = _CHANNEL_LLM_TOOL_CONTEXT.pop(tool_use_id, None)
                 if context:
                     found.append((tool_use_id, dict(context)))
+                    if len(found) >= _CHANNEL_LLM_TOOL_CONTEXT_MAX_INJECT:
+                        return found
     return found
 
 
@@ -18310,7 +19811,7 @@ def body_with_channel_tool_result_context(body: dict[str, Any]) -> dict[str, Any
         return body
     if metadata.get("claude_any_channel_tool_result_followup"):
         return body
-    contexts = _channel_tool_result_contexts_for_body(body)
+    contexts = _take_channel_tool_result_contexts_for_body(body)
     if not contexts:
         return body
     parts = [
@@ -18365,6 +19866,18 @@ def _mark_channel_payload_direct_llm_pending(payload: dict[str, Any]) -> dict[st
 def _channel_message_is_direct_llm_owned(message: dict[str, Any]) -> bool:
     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
     return bool(meta.get("llm_direct_pending") or meta.get("llm_direct_delivered"))
+
+
+def _channel_message_is_web_chat_request(message: dict[str, Any]) -> bool:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    source = str(meta.get("source") or "").strip().lower()
+    kind = str(message.get("kind") or meta.get("kind") or "").strip().lower()
+    return bool(
+        source == "claude-any-web-chat"
+        or kind == "web_chat"
+        or meta.get("reply_channel")
+        or meta.get("reply_recipient")
+    )
 
 
 def _anthropic_message_text(message: dict[str, Any]) -> str:
@@ -18910,7 +20423,13 @@ def _channel_direct_generate_fallback_reply_text(
 def _channel_direct_fallback_reply_text(message: dict[str, Any], last_text: str) -> str:
     author = _channel_direct_message_actor(message)
     prior = re.sub(r"\s+", " ", str(last_text or "")).strip()
-    if prior and not _channel_direct_text_is_deferred_action(prior):
+    if (
+        prior
+        and prior.lower().strip(" .!。") not in {"acknowledged", "ok", "okay", "understood", "noted", "확인했습니다", "알겠습니다"}
+        and not _channel_direct_text_declines_reply(prior)
+        and not _channel_direct_text_is_deferred_action(prior)
+        and not _channel_direct_fallback_text_is_internal_action(prior)
+    ):
         return truncate_for_prompt(prior, 1200)
     return (
         f"{author}, 메시지 확인했습니다. 현재 채널 컨텍스트를 확인했고 필요한 조치를 이어서 진행하겠습니다. "
@@ -18923,9 +20442,44 @@ def _channel_direct_fallback_text_is_internal_action(text: str) -> bool:
     if not body:
         return False
     lowered = body.lower()
+    if _channel_direct_fallback_text_is_diagnostic_failure(text):
+        return True
     if re.match(r"^(?:right[,. ]*)?(?:let me|i should|i need to|i will|i'll|now let me)\b", lowered):
         return True
+    if re.search(
+        r"\b(?:let me|i should|i need to|i will|i'll|now let me)\s+"
+        r"(?:check|fetch|read|send|reply|respond|acknowledge|provide|post|create|look|investigate|try|assess|confirm|share|continue|do)\b",
+        lowered,
+    ):
+        return True
+    if re.match(r"^(?:i have been|i've been|i am|i'm)\s+(?:scrolling|checking|looking|reading|trying|fetching)\b", lowered):
+        return True
+    if re.match(r"^(?:i cannot|i can't|unable to|could not)\s+(?:fetch|read|retrieve|access)\b", lowered):
+        return True
+    if "messages i've retrieved" in lowered or "messages i have retrieved" in lowered:
+        return True
+    if "notification-only event" in lowered or "hasn't appeared in the messages" in lowered:
+        return True
     return bool(re.match(r"^(?:이제|먼저|다음으로)\b.{0,120}(?:보내|답장|회신|조회|확인|조사|처리).{0,80}(?:하겠습니다|하겠다|합니다)", body))
+
+
+def _channel_direct_fallback_text_is_diagnostic_failure(text: str) -> bool:
+    body = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not body:
+        return False
+    lowered = body.lower()
+    internal_markers = (
+        "[claude-any]",
+        "upstream model",
+        "empty end_turn",
+        "no work was performed",
+        "retry or ask me to continue",
+        "internal routing",
+        "fallback handling",
+        "reply/send tool",
+        "tool_result",
+    )
+    return any(marker in lowered for marker in internal_markers)
 
 
 def _channel_direct_send_same_channel_fallback_reply(
@@ -19126,7 +20680,13 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
                     )
                     if _channel_direct_text_declines_reply(fallback_text):
                         return fallback_text, "end_turn", tool_turns
-                    if not fallback_text.strip() or _channel_direct_fallback_text_is_internal_action(fallback_text):
+                    if _channel_direct_fallback_text_is_diagnostic_failure(fallback_text):
+                        router_log(
+                            "WARN",
+                            f"channel_llm_fallback_reply_unsafe_not_sent message_id={message_id} chars={len(fallback_text)}",
+                        )
+                        return _channel_direct_reply_required_summary(message, text or last_text, tool_turns), "reply_required_unfulfilled", tool_turns
+                    if _channel_direct_fallback_text_is_internal_action(fallback_text) or not fallback_text.strip():
                         fallback_text = _channel_direct_fallback_reply_text(message, text or last_text)
                     fallback_result, fallback_sent = _channel_direct_send_same_channel_fallback_reply(
                         message_id,
@@ -19198,7 +20758,13 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
             )
             if _channel_direct_text_declines_reply(fallback_text):
                 return fallback_text, "end_turn", tool_turns
-            if not fallback_text.strip() or _channel_direct_fallback_text_is_internal_action(fallback_text):
+            if _channel_direct_fallback_text_is_diagnostic_failure(fallback_text):
+                router_log(
+                    "WARN",
+                    f"channel_llm_fallback_reply_unsafe_not_sent message_id={message_id} chars={len(fallback_text)} reason=max_turns",
+                )
+                return _channel_direct_reply_required_summary(message, last_text, tool_turns), "reply_required_unfulfilled", tool_turns
+            if _channel_direct_fallback_text_is_internal_action(fallback_text) or not fallback_text.strip():
                 fallback_text = _channel_direct_fallback_reply_text(message, last_text)
             fallback_result, fallback_sent = _channel_direct_send_same_channel_fallback_reply(
                 message_id,
@@ -19565,6 +21131,14 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                     f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={reason}",
                 )
                 continue
+            with _CHANNEL_STDIN_WAKE_LOCK:
+                stdin_wake_delivered = message_id in _CHANNEL_STDIN_WAKE_DELIVERED
+            if stdin_wake_delivered:
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason=stdin_wake_delivered",
+                )
+                continue
             pending.append(message)
         if max_seen != last_id:
             _CHANNEL_LLM_CURSOR_LAST_ID = max_seen
@@ -19670,7 +21244,31 @@ def _channel_wake_input_bytes(prompt: str, enter_bytes: bytes | None = None) -> 
     return b"\x15" + prompt.encode("utf-8", errors="replace") + _channel_wake_enter_bytes(enter_bytes)
 
 
-def _inject_pending_channel_messages(master_fd: int, last_id: int, enter_bytes: bytes | None = None) -> int:
+def _channel_wake_submit_delay_seconds() -> float:
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_SUBMIT_DELAY_MS")
+    if raw is None:
+        return 0.08
+    try:
+        return max(0.0, min(2.0, float(raw) / 1000.0))
+    except Exception:
+        return 0.08
+
+
+def _write_channel_wake_prompt(master_fd: int, prompt: str, enter_bytes: bytes | None = None) -> None:
+    _write_fd_all(master_fd, b"\x15" + prompt.encode("utf-8", errors="replace"))
+    delay = _channel_wake_submit_delay_seconds()
+    if delay > 0:
+        time.sleep(delay)
+    _write_fd_all(master_fd, _channel_wake_enter_bytes(enter_bytes))
+
+
+def _inject_pending_channel_messages(
+    master_fd: int,
+    last_id: int,
+    enter_bytes: bytes | None = None,
+    *,
+    web_chat_only: bool = False,
+) -> int:
     pending: list[dict[str, Any]] = []
     for message in read_chat_messages(last_id, None, None, 100):
         try:
@@ -19683,6 +21281,12 @@ def _inject_pending_channel_messages(master_fd: int, last_id: int, enter_bytes: 
                 f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
             )
             continue
+        if web_chat_only and not _channel_message_is_web_chat_request(message):
+            router_log(
+                "INFO",
+                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=not_web_chat",
+            )
+            continue
         noise_reason = _channel_wake_message_noise_reason(message)
         if noise_reason:
             router_log(
@@ -19692,9 +21296,21 @@ def _inject_pending_channel_messages(master_fd: int, last_id: int, enter_bytes: 
             continue
         pending.append(message)
     if pending:
-        prompt = format_channel_wake_batch_prompt(pending)
+        if web_chat_only and all(_channel_message_is_web_chat_request(message) for message in pending):
+            prompt = format_channel_web_chat_wake_batch_prompt(pending)
+        else:
+            prompt = format_channel_wake_batch_prompt(pending)
         submit_bytes = _channel_wake_enter_bytes(enter_bytes)
-        _write_fd_all(master_fd, _channel_wake_input_bytes(prompt, submit_bytes))
+        _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
+        with _CHANNEL_STDIN_WAKE_LOCK:
+            for message in pending:
+                try:
+                    _CHANNEL_STDIN_WAKE_DELIVERED.add(int(message.get("id") or 0))
+                except Exception:
+                    continue
+            if len(_CHANNEL_STDIN_WAKE_DELIVERED) > 1000:
+                for old_id in sorted(_CHANNEL_STDIN_WAKE_DELIVERED)[:500]:
+                    _CHANNEL_STDIN_WAKE_DELIVERED.discard(old_id)
         ids = ",".join(str(message.get("id") or "") for message in pending)
         channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
         router_log(
@@ -19724,7 +21340,7 @@ def _inject_pending_channel_summaries(master_fd: int, enter_bytes: bytes | None 
             router_log("WARN", f"channel_stdin_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
     prompt = format_channel_llm_summary_prompt(records)
     submit_bytes = _channel_wake_enter_bytes(enter_bytes)
-    _write_fd_all(master_fd, _channel_wake_input_bytes(prompt, submit_bytes))
+    _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
     ids = ",".join(str(item.get("message_id") or "") for item in records)
     router_log(
         "INFO",
@@ -19784,6 +21400,7 @@ def subprocess_call_with_channel_wake_proxy(
     inject_channel_messages: bool = True,
     inject_channel_summaries: bool = True,
     print_channel_summaries: bool = False,
+    inject_web_chat_only: bool = False,
 ) -> int:
     if os.name != "posix" or not sys.stdin.isatty() or not sys.stdout.isatty():
         router_log("INFO", "channel_stdin_proxy_unavailable; using direct subprocess call")
@@ -19842,7 +21459,12 @@ def subprocess_call_with_channel_wake_proxy(
                 marker = _chat_messages_file_marker()
                 if inject_channel_messages and marker != last_channel_marker:
                     last_channel_marker = marker
-                    last_id = _inject_pending_channel_messages(master_fd, last_id, channel_enter_bytes)
+                    last_id = _inject_pending_channel_messages(
+                        master_fd,
+                        last_id,
+                        channel_enter_bytes,
+                        web_chat_only=inject_web_chat_only,
+                    )
                 summary_marker = _channel_llm_summary_file_marker()
                 if inject_channel_summaries and summary_marker != last_summary_marker:
                     last_summary_marker = summary_marker
@@ -20799,7 +22421,7 @@ def launch_claude(
     if stdin_channel_proxy or screen_summary_proxy:
         if screen_summary_proxy and not stdin_channel_proxy:
             return subprocess_call_with_channel_screen_summary_proxy(cmd, env)
-        return subprocess_call_with_channel_wake_proxy(cmd, env)
+        return subprocess_call_with_channel_wake_proxy(cmd, env, inject_web_chat_only=llm_channel_delivery)
     if capture_stderr:
         return _subprocess_call_capturing_stderr(cmd, env)
     return subprocess.call(cmd, env=env)
@@ -20988,7 +22610,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-stop               Stop router/proxy
   claude-any --                      Pass all following args directly to Claude Code
 
-Provider names: anthropic, ollama, ollama-cloud, deepseek, vllm, lm-studio, nvidia-hosted, self-hosted-nim
+Provider names: anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, vllm, lm-studio, nvidia-hosted, self-hosted-nim
 Any other arguments are passed through to claude. Use -- before Claude flags that
 collide with claude-any setup flags."""
 

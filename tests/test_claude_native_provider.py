@@ -10,7 +10,9 @@
 - cleanup_managed_services_for_provider() always kills the router for native,
   even when the cleanup.managed_services_on_launch config gate is off.
 """
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import claude_any
@@ -92,6 +94,117 @@ class NativeEnvContractTests(unittest.TestCase):
             errors = claude_any.launch_readiness_errors(self._cfg(route_through_router=True, api_key=""))
 
         self.assertTrue(any("Anthropic routed mode requires" in error for error in errors))
+
+
+class NativeModelListTests(unittest.TestCase):
+    def test_public_docs_parser_extracts_current_claude_models_without_footnotes(self):
+        html = """
+        Claude API ID
+        <span>claude-opus-4-8</span><span>claude-sonnet-4-6</span>
+        <span>claude-haiku-4-5-20251001</span>
+        Claude API alias
+        <span>claude-haiku-4-5</span>
+        AWS Bedrock ID <span>anthropic.claude-opus-4-8</span>
+        Vertex AI ID <span>claude-haiku-4-5@20251001</span>
+        footnote artifact <span>claude-opus-4-1-2</span>
+        """
+
+        ids = claude_any.anthropic_model_ids_from_docs_text(html)
+
+        self.assertEqual(
+            ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5"],
+            ids,
+        )
+
+    def test_public_docs_parser_includes_latest_aliases(self):
+        html = """
+        <code>claude-3-7-sonnet-latest</code>
+        <code>claude-3-5-haiku-latest</code>
+        <code>claude-sonnet-4-6-latest</code>
+        """
+
+        ids = claude_any.anthropic_model_ids_from_docs_text(html)
+
+        self.assertEqual(
+            ["claude-3-7-sonnet-latest", "claude-3-5-haiku-latest", "claude-sonnet-4-6-latest"],
+            ids,
+        )
+
+    def test_native_refresh_bypasses_model_cache_and_uses_public_docs_without_api_key(self):
+        pcfg = {"base_url": "https://api.anthropic.com", "api_key": "", "current_model": "claude-sonnet-4-6"}
+
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=["claude-old-cache"]),
+            mock.patch.object(claude_any, "http_json", side_effect=RuntimeError("missing api key")),
+            mock.patch.object(claude_any, "fetch_anthropic_public_model_ids", return_value=["claude-opus-4-8", "claude-sonnet-4-6"]) as docs,
+            mock.patch.object(claude_any, "write_model_list_cache") as write,
+        ):
+            self.assertEqual(["claude-old-cache"], claude_any.upstream_model_ids("anthropic", pcfg))
+            refreshed = claude_any.upstream_model_ids("anthropic", pcfg, force_refresh=True)
+
+        self.assertEqual(["claude-opus-4-8", "claude-sonnet-4-6"], refreshed)
+        docs.assert_called_once()
+        write.assert_called_once_with("anthropic", pcfg, ["claude-opus-4-8", "claude-sonnet-4-6"])
+
+    def test_native_refresh_prefers_public_docs_over_api_key_model_list(self):
+        pcfg = {"base_url": "https://api.anthropic.com", "api_key": "sk-ant-real", "current_model": "claude-sonnet-4-6"}
+
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "fetch_anthropic_public_model_ids", return_value=["claude-opus-4-8", "claude-sonnet-4-6"]),
+            mock.patch.object(claude_any, "http_json", return_value={"data": [{"id": "claude-old-api"}]}) as http_json,
+            mock.patch.object(claude_any, "write_model_list_cache"),
+        ):
+            refreshed = claude_any.upstream_model_ids("anthropic", pcfg, force_refresh=True)
+
+        self.assertEqual(["claude-opus-4-8", "claude-sonnet-4-6"], refreshed)
+        http_json.assert_not_called()
+
+    def test_native_model_registry_persists_provider_model_list(self):
+        pcfg = {"base_url": "https://api.anthropic.com", "api_key": "", "current_model": "claude-sonnet-4-6"}
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "model-list-cache.json"
+            registry_path = Path(td) / "model-registry.json"
+            with (
+                mock.patch.object(claude_any, "MODEL_LIST_CACHE_PATH", cache_path),
+                mock.patch.object(claude_any, "MODEL_REGISTRY_PATH", registry_path),
+            ):
+                claude_any.write_model_registry("anthropic", pcfg, ["claude-opus-4-8", "claude-haiku-4-5"], "anthropic-docs")
+                cached = claude_any.read_model_list_cache("anthropic", pcfg)
+                registry = claude_any.read_model_registry("anthropic", pcfg)
+
+        self.assertEqual(["claude-opus-4-8", "claude-haiku-4-5"], cached)
+        self.assertIsNotNone(registry)
+        assert registry is not None
+        self.assertEqual("anthropic-docs", registry["source"])
+        recommendations = registry["recommendations"]
+        self.assertEqual("balanced", recommendations["claude-opus-4-8"]["recommended_preset"])
+        self.assertEqual(4096, recommendations["claude-opus-4-8"]["parameters"]["max_output_tokens"])
+        self.assertEqual(1048576, recommendations["claude-opus-4-8"]["limits"]["context_window"])
+        self.assertEqual(128000, recommendations["claude-opus-4-8"]["limits"]["max_output_tokens"])
+        self.assertEqual("high", recommendations["claude-opus-4-8"]["runtime"]["claude_code_default_effort"])
+        self.assertEqual("xhigh", recommendations["claude-opus-4-8"]["runtime"]["claude_code_max_effort"])
+        self.assertEqual("adaptive", recommendations["claude-opus-4-8"]["runtime"]["thinking_mode"])
+        self.assertTrue(recommendations["claude-opus-4-8"]["runtime"]["fast_mode"]["available"])
+        self.assertIn("temperature", recommendations["claude-opus-4-8"]["runtime"]["unsupported_sampling_parameters"])
+        self.assertEqual("fast", recommendations["claude-haiku-4-5"]["recommended_preset"])
+        self.assertEqual(2048, recommendations["claude-haiku-4-5"]["parameters"]["max_output_tokens"])
+        self.assertEqual(200000, recommendations["claude-haiku-4-5"]["limits"]["context_window"])
+
+    def test_native_model_panel_force_refresh_shows_latest_public_models(self):
+        pcfg = {"base_url": "https://api.anthropic.com", "api_key": "", "current_model": "claude-sonnet-4-6"}
+
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "http_json", side_effect=RuntimeError("missing api key")),
+            mock.patch.object(claude_any, "fetch_anthropic_public_model_ids", return_value=["claude-opus-4-8", "claude-sonnet-4-6"]),
+            mock.patch.object(claude_any, "write_model_list_cache"),
+        ):
+            rows, values = claude_any.model_panel_rows("anthropic", pcfg, fetch=True, force_refresh=True)
+
+        self.assertIn("claude-opus-4-8", values)
+        self.assertTrue(any("claude-opus-4-8" in row for row in rows))
 
 
 class StopRouterGuaranteeTests(unittest.TestCase):

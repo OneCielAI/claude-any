@@ -19,7 +19,7 @@
 > - **저비용** — [Ollama Cloud](https://ollama.com/cloud) 로 GLM, Qwen, DeepSeek 같은 오픈 가중치 모델을 frontier 모델 대비 매우 낮은 가격에 사용.
 > - **무료 + 로컬** — [Ollama](https://ollama.com/) 또는 [vLLM](https://github.com/vllm-project/vllm) 을 본인 GPU 에서 완전 오프라인으로 사용.
 > - **Plan Mode + Advisor 지원** — non-Anthropic provider 에서도 Claude Code Plan Mode 를 유지하고, 긴 컨텍스트 Advisor 모델로 작업 검토를 받을 수 있습니다.
-> - **로컬 브라우저 채팅** — router가 `/ca/web/chat`을 제공하며, Claude Code와 같은 `/v1/messages` 경로로 현재 선택된 provider와 대화합니다.
+> - **세션 브라우저 채팅** — router가 `/ca/web/chat`을 제공하며, 브라우저 메시지를 active Claude Code 세션의 channel inbox로 주입하고 같은 channel stream으로 답장을 받습니다. active 세션의 Claude Code 도구와 MCP 도구를 그대로 사용할 수 있습니다.
 > - **무료 모델 RPM을 부드럽게 사용** — Claude Code 는 파일을 읽고 tool 을 실행하는 시간이 있고, Claude Any 는 그 자연스러운 간격을 RPM pacing 에 활용하므로 NVIDIA hosted 무료 모델의 분당 제한을 덜 체감하며 사용할 수 있습니다.
 >
 > 프로바이더, 모델, Base URL, API 키, 스트리밍 동작, LLM 옵션을 Claude Code 실행 **전에** 콘솔 메뉴에서 모두 선택합니다. Claude Code 본체는 그대로 — 모든 native 툴링, slash command, 워크플로우가 유지됩니다.
@@ -30,7 +30,7 @@
 
 1. **DeepSeek.com 프로바이더 지원** — DeepSeek의 Anthropic 호환 Claude Code 엔드포인트를 정식 프로바이더로 선택할 수 있고, 모델 프리셋과 API 키 설정 흐름을 제공합니다.
 2. **공유 서버에서 더 안전한 라우터 수명주기** — 라우터가 기본적으로 사용자별 안정 포트를 사용하고, 같은 사용자의 stale router를 실행 전에 정리해 Robert/Sarah 같은 다중 세션이 서로 섞이는 문제를 줄였습니다.
-3. **Router 브라우저 채팅과 선택형 Anthropic 라우팅** — `/ca/web/chat`으로 로컬 router 채팅 화면을 제공하고, Anthropic도 필요할 때 Claude Any router를 경유해 SSE, 채널, 관측 기능을 사용할 수 있습니다.
+3. **Router 세션 브라우저 채팅과 선택형 Anthropic 라우팅** — `/ca/web/chat`으로 active Claude Code 세션에 메시지를 주입하고 channel stream으로 답장을 받는 로컬 router 채팅 화면을 제공하고, Anthropic도 필요할 때 Claude Any router를 경유해 SSE, 채널, 관측 기능을 사용할 수 있습니다.
 
 ### 2026-05-18
 
@@ -69,12 +69,12 @@ Ollama Cloud (glm-5.1) 를 SSE 단어경계 청킹 활성화 상태에서 claude
 ---
 
 Claude Any는 Claude Code 실행 전에 Anthropic, Ollama, Ollama Cloud,
-DeepSeek.com, vLLM, NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의
+DeepSeek.com, OpenCode Zen, OpenCode Go, vLLM, NVIDIA hosted, self-hosted NIM을 선택하고, Claude Code의
 일반 인자는 그대로 전달하는 프로바이더 선택 런처입니다.
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.101`
+현재 버전: `0.1.102`
 
 ## 왜 만들었나
 
@@ -760,10 +760,12 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 
 | Provider | Mode | Notes |
 | --- | --- | --- |
-| Anthropic | 기본 Native Claude Code, 선택형 router | 직접 native 모드에서는 Claude 로그인 또는 Anthropic API 키를 사용합니다. Claude Any router의 SSE/채널/관측 기능이 필요하면 `route_through_router`를 켜며, 이 모드는 Anthropic API 키가 필요합니다. |
+| Anthropic | 기본 Native Claude Code, 선택형 router | 직접 native 모드에서는 Claude 로그인 또는 Anthropic API 키를 사용합니다. 모델 선택기는 API 키가 있으면 `/v1/models`를 사용하고, API 키 없이 Claude Native 로그인만 쓰는 경우 Anthropic 공개 Models overview에서 최신 공개 모델 ID를 보조로 가져옵니다. Claude Any router의 SSE/채널/관측 기능이 필요하면 `route_through_router`를 켜며, 이 모드는 Anthropic API 키가 필요합니다. |
 | Ollama | Native 우선, 필요 시 router | 로컬 Ollama는 보통 API 키가 필요 없습니다. 로컬 Ollama에서 `:cloud` 모델을 쓰려면 Ollama host에서 `ollama signin`이 필요합니다. |
 | Ollama Cloud | Router | `https://ollama.com/api` 직접 호출. Ollama API 키 필요. |
 | DeepSeek.com | Router | `https://api.deepseek.com/anthropic` 호출. DeepSeek API 키를 `ANTHROPIC_AUTH_TOKEN`으로 전달하고 `ANTHROPIC_API_KEY`는 비워 Claude Code 인증 충돌을 피합니다. |
+| OpenCode Zen | Router | `https://opencode.ai/zen` 호출. OpenCode Zen API 키 필요. 모델 목록은 `/v1/models`에서 가져오며, Claude/Qwen 계열은 `/v1/messages`, chat 호환 모델은 `/v1/chat/completions`로 라우팅합니다. Responses/Gemini 전용 endpoint 계열은 메타데이터로 표시하고 아직 자동 라우팅하지 않습니다. |
+| OpenCode Go | Router | `https://opencode.ai/zen/go` 호출. OpenCode Go API 키 필요. 모델 목록은 `/v1/models`에서 가져오며, Qwen/MiniMax Go 모델은 `/v1/messages`, GLM/Kimi/DeepSeek/MiMo Go 모델은 `/v1/chat/completions`로 라우팅합니다. |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 호환 `/v1/messages`를 제공하는 vLLM endpoint 사용. 모델 계열에 맞는 `--tool-call-parser` 필요. |
 | NVIDIA hosted | Router | NVIDIA hosted API Catalog를 Claude Any local router로 사용. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM Anthropic 호환 endpoint 사용. |
@@ -827,8 +829,20 @@ Claude Any router가 실행 중이면 다음 주소를 열 수 있습니다.
 http://127.0.0.1:8799/ca/web/chat
 ```
 
-이 화면은 Teams 스타일의 로컬 채팅 UI이며, Claude Code가 사용하는 것과 같은
-Anthropic 호환 `/v1/messages` 경로로 현재 선택된 provider에 요청을 보냅니다.
+이 화면은 Teams 스타일의 로컬 세션 채팅 UI이며, 브라우저 메시지를 `/ca/channel/messages`에 저장해
+active Claude Code 세션의 channel inbox로 주입합니다. Claude Code는 기존 Read/Bash/Edit 및 MCP 도구를
+그대로 사용해 처리할 수 있고, 답장은 `claude-any-router`의 `send_message` MCP 도구를 통해 같은
+web chat channel로 돌아옵니다. 브라우저는 `/ca/channel/stream`으로 답장 메시지를 구독합니다.
+웹 채팅 composer는 파일 첨부도 지원합니다. 첨부 파일은 `/ca/channel/files`로 업로드되어
+`~/.config/claude-any/chat-files/`에 저장되고, 같은 web-chat 메시지에 router 파일 URL로 포함됩니다.
+따라서 active Claude Code 세션은 별도 provider-only 대화로 빠지지 않고 기존 도구로 파일을 가져와
+확인할 수 있습니다.
+반대 방향도 지원합니다. Claude Code는 내장 `claude-any-router` MCP 서버의 `send_file` 도구를 호출해
+로컬 `path` 또는 inline `content`를 같은 파일 저장소에 복사하고, 브라우저 세션에는 web-visible
+attachment 메시지로 보낼 수 있습니다.
+router mode에서는 브라우저 메시지만 터미널 wake bridge를 통해 실행 중인 Claude Code 세션에 넣습니다.
+따라서 별도 provider-only `/v1/messages` 대화를 만들지 않습니다. 메시지가 계속 queued 상태로 남으면
+현재 빌드 설치 후 Claude Any를 다시 시작해 활성 터미널이 wake bridge로 감싸지도록 해야 합니다.
 Cloudflare tunnel, public DNS, Tailscale route는 자동 생성하지 않습니다.
 선택된 provider가 Anthropic이고 이 웹 채팅이나 router 기능으로 Anthropic
 트래픽을 처리하려면 Anthropic LLM 옵션의 `route_through_router`를 켜고

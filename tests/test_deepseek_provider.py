@@ -76,12 +76,15 @@ class DeepSeekProviderTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(claude_any, "write_channel_mcp_config", return_value="channel-mcp.json"))
             stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=None))
             stack.enter_context(mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", return_value=[]))
-            stack.enter_context(mock.patch.object(claude_any, "subprocess_call_with_channel_wake_proxy", return_value=0))
+            proxy = stack.enter_context(mock.patch.object(claude_any, "subprocess_call_with_channel_wake_proxy", return_value=0))
             call = stack.enter_context(mock.patch.object(claude_any.subprocess, "call", return_value=0))
             rc = claude_any.launch_claude([], update_check=False, self_update_check=False)
 
         self.assertEqual(0, rc)
-        launch_env = call.call_args.kwargs["env"]
+        proxy.assert_called_once()
+        self.assertTrue(proxy.call_args.kwargs["inject_web_chat_only"])
+        call.assert_not_called()
+        launch_env = proxy.call_args.args[1]
         self.assertEqual(claude_any.ROUTER_BASE, launch_env["ANTHROPIC_BASE_URL"])
         self.assertEqual("sk-deepseek-test", launch_env["ANTHROPIC_AUTH_TOKEN"])
         self.assertNotIn("ANTHROPIC_API_KEY", launch_env)
