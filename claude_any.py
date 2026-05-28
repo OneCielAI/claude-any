@@ -83,6 +83,7 @@ MENU_KEY_DEBUG_PATH = CONFIG_DIR / "ca-key-debug.log"
 PLAN_ARTIFACTS_DIR = CONFIG_DIR / "plan-artifacts"
 PID_PATH = CONFIG_DIR / "router.pid"
 MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
+MODEL_REGISTRY_PATH = CONFIG_DIR / "model-registry.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
@@ -104,7 +105,11 @@ NCP_LOG = HOME / ".config" / "nvd-claude-proxy" / "proxy.log"
 MODEL_CACHE_TTL_SECONDS = 300
 OLLAMA_MODEL_CATALOG_URL = "https://ollama.com/api/tags"
 OLLAMA_MODEL_CATALOG_TTL_SECONDS = 24 * 60 * 60
-ANTHROPIC_MODEL_DOCS_URL = "https://platform.claude.com/docs/en/about-claude/models/overview"
+ANTHROPIC_MODEL_DOCS_URL = "https://docs.anthropic.com/en/docs/about-claude/models/overview"
+ANTHROPIC_MODEL_DOCS_URLS = (
+    ANTHROPIC_MODEL_DOCS_URL,
+    "https://platform.claude.com/docs/en/about-claude/models/overview",
+)
 OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen"
 OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go"
 NCP_PYPI_PACKAGE = "nvd-claude-proxy"
@@ -1848,6 +1853,10 @@ def clear_model_cache() -> None:
         pass
     try:
         MODEL_LIST_CACHE_PATH.unlink()
+    except FileNotFoundError:
+        pass
+    try:
+        MODEL_REGISTRY_PATH.unlink()
     except FileNotFoundError:
         pass
 
@@ -3883,17 +3892,149 @@ def model_cache_key(provider: str, pcfg: dict[str, Any]) -> str:
     )
 
 
-def read_model_list_cache(provider: str, pcfg: dict[str, Any]) -> list[str] | None:
+def anthropic_model_family_from_id(model_id: str) -> str:
+    model = (model_id or "").strip().lower()
+    for family in ("opus", "sonnet", "haiku"):
+        if re.search(rf"(?:^|-)claude-(?:\d+(?:-\d+){{0,2}}-)?{family}(?:-|$)", model) or f"-{family}-" in model:
+            return family
+    return "claude"
+
+
+def anthropic_model_limit_hints(model_id: str) -> dict[str, Any]:
+    model = (model_id or "").strip().lower()
+    family = anthropic_model_family_from_id(model)
+    # Keep provider limits as metadata, not launch defaults. The CLI default
+    # max_output_tokens below is intentionally lower for interactive safety.
+    if family == "opus" and re.search(r"(?:^|-)opus-4-[67](?:-|$)", model):
+        return {
+            "context_window": 1048576,
+            "max_output_tokens": 128000,
+            "source": "anthropic-models-overview-current-table",
+        }
+    if family == "sonnet" and re.search(r"(?:^|-)sonnet-4-6(?:-|$)", model):
+        return {
+            "context_window": 1048576,
+            "max_output_tokens": 64000,
+            "source": "anthropic-models-overview-current-table",
+        }
+    if family == "haiku" and re.search(r"(?:^|-)haiku-4-5(?:-|$)", model):
+        return {
+            "context_window": 200000,
+            "max_output_tokens": 64000,
+            "source": "anthropic-models-overview-current-table",
+        }
+    return {
+        "context_window": 200000,
+        "source": "anthropic-default-compatibility",
+    }
+
+
+def anthropic_recommended_preset_for_model(model_id: str) -> str:
+    if anthropic_model_family_from_id(model_id) == "haiku":
+        return "fast"
+    return "balanced"
+
+
+def model_registry_recommendations(provider: str, models: list[str]) -> dict[str, Any]:
+    recommendations: dict[str, Any] = {}
+    for model_id in unique_model_ids(provider, models):
+        if provider != "anthropic":
+            continue
+        preset_id = anthropic_recommended_preset_for_model(model_id)
+        timeout_ms = llm_preset_timeout_ms(preset_id)
+        recommendations[model_id] = {
+            "schema": 1,
+            "model_family": anthropic_model_family_from_id(model_id),
+            "recommended_preset": preset_id,
+            "parameters": {
+                "max_output_tokens": 2048 if preset_id == "fast" else 4096,
+                "request_timeout_ms": timeout_ms,
+                "stream_idle_timeout_ms": timeout_profile_idle_ms(timeout_ms),
+            },
+            "limits": anthropic_model_limit_hints(model_id),
+            "notes": [
+                "Native Claude Code manages the real context window; claude-any stores context limits as model metadata only.",
+                "Recommended max_output_tokens is intentionally lower than the provider hard limit for interactive CLI use.",
+            ],
+        }
+    return recommendations
+
+
+def read_model_registry(provider: str, pcfg: dict[str, Any], max_age_seconds: float = MODEL_CACHE_TTL_SECONDS) -> dict[str, Any] | None:
     try:
-        data = json.loads(MODEL_LIST_CACHE_PATH.read_text())
+        data = json.loads(MODEL_REGISTRY_PATH.read_text(encoding="utf-8"))
     except Exception:
         return None
     if not isinstance(data, dict):
         return None
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        return None
+    entry = providers.get(provider)
+    if not isinstance(entry, dict):
+        return None
+    if entry.get("key") != model_cache_key(provider, pcfg):
+        return None
+    try:
+        if max_age_seconds > 0 and time.time() - float(entry.get("time", 0)) > max_age_seconds:
+            return None
+    except Exception:
+        return None
+    models = entry.get("models")
+    if not isinstance(models, list):
+        return None
+    return entry
+
+
+def write_model_registry(provider: str, pcfg: dict[str, Any], models: list[str], source: str = "provider", metadata: dict[str, Any] | None = None) -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        data = json.loads(MODEL_REGISTRY_PATH.read_text(encoding="utf-8")) if MODEL_REGISTRY_PATH.exists() else {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    providers = data.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+    providers[provider] = {
+        "time": time.time(),
+        "key": model_cache_key(provider, pcfg),
+        "source": source,
+        "models": unique_model_ids(provider, models),
+        "recommendations": model_registry_recommendations(provider, models),
+        "metadata": metadata or {},
+    }
+    data["schema"] = 1
+    data["providers"] = providers
+    try:
+        MODEL_REGISTRY_PATH.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(MODEL_REGISTRY_PATH, 0o600)
+    except Exception:
+        pass
+
+
+def read_model_list_cache(provider: str, pcfg: dict[str, Any]) -> list[str] | None:
+    try:
+        data = json.loads(MODEL_LIST_CACHE_PATH.read_text())
+    except Exception:
+        entry = read_model_registry(provider, pcfg)
+        if not entry:
+            return None
+        models = entry.get("models")
+        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
+    if not isinstance(data, dict):
+        entry = read_model_registry(provider, pcfg)
+        models = entry.get("models") if entry else None
+        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
     if data.get("key") != model_cache_key(provider, pcfg):
-        return None
+        entry = read_model_registry(provider, pcfg)
+        models = entry.get("models") if entry else None
+        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
     if time.time() - float(data.get("time", 0)) > MODEL_CACHE_TTL_SECONDS:
-        return None
+        entry = read_model_registry(provider, pcfg)
+        models = entry.get("models") if entry else None
+        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
     models = data.get("models")
     if not isinstance(models, list):
         return None
@@ -3908,6 +4049,7 @@ def write_model_list_cache(provider: str, pcfg: dict[str, Any], models: list[str
         os.chmod(MODEL_LIST_CACHE_PATH, 0o600)
     except Exception:
         pass
+    write_model_registry(provider, pcfg, models, "provider")
 
 
 def cached_or_configured_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
@@ -3960,7 +4102,8 @@ ANTHROPIC_PUBLIC_MODEL_ID_RE = re.compile(
     r"claude-(?:opus|sonnet|haiku)-\d+-\d+-\d{8}|"
     r"claude-(?:opus|sonnet|haiku)-\d+-\d{8}|"
     r"claude-(?:opus|sonnet|haiku)-\d+-\d+|"
-    r"claude-\d+(?:-\d+)?-(?:opus|sonnet|haiku)-\d{8}"
+    r"claude-(?:opus|sonnet|haiku)-\d+(?:-\d+)?-latest|"
+    r"claude-\d+(?:-\d+){0,2}-(?:opus|sonnet|haiku)-(?:\d{8}|latest)"
     r")"
     r"(?![A-Za-z0-9_.@:-])"
 )
@@ -3992,11 +4135,19 @@ def anthropic_model_ids_from_docs_text(text: str) -> list[str]:
 
 
 def fetch_anthropic_public_model_ids(timeout: float = 8.0) -> list[str]:
-    try:
-        return anthropic_model_ids_from_docs_text(fetch_text_url(ANTHROPIC_MODEL_DOCS_URL, timeout=timeout))
-    except Exception as exc:
-        router_log("WARN", f"anthropic model docs fetch failed: {type(exc).__name__}: {exc}")
-        return []
+    ids: list[str] = []
+    errors: list[str] = []
+    for url in ANTHROPIC_MODEL_DOCS_URLS:
+        try:
+            ids.extend(anthropic_model_ids_from_docs_text(fetch_text_url(url, timeout=timeout)))
+        except Exception as exc:
+            errors.append(f"{url}: {type(exc).__name__}: {exc}")
+    out = unique_model_ids("anthropic", ids)
+    if out:
+        return out
+    if errors:
+        router_log("WARN", "anthropic model docs fetch failed: " + " ; ".join(errors))
+    return []
 
 
 def opencode_zen_endpoint_kind(model_id: str) -> str:
@@ -4703,6 +4854,33 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
         sorted_ids = sorted_model_ids(ids)
         write_model_list_cache(provider, pcfg, sorted_ids)
         return sorted_ids
+    if provider == "anthropic":
+        ids = fetch_anthropic_public_model_ids()
+        source = "anthropic-docs"
+        if not ids:
+            base = provider_upstream_request_base(provider, pcfg)
+            for path in ("/v1/models", "/models"):
+                try:
+                    data = http_json(join_url(base, path), headers=provider_model_list_headers(provider, pcfg), timeout=6.0)
+                    ids = model_ids_from_response(data)
+                    source = f"api:{path}"
+                    if ids:
+                        break
+                except Exception:
+                    continue
+        if not ids:
+            return []
+        for mid in pcfg.get("custom_models", []) or []:
+            mid = normalize_model_id(provider, mid)
+            if mid and mid not in ids:
+                ids.append(mid)
+        cur = normalize_model_id(provider, pcfg.get("current_model") or "")
+        if cur and cur not in ids:
+            ids.insert(0, cur)
+        sorted_ids = unique_model_ids(provider, ids)
+        write_model_list_cache(provider, pcfg, sorted_ids)
+        write_model_registry(provider, pcfg, sorted_ids, source, {"urls": list(ANTHROPIC_MODEL_DOCS_URLS) if source == "anthropic-docs" else []})
+        return sorted_ids
     if provider == "nvidia-hosted":
         base = (pcfg.get("base_url") or nvidia_upstream_base_url()).rstrip("/")
     else:
@@ -4747,9 +4925,6 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
                     continue
     except Exception:
         ids = []
-    if provider == "anthropic" and not ids:
-        ids = fetch_anthropic_public_model_ids()
-        fetched = bool(ids)
     if provider == "ollama-cloud" and not ids:
         ids = ollama_catalog_model_ids(provider)
         fetched = bool(ids)
@@ -18231,12 +18406,20 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
             panel_rows, panel_values = base_url_panel_rows(provider, pcfg)
         elif name == "model":
             try:
-                panel_rows, panel_values = model_panel_rows(provider, pcfg, fetch=False)
+                panel_rows, panel_values = model_panel_rows(
+                    provider,
+                    pcfg,
+                    fetch=provider == "anthropic" and read_model_list_cache(provider, pcfg) is None,
+                )
             except Exception as exc:
                 panel_rows, panel_values = [f"Model list failed: {type(exc).__name__}: {exc}", "+ Custom model id..."], []
         elif name == "advisor-model":
             try:
-                panel_rows, panel_values = advisor_model_panel_rows(provider, pcfg, fetch=False)
+                panel_rows, panel_values = advisor_model_panel_rows(
+                    provider,
+                    pcfg,
+                    fetch=provider == "anthropic" and read_model_list_cache(provider, pcfg) is None,
+                )
             except Exception as exc:
                 panel_rows, panel_values = [f"Advisor model list failed: {type(exc).__name__}: {exc}", "+ Custom advisor model id..."], []
         elif name == "test":
