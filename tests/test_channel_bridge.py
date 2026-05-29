@@ -1994,7 +1994,7 @@ class ChannelBridgeTests(unittest.TestCase):
             ),
             mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
             mock.patch.object(claude_any, "_channel_direct_execute_tool", return_value=("message sent", False)) as execute_tool,
-            mock.patch.object(claude_any, "router_log") as router_log,
+            mock.patch.object(claude_any, "router_log"),
         ):
             text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
                 26,

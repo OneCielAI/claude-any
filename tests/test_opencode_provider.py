@@ -71,7 +71,6 @@ class OpenCodeProviderTests(unittest.TestCase):
             current_model="claude-opus-4-8",
             workflows_enabled=True,
         )
-        pcfg = cfg["providers"]["opencode"]
 
         env = claude_any.env_vars(cfg)
 
