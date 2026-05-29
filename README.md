@@ -26,6 +26,12 @@
 
 ## Today's Top 3 Benefits
 
+### 2026-05-28
+
+1. **Non-native Claude Code workflow prep** — routed providers can opt in to Claude Code dynamic workflows with `workflows_enabled`, which removes Claude Any's experimental-beta disable env for that launch.
+2. **Ultracode capability guard** — `ultracode_enabled` launches Claude Code with the ultracode session setting only when the selected model advertises `xhigh_effort`; unverified DeepSeek/OpenCode/local models are not over-claimed.
+3. **Model capability overrides** — `claude_code_supported_capabilities=effort,xhigh_effort,...` lets operators declare verified Claude Code capabilities per provider/model, while known Claude Opus/Sonnet model IDs are inferred automatically.
+
 ### 2026-05-25
 
 1. **DeepSeek.com provider path** — DeepSeek's Anthropic-compatible Claude Code endpoint is available as a first-class provider with model presets and API-key launch checks.
@@ -76,7 +82,7 @@ passes normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.102`
+Current version: `0.1.103`
 
 ## Why This Exists
 

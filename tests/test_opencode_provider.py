@@ -65,6 +65,63 @@ class OpenCodeProviderTests(unittest.TestCase):
         expected_model = claude_any.claude_code_context_model_alias("opencode", pcfg, claude_any.current_alias(cfg))
         self.assertEqual(expected_model, env["ANTHROPIC_MODEL"])
 
+    def test_workflow_env_advertises_inferred_claude_capabilities(self):
+        cfg = self.opencode_cfg(
+            api_key="sk-opencode-test",
+            current_model="claude-opus-4-8",
+            workflows_enabled=True,
+        )
+        pcfg = cfg["providers"]["opencode"]
+
+        env = claude_any.env_vars(cfg)
+
+        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", env)
+        self.assertEqual(env["ANTHROPIC_MODEL"], env["ANTHROPIC_CUSTOM_MODEL_OPTION"])
+        caps = env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"].split(",")
+        self.assertIn("effort", caps)
+        self.assertIn("xhigh_effort", caps)
+        self.assertIn("max_effort", caps)
+        self.assertIn("adaptive_thinking", caps)
+        self.assertEqual(
+            env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"],
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"],
+        )
+
+    def test_configured_capabilities_override_inference(self):
+        cfg = self.opencode_cfg(
+            api_key="sk-opencode-test",
+            current_model="custom-model",
+            claude_code_supported_capabilities=["effort", "max_effort", "unknown"],
+        )
+
+        env = claude_any.env_vars(cfg)
+
+        self.assertEqual("effort,max_effort", env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"])
+
+    def test_ultracode_launch_requires_xhigh_capability(self):
+        cfg = self.opencode_cfg(
+            api_key="sk-opencode-test",
+            current_model="deepseek-v4-flash-free",
+            ultracode_enabled=True,
+        )
+        with mock.patch.object(claude_any, "base_url_status_line", return_value="Base URL: OK"):
+            errors = claude_any.launch_readiness_errors(cfg)
+
+        self.assertTrue(any("ultracode requires" in error for error in errors))
+
+    def test_ultracode_runtime_settings(self):
+        pcfg = self.opencode_cfg(ultracode_enabled=True)["providers"]["opencode"]
+
+        self.assertEqual({"ultracode": True}, claude_any.claude_code_runtime_settings("opencode", pcfg))
+
+    def test_ultracode_runtime_settings_args_are_appended(self):
+        pcfg = self.opencode_cfg(ultracode_enabled=True)["providers"]["opencode"]
+        extra_args: list[str] = []
+
+        claude_any.append_claude_code_runtime_settings_args(extra_args, [], "opencode", pcfg)
+
+        self.assertEqual(["--settings", '{"ultracode":true}'], extra_args)
+
     def test_env_vars_route_opencode_go_through_claude_any_router(self):
         cfg = self.opencode_go_cfg(api_key="sk-opencode-test")
         pcfg = cfg["providers"]["opencode-go"]

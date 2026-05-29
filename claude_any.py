@@ -2785,6 +2785,20 @@ def tool_names_in_body(body: dict[str, Any]) -> set[str]:
     return names
 
 
+def tool_schema_in_body(body: dict[str, Any], tool_name: str) -> dict[str, Any] | None:
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return None
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if str(tool.get("name") or "") != tool_name:
+            continue
+        schema = tool.get("input_schema")
+        return schema if isinstance(schema, dict) else None
+    return None
+
+
 def _match_available_tool_name(name: str, available: set[str]) -> str | None:
     if not available:
         return None
@@ -3153,6 +3167,43 @@ def has_plan_mode_exit(body: dict[str, Any]) -> bool:
     return False
 
 
+def allowed_prompt_tools_for_exit_plan_mode(body: dict[str, Any]) -> list[str]:
+    schema = tool_schema_in_body(body, "ExitPlanMode") or _lookup_tool_schema("ExitPlanMode")
+    if not isinstance(schema, dict):
+        return []
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    allowed_schema = properties.get("allowedPrompts") if isinstance(properties.get("allowedPrompts"), dict) else None
+    if not allowed_schema:
+        return []
+    items = allowed_schema.get("items") if isinstance(allowed_schema.get("items"), dict) else {}
+    item_properties = items.get("properties") if isinstance(items.get("properties"), dict) else {}
+    tool_schema = item_properties.get("tool") if isinstance(item_properties.get("tool"), dict) else {}
+    enum_values = tool_schema.get("enum")
+    if not isinstance(enum_values, list):
+        return []
+    return [str(item) for item in enum_values if isinstance(item, str) and item.strip()]
+
+
+def exit_plan_mode_default_prompt_for_tool(tool_name: str) -> str:
+    return f"use {tool_name} as needed to implement and verify the approved plan"
+
+
+def backfill_exit_plan_mode_allowed_prompts(body: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
+    existing = tool_input.get("allowedPrompts") if isinstance(tool_input, dict) else None
+    if isinstance(existing, list) and any(isinstance(item, dict) for item in existing):
+        return tool_input
+    allowed_tools = allowed_prompt_tools_for_exit_plan_mode(body)
+    if not allowed_tools:
+        return tool_input
+    out = dict(tool_input)
+    out["allowedPrompts"] = [
+        {"tool": tool_name, "prompt": exit_plan_mode_default_prompt_for_tool(tool_name)}
+        for tool_name in allowed_tools
+    ]
+    router_log("INFO", f"backfilled ExitPlanMode allowedPrompts tools={','.join(allowed_tools)}")
+    return out
+
+
 def plan_mode_tool_name_for_emit(body: dict[str, Any], name: str, tool_input: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     active = plan_mode_active(body)
     if name == "EnterPlanMode" and active:
@@ -3161,6 +3212,8 @@ def plan_mode_tool_name_for_emit(body: dict[str, Any], name: str, tool_input: di
     if name == "ExitPlanMode" and not active:
         router_log("WARN", "dropped ExitPlanMode while plan mode is not active")
         return None, tool_input
+    if name == "ExitPlanMode":
+        tool_input = backfill_exit_plan_mode_allowed_prompts(body, tool_input)
     return name, tool_input
 
 
@@ -3946,6 +3999,90 @@ def anthropic_model_runtime_hints(model_id: str) -> dict[str, Any]:
             "source": "anthropic-opus-4-8-launch-notes",
         }
     return {}
+
+
+CLAUDE_CODE_SUPPORTED_CAPABILITY_VALUES: tuple[str, ...] = (
+    "effort",
+    "xhigh_effort",
+    "max_effort",
+    "thinking",
+    "adaptive_thinking",
+    "interleaved_thinking",
+)
+
+
+def normalize_claude_code_supported_capabilities(value: Any) -> list[str]:
+    if value is None or value is False:
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r"[,;\s]+", value.strip())
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = [str(value)]
+    allowed = set(CLAUDE_CODE_SUPPORTED_CAPABILITY_VALUES)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        item = str(raw or "").strip().lower().replace("-", "_")
+        if not item:
+            continue
+        if item not in allowed:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def infer_claude_code_supported_capabilities_from_model(model_id: str) -> list[str]:
+    model = strip_claude_context_suffix(model_id).strip().lower()
+    if re.search(r"(?:^|-)opus-4-[78](?:-|$)", model):
+        return [
+            "effort",
+            "xhigh_effort",
+            "max_effort",
+            "thinking",
+            "adaptive_thinking",
+            "interleaved_thinking",
+        ]
+    if re.search(r"(?:^|-)(?:opus-4-6|sonnet-4-6)(?:-|$)", model):
+        return [
+            "effort",
+            "max_effort",
+            "thinking",
+            "adaptive_thinking",
+            "interleaved_thinking",
+        ]
+    return []
+
+
+def claude_code_supported_capabilities(provider: str, pcfg: dict[str, Any], model_id: str | None = None) -> list[str]:
+    configured = pcfg.get("claude_code_supported_capabilities")
+    caps = normalize_claude_code_supported_capabilities(configured)
+    if caps:
+        return caps
+    model = model_id or current_upstream_model_id(provider, pcfg)
+    return infer_claude_code_supported_capabilities_from_model(model)
+
+
+def claude_code_capability_string(provider: str, pcfg: dict[str, Any], model_id: str | None = None) -> str:
+    return ",".join(claude_code_supported_capabilities(provider, pcfg, model_id))
+
+
+def claude_code_workflows_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    if parse_bool(pcfg.get("ultracode_enabled") if "ultracode_enabled" in pcfg else pcfg.get("ultracode"), False):
+        return True
+    if "workflows_enabled" in pcfg:
+        return parse_bool(pcfg.get("workflows_enabled"), False)
+    return parse_bool(pcfg.get("workflows"), False)
+
+
+def claude_code_ultracode_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    if "ultracode_enabled" in pcfg:
+        return parse_bool(pcfg.get("ultracode_enabled"), False)
+    return parse_bool(pcfg.get("ultracode"), False)
 
 
 def anthropic_recommended_preset_for_model(model_id: str) -> str:
@@ -16183,6 +16320,24 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ja": "テキストdeltaを空白/単語境界までバッファしてSSEイベントを送信します。tool deltaはそのまま透過します。",
         "zh": "在空白/单词边界处合并文本 delta 后发送 SSE 事件。工具 delta 原样透传。",
     },
+    "workflows_enabled": {
+        "en": "Allow Claude Code dynamic workflow features through the claude-any gateway. This removes the experimental-beta disable env for this launch.",
+        "ko": "claude-any 게이트웨이 경유 상태에서 Claude Code dynamic workflow 기능을 허용합니다. 이 실행에서는 experimental beta 차단 env를 제거합니다.",
+        "ja": "claude-any gateway 経由で Claude Code dynamic workflow 機能を許可します。この起動では experimental beta 無効化 env を外します。",
+        "zh": "允许 Claude Code dynamic workflow 通过 claude-any gateway 工作。本次启动会移除 experimental beta 禁用环境变量。",
+    },
+    "ultracode_enabled": {
+        "en": "Start Claude Code with the ultracode session setting. Requires verified xhigh_effort model capability.",
+        "ko": "Claude Code를 ultracode 세션 설정으로 시작합니다. 검증된 xhigh_effort 모델 capability가 필요합니다.",
+        "ja": "Claude Code を ultracode セッション設定で起動します。検証済みの xhigh_effort model capability が必要です。",
+        "zh": "用 ultracode 会话设置启动 Claude Code。需要已验证的 xhigh_effort 模型 capability。",
+    },
+    "claude_code_supported_capabilities": {
+        "en": "Comma-separated Claude Code capability override for the selected model: effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking.",
+        "ko": "선택 모델의 Claude Code capability override입니다. 쉼표로 effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking 를 지정합니다.",
+        "ja": "選択モデルの Claude Code capability override。カンマ区切りで effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking を指定します。",
+        "zh": "所选模型的 Claude Code capability override，逗号分隔：effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking。",
+    },
     "router_debug_external_access": {
         "en": "Expose the router UI/API to non-local clients for debugging. Off denies external clients and next launch binds locally unless environment overrides it.",
         "ko": "디버깅을 위해 라우터 UI/API를 외부 클라이언트에 노출합니다. off면 외부 요청을 차단하고 다음 실행부터 환경값이 없으면 로컬에만 바인딩합니다.",
@@ -16260,6 +16415,8 @@ LLM_OPTION_TOGGLE_KEYS = {
     "rate_limit_status",
     "router_debug_external_access",
     "route_through_router",
+    "workflows_enabled",
+    "ultracode_enabled",
 }
 
 
@@ -16281,6 +16438,10 @@ def llm_option_current_bool(provider: str, pcfg: dict[str, Any], key: str) -> bo
         return router_debug_external_access_enabled()
     if key == "route_through_router":
         return anthropic_routed_enabled(provider, pcfg)
+    if key == "workflows_enabled":
+        return claude_code_workflows_enabled(provider, pcfg)
+    if key == "ultracode_enabled":
+        return claude_code_ultracode_enabled(provider, pcfg)
     return bool(pcfg.get(key, False))
 
 
@@ -16308,6 +16469,11 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
     add(ui_text("timeout_preset", lang), "timeout_profile", timeout_profile_status(pcfg, lang))
     add("Router debug external", "router_debug_external_access", "on" if router_debug_external_access_enabled() else "off")
     add("Event message preview", "router_debug_message_preview_chars", router_debug_message_preview_chars())
+    if not direct_native_anthropic_enabled(provider, pcfg):
+        caps = claude_code_capability_string(provider, pcfg, current_upstream_model_id(provider, pcfg))
+        add("Claude Code workflows", "workflows_enabled", "on" if claude_code_workflows_enabled(provider, pcfg) else "off")
+        add("Claude Code ultracode", "ultracode_enabled", "on" if claude_code_ultracode_enabled(provider, pcfg) else "off")
+        add("Claude Code capabilities", "claude_code_supported_capabilities", caps or "auto/none")
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         add("Context window", "num_ctx", ollama_num_ctx_status(pcfg))
@@ -16370,6 +16536,12 @@ def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> 
         return "true" if bool(pcfg.get("rate_limit_status", False)) else "false"
     if key == "rate_limit_enabled":
         return "true" if bool(router_rate_limit_configured_rpm(provider, pcfg)) else "false"
+    if key == "workflows_enabled":
+        return "true" if claude_code_workflows_enabled(provider, pcfg) else "false"
+    if key == "ultracode_enabled":
+        return "true" if claude_code_ultracode_enabled(provider, pcfg) else "false"
+    if key == "claude_code_supported_capabilities":
+        return claude_code_capability_string(provider, pcfg, current_upstream_model_id(provider, pcfg))
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         if key == "num_ctx":
@@ -16419,6 +16591,24 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
         save_config(cfg)
         clear_model_cache()
         return ["RPM limiter disabled.", "rate_limit_rpm: 0", "rate_limit_status: off"]
+    if key in ("workflows_enabled", "workflow", "workflows"):
+        pcfg["workflows_enabled"] = parse_bool(value, default=False)
+        save_config(cfg)
+        clear_model_cache()
+        return ["Claude Code workflow support updated.", f"workflows_enabled: {pcfg['workflows_enabled']}"]
+    if key in ("ultracode_enabled", "ultracode"):
+        pcfg["ultracode_enabled"] = parse_bool(value, default=False)
+        if pcfg["ultracode_enabled"]:
+            pcfg["workflows_enabled"] = True
+        save_config(cfg)
+        clear_model_cache()
+        return ["Claude Code ultracode setting updated.", f"ultracode_enabled: {pcfg['ultracode_enabled']}"]
+    if key in ("claude_code_supported_capabilities", "supported_capabilities", "capabilities"):
+        caps = normalize_claude_code_supported_capabilities(value)
+        pcfg["claude_code_supported_capabilities"] = caps
+        save_config(cfg)
+        clear_model_cache()
+        return ["Claude Code model capabilities updated.", f"capabilities: {','.join(caps) or 'none'}"]
     numeric_keys = {
         "context_window",
         "context",
@@ -16522,6 +16712,12 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg["stream_enabled"] = True
         elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
             pcfg["stream_word_chunking"] = False
+        elif key in ("workflows_enabled", "workflow", "workflows"):
+            pcfg["workflows_enabled"] = False
+        elif key in ("ultracode_enabled", "ultracode"):
+            pcfg["ultracode_enabled"] = False
+        elif key in ("claude_code_supported_capabilities", "supported_capabilities", "capabilities"):
+            pcfg.pop("claude_code_supported_capabilities", None)
         elif provider in OPENCODE_PROVIDER_NAMES and key.startswith("endpoint:"):
             model_id = normalize_model_id(provider, key.split(":", 1)[1].strip())
             endpoints = pcfg.get("model_endpoints")
@@ -16598,6 +16794,17 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         return
     if key in ("rate_limit_status", "rpm_status"):
         pcfg["rate_limit_status"] = parse_bool(value, default=False)
+        return
+    if key in ("workflows_enabled", "workflow", "workflows"):
+        pcfg["workflows_enabled"] = parse_bool(value, default=False)
+        return
+    if key in ("ultracode_enabled", "ultracode"):
+        pcfg["ultracode_enabled"] = parse_bool(value, default=False)
+        if pcfg["ultracode_enabled"]:
+            pcfg["workflows_enabled"] = True
+        return
+    if key in ("claude_code_supported_capabilities", "supported_capabilities", "capabilities"):
+        pcfg["claude_code_supported_capabilities"] = normalize_claude_code_supported_capabilities(value)
         return
     sample_key = sampling_option_key(key)
     if sample_key:
@@ -17171,6 +17378,20 @@ def apply_common_claude_env(provider: str, pcfg: dict[str, Any], env: dict[str, 
     advisor_model = str(pcfg.get("advisor_model") or "").strip()
     if advisor_model:
         env["CLAUDE_ANY_ADVISOR_MODEL"] = advisor_model
+    claude_model = str(env.get("ANTHROPIC_MODEL") or env.get("CLAUDE_ANY_MODEL_ALIAS") or "").strip()
+    capability_string = claude_code_capability_string(provider, pcfg, current_upstream_model_id(provider, pcfg))
+    if claude_model and capability_string:
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = claude_model
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"] = capability_string
+        for key in (
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        ):
+            if key in env:
+                env[f"{key}_SUPPORTED_CAPABILITIES"] = capability_string
+    if claude_code_workflows_enabled(provider, pcfg):
+        env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
     return env
 
 
@@ -17219,6 +17440,23 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
     })
 
 
+def claude_code_runtime_settings(provider: str, pcfg: dict[str, Any]) -> dict[str, Any]:
+    settings: dict[str, Any] = {}
+    if claude_code_ultracode_enabled(provider, pcfg):
+        settings["ultracode"] = True
+    return settings
+
+
+def append_claude_code_runtime_settings_args(extra_args: list[str], passthrough: list[str], provider: str, pcfg: dict[str, Any]) -> None:
+    settings = claude_code_runtime_settings(provider, pcfg)
+    if not settings:
+        return
+    if has_passthrough_option(passthrough, "--settings"):
+        router_log("WARN", "claude_code_runtime_settings_skipped reason=passthrough_settings_present")
+        return
+    extra_args.extend(["--settings", json.dumps(settings, separators=(",", ":"))])
+
+
 def cmd_env(_: argparse.Namespace) -> None:
     env = env_vars()
     for optional in ("ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY"):
@@ -17239,9 +17477,13 @@ def cmd_env(_: argparse.Namespace) -> None:
         "CLAUDE_CODE_EFFORT_LEVEL",
         "ANTHROPIC_MODEL",
         "ANTHROPIC_CUSTOM_MODEL_OPTION",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES",
         "CLAUDE_CODE_SUBAGENT_MODEL",
         "CLAUDE_ANY_MODEL_ALIAS",
         "CLAUDE_ANY_PROVIDER",
@@ -17853,6 +18095,13 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
         errors.append(f"Launch blocked: {label} requires a {label} API key.")
     if anthropic_routed_enabled(provider, pcfg) and not meaningful_key(pcfg.get("api_key")):
         errors.append("Launch blocked: Anthropic routed mode requires an Anthropic API key.")
+    if claude_code_ultracode_enabled(provider, pcfg):
+        caps = set(claude_code_supported_capabilities(provider, pcfg, current_upstream_model_id(provider, pcfg)))
+        if "xhigh_effort" not in caps:
+            errors.append(
+                "Launch blocked: ultracode requires a Claude Code model capability set that includes xhigh_effort. "
+                "Use a compatible Claude model or set claude_code_supported_capabilities after verifying the provider/model supports xhigh workflow thinking."
+            )
     if provider == "lm-studio":
         try:
             ensure_lm_studio_model_loaded_for_context(pcfg, timeout=1.5)
@@ -22296,9 +22545,13 @@ def launch_claude(
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_MODEL",
             "ANTHROPIC_CUSTOM_MODEL_OPTION",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES",
             "CLAUDE_CODE_SUBAGENT_MODEL",
             "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
@@ -22402,6 +22655,7 @@ def launch_claude(
             native_channel_bridge=native_channel_bridge,
         )
     )
+    append_claude_code_runtime_settings_args(extra_args, launch_passthrough, provider, pcfg)
     cmd = [
         claude,
         "--dangerously-skip-permissions",
@@ -22461,6 +22715,7 @@ def _log_claude_command_for_diagnostics(cmd: list[str], env: dict[str, str]) -> 
         "CLAUDE_ANY_MODEL_ALIAS",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
         "CLAUDE_CODE_EFFORT_LEVEL",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
     )
     env_summary = []
     for key in relevant_env_keys:

@@ -15,6 +15,71 @@ def body_with_tools(user_text: str, tool_names: list[str]) -> dict:
 
 
 class EmptyEndTurnRecoveryTests(unittest.TestCase):
+    def test_exit_plan_mode_backfills_allowed_prompts_from_schema(self):
+        body = body_with_tools("implement feature", ["ExitPlanMode"])
+        body["tools"][0]["input_schema"] = {
+            "type": "object",
+            "properties": {
+                "allowedPrompts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string", "enum": ["Bash"]},
+                            "prompt": {"type": "string"},
+                        },
+                        "required": ["tool", "prompt"],
+                    },
+                }
+            },
+        }
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [],
+                "attachment": {"type": "plan_mode", "planFilePath": "/tmp/plan.md"},
+            }
+        )
+
+        name, fixed = claude_any.plan_mode_tool_name_for_emit(body, "ExitPlanMode", {})
+
+        self.assertEqual("ExitPlanMode", name)
+        self.assertEqual(
+            [{"tool": "Bash", "prompt": "use Bash as needed to implement and verify the approved plan"}],
+            fixed["allowedPrompts"],
+        )
+
+    def test_exit_plan_mode_preserves_existing_allowed_prompts(self):
+        body = body_with_tools("implement feature", ["ExitPlanMode"])
+        body["tools"][0]["input_schema"] = {
+            "type": "object",
+            "properties": {
+                "allowedPrompts": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "tool": {"type": "string", "enum": ["Bash"]},
+                            "prompt": {"type": "string"},
+                        },
+                    },
+                }
+            },
+        }
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [],
+                "attachment": {"type": "plan_mode", "planFilePath": "/tmp/plan.md"},
+            }
+        )
+        existing = {"allowedPrompts": [{"tool": "Bash", "prompt": "run tests"}]}
+
+        name, fixed = claude_any.plan_mode_tool_name_for_emit(body, "ExitPlanMode", existing)
+
+        self.assertEqual("ExitPlanMode", name)
+        self.assertEqual(existing, fixed)
+
     def test_latest_user_text_ignores_system_reminder_blocks(self):
         body = body_with_tools("initial task", ["TaskList"])
         body["messages"].append(
