@@ -2186,6 +2186,86 @@ class ChannelBridgeTests(unittest.TestCase):
         execute_tool.assert_called_once()
         self.assertEqual(2, len(calls))
 
+    def test_channel_direct_router_response_suppresses_internal_reply_content(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) == 1:
+                return {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_reply",
+                            "name": "mcp__generic-sse__send_message",
+                            "input": {
+                                "room_id": "room_generic",
+                                "content": (
+                                    "No reply is needed. NO_REPLY: this activity notification was already handled.\n\n"
+                                    "## tool_result\n{\"success\": true}"
+                                ),
+                            },
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            return {"content": [{"type": "text", "text": "NO_REPLY: already handled."}], "stop_reason": "end_turn"}
+
+        with (
+            mock.patch.object(
+                claude_any,
+                "_channel_direct_tool_schemas",
+                return_value=[{"name": "mcp__generic-sse__send_message"}],
+            ),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool") as execute_tool,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                32,
+                "수신 메시지를 처리하세요",
+                {
+                    "id": 32,
+                    "channel": "room_generic",
+                    "message": "New message from teammate",
+                    "meta": {"sse_source": "generic-sse", "message_id": "msg_target", "kind": "activity"},
+                },
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("NO_REPLY: already handled.", text)
+        self.assertEqual("end_turn", stop_reason)
+        self.assertEqual(1, tool_turns)
+        execute_tool.assert_not_called()
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_reply_suppressed_internal_content" in item for item in log_messages))
+
+    def test_channel_direct_fallback_reply_summary_sanitizes_tool_result(self):
+        summary = claude_any._channel_direct_fallback_reply_summary(
+            "Public reply",
+            json.dumps(
+                {
+                    "success": True,
+                    "data": {
+                        "id": "msg_public",
+                        "room_id": "room_generic",
+                        "sender_name": "Agent",
+                        "content": "full public message body should not be repeated here",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+        )
+
+        self.assertIn("## 전송 결과", summary)
+        self.assertIn("success=True", summary)
+        self.assertIn("id=msg_public", summary)
+        self.assertIn("room_id=room_generic", summary)
+        self.assertNotIn("## tool_result", summary)
+        self.assertNotIn("full public message body", summary)
+
     def test_channel_direct_router_response_replaces_deferred_text_at_max_turns(self):
         calls: list[dict[str, object]] = []
 

@@ -20707,6 +20707,55 @@ def _channel_direct_execute_tool(tool_use: dict[str, Any]) -> tuple[str, bool]:
         return f"{type(exc).__name__}: {exc}", True
 
 
+def _channel_direct_reply_tool_content(tool_use: dict[str, Any]) -> str:
+    arguments = tool_use.get("input") if isinstance(tool_use.get("input"), dict) else {}
+    for key in ("content", "message", "text", "body"):
+        if key in arguments:
+            return str(arguments.get(key) or "")
+    return ""
+
+
+def _channel_direct_text_contains_no_reply_directive(text: str) -> bool:
+    body = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not body:
+        return False
+    lowered = body.lower()
+    return bool(
+        _channel_direct_text_declines_reply(body)
+        or re.search(r"\bno[_ -]?reply\s*:", lowered)
+        or "no reply is needed" in lowered
+        or "no response needed" in lowered
+        or "reply is not needed" in lowered
+        or "회신 불필요" in body
+        or "응답 불필요" in body
+        or "추가 답장은 불필요" in body
+    )
+
+
+def _channel_direct_reply_content_should_suppress(text: str) -> bool:
+    body = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not body:
+        return False
+    lowered = body.lower()
+    if _channel_direct_text_contains_no_reply_directive(body):
+        return True
+    if _channel_direct_fallback_text_is_diagnostic_failure(body):
+        return True
+    internal_markers = (
+        "## tool_result",
+        "direct_handler_summary",
+        "fallback loop",
+        "fallback 루프",
+        "fallback 라우터",
+        "claude-any 라우터",
+        "claude-any router",
+        "system-generated activity alert",
+        "kind: activity",
+        "사용자 액션 필요",
+    )
+    return any(marker in lowered for marker in internal_markers)
+
+
 _CHANNEL_DIRECT_MESSAGE_CURSOR_KEYS = (
     "after_id",
     "after",
@@ -21135,15 +21184,41 @@ def _channel_direct_send_same_channel_fallback_reply(
 
 def _channel_direct_fallback_reply_summary(reply_text: str, tool_result: str) -> str:
     sent = truncate_for_prompt(str(reply_text or "").strip(), 4000)
-    result = truncate_for_prompt(str(tool_result or "").strip(), 2000)
+    result = _channel_direct_fallback_tool_result_summary(tool_result)
     return (
         "reply-required 채널 메시지가 일반 재시도에서는 reply/send 호출 없이 끝나서, "
         "라우터가 같은 채널에 안전 fallback 회신을 직접 전송했습니다.\n\n"
         "## 보낸 메시지\n"
         f"{sent}\n\n"
-        "## tool_result\n"
+        "## 전송 결과\n"
         f"{result}"
     )
+
+
+def _channel_direct_fallback_tool_result_summary(tool_result: str) -> str:
+    raw = str(tool_result or "").strip()
+    if not raw:
+        return "tool returned an empty result"
+    try:
+        parsed = json.loads(raw)
+    except Exception:
+        return truncate_for_prompt(re.sub(r"\s+", " ", raw), 500)
+    if not isinstance(parsed, dict):
+        return truncate_for_prompt(re.sub(r"\s+", " ", raw), 500)
+    success = parsed.get("success")
+    data = parsed.get("data") if isinstance(parsed.get("data"), dict) else {}
+    fields: list[str] = []
+    if success is not None:
+        fields.append(f"success={bool(success)}")
+    for key in ("id", "message_id", "room_id", "channel", "sender_name", "created_at"):
+        value = data.get(key) if key in data else parsed.get(key)
+        if value:
+            fields.append(f"{key}={value}")
+    if fields:
+        return ", ".join(fields)
+    if parsed.get("error"):
+        return "error=" + truncate_for_prompt(json.dumps(parsed.get("error"), ensure_ascii=False), 400)
+    return truncate_for_prompt(json.dumps(parsed, ensure_ascii=False, separators=(",", ":")), 500)
 
 
 def _channel_direct_append_summary(message: dict[str, Any], text: str, stop_reason: str, tool_turns: int = 0) -> None:
@@ -21347,6 +21422,26 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
                 )
                 continue
             if parts is not None:
+                if _channel_direct_tool_is_reply_action(parts[1]):
+                    reply_content = _channel_direct_reply_tool_content(tool_use)
+                    if _channel_direct_reply_content_should_suppress(reply_content):
+                        router_log(
+                            "WARN",
+                            f"channel_llm_reply_suppressed_internal_content tool_use_id={tool_use.get('id')} tool={parts[1]} chars={len(reply_content)}",
+                        )
+                        results.append(
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": str(tool_use.get("id") or ""),
+                                "content": (
+                                    "Automatic channel reply was suppressed because the proposed message body contained "
+                                    "an internal no-reply directive or router/tool diagnostic text. End with NO_REPLY: "
+                                    "if no external response is needed, or call a reply tool again with only the public message body."
+                                ),
+                                "is_error": False,
+                            }
+                        )
+                        continue
                 executed_tool_names.append(parts[1])
             tool_use_for_call = _channel_direct_prepare_read_tool_use(tool_use, message)
             result_text, is_error = _channel_direct_execute_tool(tool_use_for_call)
