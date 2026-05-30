@@ -527,6 +527,33 @@ class ChannelBridgeTests(unittest.TestCase):
 
         self.assertEqual("", notice)
 
+    def test_channel_summary_prompt_is_local_only_and_sanitized(self):
+        prompt = claude_any.format_channel_llm_summary_prompt(
+            [
+                {
+                    "message_id": 56,
+                    "channel": "room_generic",
+                    "incoming": "New message from teammate",
+                    "stop_reason": "fallback_reply_sent",
+                    "tool_turns": 8,
+                    "summary": (
+                        "reply-required 채널 메시지가 일반 재시도에서는 reply/send 호출 없이 끝나서, "
+                        "라우터가 같은 채널에 안전 fallback 회신을 직접 전송했습니다.\n\n"
+                        "## 보낸 메시지\nPublic message\n\n"
+                        "## tool_result\n{\"success\": true, \"data\": {\"content\": \"raw body\"}}"
+                    ),
+                }
+            ]
+        )
+
+        self.assertIn("LOCAL NOTICE ONLY", prompt)
+        self.assertIn("이 내용을 외부 채널/DM/그룹방에 post/send 하지 마세요", prompt)
+        self.assertIn("local_note=", prompt)
+        self.assertNotIn("[claude-any", prompt.lower())
+        self.assertNotIn("direct_handler_summary", prompt)
+        self.assertNotIn("## tool_result", prompt)
+        self.assertNotIn("raw body", prompt)
+
     def test_channel_llm_prompt_warns_against_dm_label_recipient_misread(self):
         prompt = claude_any.format_channel_llm_batch_prompt(
             [
@@ -881,7 +908,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual({"last_id": 12}, cursor_payload)
         self.assertEqual(2, write_all.call_count)
         payload = write_all.call_args_list[0].args[1]
-        self.assertIn("channel direct handling summaries".encode("utf-8"), payload)
+        self.assertIn("local channel update summary".encode("utf-8"), payload)
+        self.assertIn("LOCAL NOTICE ONLY".encode("utf-8"), payload)
         self.assertIn("Sarah".encode("utf-8"), payload)
         self.assertTrue(payload.startswith(b"\x15"))
         self.assertEqual(b"\r\n", write_all.call_args_list[1].args[1])
@@ -1156,7 +1184,8 @@ class ChannelBridgeTests(unittest.TestCase):
 
         self.assertEqual(2, len(out["messages"]))
         injected = out["messages"][-1]["content"][0]["text"]
-        self.assertIn("channel direct handling summaries", injected)
+        self.assertIn("local channel update summary", injected)
+        self.assertIn("LOCAL NOTICE ONLY", injected)
         self.assertIn("message_id=12", injected)
         self.assertIn("Sarah에게 업무를 배정", injected)
         self.assertTrue(out["metadata"]["claude_any_channel_summary_injected"])
@@ -2202,7 +2231,8 @@ class ChannelBridgeTests(unittest.TestCase):
                                 "room_id": "room_generic",
                                 "content": (
                                     "No reply is needed. NO_REPLY: this activity notification was already handled.\n\n"
-                                    "## tool_result\n{\"success\": true}"
+                                    "## tool_result\n{\"success\": true}\n"
+                                    "Claude-Any 백그라운드 자동 처리 요약 (#56)"
                                 ),
                             },
                         }

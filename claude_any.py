@@ -20742,8 +20742,13 @@ def _channel_direct_reply_content_should_suppress(text: str) -> bool:
     if _channel_direct_fallback_text_is_diagnostic_failure(body):
         return True
     internal_markers = (
+        "claude-any",
         "## tool_result",
+        "tool_result",
         "direct_handler_summary",
+        "background auto handling summary",
+        "background message handling summary",
+        "백그라운드 자동 처리 요약",
         "fallback loop",
         "fallback 루프",
         "fallback 라우터",
@@ -21649,13 +21654,28 @@ def _read_channel_llm_summary_records(after_id: int, limit: int = 20) -> list[di
     return records
 
 
+def _channel_llm_summary_prompt_note(text: str) -> str:
+    body = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not body:
+        return ""
+    body = re.sub(r"##\s*tool_result\b.*", "", body, flags=re.IGNORECASE | re.DOTALL).strip()
+    body = re.sub(r"##\s*전송 결과\b.*", "", body, flags=re.IGNORECASE | re.DOTALL).strip()
+    body = re.sub(r"\bclaude-any\b", "channel bridge", body, flags=re.IGNORECASE)
+    body = body.replace("direct_handler_summary", "handler summary")
+    body = body.replace("백그라운드 자동 처리 요약", "자동 처리 요약")
+    body = body.replace("라우터가 같은 채널에 안전 fallback 회신을 직접 전송했습니다", "same-channel fallback reply was sent")
+    return truncate_for_prompt(body, 700)
+
+
 def format_channel_llm_summary_prompt(records: list[dict[str, Any]]) -> str:
     parts = [
-        "[claude-any channel direct handling summaries]",
-        "아래 항목은 claude-any가 외부 채널/AI-Net 메시지를 백그라운드에서 자동 처리한 결과입니다.",
-        "사용자가 화면에서 알 수 있도록 각 항목의 수신 메시지, 수행한 tool/action, 최종 응답 또는 남은 조치를 간단히 요약하세요.",
+        "[local channel update summary]",
+        "LOCAL NOTICE ONLY. 아래 항목은 외부 채널 메시지를 백그라운드에서 자동 처리한 결과입니다.",
+        "이 알림 자체에는 답장하지 말고, 이 내용을 외부 채널/DM/그룹방에 post/send 하지 마세요.",
+        "이 알림 때문에 도구를 호출하지 마세요. 사용자가 화면에서 알 수 있도록 필요한 경우에만 아주 짧게 상태를 말하세요.",
     ]
     for item in records:
+        note = _channel_llm_summary_prompt_note(str(item.get("summary") or ""))
         parts.append(
             "\n".join(
                 [
@@ -21666,7 +21686,7 @@ def format_channel_llm_summary_prompt(records: list[dict[str, Any]]) -> str:
                     f"stop_reason={item.get('stop_reason') or ''}",
                     f"tool_turns={item.get('tool_turns') or 0}",
                     f"incoming={json.dumps(str(item.get('incoming') or ''), ensure_ascii=False)}",
-                    f"direct_handler_summary:\n{item.get('summary') or '(empty)'}",
+                    f"local_note={json.dumps(note or '(empty)', ensure_ascii=False)}",
                 ]
             )
         )
