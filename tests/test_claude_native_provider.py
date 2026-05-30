@@ -11,6 +11,8 @@
   even when the cleanup.managed_services_on_launch config gate is off.
 """
 import tempfile
+import io
+import urllib.error
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -25,6 +27,111 @@ class ProviderLabelTests(unittest.TestCase):
     def test_aliases_route_to_anthropic(self):
         for alias in ("anthropic", "claude", "claude-native", "native", "claude-code"):
             self.assertEqual("anthropic", claude_any.PROVIDER_ALIASES[alias])
+
+    def test_provider_menu_exposes_native_and_routed_anthropic_choices(self):
+        cfg = {
+            "current_provider": "anthropic",
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "",
+                    "route_through_router": False,
+                },
+            },
+        }
+
+        rows, values = claude_any.provider_panel_rows(cfg)
+
+        self.assertIn(claude_any.ANTHROPIC_NATIVE_PROVIDER_CHOICE, values)
+        self.assertIn(claude_any.ANTHROPIC_ROUTED_PROVIDER_CHOICE, values)
+        self.assertTrue(any("Claude Native" in row and row.startswith("*") for row in rows))
+        self.assertTrue(any("Anthropic routed" in row and "Claude Code auth" in row for row in rows))
+
+    def test_provider_menu_marks_routed_anthropic_choice(self):
+        cfg = {
+            "current_provider": "anthropic",
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "sk-ant-real",
+                    "route_through_router": True,
+                },
+            },
+        }
+
+        rows, _ = claude_any.provider_panel_rows(cfg)
+
+        self.assertTrue(any("Anthropic routed" in row and row.startswith("*") for row in rows))
+        self.assertTrue(any("Claude Native" in row and row.startswith(" ") for row in rows))
+        self.assertEqual(
+            claude_any.ANTHROPIC_ROUTED_PROVIDER_CHOICE,
+            claude_any.current_provider_panel_choice("anthropic", cfg["providers"]["anthropic"]),
+        )
+
+    def test_main_menu_provider_label_reflects_anthropic_route_mode(self):
+        cfg = {"language": "en"}
+        native = {"route_through_router": False, "advisor_model": "", "current_model": "claude-opus-4-7"}
+        routed = {"route_through_router": True, "advisor_model": "", "current_model": "claude-opus-4-7"}
+
+        self.assertIn("Provider  [Claude Native]", claude_any.main_menu_rows(cfg, "anthropic", native, "en")[1])
+        self.assertIn("Provider  [Anthropic routed]", claude_any.main_menu_rows(cfg, "anthropic", routed, "en")[1])
+
+    def test_provider_choice_toggles_anthropic_routing(self):
+        cfg = {
+            "current_provider": "anthropic",
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "",
+                    "route_through_router": False,
+                },
+            },
+        }
+        saved: dict[str, object] = {}
+
+        def fake_save_config(next_cfg):
+            saved.clear()
+            saved.update(next_cfg)
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config", side_effect=fake_save_config),
+            mock.patch.object(claude_any, "clear_model_cache"),
+        ):
+            lines = claude_any.set_provider_choice_config(claude_any.ANTHROPIC_ROUTED_PROVIDER_CHOICE)
+
+        self.assertEqual("anthropic", saved["current_provider"])
+        self.assertTrue(saved["providers"]["anthropic"]["route_through_router"])
+        self.assertTrue(any("Claude Code OAuth/API auth headers" in line for line in lines))
+
+    def test_plain_anthropic_provider_selection_resets_to_native(self):
+        cfg = {
+            "current_provider": "opencode",
+            "providers": {
+                "anthropic": {
+                    "base_url": "https://api.anthropic.com",
+                    "api_key": "",
+                    "route_through_router": True,
+                },
+                "opencode": {},
+            },
+        }
+        saved: dict[str, object] = {}
+
+        def fake_save_config(next_cfg):
+            saved.clear()
+            saved.update(next_cfg)
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config", side_effect=fake_save_config),
+            mock.patch.object(claude_any, "clear_model_cache"),
+        ):
+            lines = claude_any.set_provider_config("anthropic")
+
+        self.assertEqual("anthropic", saved["current_provider"])
+        self.assertFalse(saved["providers"]["anthropic"]["route_through_router"])
+        self.assertIn("mode: anthropic-native", lines)
 
 
 class NativeEnvContractTests(unittest.TestCase):
@@ -79,7 +186,7 @@ class NativeEnvContractTests(unittest.TestCase):
 
         self.assertEqual("anthropic", env.get("CLAUDE_ANY_PROVIDER"))
         self.assertEqual(claude_any.ROUTER_BASE, env.get("ANTHROPIC_BASE_URL"))
-        self.assertEqual("not-used", env.get("ANTHROPIC_AUTH_TOKEN"))
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
         self.assertEqual("claude-any-anthropic-claude-sonnet-4-7", env.get("ANTHROPIC_MODEL"))
         self.assertNotIn("ANTHROPIC_API_KEY", env)
 
@@ -89,11 +196,221 @@ class NativeEnvContractTests(unittest.TestCase):
         self.assertEqual("anthropic-routed", claude_any.provider_mode_label("anthropic", pcfg))
         self.assertFalse(claude_any.direct_native_anthropic_enabled("anthropic", pcfg))
 
-    def test_routed_anthropic_requires_api_key_for_launch(self):
+    def test_routed_anthropic_without_api_key_can_launch_for_oauth_header_pass_through(self):
         with mock.patch.object(claude_any, "base_url_status_line", return_value="Base URL: model list reachable"):
             errors = claude_any.launch_readiness_errors(self._cfg(route_through_router=True, api_key=""))
 
-        self.assertTrue(any("Anthropic routed mode requires" in error for error in errors))
+        self.assertEqual([], errors)
+
+    def test_routed_anthropic_provider_headers_use_inbound_oauth_when_no_api_key(self):
+        headers = claude_any.provider_headers(
+            "anthropic",
+            {"api_key": ""},
+            {"authorization": "Bearer oauth-token", "anthropic-beta": "tools-2026"},
+        )
+
+        self.assertEqual("Bearer oauth-token", headers["authorization"])
+        self.assertEqual("tools-2026", headers["anthropic-beta"])
+        self.assertNotIn("x-api-key", headers)
+
+    def test_routed_anthropic_provider_headers_prefer_configured_api_key(self):
+        headers = claude_any.provider_headers(
+            "anthropic",
+            {"api_key": "sk-ant-real"},
+            {"authorization": "Bearer oauth-token"},
+        )
+
+        self.assertEqual("sk-ant-real", headers["x-api-key"])
+        self.assertNotIn("authorization", headers)
+
+    def test_routed_anthropic_advisor_request_uses_messages_api(self):
+        pcfg = {
+            "base_url": "https://api.anthropic.com",
+            "api_key": "",
+            "advisor_model": "claude-opus-4-8",
+            "route_through_router": True,
+            "max_output_tokens": 4096,
+        }
+        body = {
+            "system": "You are in Claude Code.",
+            "model": "claude-sonnet-4-6",
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "CLAUDE_ANY_ADVISOR_CALL\nFocus: plan"}]},
+                {"role": "system", "content": [{"type": "text", "text": "Runtime state from Claude Code."}]},
+                {"role": "assistant", "content": [{"type": "text", "text": "I will inspect files."}]},
+            ],
+            "tools": [{"name": "Bash"}],
+            "tool_choice": {"type": "auto"},
+        }
+
+        self.assertTrue(claude_any.advisor_provider_supported("anthropic"))
+        self.assertEqual("https://api.anthropic.com/v1/messages", claude_any.advisor_endpoint("anthropic", pcfg))
+        req = claude_any.advisor_request("anthropic", "claude-opus-4-8", body, pcfg)
+
+        self.assertEqual("claude-opus-4-8", req["model"])
+        self.assertEqual(False, req["stream"])
+        self.assertNotIn("tools", req)
+        self.assertNotIn("tool_choice", req)
+        self.assertEqual(["user", "assistant", "user"], [message["role"] for message in req["messages"]])
+        self.assertIn("Advisor focus", claude_any.anthropic_content_to_text(req["messages"][-1]["content"]))
+        self.assertIn("claude-any Advisor", claude_any.anthropic_content_to_text(req["system"]))
+        self.assertIn("Original session system context", claude_any.anthropic_content_to_text(req["system"]))
+        self.assertIn("Runtime state from Claude Code.", claude_any.anthropic_content_to_text(req["system"]))
+
+    def test_routed_anthropic_advisor_call_forwards_oauth_headers(self):
+        pcfg = {
+            "base_url": "https://api.anthropic.com",
+            "api_key": "",
+            "advisor_model": "claude-opus-4-8",
+            "route_through_router": True,
+            "max_output_tokens": 4096,
+        }
+        body = {
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "CLAUDE_ANY_ADVISOR_CALL"}]}],
+        }
+
+        with mock.patch.object(
+            claude_any,
+            "post_json_with_rate_retry",
+            return_value={"content": [{"type": "text", "text": "advisor ok"}]},
+        ) as post:
+            text = claude_any.call_advisor_text(
+                "anthropic",
+                pcfg,
+                body,
+                inbound_headers={"authorization": "Bearer oauth-token", "anthropic-beta": "tools-2026"},
+            )
+
+        self.assertEqual("advisor ok", text)
+        args = post.call_args.args
+        self.assertEqual("https://api.anthropic.com/v1/messages", args[0])
+        self.assertEqual("Bearer oauth-token", args[2]["authorization"])
+        self.assertEqual("tools-2026", args[2]["anthropic-beta"])
+
+    def test_interactive_advisor_call_can_skip_rate_limit_wait_and_retry(self):
+        pcfg = {
+            "base_url": "https://api.anthropic.com",
+            "api_key": "",
+            "advisor_model": "claude-opus-4-8",
+            "route_through_router": True,
+            "max_output_tokens": 4096,
+        }
+        body = {
+            "model": "claude-sonnet-4-6",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "CLAUDE_ANY_ADVISOR_CALL"}]}],
+        }
+
+        with (
+            mock.patch.object(claude_any, "apply_router_rate_limit") as apply_rate_limit,
+            mock.patch.object(claude_any, "post_json_with_rate_retry", side_effect=RuntimeError("rate limited")) as post,
+        ):
+            with self.assertRaises(RuntimeError):
+                claude_any.call_advisor_text(
+                    "anthropic",
+                    pcfg,
+                    body,
+                    inbound_headers={"authorization": "Bearer oauth-token"},
+                    allow_rate_limit_wait=False,
+                    retry_rate_limits=False,
+                    raise_errors=True,
+                )
+
+        apply_rate_limit.assert_not_called()
+        self.assertFalse(post.call_args.kwargs["retry_rate_limits"])
+
+    def test_post_json_can_fail_fast_on_429_without_retry_sleep(self):
+        error = urllib.error.HTTPError(
+            "https://api.anthropic.com/v1/messages",
+            429,
+            "Too Many Requests",
+            {},
+            io.BytesIO(b'{"error":{"message":"rate limit"}}'),
+        )
+
+        with (
+            mock.patch("urllib.request.urlopen", side_effect=error) as urlopen,
+            mock.patch.object(claude_any, "learn_router_rate_limit_headers"),
+            mock.patch.object(claude_any, "write_router_activity"),
+            mock.patch.object(claude_any, "router_log"),
+            mock.patch("time.sleep") as sleep,
+        ):
+            with self.assertRaises(RuntimeError):
+                claude_any.post_json_with_rate_retry(
+                    "https://api.anthropic.com/v1/messages",
+                    {"model": "claude-opus-4-8", "messages": []},
+                    {},
+                    30.0,
+                    "anthropic",
+                    {"gateway_retries": 2},
+                    "claude-opus-4-8",
+                    retry_rate_limits=False,
+                )
+
+        self.assertEqual(1, urlopen.call_count)
+        sleep.assert_not_called()
+
+    def test_direct_native_anthropic_does_not_require_api_key_or_base_url(self):
+        errors = claude_any.launch_readiness_errors(self._cfg(base_url="", api_key="", route_through_router=False))
+
+        self.assertEqual([], errors)
+
+
+class NativeSlashCommandContractTests(unittest.TestCase):
+    def test_native_mode_removes_claude_any_slash_commands(self):
+        with tempfile.TemporaryDirectory() as td:
+            commands_dir = Path(td) / "commands"
+            commands_dir.mkdir()
+            advisor = commands_dir / "advisor.md"
+            router_debug = commands_dir / "router-debug.md"
+            advisor.write_text(claude_any.ADVISOR_SLASH_COMMAND, encoding="utf-8")
+            router_debug.write_text(claude_any.ROUTER_DEBUG_SLASH_COMMAND, encoding="utf-8")
+
+            with mock.patch.object(claude_any, "CLAUDE_COMMANDS_DIR", commands_dir):
+                claude_any.disable_claude_any_slash_commands_for_native()
+
+            self.assertFalse(advisor.exists())
+            self.assertFalse(router_debug.exists())
+
+    def test_non_native_install_restores_router_backed_slash_commands(self):
+        with tempfile.TemporaryDirectory() as td:
+            commands_dir = Path(td) / "commands"
+            commands_dir.mkdir()
+            advisor = commands_dir / "advisor.md"
+            advisor.write_text(claude_any.ADVISOR_SLASH_COMMAND, encoding="utf-8")
+
+            with mock.patch.object(claude_any, "CLAUDE_COMMANDS_DIR", commands_dir):
+                claude_any.disable_claude_any_slash_commands_for_native()
+                self.assertFalse(advisor.exists())
+                claude_any.install_claude_any_slash_commands()
+
+            self.assertIn("CLAUDE_ANY_ADVISOR_CALL", advisor.read_text(encoding="utf-8"))
+
+    def test_native_mode_preserves_user_custom_advisor_command(self):
+        custom = "---\ndescription: My advisor\n---\n\nCustom user command\n"
+        with tempfile.TemporaryDirectory() as td:
+            commands_dir = Path(td) / "commands"
+            commands_dir.mkdir()
+            advisor = commands_dir / "advisor.md"
+            advisor.write_text(custom, encoding="utf-8")
+
+            with mock.patch.object(claude_any, "CLAUDE_COMMANDS_DIR", commands_dir):
+                claude_any.disable_claude_any_slash_commands_for_native()
+
+            self.assertEqual(custom, advisor.read_text(encoding="utf-8"))
+
+    def test_non_native_install_preserves_user_custom_advisor_command(self):
+        custom = "---\ndescription: My advisor\n---\n\nCustom user command\n"
+        with tempfile.TemporaryDirectory() as td:
+            commands_dir = Path(td) / "commands"
+            commands_dir.mkdir()
+            advisor = commands_dir / "advisor.md"
+            advisor.write_text(custom, encoding="utf-8")
+
+            with mock.patch.object(claude_any, "CLAUDE_COMMANDS_DIR", commands_dir):
+                claude_any.install_claude_any_slash_commands()
+
+            self.assertEqual(custom, advisor.read_text(encoding="utf-8"))
 
 
 class NativeModelListTests(unittest.TestCase):
@@ -191,6 +508,27 @@ class NativeModelListTests(unittest.TestCase):
         self.assertEqual("fast", recommendations["claude-haiku-4-5"]["recommended_preset"])
         self.assertEqual(2048, recommendations["claude-haiku-4-5"]["parameters"]["max_output_tokens"])
         self.assertEqual(200000, recommendations["claude-haiku-4-5"]["limits"]["context_window"])
+
+    def test_anthropic_docs_registry_survives_api_key_state_changes(self):
+        pcfg_with_key = {"base_url": "https://api.anthropic.com", "api_key": "sk-ant-real", "current_model": "claude-sonnet-4-6"}
+        pcfg_without_key = {"base_url": "https://api.anthropic.com", "api_key": "", "current_model": "claude-sonnet-4-6"}
+
+        with tempfile.TemporaryDirectory() as td:
+            cache_path = Path(td) / "model-list-cache.json"
+            registry_path = Path(td) / "model-registry.json"
+            with (
+                mock.patch.object(claude_any, "MODEL_LIST_CACHE_PATH", cache_path),
+                mock.patch.object(claude_any, "MODEL_REGISTRY_PATH", registry_path),
+            ):
+                claude_any.write_model_registry(
+                    "anthropic",
+                    pcfg_with_key,
+                    ["claude-opus-4-8", "claude-sonnet-4-6"],
+                    "anthropic-docs",
+                )
+                cached = claude_any.read_model_list_cache("anthropic", pcfg_without_key)
+
+        self.assertEqual(["claude-opus-4-8", "claude-sonnet-4-6"], cached)
 
     def test_native_model_panel_force_refresh_shows_latest_public_models(self):
         pcfg = {"base_url": "https://api.anthropic.com", "api_key": "", "current_model": "claude-sonnet-4-6"}

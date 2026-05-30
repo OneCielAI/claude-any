@@ -164,6 +164,9 @@ PROVIDER_LABELS = {
     "self-hosted-nim": "Self Hosted NIM",
 }
 
+ANTHROPIC_NATIVE_PROVIDER_CHOICE = "anthropic:native"
+ANTHROPIC_ROUTED_PROVIDER_CHOICE = "anthropic:routed"
+
 OPENCODE_PROVIDER_NAMES = ("opencode", "opencode-go")
 OPENCODE_ENDPOINT_ALIASES = {
     "messages": "anthropic-messages",
@@ -2576,6 +2579,18 @@ Focus: $ARGUMENTS
 Use the Advisor Model selected in the claude-any launch menu. If the Advisor Model is off, explain how to enable it. Otherwise review the current conversation, tool history, and task state. Return concise guidance with the blocker, next concrete action, and validation step.
 """
 
+ADVISOR_NATIVE_DISABLED_SLASH_COMMAND = """---
+description: Claude Any Advisor unavailable in Claude Native mode
+argument-hint: [ignored]
+---
+
+Claude Any Advisor is unavailable in direct Claude Native mode.
+
+Do not run tools, shell commands, file searches, config scans, or environment checks for this command. Reply immediately with this exact status and the short enablement hint below.
+
+This session bypasses the claude-any router, so /advisor cannot call the configured Advisor Model here. To use /advisor, launch a non-native provider or enable Anthropic routed mode in claude-any.
+"""
+
 ROUTER_DEBUG_SLASH_COMMAND = """---
 description: Toggle claude-any router external debug access
 argument-hint: [on|off|status]
@@ -2587,6 +2602,38 @@ Value: $ARGUMENTS
 
 Toggle claude-any router debug external access. With no argument, this toggles the current state. Use `on`, `off`, or `status` for explicit control.
 """
+
+ROUTER_DEBUG_NATIVE_DISABLED_SLASH_COMMAND = """---
+description: claude-any router debug unavailable in Claude Native mode
+argument-hint: [ignored]
+---
+
+claude-any router debug controls are unavailable in direct Claude Native mode.
+
+Do not run tools, shell commands, file searches, config scans, or environment checks for this command. Reply immediately with this exact status and the short enablement hint below.
+
+This session bypasses the claude-any router. Launch a non-native provider or enable Anthropic routed mode to use /router-debug.
+"""
+
+CLAUDE_ANY_ADVISOR_COMMAND_MARKERS = (
+    "CLAUDE_ANY_ADVISOR_CALL",
+    "Run the selected claude-any Advisor Model",
+    "Claude Any Advisor is unavailable in direct Claude Native mode",
+)
+CLAUDE_ANY_ROUTER_DEBUG_COMMAND_MARKERS = (
+    "CLAUDE_ANY_ROUTER_DEBUG_ACCESS",
+    "Toggle claude-any router external debug access",
+    "claude-any router debug controls are unavailable in direct Claude Native mode",
+)
+
+
+def command_file_is_claude_any_owned(path: Path, markers: tuple[str, ...]) -> bool:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except Exception:
+        return False
+    return any(marker in text for marker in markers)
+
 
 def install_claude_any_slash_commands() -> None:
     try:
@@ -2605,8 +2652,17 @@ def install_claude_any_slash_commands() -> None:
                 pass
         for name, content in commands.items():
             path = CLAUDE_COMMANDS_DIR / name
-            if path.exists() and path.read_text(encoding="utf-8") == content:
-                continue
+            if path.exists():
+                existing = path.read_text(encoding="utf-8", errors="replace")
+                markers = (
+                    CLAUDE_ANY_ADVISOR_COMMAND_MARKERS
+                    if name == "advisor.md"
+                    else CLAUDE_ANY_ROUTER_DEBUG_COMMAND_MARKERS
+                )
+                if existing == content:
+                    continue
+                if not command_file_is_claude_any_owned(path, markers):
+                    continue
             path.write_text(content, encoding="utf-8")
             try:
                 os.chmod(path, 0o600)
@@ -2614,6 +2670,23 @@ def install_claude_any_slash_commands() -> None:
                 pass
     except Exception as exc:
         print(f"Claude Any warning: could not install claude-any slash commands ({type(exc).__name__}: {exc}).", flush=True)
+
+
+def disable_claude_any_slash_commands_for_native() -> None:
+    try:
+        if not CLAUDE_COMMANDS_DIR.exists():
+            return
+        commands = {
+            "advisor.md": CLAUDE_ANY_ADVISOR_COMMAND_MARKERS,
+            "router-debug.md": CLAUDE_ANY_ROUTER_DEBUG_COMMAND_MARKERS,
+        }
+        for name, markers in commands.items():
+            path = CLAUDE_COMMANDS_DIR / name
+            if not path.exists() or not command_file_is_claude_any_owned(path, markers):
+                continue
+            path.unlink()
+    except Exception as exc:
+        print(f"Claude Any warning: could not remove claude-any slash commands for native mode ({type(exc).__name__}: {exc}).", flush=True)
 
 
 def http_json(url: str, headers: dict[str, str] | None = None, timeout: float = 8.0) -> Any:
@@ -2783,6 +2856,20 @@ def tool_names_in_body(body: dict[str, Any]) -> set[str]:
         if isinstance(tool, dict) and isinstance(tool.get("name"), str):
             names.add(tool["name"])
     return names
+
+
+def tool_schema_in_body(body: dict[str, Any], tool_name: str) -> dict[str, Any] | None:
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return None
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        if str(tool.get("name") or "") != tool_name:
+            continue
+        schema = tool.get("input_schema")
+        return schema if isinstance(schema, dict) else None
+    return None
 
 
 def _match_available_tool_name(name: str, available: set[str]) -> str | None:
@@ -3153,6 +3240,43 @@ def has_plan_mode_exit(body: dict[str, Any]) -> bool:
     return False
 
 
+def allowed_prompt_tools_for_exit_plan_mode(body: dict[str, Any]) -> list[str]:
+    schema = tool_schema_in_body(body, "ExitPlanMode") or _lookup_tool_schema("ExitPlanMode")
+    if not isinstance(schema, dict):
+        return []
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    allowed_schema = properties.get("allowedPrompts") if isinstance(properties.get("allowedPrompts"), dict) else None
+    if not allowed_schema:
+        return []
+    items = allowed_schema.get("items") if isinstance(allowed_schema.get("items"), dict) else {}
+    item_properties = items.get("properties") if isinstance(items.get("properties"), dict) else {}
+    tool_schema = item_properties.get("tool") if isinstance(item_properties.get("tool"), dict) else {}
+    enum_values = tool_schema.get("enum")
+    if not isinstance(enum_values, list):
+        return []
+    return [str(item) for item in enum_values if isinstance(item, str) and item.strip()]
+
+
+def exit_plan_mode_default_prompt_for_tool(tool_name: str) -> str:
+    return f"use {tool_name} as needed to implement and verify the approved plan"
+
+
+def backfill_exit_plan_mode_allowed_prompts(body: dict[str, Any], tool_input: dict[str, Any]) -> dict[str, Any]:
+    existing = tool_input.get("allowedPrompts") if isinstance(tool_input, dict) else None
+    if isinstance(existing, list) and any(isinstance(item, dict) for item in existing):
+        return tool_input
+    allowed_tools = allowed_prompt_tools_for_exit_plan_mode(body)
+    if not allowed_tools:
+        return tool_input
+    out = dict(tool_input)
+    out["allowedPrompts"] = [
+        {"tool": tool_name, "prompt": exit_plan_mode_default_prompt_for_tool(tool_name)}
+        for tool_name in allowed_tools
+    ]
+    router_log("INFO", f"backfilled ExitPlanMode allowedPrompts tools={','.join(allowed_tools)}")
+    return out
+
+
 def plan_mode_tool_name_for_emit(body: dict[str, Any], name: str, tool_input: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     active = plan_mode_active(body)
     if name == "EnterPlanMode" and active:
@@ -3161,6 +3285,8 @@ def plan_mode_tool_name_for_emit(body: dict[str, Any], name: str, tool_input: di
     if name == "ExitPlanMode" and not active:
         router_log("WARN", "dropped ExitPlanMode while plan mode is not active")
         return None, tool_input
+    if name == "ExitPlanMode":
+        tool_input = backfill_exit_plan_mode_allowed_prompts(body, tool_input)
     return name, tool_input
 
 
@@ -3948,6 +4074,90 @@ def anthropic_model_runtime_hints(model_id: str) -> dict[str, Any]:
     return {}
 
 
+CLAUDE_CODE_SUPPORTED_CAPABILITY_VALUES: tuple[str, ...] = (
+    "effort",
+    "xhigh_effort",
+    "max_effort",
+    "thinking",
+    "adaptive_thinking",
+    "interleaved_thinking",
+)
+
+
+def normalize_claude_code_supported_capabilities(value: Any) -> list[str]:
+    if value is None or value is False:
+        return []
+    if isinstance(value, str):
+        raw_items = re.split(r"[,;\s]+", value.strip())
+    elif isinstance(value, (list, tuple, set)):
+        raw_items = [str(item) for item in value]
+    else:
+        raw_items = [str(value)]
+    allowed = set(CLAUDE_CODE_SUPPORTED_CAPABILITY_VALUES)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in raw_items:
+        item = str(raw or "").strip().lower().replace("-", "_")
+        if not item:
+            continue
+        if item not in allowed:
+            continue
+        if item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
+
+
+def infer_claude_code_supported_capabilities_from_model(model_id: str) -> list[str]:
+    model = strip_claude_context_suffix(model_id).strip().lower()
+    if re.search(r"(?:^|-)opus-4-[78](?:-|$)", model):
+        return [
+            "effort",
+            "xhigh_effort",
+            "max_effort",
+            "thinking",
+            "adaptive_thinking",
+            "interleaved_thinking",
+        ]
+    if re.search(r"(?:^|-)(?:opus-4-6|sonnet-4-6)(?:-|$)", model):
+        return [
+            "effort",
+            "max_effort",
+            "thinking",
+            "adaptive_thinking",
+            "interleaved_thinking",
+        ]
+    return []
+
+
+def claude_code_supported_capabilities(provider: str, pcfg: dict[str, Any], model_id: str | None = None) -> list[str]:
+    configured = pcfg.get("claude_code_supported_capabilities")
+    caps = normalize_claude_code_supported_capabilities(configured)
+    if caps:
+        return caps
+    model = model_id or current_upstream_model_id(provider, pcfg)
+    return infer_claude_code_supported_capabilities_from_model(model)
+
+
+def claude_code_capability_string(provider: str, pcfg: dict[str, Any], model_id: str | None = None) -> str:
+    return ",".join(claude_code_supported_capabilities(provider, pcfg, model_id))
+
+
+def claude_code_workflows_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    if parse_bool(pcfg.get("ultracode_enabled") if "ultracode_enabled" in pcfg else pcfg.get("ultracode"), False):
+        return True
+    if "workflows_enabled" in pcfg:
+        return parse_bool(pcfg.get("workflows_enabled"), False)
+    return parse_bool(pcfg.get("workflows"), False)
+
+
+def claude_code_ultracode_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    if "ultracode_enabled" in pcfg:
+        return parse_bool(pcfg.get("ultracode_enabled"), False)
+    return parse_bool(pcfg.get("ultracode"), False)
+
+
 def anthropic_recommended_preset_for_model(model_id: str) -> str:
     if anthropic_model_family_from_id(model_id) == "haiku":
         return "fast"
@@ -3994,7 +4204,17 @@ def read_model_registry(provider: str, pcfg: dict[str, Any], max_age_seconds: fl
     if not isinstance(entry, dict):
         return None
     if entry.get("key") != model_cache_key(provider, pcfg):
-        return None
+        if provider != "anthropic" or entry.get("source") != "anthropic-docs":
+            return None
+        try:
+            entry_key = json.loads(str(entry.get("key") or "{}"))
+            current_key = json.loads(model_cache_key(provider, pcfg))
+            entry_key.pop("api", None)
+            current_key.pop("api", None)
+            if entry_key != current_key:
+                return None
+        except Exception:
+            return None
     try:
         if max_age_seconds > 0 and time.time() - float(entry.get("time", 0)) > max_age_seconds:
             return None
@@ -4004,6 +4224,12 @@ def read_model_registry(provider: str, pcfg: dict[str, Any], max_age_seconds: fl
     if not isinstance(models, list):
         return None
     return entry
+
+
+def read_model_registry_models(provider: str, pcfg: dict[str, Any], max_age_seconds: float = MODEL_CACHE_TTL_SECONDS) -> list[str] | None:
+    entry = read_model_registry(provider, pcfg, max_age_seconds=max_age_seconds)
+    models = entry.get("models") if entry else None
+    return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
 
 
 def write_model_registry(provider: str, pcfg: dict[str, Any], models: list[str], source: str = "provider", metadata: dict[str, Any] | None = None) -> None:
@@ -4038,23 +4264,15 @@ def read_model_list_cache(provider: str, pcfg: dict[str, Any]) -> list[str] | No
     try:
         data = json.loads(MODEL_LIST_CACHE_PATH.read_text())
     except Exception:
-        entry = read_model_registry(provider, pcfg)
-        if not entry:
-            return None
-        models = entry.get("models")
-        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
+        return read_model_registry_models(provider, pcfg, max_age_seconds=0)
     if not isinstance(data, dict):
-        entry = read_model_registry(provider, pcfg)
-        models = entry.get("models") if entry else None
-        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
+        return read_model_registry_models(provider, pcfg, max_age_seconds=0)
     if data.get("key") != model_cache_key(provider, pcfg):
-        entry = read_model_registry(provider, pcfg)
-        models = entry.get("models") if entry else None
-        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
+        return read_model_registry_models(provider, pcfg, max_age_seconds=0)
     if time.time() - float(data.get("time", 0)) > MODEL_CACHE_TTL_SECONDS:
-        entry = read_model_registry(provider, pcfg)
-        models = entry.get("models") if entry else None
-        return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
+        registry_models = read_model_registry_models(provider, pcfg, max_age_seconds=0)
+        if registry_models:
+            return registry_models
     models = data.get("models")
     if not isinstance(models, list):
         return None
@@ -4819,15 +5037,29 @@ def ncp_model_id_for_nvidia_hosted(model_id: str) -> str:
     return model_id
 
 
-def provider_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
+def provider_headers(provider: str, pcfg: dict[str, Any], inbound_headers: Any | None = None) -> dict[str, str]:
     headers = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
     if provider in OPENCODE_PROVIDER_NAMES:
         headers["user-agent"] = f"claude-any/{VERSION}"
     key = pcfg.get("api_key") or "not-used"
     if provider == "anthropic":
-        if not pcfg.get("api_key"):
-            raise RuntimeError("Anthropic API key is missing. Run: claude-anyctl api-key anthropic")
-        headers["x-api-key"] = pcfg["api_key"]
+        if meaningful_key(pcfg.get("api_key")):
+            headers["x-api-key"] = str(pcfg["api_key"])
+        elif inbound_headers is not None:
+            for name in (
+                "authorization",
+                "x-api-key",
+                "anthropic-version",
+                "anthropic-beta",
+                "anthropic-dangerous-direct-browser-access",
+            ):
+                value = inbound_headers.get(name)
+                if value:
+                    headers[name] = value
+            if not (headers.get("authorization") or headers.get("x-api-key")):
+                raise RuntimeError("Anthropic routed mode did not receive Claude Code OAuth/API auth headers.")
+        else:
+            raise RuntimeError("Anthropic routed mode needs a configured API key or inbound Claude Code auth headers.")
     elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
@@ -8324,6 +8556,7 @@ def anthropic_content_to_text(content: Any) -> str:
 PROMPT_TOOL_INPUT_FIELD_LIMIT = 1200
 PROMPT_TOOL_RESULT_LIMIT = 12000
 PROMPT_MESSAGE_TEXT_LIMIT = 20000
+CLAUDE_CODE_PERSISTED_OUTPUT_MARKER = "<persisted-output>"
 
 
 def truncate_for_prompt(text: str, limit: int) -> str:
@@ -8331,6 +8564,10 @@ def truncate_for_prompt(text: str, limit: int) -> str:
         return text
     omitted = len(text) - limit
     return text[:limit] + f"\n...[truncated {omitted} chars]..."
+
+
+def is_claude_code_persisted_output_text(text: str) -> bool:
+    return CLAUDE_CODE_PERSISTED_OUTPUT_MARKER in str(text or "")
 
 
 def compact_tool_value_for_prompt(value: Any, limit: int = PROMPT_TOOL_INPUT_FIELD_LIMIT) -> Any:
@@ -8444,6 +8681,8 @@ def advisor_model_enabled(pcfg: dict[str, Any]) -> str:
 
 
 def advisor_provider_kind(provider: str) -> str:
+    if provider == "anthropic":
+        return "anthropic"
     if provider in ("ollama", "ollama-cloud"):
         return "ollama"
     if provider in ("lm-studio", "nvidia-hosted"):
@@ -8453,6 +8692,46 @@ def advisor_provider_kind(provider: str) -> str:
 
 def advisor_provider_supported(provider: str) -> bool:
     return bool(advisor_provider_kind(provider))
+
+
+def anthropic_system_with_advisor(system: Any, extra_system_texts: list[str] | None = None) -> list[dict[str, Any]]:
+    blocks: list[dict[str, Any]] = [{"type": "text", "text": ADVISOR_REVIEW_PROMPT}]
+    original_text = ""
+    if isinstance(system, str):
+        original_text = system.strip()
+    elif system:
+        original_text = anthropic_content_to_text(system).strip()
+    if original_text:
+        blocks.append({"type": "text", "text": "Original session system context:\n" + original_text})
+    for text in extra_system_texts or []:
+        clean = str(text or "").strip()
+        if clean:
+            blocks.append({"type": "text", "text": "Additional system context from message history:\n" + clean})
+    return blocks
+
+
+def anthropic_advisor_messages_and_system(body: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
+    messages: list[dict[str, Any]] = []
+    system_texts: list[str] = []
+    for message in body.get("messages", []) or []:
+        if not isinstance(message, dict):
+            continue
+        role = str(message.get("role") or "").strip()
+        if role == "system":
+            text = anthropic_content_to_text(message.get("content")).strip()
+            if text:
+                system_texts.append(text)
+            continue
+        if role in ("user", "assistant"):
+            messages.append(message)
+            continue
+        text = anthropic_content_to_text(message.get("content")).strip()
+        if text:
+            messages.append({
+                "role": "user",
+                "content": [{"type": "text", "text": f"[{role or 'unknown'} message]\n{text}"}],
+            })
+    return messages, system_texts
 
 
 def advisor_tool_schema() -> dict[str, Any]:
@@ -8788,7 +9067,12 @@ def collect_tool_result_context(body: dict[str, Any]) -> tuple[dict[str, str], s
                 signature = canonical_tool_signature(tool_name, tool_input)
                 is_error = bool(block.get("is_error"))
                 tool_result_records.append((message_index, tool_use_id, tool_name, tool_input, result_text, is_error))
-                if not is_read_unchanged_result(tool_name, result_text) and not is_error and result_text.strip():
+                if (
+                    not is_claude_code_persisted_output_text(result_text)
+                    and not is_read_unchanged_result(tool_name, result_text)
+                    and not is_error
+                    and result_text.strip()
+                ):
                     successful_results[signature] = result_text
     current_read_noop_ids = {
         tool_use_id
@@ -8941,26 +9225,32 @@ def anthropic_messages_to_ollama(body: dict[str, Any]) -> list[dict[str, Any]]:
                 tool_name = tool_names_by_id.get(tool_use_id, "tool")
                 tool_input = tool_inputs_by_id.get(tool_use_id)
                 tool_input_text = tool_input_for_prompt(tool_input)
-                result_text = truncate_for_prompt(anthropic_content_to_text(block.get("content", "")), PROMPT_TOOL_RESULT_LIMIT)
-                signature = canonical_tool_signature(tool_name, tool_input)
-                tool_text, tool_summary = format_tool_result_for_upstream(
-                    tool_name=tool_name,
-                    tool_input_text=tool_input_text,
-                    result_text=result_text,
-                    is_error=bool(block.get("is_error")),
-                    prior_success_text=prior_tool_results.get(signature, ""),
-                    include_prior_success=tool_use_id in latest_noop_result_ids,
-                    in_plan_mode=in_plan_mode,
-                )
-                if not block.get("is_error"):
-                    if tool_name == "TaskList":
-                        tool_summary = (
-                            f"The task list is current:\n{result_text}\n\n"
-                            "If any task is in_progress and the user's request is not finished, your next response "
-                            "must call a concrete work tool such as Write, Edit, Read, or Bash. Do not respond with "
-                            "another progress announcement like 'I will write the files now'. If everything is "
-                            "actually complete, provide the final answer."
-                        )
+                raw_result_text = anthropic_content_to_text(block.get("content", ""))
+                if is_claude_code_persisted_output_text(raw_result_text):
+                    result_text = raw_result_text
+                    tool_text = raw_result_text
+                    tool_summary = ""
+                else:
+                    result_text = truncate_for_prompt(raw_result_text, PROMPT_TOOL_RESULT_LIMIT)
+                    signature = canonical_tool_signature(tool_name, tool_input)
+                    tool_text, tool_summary = format_tool_result_for_upstream(
+                        tool_name=tool_name,
+                        tool_input_text=tool_input_text,
+                        result_text=result_text,
+                        is_error=bool(block.get("is_error")),
+                        prior_success_text=prior_tool_results.get(signature, ""),
+                        include_prior_success=tool_use_id in latest_noop_result_ids,
+                        in_plan_mode=in_plan_mode,
+                    )
+                    if not block.get("is_error"):
+                        if tool_name == "TaskList":
+                            tool_summary = (
+                                f"The task list is current:\n{result_text}\n\n"
+                                "If any task is in_progress and the user's request is not finished, your next response "
+                                "must call a concrete work tool such as Write, Edit, Read, or Bash. Do not respond with "
+                                "another progress announcement like 'I will write the files now'. If everything is "
+                                "actually complete, provide the final answer."
+                            )
                 messages.append({"role": "tool", "tool_name": tool_name, "content": tool_text})
                 if tool_summary:
                     messages.append({"role": "user", "content": tool_summary})
@@ -9062,7 +9352,15 @@ def anthropic_messages_to_openai(body: dict[str, Any], reasoning_passback: bool 
                 if isinstance(block, dict) and block.get("type") == "tool_result":
                     tool_id = str(block.get("tool_use_id") or "call_tool")
                     if tool_id not in tool_names_by_id:
-                        result_text = truncate_for_prompt(anthropic_content_to_text(block.get("content", "")), PROMPT_TOOL_RESULT_LIMIT)
+                        raw_result_text = anthropic_content_to_text(block.get("content", ""))
+                        result_text = (
+                            raw_result_text
+                            if is_claude_code_persisted_output_text(raw_result_text)
+                            else truncate_for_prompt(raw_result_text, PROMPT_TOOL_RESULT_LIMIT)
+                        )
+                        if is_claude_code_persisted_output_text(result_text):
+                            text_blocks.append({"type": "text", "text": result_text})
+                            continue
                         text_blocks.append({
                             "type": "text",
                             "text": (
@@ -9074,17 +9372,21 @@ def anthropic_messages_to_openai(body: dict[str, Any], reasoning_passback: bool 
                     tool_name = tool_names_by_id.get(tool_id, "tool")
                     tool_input = tool_inputs_by_id.get(tool_id)
                     tool_input_text = tool_input_for_prompt(tool_input)
-                    result_text = truncate_for_prompt(anthropic_content_to_text(block.get("content", "")), PROMPT_TOOL_RESULT_LIMIT)
-                    signature = canonical_tool_signature(tool_name, tool_input)
-                    tool_text, _ = format_tool_result_for_upstream(
-                        tool_name=tool_name,
-                        tool_input_text=tool_input_text,
-                        result_text=result_text,
-                        is_error=bool(block.get("is_error")),
-                        prior_success_text=prior_tool_results.get(signature, ""),
-                        include_prior_success=tool_id in latest_noop_result_ids,
-                        in_plan_mode=in_plan_mode,
-                    )
+                    raw_result_text = anthropic_content_to_text(block.get("content", ""))
+                    if is_claude_code_persisted_output_text(raw_result_text):
+                        tool_text = raw_result_text
+                    else:
+                        result_text = truncate_for_prompt(raw_result_text, PROMPT_TOOL_RESULT_LIMIT)
+                        signature = canonical_tool_signature(tool_name, tool_input)
+                        tool_text, _ = format_tool_result_for_upstream(
+                            tool_name=tool_name,
+                            tool_input_text=tool_input_text,
+                            result_text=result_text,
+                            is_error=bool(block.get("is_error")),
+                            prior_success_text=prior_tool_results.get(signature, ""),
+                            include_prior_success=tool_id in latest_noop_result_ids,
+                            in_plan_mode=in_plan_mode,
+                        )
                     messages.append({
                         "role": "tool",
                         "tool_call_id": tool_id,
@@ -9587,23 +9889,32 @@ ADVISOR_REVIEW_PROMPT = (
 
 def advisor_messages_for_provider(provider: str, body: dict[str, Any], focus_override: str = "") -> list[dict[str, Any]]:
     kind = advisor_provider_kind(provider)
-    if kind == "openai-compatible":
+    if kind == "anthropic":
+        messages, _ = anthropic_advisor_messages_and_system(body)
+    elif kind == "openai-compatible":
         messages = anthropic_messages_to_openai(body)
     else:
         messages = anthropic_messages_to_ollama(body)
     focus = focus_override or advisor_focus_from_body(body)
-    messages.insert(0, {"role": "system", "content": ADVISOR_REVIEW_PROMPT})
+    if kind != "anthropic":
+        messages.insert(0, {"role": "system", "content": ADVISOR_REVIEW_PROMPT})
     if focus:
-        messages.append({"role": "user", "content": f"Advisor focus:\n{compact_message_text_for_prompt(focus)}"})
+        focus_text = f"Advisor focus:\n{compact_message_text_for_prompt(focus)}"
+        if kind == "anthropic":
+            messages.append({"role": "user", "content": [{"type": "text", "text": focus_text}]})
+        else:
+            messages.append({"role": "user", "content": focus_text})
     return messages
 
 
 def advisor_input_budget(provider: str, pcfg: dict[str, Any]) -> int:
-    context_limit = (
-        ollama_context_limit_for_budget(pcfg)
-        if advisor_provider_kind(provider) == "ollama"
-        else openai_context_limit_for_budget(provider, pcfg)
-    )
+    kind = advisor_provider_kind(provider)
+    if kind == "ollama":
+        context_limit = ollama_context_limit_for_budget(pcfg)
+    elif kind == "anthropic":
+        context_limit = context_limit_for_status(provider, pcfg) or 200000
+    else:
+        context_limit = openai_context_limit_for_budget(provider, pcfg)
     return max(8192, context_limit - 4096 - (positive_int(pcfg.get("context_reserve_tokens")) or 1024))
 
 
@@ -9613,8 +9924,22 @@ def advisor_upstream_model(provider: str, model: str) -> str:
 
 def advisor_request(provider: str, model: str, body: dict[str, Any], pcfg: dict[str, Any], focus_override: str = "") -> dict[str, Any]:
     messages = advisor_messages_for_provider(provider, body, focus_override=focus_override)
-    messages = compact_ollama_messages_for_budget(messages, [], advisor_input_budget(provider, pcfg))
+    if advisor_provider_kind(provider) != "anthropic":
+        messages = compact_ollama_messages_for_budget(messages, [], advisor_input_budget(provider, pcfg))
     upstream_model = advisor_upstream_model(provider, model)
+    if advisor_provider_kind(provider) == "anthropic":
+        _, extra_system_texts = anthropic_advisor_messages_and_system(body)
+        req = {
+            "model": upstream_model,
+            "system": anthropic_system_with_advisor(body.get("system"), extra_system_texts),
+            "messages": messages,
+            "stream": False,
+            "max_tokens": min(4096, configured_output_tokens(pcfg, body) or 4096),
+        }
+        for key in ("temperature", "top_p"):
+            if pcfg.get(key) is not None:
+                req[key] = pcfg[key]
+        return req
     if advisor_provider_kind(provider) == "openai-compatible":
         req: dict[str, Any] = {
             "model": upstream_model,
@@ -9645,6 +9970,8 @@ def advisor_request(provider: str, model: str, body: dict[str, Any], pcfg: dict[
 def advisor_response_text(provider: str, data: Any) -> str:
     if not isinstance(data, dict):
         return ""
+    if advisor_provider_kind(provider) == "anthropic":
+        return anthropic_content_to_text(data.get("content")).strip()
     if advisor_provider_kind(provider) == "openai-compatible":
         choices = data.get("choices")
         if isinstance(choices, list) and choices:
@@ -9658,19 +9985,32 @@ def advisor_response_text(provider: str, data: Any) -> str:
 
 def advisor_endpoint(provider: str, pcfg: dict[str, Any]) -> str:
     base = pcfg.get("base_url", "").rstrip("/")
+    if advisor_provider_kind(provider) == "anthropic":
+        return join_url(base, "/v1/messages")
     if advisor_provider_kind(provider) == "openai-compatible":
         return join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions")
     return join_url(base, "/api/chat")
 
 
-def call_advisor_text(provider: str, pcfg: dict[str, Any], body: dict[str, Any], focus: str = "") -> str:
+def call_advisor_text(
+    provider: str,
+    pcfg: dict[str, Any],
+    body: dict[str, Any],
+    focus: str = "",
+    inbound_headers: Any | None = None,
+    *,
+    allow_rate_limit_wait: bool = True,
+    retry_rate_limits: bool = True,
+    raise_errors: bool = False,
+) -> str:
     advisor_model = advisor_model_enabled(pcfg)
     if not advisor_model or not advisor_provider_supported(provider):
         return ""
     upstream_model = advisor_upstream_model(provider, advisor_model)
     req_body = advisor_request(provider, advisor_model, body, pcfg, focus_override=focus)
     try:
-        apply_router_rate_limit(provider, pcfg, upstream_model)
+        if allow_rate_limit_wait:
+            apply_router_rate_limit(provider, pcfg, upstream_model)
         write_router_activity("advisor", provider, upstream_model, tokens=estimate_tokens(req_body))
         if advisor_provider_kind(provider) == "openai-compatible":
             data = post_json_with_rate_retry(
@@ -9682,6 +10022,19 @@ def call_advisor_text(provider: str, pcfg: dict[str, Any], body: dict[str, Any],
                 pcfg,
                 upstream_model,
                 None,
+                retry_rate_limits=retry_rate_limits,
+            )
+        elif advisor_provider_kind(provider) == "anthropic":
+            data = post_json_with_rate_retry(
+                advisor_endpoint(provider, pcfg),
+                req_body,
+                provider_headers(provider, pcfg, inbound_headers),
+                provider_request_timeout_seconds(pcfg),
+                provider,
+                pcfg,
+                upstream_model,
+                None,
+                retry_rate_limits=retry_rate_limits,
             )
         else:
             data = post_json_with_rate_retry(
@@ -9693,6 +10046,7 @@ def call_advisor_text(provider: str, pcfg: dict[str, Any], body: dict[str, Any],
                 pcfg,
                 upstream_model,
                 None,
+                retry_rate_limits=retry_rate_limits,
             )
         text = advisor_response_text(provider, data)
         if text:
@@ -9701,6 +10055,8 @@ def call_advisor_text(provider: str, pcfg: dict[str, Any], body: dict[str, Any],
     except Exception as exc:
         router_log("WARN", f"advisor_request_failed provider={provider} advisor_model={upstream_model} error={type(exc).__name__}: {exc}")
         write_router_activity("advisor_error", provider, upstream_model, error=type(exc).__name__)
+        if raise_errors:
+            raise
         return ""
 
 
@@ -9995,7 +10351,7 @@ def maybe_handle_advisor_request(handler: BaseHTTPRequestHandler, provider: str,
         write_anthropic_text_response(
             handler,
             str(body.get("model") or current_alias(load_config())),
-            "Advisor is off. Choose an Advisor Model in the claude-any launch menu, or run `claude-anyctl advisor-model deepseek-v4-pro`, then use `/advisor` again.",
+            "Advisor is off. Choose an Advisor Model in the claude-any launch menu (item 5), or run `claude-any advisor-model <model-id>`, then use `/advisor` again.",
             stream,
         )
         return True
@@ -10008,7 +10364,15 @@ def maybe_handle_advisor_request(handler: BaseHTTPRequestHandler, provider: str,
         )
         return True
     try:
-        text = call_advisor_text(provider, pcfg, body)
+        text = call_advisor_text(
+            provider,
+            pcfg,
+            body,
+            inbound_headers=handler.headers,
+            allow_rate_limit_wait=False,
+            retry_rate_limits=False,
+            raise_errors=True,
+        )
         if not text:
             text = "Advisor returned no text."
     except Exception as exc:
@@ -12000,6 +12364,8 @@ def post_json_with_rate_retry(
     pcfg: dict[str, Any],
     model: str,
     retry_notice: Callable[[str], None] | None = None,
+    *,
+    retry_rate_limits: bool = True,
 ) -> Any:
     gateway_retries = configured_gateway_retries(pcfg)
     max_attempts = max(1, gateway_retries + 1)
@@ -12028,7 +12394,7 @@ def post_json_with_rate_retry(
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="ignore")
             learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
-            if exc.code == 429 and attempt + 1 < max_attempts:
+            if exc.code == 429 and retry_rate_limits and attempt + 1 < max_attempts:
                 retry_no = attempt + 1
                 wait = register_router_rate_limit_backoff(provider, pcfg, model, exc.headers.get("Retry-After"))
                 write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, wait=wait, tokens=token_estimate, bytes=byte_estimate)
@@ -12416,7 +12782,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             data = json.dumps(body).encode("utf-8")
             base = provider_upstream_request_base(provider, pcfg)
             url = join_url(base, "/v1/messages")
-            headers = provider_headers(provider, pcfg)
+            headers = provider_headers(provider, pcfg, self.headers)
             for h in ("anthropic-beta", "anthropic-dangerous-direct-browser-access"):
                 if self.headers.get(h):
                     headers[h] = self.headers[h]
@@ -12563,13 +12929,42 @@ def set_provider_config(provider: str) -> list[str]:
     cfg = load_config()
     cfg["current_provider"] = provider
     pcfg = cfg["providers"][provider]
+    if provider == "anthropic":
+        pcfg["route_through_router"] = False
     fixed_base = ensure_nvidia_hosted_base_url(pcfg) if provider == "nvidia-hosted" else False
     save_config(cfg)
     clear_model_cache()
     lines = [f"Provider set to {provider} ({PROVIDER_LABELS[provider]})."]
+    if provider == "anthropic":
+        lines.append("mode: anthropic-native")
     if fixed_base:
         lines.append(f"Base URL set to {pcfg['base_url']} for NVIDIA hosted.")
     return lines
+
+
+def set_provider_choice_config(choice: str) -> list[str]:
+    cfg = load_config()
+    if choice in (ANTHROPIC_NATIVE_PROVIDER_CHOICE, ANTHROPIC_ROUTED_PROVIDER_CHOICE):
+        cfg["current_provider"] = "anthropic"
+        pcfg = cfg["providers"]["anthropic"]
+        routed = choice == ANTHROPIC_ROUTED_PROVIDER_CHOICE
+        pcfg["route_through_router"] = routed
+        save_config(cfg)
+        clear_model_cache()
+        if routed:
+            lines = [
+                "Provider set to anthropic (Anthropic routed).",
+                "mode: anthropic-routed",
+            ]
+            if not meaningful_key(pcfg.get("api_key")):
+                lines.append("Anthropic routed mode will use Claude Code OAuth/API auth headers when available.")
+            return lines
+        return [
+            "Provider set to anthropic (Claude Native).",
+            "mode: anthropic-native",
+            "Claude Code OAuth/Max can be used directly, but claude-any router features such as /advisor are unavailable.",
+        ]
+    return set_provider_config(choice)
 
 
 def set_base_url_config(provider: str, url: str) -> list[str]:
@@ -16183,6 +16578,24 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ja": "テキストdeltaを空白/単語境界までバッファしてSSEイベントを送信します。tool deltaはそのまま透過します。",
         "zh": "在空白/单词边界处合并文本 delta 后发送 SSE 事件。工具 delta 原样透传。",
     },
+    "workflows_enabled": {
+        "en": "Allow Claude Code dynamic workflow features through the claude-any gateway. This removes the experimental-beta disable env for this launch.",
+        "ko": "claude-any 게이트웨이 경유 상태에서 Claude Code dynamic workflow 기능을 허용합니다. 이 실행에서는 experimental beta 차단 env를 제거합니다.",
+        "ja": "claude-any gateway 経由で Claude Code dynamic workflow 機能を許可します。この起動では experimental beta 無効化 env を外します。",
+        "zh": "允许 Claude Code dynamic workflow 通过 claude-any gateway 工作。本次启动会移除 experimental beta 禁用环境变量。",
+    },
+    "ultracode_enabled": {
+        "en": "Start Claude Code with the ultracode session setting. Requires verified xhigh_effort model capability.",
+        "ko": "Claude Code를 ultracode 세션 설정으로 시작합니다. 검증된 xhigh_effort 모델 capability가 필요합니다.",
+        "ja": "Claude Code を ultracode セッション設定で起動します。検証済みの xhigh_effort model capability が必要です。",
+        "zh": "用 ultracode 会话设置启动 Claude Code。需要已验证的 xhigh_effort 模型 capability。",
+    },
+    "claude_code_supported_capabilities": {
+        "en": "Comma-separated Claude Code capability override for the selected model: effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking.",
+        "ko": "선택 모델의 Claude Code capability override입니다. 쉼표로 effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking 를 지정합니다.",
+        "ja": "選択モデルの Claude Code capability override。カンマ区切りで effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking を指定します。",
+        "zh": "所选模型的 Claude Code capability override，逗号分隔：effort,xhigh_effort,max_effort,thinking,adaptive_thinking,interleaved_thinking。",
+    },
     "router_debug_external_access": {
         "en": "Expose the router UI/API to non-local clients for debugging. Off denies external clients and next launch binds locally unless environment overrides it.",
         "ko": "디버깅을 위해 라우터 UI/API를 외부 클라이언트에 노출합니다. off면 외부 요청을 차단하고 다음 실행부터 환경값이 없으면 로컬에만 바인딩합니다.",
@@ -16190,10 +16603,10 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "zh": "为了调试向外部客户端暴露路由器 UI/API。关闭时会拒绝外部请求；下次启动在没有环境变量覆盖时仅绑定本地。",
     },
     "route_through_router": {
-        "en": "Route Anthropic through the local claude-any router. This enables router features such as LLM channel injection, but requires an Anthropic API key and does not use Claude Code OAuth.",
-        "ko": "Anthropic을 로컬 claude-any 라우터로 경유합니다. LLM 채널 주입 같은 라우터 기능을 쓸 수 있지만 Anthropic API 키가 필요하고 Claude Code OAuth는 사용하지 않습니다.",
-        "ja": "Anthropic をローカル claude-any ルーター経由にします。LLM channel injection などのルーター機能を使えますが、Anthropic API key が必要で Claude Code OAuth は使いません。",
-        "zh": "通过本地 claude-any 路由器转发 Anthropic。可使用 LLM channel injection 等路由器功能，但需要 Anthropic API key，且不使用 Claude Code OAuth。",
+        "en": "Route Anthropic through the local claude-any router. This enables router features such as LLM channel injection. If no Anthropic API key is configured, the router forwards Claude Code OAuth/API auth headers.",
+        "ko": "Anthropic을 로컬 claude-any 라우터로 경유합니다. LLM 채널 주입 같은 라우터 기능을 쓸 수 있습니다. Anthropic API 키가 없으면 Claude Code의 OAuth/API 인증 헤더를 라우터가 전달합니다.",
+        "ja": "Anthropic をローカル claude-any ルーター経由にします。LLM channel injection などのルーター機能を使えます。Anthropic API key が未設定の場合は Claude Code の OAuth/API 認証ヘッダーをルーターが転送します。",
+        "zh": "通过本地 claude-any 路由器转发 Anthropic。可使用 LLM channel injection 等路由器功能。未配置 Anthropic API key 时，路由器会转发 Claude Code 的 OAuth/API 认证头。",
     },
     "router_debug_message_preview_chars": {
         "en": "When greater than 0, include the first N characters of the latest user message in router event data for debugging. Keep 0 for privacy.",
@@ -16260,6 +16673,8 @@ LLM_OPTION_TOGGLE_KEYS = {
     "rate_limit_status",
     "router_debug_external_access",
     "route_through_router",
+    "workflows_enabled",
+    "ultracode_enabled",
 }
 
 
@@ -16281,6 +16696,10 @@ def llm_option_current_bool(provider: str, pcfg: dict[str, Any], key: str) -> bo
         return router_debug_external_access_enabled()
     if key == "route_through_router":
         return anthropic_routed_enabled(provider, pcfg)
+    if key == "workflows_enabled":
+        return claude_code_workflows_enabled(provider, pcfg)
+    if key == "ultracode_enabled":
+        return claude_code_ultracode_enabled(provider, pcfg)
     return bool(pcfg.get(key, False))
 
 
@@ -16308,6 +16727,11 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
     add(ui_text("timeout_preset", lang), "timeout_profile", timeout_profile_status(pcfg, lang))
     add("Router debug external", "router_debug_external_access", "on" if router_debug_external_access_enabled() else "off")
     add("Event message preview", "router_debug_message_preview_chars", router_debug_message_preview_chars())
+    if not direct_native_anthropic_enabled(provider, pcfg):
+        caps = claude_code_capability_string(provider, pcfg, current_upstream_model_id(provider, pcfg))
+        add("Claude Code workflows", "workflows_enabled", "on" if claude_code_workflows_enabled(provider, pcfg) else "off")
+        add("Claude Code ultracode", "ultracode_enabled", "on" if claude_code_ultracode_enabled(provider, pcfg) else "off")
+        add("Claude Code capabilities", "claude_code_supported_capabilities", caps or "auto/none")
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         add("Context window", "num_ctx", ollama_num_ctx_status(pcfg))
@@ -16370,6 +16794,12 @@ def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> 
         return "true" if bool(pcfg.get("rate_limit_status", False)) else "false"
     if key == "rate_limit_enabled":
         return "true" if bool(router_rate_limit_configured_rpm(provider, pcfg)) else "false"
+    if key == "workflows_enabled":
+        return "true" if claude_code_workflows_enabled(provider, pcfg) else "false"
+    if key == "ultracode_enabled":
+        return "true" if claude_code_ultracode_enabled(provider, pcfg) else "false"
+    if key == "claude_code_supported_capabilities":
+        return claude_code_capability_string(provider, pcfg, current_upstream_model_id(provider, pcfg))
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         if key == "num_ctx":
@@ -16419,6 +16849,24 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
         save_config(cfg)
         clear_model_cache()
         return ["RPM limiter disabled.", "rate_limit_rpm: 0", "rate_limit_status: off"]
+    if key in ("workflows_enabled", "workflow", "workflows"):
+        pcfg["workflows_enabled"] = parse_bool(value, default=False)
+        save_config(cfg)
+        clear_model_cache()
+        return ["Claude Code workflow support updated.", f"workflows_enabled: {pcfg['workflows_enabled']}"]
+    if key in ("ultracode_enabled", "ultracode"):
+        pcfg["ultracode_enabled"] = parse_bool(value, default=False)
+        if pcfg["ultracode_enabled"]:
+            pcfg["workflows_enabled"] = True
+        save_config(cfg)
+        clear_model_cache()
+        return ["Claude Code ultracode setting updated.", f"ultracode_enabled: {pcfg['ultracode_enabled']}"]
+    if key in ("claude_code_supported_capabilities", "supported_capabilities", "capabilities"):
+        caps = normalize_claude_code_supported_capabilities(value)
+        pcfg["claude_code_supported_capabilities"] = caps
+        save_config(cfg)
+        clear_model_cache()
+        return ["Claude Code model capabilities updated.", f"capabilities: {','.join(caps) or 'none'}"]
     numeric_keys = {
         "context_window",
         "context",
@@ -16522,6 +16970,12 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg["stream_enabled"] = True
         elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
             pcfg["stream_word_chunking"] = False
+        elif key in ("workflows_enabled", "workflow", "workflows"):
+            pcfg["workflows_enabled"] = False
+        elif key in ("ultracode_enabled", "ultracode"):
+            pcfg["ultracode_enabled"] = False
+        elif key in ("claude_code_supported_capabilities", "supported_capabilities", "capabilities"):
+            pcfg.pop("claude_code_supported_capabilities", None)
         elif provider in OPENCODE_PROVIDER_NAMES and key.startswith("endpoint:"):
             model_id = normalize_model_id(provider, key.split(":", 1)[1].strip())
             endpoints = pcfg.get("model_endpoints")
@@ -16598,6 +17052,17 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         return
     if key in ("rate_limit_status", "rpm_status"):
         pcfg["rate_limit_status"] = parse_bool(value, default=False)
+        return
+    if key in ("workflows_enabled", "workflow", "workflows"):
+        pcfg["workflows_enabled"] = parse_bool(value, default=False)
+        return
+    if key in ("ultracode_enabled", "ultracode"):
+        pcfg["ultracode_enabled"] = parse_bool(value, default=False)
+        if pcfg["ultracode_enabled"]:
+            pcfg["workflows_enabled"] = True
+        return
+    if key in ("claude_code_supported_capabilities", "supported_capabilities", "capabilities"):
+        pcfg["claude_code_supported_capabilities"] = normalize_claude_code_supported_capabilities(value)
         return
     sample_key = sampling_option_key(key)
     if sample_key:
@@ -17171,6 +17636,20 @@ def apply_common_claude_env(provider: str, pcfg: dict[str, Any], env: dict[str, 
     advisor_model = str(pcfg.get("advisor_model") or "").strip()
     if advisor_model:
         env["CLAUDE_ANY_ADVISOR_MODEL"] = advisor_model
+    claude_model = str(env.get("ANTHROPIC_MODEL") or env.get("CLAUDE_ANY_MODEL_ALIAS") or "").strip()
+    capability_string = claude_code_capability_string(provider, pcfg, current_upstream_model_id(provider, pcfg))
+    if claude_model and capability_string:
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION"] = claude_model
+        env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"] = capability_string
+        for key in (
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        ):
+            if key in env:
+                env[f"{key}_SUPPORTED_CAPABILITIES"] = capability_string
+    if claude_code_workflows_enabled(provider, pcfg):
+        env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
     return env
 
 
@@ -17195,17 +17674,16 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         return env
     alias = current_alias(cfg)
     claude_model = claude_code_context_model_alias(provider, pcfg, alias)
-    auth_token = "not-used"
+    auth_token = ""
     if provider in ("deepseek", "opencode", "opencode-go") and meaningful_key(pcfg.get("api_key")):
         # Non-Anthropic native-compatible gateway integrations expect their key in
         # ANTHROPIC_AUTH_TOKEN. Keep ANTHROPIC_API_KEY unset to avoid Claude
         # Code's auth-conflict path, but do not send a dummy token that can
         # trigger gateway/Claude Code governor authentication failures.
         auth_token = str(pcfg["api_key"])
-    return apply_common_claude_env(provider, pcfg, {
+    env = {
         "CLAUDE_ANY_PROVIDER": provider,
         "ANTHROPIC_BASE_URL": ROUTER_BASE,
-        "ANTHROPIC_AUTH_TOKEN": auth_token,
         "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY": "1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
         "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
@@ -17216,7 +17694,27 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         "CLAUDE_CODE_SUBAGENT_MODEL": claude_model,
         "CLAUDE_ANY_MODEL_ALIAS": claude_model,
         "CLAUDE_ANY_BYPASS_PERMISSIONS": "1",
-    })
+    }
+    if auth_token:
+        env["ANTHROPIC_AUTH_TOKEN"] = auth_token
+    return apply_common_claude_env(provider, pcfg, env)
+
+
+def claude_code_runtime_settings(provider: str, pcfg: dict[str, Any]) -> dict[str, Any]:
+    settings: dict[str, Any] = {}
+    if claude_code_ultracode_enabled(provider, pcfg):
+        settings["ultracode"] = True
+    return settings
+
+
+def append_claude_code_runtime_settings_args(extra_args: list[str], passthrough: list[str], provider: str, pcfg: dict[str, Any]) -> None:
+    settings = claude_code_runtime_settings(provider, pcfg)
+    if not settings:
+        return
+    if has_passthrough_option(passthrough, "--settings"):
+        router_log("WARN", "claude_code_runtime_settings_skipped reason=passthrough_settings_present")
+        return
+    extra_args.extend(["--settings", json.dumps(settings, separators=(",", ":"))])
 
 
 def cmd_env(_: argparse.Namespace) -> None:
@@ -17239,9 +17737,13 @@ def cmd_env(_: argparse.Namespace) -> None:
         "CLAUDE_CODE_EFFORT_LEVEL",
         "ANTHROPIC_MODEL",
         "ANTHROPIC_CUSTOM_MODEL_OPTION",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
         "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
         "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
         "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES",
         "CLAUDE_CODE_SUBAGENT_MODEL",
         "CLAUDE_ANY_MODEL_ALIAS",
         "CLAUDE_ANY_PROVIDER",
@@ -17737,7 +18239,7 @@ def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         return "API key: set (NVIDIA)" if meaningful_key(key) else "API key: missing (NVIDIA required)"
     if provider == "anthropic":
         if anthropic_routed_enabled(provider, pcfg):
-            return "API key: set (Anthropic routed)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (Anthropic routed requires an API key)"
+            return "API key: set (Anthropic routed)" if meaningful_key(pcfg.get("api_key")) else "API key: not set (uses Claude Code OAuth/API auth headers)"
         return "API key: set (Anthropic)" if meaningful_key(pcfg.get("api_key")) else "API key: not set (use API key or Claude login)"
     if provider == "ollama-cloud":
         return "API key: set (Ollama Cloud)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (Ollama Cloud required)"
@@ -17827,6 +18329,8 @@ def preflight_lines() -> list[str]:
 def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
     cfg = cfg or load_config()
     provider, pcfg = get_current_provider(cfg)
+    if direct_native_anthropic_enabled(provider, pcfg):
+        return []
     status = base_url_status_line(provider, pcfg)
     low = status.lower()
     errors: list[str] = []
@@ -17851,8 +18355,13 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
     if provider in OPENCODE_PROVIDER_NAMES and not meaningful_key(pcfg.get("api_key")):
         label = PROVIDER_LABELS.get(provider, provider)
         errors.append(f"Launch blocked: {label} requires a {label} API key.")
-    if anthropic_routed_enabled(provider, pcfg) and not meaningful_key(pcfg.get("api_key")):
-        errors.append("Launch blocked: Anthropic routed mode requires an Anthropic API key.")
+    if claude_code_ultracode_enabled(provider, pcfg):
+        caps = set(claude_code_supported_capabilities(provider, pcfg, current_upstream_model_id(provider, pcfg)))
+        if "xhigh_effort" not in caps:
+            errors.append(
+                "Launch blocked: ultracode requires a Claude Code model capability set that includes xhigh_effort. "
+                "Use a compatible Claude model or set claude_code_supported_capabilities after verifying the provider/model supports xhigh workflow thinking."
+            )
     if provider == "lm-studio":
         try:
             ensure_lm_studio_model_loaded_for_context(pcfg, timeout=1.5)
@@ -18172,10 +18681,22 @@ def compact_text(value: Any, width: int = 72) -> str:
     return fit_cells(value, width)
 
 
+def provider_menu_label(provider: str, pcfg: dict[str, Any]) -> str:
+    if provider == "anthropic":
+        return "Anthropic routed" if anthropic_routed_enabled(provider, pcfg) else "Claude Native"
+    return PROVIDER_LABELS.get(provider, provider)
+
+
+def current_provider_panel_choice(provider: str, pcfg: dict[str, Any]) -> str:
+    if provider == "anthropic":
+        return ANTHROPIC_ROUTED_PROVIDER_CHOICE if anthropic_routed_enabled(provider, pcfg) else ANTHROPIC_NATIVE_PROVIDER_CHOICE
+    return provider
+
+
 def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lang: str) -> list[str]:
     return [
         f"0. {ui_text('language', lang)}  [{LANGUAGES.get(lang, lang)}]",
-        f"1. {ui_text('provider', lang)}  [{provider}]",
+        f"1. {ui_text('provider', lang)}  [{provider_menu_label(provider, pcfg)}]",
         f"2. {ui_text('api_key', lang)}  [{stored_api_key_mask(provider, pcfg)}]",
         f"3. {ui_text('base_url', lang)}  [{compact_text(pcfg.get('base_url', 'unset'), 62)}]",
         f"4. {ui_text('model', lang)}  [{compact_text(pcfg.get('current_model', 'unset'), 62)}]",
@@ -18194,6 +18715,16 @@ def provider_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
     current = cfg.get("current_provider", "nvidia-hosted")
     for key, label in PROVIDER_LABELS.items():
         pcfg = cfg.get("providers", {}).get(key, {})
+        if key == "anthropic":
+            routed = anthropic_routed_enabled(key, pcfg)
+            native_mark = "*" if current == key and not routed else " "
+            routed_mark = "*" if current == key and routed else " "
+            rows.append(f"{native_mark} {'Claude Native':<16} {'anthropic-native':<17} {compact_text(pcfg.get('base_url', ''), 52)}")
+            values.append(ANTHROPIC_NATIVE_PROVIDER_CHOICE)
+            suffix = "router via Claude Code auth" if not meaningful_key(pcfg.get("api_key")) else "router features"
+            rows.append(f"{routed_mark} {'Anthropic routed':<16} {'anthropic-routed':<17} {suffix}")
+            values.append(ANTHROPIC_ROUTED_PROVIDER_CHOICE)
+            continue
         mark = "*" if key == current else " "
         rows.append(f"{mark} {label:<16} {key:<15} {compact_text(pcfg.get('base_url', ''), 54)}")
         values.append(key)
@@ -18768,7 +19299,8 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
             panel_idx = panel_values.index(cfg.get("language", "en"))
         elif name == "provider":
             panel_rows, panel_values = provider_panel_rows(cfg)
-            panel_idx = panel_values.index(provider)
+            current_choice = current_provider_panel_choice(provider, pcfg)
+            panel_idx = panel_values.index(current_choice) if current_choice in panel_values else 0
         elif name == "api-key":
             panel_rows, panel_values = api_key_panel_rows(provider)
         elif name == "base-url":
@@ -18900,7 +19432,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                     refresh_checks()
                     close_panel(1)
                 elif panel == "provider" and value:
-                    messages = set_provider_config(value)
+                    messages = set_provider_choice_config(value)
                     refresh_checks()
                     main_idx = 4
                     open_panel("model")
@@ -22296,9 +22828,13 @@ def launch_claude(
             "ANTHROPIC_BASE_URL",
             "ANTHROPIC_MODEL",
             "ANTHROPIC_CUSTOM_MODEL_OPTION",
+            "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
             "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES",
             "ANTHROPIC_DEFAULT_OPUS_MODEL",
+            "ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES",
             "ANTHROPIC_DEFAULT_SONNET_MODEL",
+            "ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES",
             "CLAUDE_CODE_SUBAGENT_MODEL",
             "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY",
             "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
@@ -22318,6 +22854,7 @@ def launch_claude(
             "INFO",
             "claude_native_launch model=<defer-to-claude-code> advisor=off backend=<default-anthropic>",
         )
+        disable_claude_any_slash_commands_for_native()
     elif anthropic_routed_enabled(provider, pcfg):
         router_log(
             "INFO",
@@ -22325,8 +22862,9 @@ def launch_claude(
         )
     env.update(launch_env)
     if not use_native_anthropic:
+        preserve_anthropic_auth = anthropic_routed_enabled(provider, pcfg)
         for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
-            if key not in launch_env:
+            if key not in launch_env and not preserve_anthropic_auth:
                 env.pop(key, None)
         install_claude_any_slash_commands()
         install_tool_guard_hooks()
@@ -22402,6 +22940,7 @@ def launch_claude(
             native_channel_bridge=native_channel_bridge,
         )
     )
+    append_claude_code_runtime_settings_args(extra_args, launch_passthrough, provider, pcfg)
     cmd = [
         claude,
         "--dangerously-skip-permissions",
@@ -22461,6 +23000,7 @@ def _log_claude_command_for_diagnostics(cmd: list[str], env: dict[str, str]) -> 
         "CLAUDE_ANY_MODEL_ALIAS",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS",
         "CLAUDE_CODE_EFFORT_LEVEL",
+        "ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES",
     )
     env_summary = []
     for key in relevant_env_keys:

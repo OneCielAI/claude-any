@@ -10,7 +10,7 @@ Code starts, while passing normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.102`
+Current version: `0.1.103`
 
 ## Install
 
@@ -199,6 +199,34 @@ enable the Anthropic `route_through_router` LLM option and set an Anthropic API
 key. In that mode Claude Code still talks to `http://127.0.0.1:<router-port>`,
 and the router forwards Anthropic-compatible `/v1/messages` requests to the
 configured Anthropic base URL. Direct Claude Native mode remains the default.
+
+### Claude Code workflows and ultracode through the router
+
+Claude Any does not implement Claude Code workflows itself. In non-native
+provider mode, Claude Code still owns `/workflows`, `/deep-research`,
+subagents, MCP tools, and plan/tool execution. Claude Any only provides the
+Anthropic Messages-compatible gateway that Claude Code talks to through
+`ANTHROPIC_BASE_URL=http://127.0.0.1:<router-port>`.
+
+For providers routed through Claude Any, `LLM options` exposes:
+
+- `workflows_enabled=true|false`: allows Claude Code dynamic workflow features
+  through the router by removing Claude Any's experimental-beta disable env for
+  that launch.
+- `ultracode_enabled=true|false`: starts Claude Code with
+  `--settings {"ultracode":true}`. This is blocked at launch unless the selected
+  model capability set includes `xhigh_effort`.
+- `claude_code_supported_capabilities=...`: comma-separated override for the
+  selected model. Accepted values are `effort`, `xhigh_effort`, `max_effort`,
+  `thinking`, `adaptive_thinking`, and `interleaved_thinking`.
+
+Claude Any automatically infers Claude Code capabilities for known Claude model
+IDs such as `claude-opus-4-8`, `claude-opus-4-7`, `claude-opus-4-6`, and
+`claude-sonnet-4-6` when those IDs are served by a routed gateway such as
+OpenCode. Other providers/models require an explicit capability override before
+ultracode can be enabled. This avoids advertising `xhigh` workflow thinking for
+models that have not been verified to preserve Claude Code's thinking/tool
+round trip.
 
 - Claude Code docs: https://docs.anthropic.com/en/docs/claude-code
 - Claude Console API keys: https://console.anthropic.com/settings/keys

@@ -396,7 +396,7 @@ class LMStudioProviderTests(unittest.TestCase):
         env = claude_any.env_vars(cfg)
 
         self.assertEqual(claude_any.ROUTER_BASE, env["ANTHROPIC_BASE_URL"])
-        self.assertEqual("not-used", env["ANTHROPIC_AUTH_TOKEN"])
+        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
         self.assertEqual(claude_any.current_alias(cfg), env["ANTHROPIC_MODEL"])
         self.assertNotEqual(claude_any.native_anthropic_base_url("lm-studio", pcfg), env["ANTHROPIC_BASE_URL"])
         self.assertEqual("lm-studio", env["CLAUDE_ANY_PROVIDER"])

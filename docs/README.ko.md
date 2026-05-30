@@ -26,6 +26,12 @@
 
 ## 오늘 추가된 최고의 3가지 베네핏
 
+### 2026-05-28
+
+1. **non-native Claude Code workflow 준비** — router 경유 provider에서도 Claude Code의 dynamic workflow가 동작할 수 있도록 `workflows_enabled` 옵션을 추가했습니다. 이 옵션을 켜면 해당 실행에서 experimental beta 차단 env를 제거합니다.
+2. **ultracode capability guard** — `ultracode_enabled`는 `xhigh_effort` capability가 확인된 모델에서만 실행됩니다. 검증되지 않은 DeepSeek/OpenCode/로컬 모델에 xhigh workflow thinking을 잘못 광고하지 않습니다.
+3. **모델 capability override** — `claude_code_supported_capabilities=effort,xhigh_effort,...` 옵션으로 provider/model별 Claude Code capability를 명시할 수 있습니다. Claude Opus/Sonnet 계열 ID는 가능한 범위에서 자동 추론합니다.
+
 ### 2026-05-25
 
 1. **DeepSeek.com 프로바이더 지원** — DeepSeek의 Anthropic 호환 Claude Code 엔드포인트를 정식 프로바이더로 선택할 수 있고, 모델 프리셋과 API 키 설정 흐름을 제공합니다.
@@ -74,7 +80,7 @@ DeepSeek.com, OpenCode Zen, OpenCode Go, vLLM, NVIDIA hosted, self-hosted NIM을
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.102`
+현재 버전: `0.1.103`
 
 ## 왜 만들었나
 
