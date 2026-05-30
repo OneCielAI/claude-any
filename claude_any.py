@@ -21667,30 +21667,59 @@ def _channel_llm_summary_prompt_note(text: str) -> str:
     return truncate_for_prompt(body, 700)
 
 
-def format_channel_llm_summary_prompt(records: list[dict[str, Any]]) -> str:
-    parts = [
-        "[local channel update summary]",
-        "LOCAL NOTICE ONLY. 아래 항목은 외부 채널 메시지를 백그라운드에서 자동 처리한 결과입니다.",
-        "이 알림 자체에는 답장하지 말고, 이 내용을 외부 채널/DM/그룹방에 post/send 하지 마세요.",
-        "이 알림 때문에 도구를 호출하지 마세요. 사용자가 화면에서 알 수 있도록 필요한 경우에만 아주 짧게 상태를 말하세요.",
-    ]
-    for item in records:
-        note = _channel_llm_summary_prompt_note(str(item.get("summary") or ""))
-        parts.append(
-            "\n".join(
-                [
-                    f"message_id={item.get('message_id')}",
-                    f"channel={item.get('channel') or 'default'}",
-                    f"source={item.get('source') or ''}",
-                    f"sender={item.get('sender_id') or ''}",
-                    f"stop_reason={item.get('stop_reason') or ''}",
-                    f"tool_turns={item.get('tool_turns') or 0}",
-                    f"incoming={json.dumps(str(item.get('incoming') or ''), ensure_ascii=False)}",
-                    f"local_note={json.dumps(note or '(empty)', ensure_ascii=False)}",
-                ]
-            )
+def _channel_llm_summary_source_name(item: dict[str, Any]) -> str:
+    source = str(item.get("source") or "").strip()
+    if source:
+        return _channel_sse_public_mcp_name(source)
+    sender = str(item.get("sender_id") or "").strip()
+    if sender:
+        return _channel_sse_public_mcp_name(sender)
+    return "external-channel"
+
+
+def _channel_llm_summary_record_id(item: dict[str, Any]) -> int:
+    try:
+        return int(item.get("message_id") or 0)
+    except Exception:
+        return 0
+
+
+def _channel_llm_summary_digest_lines(records: list[dict[str, Any]]) -> list[str]:
+    visible = _channel_llm_summary_notice_records(records)
+    if not visible:
+        return []
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for item in visible:
+        grouped.setdefault(_channel_llm_summary_source_name(item), []).append(item)
+    lines: list[str] = ["[channel mailbox digest]"]
+    for source in sorted(grouped):
+        items = grouped[source]
+        ids = sorted(message_id for message_id in (_channel_llm_summary_record_id(item) for item in items) if message_id > 0)
+        if len(ids) >= 2:
+            id_text = f"{ids[0]}..{ids[-1]}"
+        elif ids:
+            id_text = str(ids[0])
+        else:
+            id_text = "-"
+        channels = ", ".join(
+            sorted(
+                {
+                    str(item.get("channel") or "default")
+                    for item in items
+                    if str(item.get("channel") or "default").strip()
+                }
+            )[:6]
         )
-    return "\n\n".join(parts)
+        channel_text = f" channels={channels}" if channels else ""
+        lines.append(
+            f"{source}에서 전달된 알림이 {len(items)}개 있습니다. {source}에서 확인하세요. "
+            f"message_ids={id_text}{channel_text}"
+        )
+    return lines
+
+
+def format_channel_llm_summary_prompt(records: list[dict[str, Any]]) -> str:
+    return "\n".join(_channel_llm_summary_digest_lines(records))
 
 
 def _channel_llm_summary_notice_actor(item: dict[str, Any]) -> str:
@@ -21748,29 +21777,10 @@ def _format_channel_llm_summary_notice_verbose(records: list[dict[str, Any]]) ->
 
 
 def _format_channel_llm_summary_notice_compact(records: list[dict[str, Any]]) -> str:
-    visible = _channel_llm_summary_notice_records(records)
-    if not visible:
+    lines = _channel_llm_summary_digest_lines(records)
+    if not lines:
         return ""
-    actor_counts: dict[str, int] = {}
-    stop_counts: dict[str, int] = {}
-    for item in visible:
-        actor = _channel_llm_summary_notice_actor(item)
-        actor_counts[actor] = actor_counts.get(actor, 0) + 1
-        stop_reason = str(item.get("stop_reason") or "end_turn")
-        stop_counts[stop_reason] = stop_counts.get(stop_reason, 0) + 1
-    actors = ", ".join(f"{name} x{count}" for name, count in sorted(actor_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:4])
-    stops = ", ".join(f"{name} x{count}" for name, count in sorted(stop_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:4])
-    latest = visible[-1]
-    latest_actor = _channel_llm_summary_notice_actor(latest)
-    latest_summary = re.sub(r"\s+", " ", str(latest.get("summary") or "")).strip()
-    latest_line = truncate_for_prompt(latest_summary, 220)
-    return (
-        "\r\n"
-        f"[claude-any channel] handled {len(visible)} background update(s); actors: {actors}; outcomes: {stops}; "
-        f"latest=#{latest.get('message_id')} {latest_actor} {latest.get('channel') or 'default'} -> {latest.get('stop_reason') or 'end_turn'}"
-        + (f" | {latest_line}" if latest_line else "")
-        + "\r\n"
-    )
+    return "\r\n" + " ".join(lines) + "\r\n"
 
 
 def format_channel_llm_summary_notice(records: list[dict[str, Any]]) -> str:
@@ -21806,9 +21816,12 @@ def body_with_pending_channel_summaries(body: dict[str, Any]) -> dict[str, Any]:
             _channel_llm_summary_write_cursor_locked(max_seen)
         except Exception as exc:
             router_log("WARN", f"channel_llm_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
+    prompt = format_channel_llm_summary_prompt(records)
+    if not prompt.strip():
+        return body
     out = dict(body)
     messages = [m for m in body.get("messages", []) if isinstance(m, dict)]
-    messages.append({"role": "user", "content": [{"type": "text", "text": format_channel_llm_summary_prompt(records)}]})
+    messages.append({"role": "user", "content": [{"type": "text", "text": prompt}]})
     out["messages"] = messages
     out_metadata = dict(metadata)
     out_metadata["claude_any_channel_summary_injected"] = True
@@ -22070,6 +22083,10 @@ def _inject_pending_channel_summaries(master_fd: int, enter_bytes: bytes | None 
         except Exception as exc:
             router_log("WARN", f"channel_stdin_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
     prompt = format_channel_llm_summary_prompt(records)
+    if not prompt.strip():
+        ids = ",".join(str(item.get("message_id") or "") for item in records)
+        router_log("INFO", f"channel_stdin_summary_skipped_quiet count={len(records)} message_ids={ids}")
+        return max_seen
     submit_bytes = _channel_wake_enter_bytes(enter_bytes)
     _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
     ids = ",".join(str(item.get("message_id") or "") for item in records)

@@ -479,6 +479,7 @@ class ChannelBridgeTests(unittest.TestCase):
             {
                 "message_id": 10,
                 "channel": "room_dm_a",
+                "source": "mcp-ai-net-sse",
                 "incoming": "New message from Sarah",
                 "stop_reason": "end_turn",
                 "tool_turns": 1,
@@ -487,6 +488,7 @@ class ChannelBridgeTests(unittest.TestCase):
             {
                 "message_id": 11,
                 "channel": "room_dm_a",
+                "source": "mcp-ai-net-sse",
                 "incoming": "New message from Sarah",
                 "stop_reason": "fallback_reply_sent",
                 "tool_turns": 5,
@@ -495,6 +497,7 @@ class ChannelBridgeTests(unittest.TestCase):
             {
                 "message_id": 12,
                 "channel": "room_team",
+                "source": "mcp-ai-net-sse",
                 "incoming": "New message from Joy",
                 "stop_reason": "end_turn",
                 "tool_turns": 3,
@@ -504,11 +507,11 @@ class ChannelBridgeTests(unittest.TestCase):
 
         notice = claude_any.format_channel_llm_summary_notice(records)
 
-        self.assertIn("handled 2 background update(s)", notice)
-        self.assertIn("Sarah x1", notice)
-        self.assertIn("Joy x1", notice)
-        self.assertIn("fallback_reply_sent x1", notice)
-        self.assertIn("latest=#12 Joy room_team", notice)
+        self.assertIn("channel mailbox digest", notice)
+        self.assertIn("ai-net-sse에서 전달된 알림이 2개 있습니다", notice)
+        self.assertIn("ai-net-sse에서 확인하세요", notice)
+        self.assertIn("message_ids=11..12", notice)
+        self.assertIn("channels=room_dm_a, room_team", notice)
         self.assertNotIn("NO_REPLY", notice)
         self.assertNotIn("direct_handler_summary", notice)
 
@@ -533,6 +536,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 {
                     "message_id": 56,
                     "channel": "room_generic",
+                    "source": "mcp-ai-net-sse",
                     "incoming": "New message from teammate",
                     "stop_reason": "fallback_reply_sent",
                     "tool_turns": 8,
@@ -546,9 +550,11 @@ class ChannelBridgeTests(unittest.TestCase):
             ]
         )
 
-        self.assertIn("LOCAL NOTICE ONLY", prompt)
-        self.assertIn("이 내용을 외부 채널/DM/그룹방에 post/send 하지 마세요", prompt)
-        self.assertIn("local_note=", prompt)
+        self.assertIn("channel mailbox digest", prompt)
+        self.assertIn("ai-net-sse에서 전달된 알림이 1개 있습니다", prompt)
+        self.assertIn("ai-net-sse에서 확인하세요", prompt)
+        self.assertNotIn("LOCAL NOTICE ONLY", prompt)
+        self.assertNotIn("local_note=", prompt)
         self.assertNotIn("[claude-any", prompt.lower())
         self.assertNotIn("direct_handler_summary", prompt)
         self.assertNotIn("## tool_result", prompt)
@@ -879,6 +885,7 @@ class ChannelBridgeTests(unittest.TestCase):
                     {
                         "message_id": 12,
                         "channel": "room_dm_generic",
+                        "source": "mcp-ai-net-sse",
                         "sender_id": "Sarah",
                         "stop_reason": "end_turn",
                         "tool_turns": 2,
@@ -908,9 +915,10 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual({"last_id": 12}, cursor_payload)
         self.assertEqual(2, write_all.call_count)
         payload = write_all.call_args_list[0].args[1]
-        self.assertIn("local channel update summary".encode("utf-8"), payload)
-        self.assertIn("LOCAL NOTICE ONLY".encode("utf-8"), payload)
-        self.assertIn("Sarah".encode("utf-8"), payload)
+        self.assertIn("channel mailbox digest".encode("utf-8"), payload)
+        self.assertIn("ai-net-sse에서 전달된 알림이 1개 있습니다".encode("utf-8"), payload)
+        self.assertIn("ai-net-sse에서 확인하세요".encode("utf-8"), payload)
+        self.assertNotIn("LOCAL NOTICE ONLY".encode("utf-8"), payload)
         self.assertTrue(payload.startswith(b"\x15"))
         self.assertEqual(b"\r\n", write_all.call_args_list[1].args[1])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
@@ -1155,6 +1163,7 @@ class ChannelBridgeTests(unittest.TestCase):
                     {
                         "message_id": 12,
                         "channel": "room_4pyr8vvwm2cd",
+                        "source": "mcp-ai-net-sse",
                         "sender": "Sarah",
                         "stop_reason": "end_turn",
                         "tool_turns": 1,
@@ -1184,10 +1193,11 @@ class ChannelBridgeTests(unittest.TestCase):
 
         self.assertEqual(2, len(out["messages"]))
         injected = out["messages"][-1]["content"][0]["text"]
-        self.assertIn("local channel update summary", injected)
-        self.assertIn("LOCAL NOTICE ONLY", injected)
-        self.assertIn("message_id=12", injected)
-        self.assertIn("Sarah에게 업무를 배정", injected)
+        self.assertIn("channel mailbox digest", injected)
+        self.assertIn("ai-net-sse에서 전달된 알림이 1개 있습니다", injected)
+        self.assertIn("message_ids=12", injected)
+        self.assertNotIn("LOCAL NOTICE ONLY", injected)
+        self.assertNotIn("Sarah에게 업무를 배정", injected)
         self.assertTrue(out["metadata"]["claude_any_channel_summary_injected"])
         self.assertEqual("12", out["metadata"]["claude_any_channel_summary_message_ids"])
         self.assertEqual({"last_id": 12}, cursor_payload)
