@@ -20251,6 +20251,8 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         "이전 자동 답장에서 이미 차단 사유나 대기 요청을 전달했다면, 반복 업데이트를 보내지 말고 로컬 요약만 남기세요. "
         "sender/from, recipients/to, room/channel, text를 기준으로 누가 누구에게 보낸 DM/그룹 메시지인지 먼저 판단하세요. "
         "알림 본문이 'New message...' 같은 짧은 통지이고 room/message id가 있으면 먼저 사용 가능한 read/get_messages 계열 도구로 실제 메시지를 조회하세요. "
+        "metadata의 message_id/source_message_id는 찾아야 할 실제 원본 메시지 id이지 after_id/cursor가 아닙니다. "
+        "짧은 통지를 조회할 때 그 id를 after_id/cursor로 쓰지 말고, 같은 room/channel의 최근 메시지를 충분히 읽은 뒤 id가 일치하는 항목을 찾으세요. "
         "DM/업무 지시/상태 확인/컨텍스트 요청처럼 안전한 협업 응답은 로컬 사용자 승인 없이 같은 채널/DM에 답장하거나 필요한 읽기/쓰기 도구를 호출하세요. "
         "로컬 사용자에게 '답장할까요?'처럼 답장 여부를 묻고 멈추지 마세요. "
         "짧은 DM/상태 확인/컨텍스트 요청은 범위를 작게 유지하세요. 실제 메시지를 읽은 뒤 같은 DM/채널에 직접 답장하는 것을 우선하세요. "
@@ -20703,6 +20705,80 @@ def _channel_direct_execute_tool(tool_use: dict[str, Any]) -> tuple[str, bool]:
     except Exception as exc:
         router_log("WARN", f"channel_llm_tool_call_failed tool_use_id={tool_id} server={state_name} tool={tool_name} error={type(exc).__name__}: {exc}")
         return f"{type(exc).__name__}: {exc}", True
+
+
+_CHANNEL_DIRECT_MESSAGE_CURSOR_KEYS = (
+    "after_id",
+    "after",
+    "before_id",
+    "before",
+    "cursor",
+    "page_token",
+    "next_cursor",
+)
+_CHANNEL_DIRECT_MESSAGE_LIMIT_KEYS = ("limit", "count", "max_results", "page_size")
+
+
+def _channel_direct_tool_reads_messages(tool_name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(tool_name or "").strip().lower()).strip("_")
+    return bool(normalized and "message" in normalized and normalized.startswith(("get_", "list_", "read_", "search_")))
+
+
+def _channel_direct_message_has_reference_notification(message: dict[str, Any]) -> bool:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    if not (meta.get("message_id") or meta.get("source_message_id")):
+        return False
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip().lower()
+    kind = str(meta.get("kind") or meta.get("event") or meta.get("type") or "").strip().lower()
+    if kind in {"activity", "message", "messages", "mention", "mentioned", "dm", "direct", "direct_message"}:
+        return True
+    return bool(
+        "new message" in body
+        or "mentioned" in body
+        or "mention" in body
+        or "dm" in body
+        or "direct message" in body
+        or "멘션" in body
+    )
+
+
+def _channel_direct_prepare_read_tool_use(tool_use: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
+    parts = _channel_direct_tool_name_parts(str(tool_use.get("name") or ""))
+    if parts is None or not _channel_direct_tool_reads_messages(parts[1]):
+        return tool_use
+    if not _channel_direct_message_has_reference_notification(message):
+        return tool_use
+    raw_input = tool_use.get("input") if isinstance(tool_use.get("input"), dict) else {}
+    adjusted = dict(raw_input)
+    removed = [key for key in _CHANNEL_DIRECT_MESSAGE_CURSOR_KEYS if key in adjusted]
+    for key in removed:
+        adjusted.pop(key, None)
+    if not any(key in adjusted for key in _CHANNEL_DIRECT_MESSAGE_LIMIT_KEYS):
+        adjusted["limit"] = 20
+    else:
+        for key in _CHANNEL_DIRECT_MESSAGE_LIMIT_KEYS:
+            if key not in adjusted:
+                continue
+            try:
+                current = int(float(adjusted.get(key) or 0))
+            except Exception:
+                current = 0
+            if current < 20:
+                adjusted[key] = 20
+            break
+    if adjusted == raw_input:
+        return tool_use
+    out = dict(tool_use)
+    out["input"] = adjusted
+    if removed:
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        router_log(
+            "INFO",
+            "channel_llm_read_cursor_normalized "
+            f"tool={parts[1]} message_ref={meta.get('message_id') or meta.get('source_message_id') or ''} "
+            f"removed={','.join(removed)}",
+        )
+    return out
 
 
 def _channel_direct_tool_uses(message: dict[str, Any]) -> list[dict[str, Any]]:
@@ -21272,7 +21348,8 @@ def _channel_direct_llm_router_response(message_id: int, prompt: str, message: d
                 continue
             if parts is not None:
                 executed_tool_names.append(parts[1])
-            result_text, is_error = _channel_direct_execute_tool(tool_use)
+            tool_use_for_call = _channel_direct_prepare_read_tool_use(tool_use, message)
+            result_text, is_error = _channel_direct_execute_tool(tool_use_for_call)
             results.append(
                 {
                     "type": "tool_result",

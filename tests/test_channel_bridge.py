@@ -994,7 +994,7 @@ class ChannelBridgeTests(unittest.TestCase):
                     "sender_id": "agent_2i7ibhkysdk1",
                     "recipients": ["agent_n3wy9gfjmcil"],
                     "message": "Sarah, 추가 매크로 분석 보고서를 보내주세요.",
-                    "meta": {"room_id": "room_4pyr8vvwm2cd", "sender": "Robert", "recipient": "Sarah"},
+                    "meta": {"room_id": "room_4pyr8vvwm2cd", "sender": "Robert", "recipient": "Sarah", "message_id": "msg_task"},
                 }
             ]
         )
@@ -1009,6 +1009,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn("NO_REPLY", prompt)
         self.assertIn("Sarah, 추가 매크로 분석 보고서를 보내주세요.", prompt)
         self.assertIn('to=["agent_n3wy9gfjmcil"]', prompt)
+        self.assertIn("message_id/source_message_id", prompt)
+        self.assertIn("after_id/cursor", prompt)
 
     def test_channel_tool_result_context_is_injected_for_remembered_tool_use(self):
         claude_any._CHANNEL_LLM_TOOL_CONTEXT.clear()
@@ -1684,6 +1686,56 @@ class ChannelBridgeTests(unittest.TestCase):
         )
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_reply_action_retry" in item for item in log_messages))
+
+    def test_channel_direct_router_response_expands_notification_message_reads(self):
+        calls: list[dict[str, object]] = []
+
+        def fake_http(_message_id, body, _provider, _pcfg, _model):
+            calls.append(json.loads(json.dumps(body, ensure_ascii=False)))
+            if len(calls) == 1:
+                return {
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_read",
+                            "name": "mcp__generic-sse__get_messages",
+                            "input": {"room_id": "room_dm_generic", "after_id": "msg_target", "limit": 3},
+                        }
+                    ],
+                    "stop_reason": "tool_use",
+                }
+            return {"content": [{"type": "text", "text": "NO_REPLY: checked message history."}], "stop_reason": "end_turn"}
+
+        with (
+            mock.patch.object(
+                claude_any,
+                "_channel_direct_tool_schemas",
+                return_value=[{"name": "mcp__generic-sse__get_messages"}, {"name": "mcp__generic-sse__send_message"}],
+            ),
+            mock.patch.object(claude_any, "_channel_direct_llm_http_message", side_effect=fake_http),
+            mock.patch.object(claude_any, "_channel_direct_execute_tool", return_value=("[]", False)) as execute_tool,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            text, stop_reason, tool_turns = claude_any._channel_direct_llm_router_response(
+                31,
+                "수신 메시지를 처리하세요",
+                {
+                    "id": 31,
+                    "channel": "room_dm_generic",
+                    "message": "New message from teammate",
+                    "meta": {"sse_source": "generic-sse", "message_id": "msg_target", "kind": "activity"},
+                },
+                "deepseek",
+                {"request_timeout_ms": 300000},
+                "deepseek-v4-pro",
+            )
+
+        self.assertEqual("NO_REPLY: checked message history.", text)
+        self.assertEqual("end_turn", stop_reason)
+        self.assertEqual(1, tool_turns)
+        self.assertEqual({"room_id": "room_dm_generic", "limit": 20}, execute_tool.call_args.args[0]["input"])
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_read_cursor_normalized" in item for item in log_messages))
 
     def test_channel_direct_router_response_marks_reply_required_unfulfilled(self):
         calls: list[dict[str, object]] = []
