@@ -82,7 +82,7 @@ passes normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.103`
+Current version: `0.1.104`
 
 ## Why This Exists
 

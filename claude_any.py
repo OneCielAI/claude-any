@@ -188,7 +188,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.103"
+VERSION = "0.1.104"
 
 
 def claude_any_source_fingerprint() -> str:

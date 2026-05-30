@@ -80,7 +80,7 @@ DeepSeek.com, OpenCode Zen, OpenCode Go, vLLM, NVIDIA hosted, self-hosted NIM을
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.103`
+현재 버전: `0.1.104`
 
 ## 왜 만들었나
 
