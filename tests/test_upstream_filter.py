@@ -92,6 +92,66 @@ class UpstreamFilterTests(unittest.TestCase):
         self.assertEqual(1, len(tool_call_messages))
         self.assertEqual("Read", tool_call_messages[0]["tool_calls"][0]["function"]["name"])
 
+    def test_persisted_tool_output_is_not_rewritten_on_ollama_path(self):
+        persisted = (
+            "<persisted-output>\n"
+            "Output too large (55.5KB). Full output saved to: /tmp/tool-results/toolu_1.json\n\n"
+            "Preview (first 2KB):\n"
+            "{\"ok\": true}\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "checkin", "input": {"ack_previous": True}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": persisted},
+                ],
+            },
+        ]
+
+        out = claude_any.anthropic_messages_to_ollama({"messages": messages})
+
+        tool_messages = [message for message in out if message.get("role") == "tool"]
+        self.assertEqual(1, len(tool_messages))
+        self.assertEqual(persisted, tool_messages[0]["content"])
+        self.assertFalse(any("Tool `checkin` completed successfully" in str(message.get("content", "")) for message in out))
+
+    def test_persisted_tool_output_is_not_rewritten_on_openai_path(self):
+        persisted = (
+            "<persisted-output>\n"
+            "Output too large (55.5KB). Full output saved to: /tmp/tool-results/toolu_1.json\n\n"
+            "Preview (first 2KB):\n"
+            "{\"ok\": true}\n"
+            "</persisted-output>"
+        )
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "id": "toolu_1", "name": "checkin", "input": {"ack_previous": True}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": persisted},
+                ],
+            },
+        ]
+
+        out = claude_any.anthropic_messages_to_openai({"messages": messages})
+
+        tool_messages = [message for message in out if message.get("role") == "tool"]
+        self.assertEqual(1, len(tool_messages))
+        self.assertEqual(persisted, tool_messages[0]["content"])
+        self.assertFalse(any("Tool `checkin` completed successfully" in str(message.get("content", "")) for message in out))
+
 
 if __name__ == "__main__":
     unittest.main()
