@@ -186,6 +186,19 @@ class LMStudioProviderTests(unittest.TestCase):
         self.assertIn("deepseek-v4-pro", models)
         write_cache.assert_called_once()
 
+    def test_ollama_cloud_launch_env_sets_auth_token_for_claude_login_gate(self):
+        cfg = {
+            "current_provider": "ollama-cloud",
+            "providers": {"ollama-cloud": dict(claude_any.DEFAULT_CONFIG["providers"]["ollama-cloud"])},
+        }
+        cfg["providers"]["ollama-cloud"]["api_key"] = "ollama-cloud-key"
+
+        env = claude_any.env_vars(cfg)
+
+        self.assertEqual(claude_any.ROUTER_BASE, env["ANTHROPIC_BASE_URL"])
+        self.assertEqual("ollama-cloud-key", env["ANTHROPIC_AUTH_TOKEN"])
+        self.assertNotIn("ANTHROPIC_API_KEY", env)
+
     def test_lm_studio_set_model_does_not_fetch_model_list(self):
         cfg = {
             "current_provider": "lm-studio",
@@ -396,7 +409,7 @@ class LMStudioProviderTests(unittest.TestCase):
         env = claude_any.env_vars(cfg)
 
         self.assertEqual(claude_any.ROUTER_BASE, env["ANTHROPIC_BASE_URL"])
-        self.assertNotIn("ANTHROPIC_AUTH_TOKEN", env)
+        self.assertEqual("not-used", env["ANTHROPIC_AUTH_TOKEN"])
         self.assertEqual(claude_any.current_alias(cfg), env["ANTHROPIC_MODEL"])
         self.assertNotEqual(claude_any.native_anthropic_base_url("lm-studio", pcfg), env["ANTHROPIC_BASE_URL"])
         self.assertEqual("lm-studio", env["CLAUDE_ANY_PROVIDER"])

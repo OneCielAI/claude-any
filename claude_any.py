@@ -17674,13 +17674,7 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
         return env
     alias = current_alias(cfg)
     claude_model = claude_code_context_model_alias(provider, pcfg, alias)
-    auth_token = ""
-    if provider in ("deepseek", "opencode", "opencode-go") and meaningful_key(pcfg.get("api_key")):
-        # Non-Anthropic native-compatible gateway integrations expect their key in
-        # ANTHROPIC_AUTH_TOKEN. Keep ANTHROPIC_API_KEY unset to avoid Claude
-        # Code's auth-conflict path, but do not send a dummy token that can
-        # trigger gateway/Claude Code governor authentication failures.
-        auth_token = str(pcfg["api_key"])
+    auth_token = claude_code_router_auth_token(provider, pcfg)
     env = {
         "CLAUDE_ANY_PROVIDER": provider,
         "ANTHROPIC_BASE_URL": ROUTER_BASE,
@@ -17698,6 +17692,19 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
     if auth_token:
         env["ANTHROPIC_AUTH_TOKEN"] = auth_token
     return apply_common_claude_env(provider, pcfg, env)
+
+
+def claude_code_router_auth_token(provider: str, pcfg: dict[str, Any]) -> str:
+    if provider == "anthropic":
+        return ""
+    key = nvidia_api_key() if provider == "nvidia-hosted" else ""
+    if not key:
+        key = str(pcfg.get("api_key") or "")
+    if meaningful_key(key):
+        return key
+    if provider == "ollama":
+        return "ollama"
+    return "not-used"
 
 
 def claude_code_runtime_settings(provider: str, pcfg: dict[str, Any]) -> dict[str, Any]:
