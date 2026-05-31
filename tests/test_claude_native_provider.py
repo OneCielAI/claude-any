@@ -76,6 +76,22 @@ class ProviderLabelTests(unittest.TestCase):
         self.assertIn("Provider  [Claude Native]", claude_any.main_menu_rows(cfg, "anthropic", native, "en")[1])
         self.assertIn("Provider  [Anthropic routed]", claude_any.main_menu_rows(cfg, "anthropic", routed, "en")[1])
 
+    def test_routed_anthropic_resolves_tool_model_aliases(self):
+        pcfg = {"current_model": "claude-opus-4-8"}
+        body = {
+            "model": "claude-any-anthropic-claude-opus-4-8",
+            "tools": [
+                {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+                {"type": "advisor_20260301", "name": "advisor", "model": "claude-any-anthropic-claude-opus-4-8"},
+            ],
+        }
+
+        out = claude_any.resolve_tool_model_references("anthropic", pcfg, body)
+
+        self.assertEqual("claude-opus-4-8", out["tools"][1]["model"])
+        self.assertIs(body["tools"][0], out["tools"][0])
+        self.assertEqual("claude-any-anthropic-claude-opus-4-8", body["tools"][1]["model"])
+
     def test_provider_choice_toggles_anthropic_routing(self):
         cfg = {
             "current_provider": "anthropic",

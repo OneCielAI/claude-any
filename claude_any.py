@@ -5608,6 +5608,38 @@ def resolve_requested_model(provider: str, pcfg: dict[str, Any], requested: str 
     return fallback
 
 
+def resolve_tool_model_references(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return body
+    changed = False
+    resolved_count = 0
+    next_tools: list[Any] = []
+    for tool in tools:
+        if not isinstance(tool, dict):
+            next_tools.append(tool)
+            continue
+        model = tool.get("model")
+        if not isinstance(model, str) or not model.strip():
+            next_tools.append(tool)
+            continue
+        resolved = resolve_requested_model(provider, pcfg, model)
+        if resolved and resolved != model:
+            next_tool = dict(tool)
+            next_tool["model"] = resolved
+            next_tools.append(next_tool)
+            changed = True
+            resolved_count += 1
+        else:
+            next_tools.append(tool)
+    if not changed:
+        return body
+    out = dict(body)
+    out["tools"] = next_tools
+    router_log("INFO", f"resolved upstream tool model references for {provider}: {resolved_count}")
+    return out
+
+
 def list_model_objects(provider: str, pcfg: dict[str, Any]) -> list[dict[str, Any]]:
     return [model_object(provider, mid, pcfg) for mid in upstream_model_ids(provider, pcfg)]
 
@@ -12775,6 +12807,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             if provider == "nvidia-hosted":
                 upstream_model = ncp_model_id_for_nvidia_hosted(upstream_model)
             body["model"] = upstream_model
+            body = resolve_tool_model_references(provider, pcfg, body)
             stream_enabled = bool(pcfg.get("stream_enabled", True))
             word_chunking = bool(pcfg.get("stream_word_chunking", False))
             if not stream_enabled:
