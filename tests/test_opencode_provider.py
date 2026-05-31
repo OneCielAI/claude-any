@@ -226,7 +226,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("https://opencode.ai/zen/v1/models", url)
         headers = http_json.call_args.kwargs["headers"]
         self.assertEqual("Bearer sk-opencode-test", headers["authorization"])
-        self.assertEqual(f"claude-any/{claude_any.VERSION}", headers["user-agent"])
+        self.assertEqual("claude-cli", headers["user-agent"])
         self.assertIn("claude-sonnet-4-6", models)
         self.assertIn("glm-5.1", models)
         self.assertIn("gpt-5.1", models)
@@ -253,7 +253,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("https://opencode.ai/zen/go/v1/models", url)
         headers = http_json.call_args.kwargs["headers"]
         self.assertEqual("Bearer sk-opencode-test", headers["authorization"])
-        self.assertEqual(f"claude-any/{claude_any.VERSION}", headers["user-agent"])
+        self.assertEqual("claude-cli", headers["user-agent"])
         self.assertIn("qwen3.6-plus", models)
         self.assertIn("glm-5.1", models)
         self.assertIn("deepseek-v4-pro", models)
@@ -324,7 +324,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("Bearer sk-opencode-test", headers["authorization"])
         self.assertEqual("sk-opencode-test", headers["x-api-key"])
         self.assertEqual("2023-06-01", headers["anthropic-version"])
-        self.assertEqual(f"claude-any/{claude_any.VERSION}", headers["user-agent"])
+        self.assertEqual("claude-cli", headers["user-agent"])
 
     def test_provider_headers_include_opencode_go_api_key(self):
         pcfg = self.opencode_go_cfg(api_key="sk-opencode-test")["providers"]["opencode-go"]
@@ -332,7 +332,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("Bearer sk-opencode-test", headers["authorization"])
         self.assertEqual("sk-opencode-test", headers["x-api-key"])
         self.assertEqual("2023-06-01", headers["anthropic-version"])
-        self.assertEqual(f"claude-any/{claude_any.VERSION}", headers["user-agent"])
+        self.assertEqual("claude-cli", headers["user-agent"])
 
     def test_zen_endpoint_family_mapping(self):
         self.assertEqual("anthropic-messages", claude_any.opencode_zen_endpoint_kind("claude-sonnet-4-6"))

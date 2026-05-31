@@ -35,10 +35,12 @@ class LMStudioProviderTests(unittest.TestCase):
         headers = claude_any.provider_headers("lm-studio", {"api_key": ""})
         self.assertNotIn("authorization", headers)
         self.assertNotIn("x-api-key", headers)
+        self.assertEqual("claude-cli", headers["user-agent"])
 
         keyed = claude_any.provider_headers("lm-studio", {"api_key": "lm-key"})
         self.assertEqual("Bearer lm-key", keyed["authorization"])
         self.assertEqual("lm-key", keyed["x-api-key"])
+        self.assertEqual("claude-cli", keyed["user-agent"])
 
     def test_openai_compatible_request_for_lm_studio(self):
         body = {

@@ -124,6 +124,7 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertEqual("Bearer sk-deepseek-test", headers["authorization"])
         self.assertEqual("sk-deepseek-test", headers["x-api-key"])
         self.assertEqual("2023-06-01", headers["anthropic-version"])
+        self.assertEqual("claude-cli", headers["user-agent"])
 
 
 if __name__ == "__main__":

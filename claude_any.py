@@ -189,6 +189,25 @@ OFFICIAL_CHANNEL_PLUGINS = {
 }
 APP_NAME = "Claude Any"
 VERSION = "0.1.104"
+DEFAULT_UPSTREAM_USER_AGENT = "claude-cli"
+
+
+def upstream_user_agent() -> str:
+    """Return the User-Agent used for upstream provider HTTP calls.
+
+    Some provider gateways/WAFs treat Python's default urllib identity as a
+    non-CLI browser signature. claude-any is acting as the Claude CLI transport
+    here, so keep that identity explicit and generic across providers.
+    """
+    configured = str(os.environ.get("CLAUDE_ANY_UPSTREAM_USER_AGENT") or "").strip()
+    return configured or DEFAULT_UPSTREAM_USER_AGENT
+
+
+def with_upstream_user_agent(headers: dict[str, str] | None = None) -> dict[str, str]:
+    out = dict(headers or {})
+    if not any(str(k).lower() == "user-agent" for k in out):
+        out["user-agent"] = upstream_user_agent()
+    return out
 
 
 def claude_any_source_fingerprint() -> str:
@@ -507,7 +526,7 @@ def ollama_catalog_is_stale(catalog: dict[str, Any], ttl_seconds: int = OLLAMA_M
 
 
 def fetch_json_url(url: str, timeout: float = 12.0) -> Any:
-    req = urllib.request.Request(url, headers={"user-agent": f"claude-any/{VERSION}"})
+    req = urllib.request.Request(url, headers=with_upstream_user_agent())
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read(5_000_000).decode("utf-8", errors="replace"))
 
@@ -559,7 +578,7 @@ def fetch_ollama_library_context_map(base_model: str, timeout: float = 10.0) -> 
     merged: dict[str, int] = {}
     source_url: str | None = None
     for url in urls:
-        req = urllib.request.Request(url, headers={"user-agent": f"claude-any/{VERSION}"})
+        req = urllib.request.Request(url, headers=with_upstream_user_agent())
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read(3_000_000)
@@ -2702,7 +2721,7 @@ def disable_claude_any_slash_commands_for_native() -> None:
 
 
 def http_json(url: str, headers: dict[str, str] | None = None, timeout: float = 8.0) -> Any:
-    req = urllib.request.Request(url, headers=headers or {})
+    req = urllib.request.Request(url, headers=with_upstream_user_agent(headers))
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -4360,7 +4379,7 @@ ANTHROPIC_PUBLIC_MODEL_ID_RE = re.compile(
 
 
 def fetch_text_url(url: str, timeout: float = 8.0) -> str:
-    req = urllib.request.Request(url, headers={"user-agent": f"claude-any/{VERSION}"})
+    req = urllib.request.Request(url, headers=with_upstream_user_agent())
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read(5_000_000).decode("utf-8", errors="replace")
 
@@ -4497,9 +4516,7 @@ def nvidia_hosted_list_headers() -> dict[str, str]:
 
 
 def provider_model_list_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
-    headers = {"content-type": "application/json"}
-    if provider in OPENCODE_PROVIDER_NAMES:
-        headers["user-agent"] = f"claude-any/{VERSION}"
+    headers = with_upstream_user_agent({"content-type": "application/json"})
     key = pcfg.get("api_key")
     if provider == "anthropic" and key:
         headers["anthropic-version"] = "2023-06-01"
@@ -4512,7 +4529,7 @@ def provider_model_list_headers(provider: str, pcfg: dict[str, Any]) -> dict[str
 
 def post_json(url: str, body: Any, headers: dict[str, str] | None = None, timeout: float = 60.0) -> Any:
     data = json.dumps(body).encode("utf-8")
-    req = urllib.request.Request(url, data=data, headers=headers or {}, method="POST")
+    req = urllib.request.Request(url, data=data, headers=with_upstream_user_agent(headers), method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode("utf-8"))
 
@@ -5050,9 +5067,7 @@ def ncp_model_id_for_nvidia_hosted(model_id: str) -> str:
 
 
 def provider_headers(provider: str, pcfg: dict[str, Any], inbound_headers: Any | None = None) -> dict[str, str]:
-    headers = {"content-type": "application/json", "anthropic-version": "2023-06-01"}
-    if provider in OPENCODE_PROVIDER_NAMES:
-        headers["user-agent"] = f"claude-any/{VERSION}"
+    headers = with_upstream_user_agent({"content-type": "application/json", "anthropic-version": "2023-06-01"})
     key = pcfg.get("api_key") or "not-used"
     if provider == "anthropic":
         if meaningful_key(pcfg.get("api_key")):
@@ -18350,6 +18365,7 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
     key = pcfg.get("api_key")
     if meaningful_key(key):
         headers = {"x-api-key": key, "authorization": f"Bearer {key}"}
+    headers = with_upstream_user_agent(headers)
     try:
         req = urllib.request.Request(join_url(base, path), headers=headers)
         with urllib.request.urlopen(req, timeout=2.5) as resp:
