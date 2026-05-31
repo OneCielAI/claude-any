@@ -52,7 +52,70 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("qwen3.6-plus", pcfg["current_model"])
         self.assertEqual("qwen3.5-plus", pcfg["haiku_model"])
         self.assertEqual("qwen3.6-plus", pcfg["subagent_model"])
+        self.assertEqual(1048576, pcfg["context_window"])
         self.assertTrue(pcfg["native_compat"])
+
+    def test_qwen36_plus_models_are_million_context(self):
+        models = ["qwen3.6-plus", "qwen3.6-plus-free", "Qwen3.6 Plus", "Qwen3.6 Plus Free"]
+        for model in models:
+            with self.subTest(model=model):
+                pcfg = self.opencode_go_cfg(current_model=model, context_window=262144)["providers"]["opencode-go"]
+
+                with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=None):
+                    self.assertEqual(1048576, claude_any.model_context_hint_from_model_id(model))
+                    self.assertEqual(1048576, claude_any.provider_model_context_capacity("opencode-go", pcfg))
+                    self.assertEqual("million-context", claude_any.model_option_family("opencode-go", pcfg))
+                    self.assertEqual("million-context-1m", claude_any.recommended_preset_id("opencode-go", pcfg))
+
+    def test_qwen36_non_plus_models_remain_quarter_million_context(self):
+        pcfg = self.opencode_go_cfg(current_model="qwen3.6-27b-mtp", context_window=262144)["providers"]["opencode-go"]
+
+        with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=None):
+            self.assertEqual(262144, claude_any.model_context_hint_from_model_id("qwen3.6-27b-mtp"))
+            self.assertEqual("long-context", claude_any.model_option_family("opencode-go", pcfg))
+            self.assertEqual("long-context-65k", claude_any.recommended_preset_id("opencode-go", pcfg))
+
+    def test_qwen36_plus_auto_preset_applies_one_million_context(self):
+        pcfg = self.opencode_go_cfg(current_model="qwen3.6-plus-free", context_window=262144)["providers"]["opencode-go"]
+
+        with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=None):
+            messages = claude_any.auto_apply_recommended_llm_preset_for_model("opencode-go", pcfg, "en")
+
+        self.assertEqual("million-context-1m", pcfg["llm_preset"])
+        self.assertEqual(1048576, pcfg["context_window"])
+        self.assertTrue(any("Ultra context 1M" in message for message in messages))
+
+    def test_migration_updates_old_qwen36_plus_default_context(self):
+        cfg = {
+            "migrations": {},
+            "providers": {
+                "opencode-go": {
+                    "current_model": "qwen3.6-plus-free",
+                    "context_window": 262144,
+                }
+            },
+        }
+
+        claude_any.apply_config_migrations(cfg)
+
+        self.assertEqual(1048576, cfg["providers"]["opencode-go"]["context_window"])
+        self.assertTrue(cfg["migrations"]["opencode_go_qwen36_plus_context_1m_20260530"])
+
+    def test_migration_keeps_non_plus_qwen36_context(self):
+        cfg = {
+            "migrations": {},
+            "providers": {
+                "opencode-go": {
+                    "current_model": "qwen3.6-27b-mtp",
+                    "context_window": 262144,
+                }
+            },
+        }
+
+        claude_any.apply_config_migrations(cfg)
+
+        self.assertEqual(262144, cfg["providers"]["opencode-go"]["context_window"])
+        self.assertTrue(cfg["migrations"]["opencode_go_qwen36_plus_context_1m_20260530"])
 
     def test_env_vars_route_opencode_through_claude_any_router(self):
         cfg = self.opencode_cfg(api_key="sk-opencode-test")

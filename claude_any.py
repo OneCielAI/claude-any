@@ -1594,7 +1594,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "advisor_model": "",
             "custom_models": ["qwen3.6-plus"],
             "native_compat": True,
-            "context_window": 262144,
+            "context_window": 1048576,
             "max_output_tokens": 8192,
             "context_reserve_tokens": 8192,
             "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT_MS,
@@ -1791,6 +1791,18 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
             and bool(pcfg.get("rate_limit_status", True))
         ):
             pcfg["rate_limit_status"] = False
+        migrations[marker] = True
+
+    marker = "opencode_go_qwen36_plus_context_1m_20260530"
+    if not migrations.get(marker):
+        providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        pcfg = providers.get("opencode-go")
+        if (
+            isinstance(pcfg, dict)
+            and is_qwen36_plus_model_id(str(pcfg.get("current_model") or ""))
+            and positive_int(pcfg.get("context_window")) == 262144
+        ):
+            pcfg["context_window"] = 1048576
         migrations[marker] = True
 
 
@@ -15268,10 +15280,14 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
     if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
+        hint_limit = model_context_hint_from_model_id(model)
         server_limit = (
-            model_context_hint_from_model_id(model)
-            if provider == "lm-studio"
-            else upstream_model_context_limit(provider, pcfg, timeout=1.5)
+            hint_limit
+            or (
+                0
+                if provider == "lm-studio"
+                else upstream_model_context_limit(provider, pcfg, timeout=1.5)
+            )
         ) or 0
         ctx = server_limit or positive_int(pcfg.get("context_window")) or 0
         if ctx >= 524288:
@@ -15508,10 +15524,17 @@ CONTEXT_HEAVY_PRESETS = {
 }
 
 
+def is_qwen36_plus_model_id(model_id: str) -> bool:
+    compact = re.sub(r"[^a-z0-9]+", "", (model_id or "").lower())
+    return "qwen36plus" in compact
+
+
 def model_context_hint_from_model_id(model_id: str) -> int | None:
     model = (model_id or "").lower()
     if not model:
         return None
+    if is_qwen36_plus_model_id(model_id):
+        return 1048576
     catalog_limit, _, _ = ollama_catalog_context_for_model(model_id)
     if catalog_limit:
         return catalog_limit
