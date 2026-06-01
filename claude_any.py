@@ -12652,6 +12652,8 @@ def open_openai_stream_with_rate_retry(
     pcfg: dict[str, Any],
     model: str,
     retry_notice: Callable[[str], None] | None = None,
+    *,
+    retry_rate_limits: bool = True,
 ) -> Any:
     gateway_retries = configured_gateway_retries(pcfg)
     max_attempts = max(1, gateway_retries + 1)
@@ -12680,7 +12682,7 @@ def open_openai_stream_with_rate_retry(
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="ignore")
             learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
-            if exc.code == 429 and attempt + 1 < max_attempts:
+            if exc.code == 429 and retry_rate_limits and attempt + 1 < max_attempts:
                 skip_retry, retry_after_seconds = retry_after_exceeds_request_timeout(exc.headers, timeout)
                 if skip_retry:
                     write_router_activity("error", provider, model, code=exc.code, retry_after=retry_after_seconds, tokens=token_estimate, bytes=byte_estimate, stream=True)
@@ -12731,6 +12733,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
     upstream_body = body_with_advisor_tool(body, pcfg) if advisor_provider_supported(provider) else body
     url = join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions")
     waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
+    compatibility_test = str(handler.headers.get(COMPATIBILITY_TEST_HEADER) or "").strip().lower() in ("1", "true", "yes", "on")
     stream_enabled = bool(pcfg.get("stream_enabled", True))
     stream = True if provider == "nvidia-hosted" else bool(body.get("stream", stream_enabled)) and stream_enabled
     if stream and advisor_model_enabled(pcfg) and advisor_provider_supported(provider):
@@ -12763,6 +12766,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
                 pcfg,
                 model,
                 emit_retry_notice,
+                retry_rate_limits=not compatibility_test,
             )
             stream_ok = stream_openai_chat_to_anthropic_sse(
                 handler,
@@ -12800,6 +12804,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
             pcfg,
             model,
             None,
+            retry_rate_limits=not compatibility_test,
         )
     except RuntimeError as exc:
         write_json(handler, {"type": "error", "error": {"type": "upstream_error", "message": str(exc)}}, 500)
@@ -17419,6 +17424,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
 
 
 COMPAT_TOOL_NAME = "compat_echo"
+COMPATIBILITY_TEST_HEADER = "x-claude-any-compatibility-test"
 
 
 def compatibility_tool_schema() -> dict[str, Any]:
@@ -17845,12 +17851,14 @@ def _cmd_test(args: argparse.Namespace) -> None:
         start_router_if_needed()
     url = join_url(base, "/v1/messages")
     headers = provider_headers(provider, pcfg)
+    headers[COMPATIBILITY_TEST_HEADER] = "1"
     if ollama_native:
         headers = {
             "content-type": "application/json",
             "anthropic-version": "2023-06-01",
             "authorization": "Bearer ollama",
             "x-api-key": "ollama",
+            COMPATIBILITY_TEST_HEADER: "1",
         }
     text_body = compatibility_text_request(model)
     tool_body = compatibility_tool_request(model)

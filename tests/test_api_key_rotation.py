@@ -221,6 +221,41 @@ class ApiKeyRotationTests(unittest.TestCase):
         self.assertIn("Retry-After", str(caught.exception))
         sleep.assert_not_called()
 
+    def test_stream_429_can_disable_rate_limit_retry_for_compatibility_tests(self):
+        pcfg = self.provider_pcfg("opencode", api_key="sk-one", current_model="deepseek-v4-flash-free")
+        error = urllib.error.HTTPError(
+            "https://opencode.ai/zen/v1/chat/completions",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "300"},
+            io.BytesIO(
+                b'{"type":"error","error":{"type":"FreeUsageLimitError",'
+                b'"message":"Rate limit exceeded. Please try again later."},"metadata":{}}'
+            ),
+        )
+
+        with (
+            mock.patch.object(claude_any.urllib.request, "urlopen", side_effect=error) as urlopen,
+            mock.patch.object(claude_any, "write_router_activity"),
+            mock.patch.object(claude_any, "learn_router_rate_limit_headers"),
+            mock.patch.object(claude_any.time, "sleep") as sleep,
+        ):
+            with self.assertRaises(RuntimeError) as caught:
+                claude_any.open_openai_stream_with_rate_retry(
+                    "https://opencode.ai/zen/v1/chat/completions",
+                    {"model": "deepseek-v4-flash-free", "messages": [], "stream": True},
+                    {},
+                    120.0,
+                    "opencode",
+                    pcfg,
+                    "deepseek-v4-flash-free",
+                    retry_rate_limits=False,
+                )
+
+        self.assertEqual(1, urlopen.call_count)
+        self.assertIn("FreeUsageLimitError", str(caught.exception))
+        sleep.assert_not_called()
+
     def test_compatibility_api_key_probe_uses_provider_specific_routes(self):
         cases = [
             ("ollama-cloud", "glm-5.1", "/api/chat"),

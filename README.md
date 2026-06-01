@@ -593,6 +593,11 @@ steps under that larger model's supervision.
   `Retry-After` longer than the current request timeout now fail fast and report
   the provider's real error type/message plus `Retry-After`, instead of sleeping
   until Claude Code surfaces the situation as a generic timeout.
+- **Compatibility-test rate-limit diagnostics**: compatibility-test requests now
+  mark themselves for the local router, and router-backed OpenAI-compatible
+  paths skip rate-limit retry sleeps for those probes. A provider-side 429 should
+  show as the provider's rate-limit error instead of leaving the menu stuck and
+  later reporting a generic timeout.
 - **Claude native model registry refresh**: Anthropic native model refresh now
   prefers the official Claude model documentation before falling back to API
   model-list endpoints, stores the refreshed list in a provider-scoped
