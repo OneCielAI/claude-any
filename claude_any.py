@@ -19903,9 +19903,9 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         _, out = self_cmd(["test"])
                         lines = [line for line in out.splitlines() if line.strip()]
                         messages = lines[-8:] if lines else ["Test produced no output."]
-                        panel_rows, panel_values = ["Run compatibility test again", "Back"], ["run", "back"]
+                        test_ok = "Compatibility: OK" in out
                         refresh_checks()
-                        main_idx = 9 if "Compatibility: OK" in out else 4
+                        close_panel(9 if test_ok else 4)
                 elif panel == "log-level":
                     if value == "back":
                         close_panel()
