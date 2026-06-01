@@ -235,6 +235,8 @@ CHAT_MESSAGES_MAX_BYTES = 20_000_000
 DEFAULT_REQUEST_TIMEOUT_MS = 300000
 _LOG_LEVEL_CACHE: dict[str, Any] = {"value": None, "checked_at": 0.0, "file_mtime": 0.0}
 _RATE_LIMIT_LOCK = threading.Lock()
+_API_KEY_ROTATION_LOCK = threading.Lock()
+_API_KEY_ROTATION_CURSOR: dict[str, int] = {}
 _CHAT_CONDITION = threading.Condition()
 _CHAT_NEXT_ID: int | None = None
 _CHANNEL_SSE_LOCK = threading.Lock()
@@ -2017,6 +2019,72 @@ def meaningful_key_value(value: Any) -> bool:
         return False
     text = str(value).strip()
     return bool(text and text not in ("dummy", "not-used", "ollama"))
+
+
+def parse_api_key_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    raw_items: list[Any]
+    if isinstance(value, (list, tuple, set)):
+        raw_items = list(value)
+    else:
+        raw_items = re.split(r"[\r\n,;]+", str(value))
+    keys: list[str] = []
+    seen: set[str] = set()
+    for item in raw_items:
+        key = str(item or "").strip()
+        if not meaningful_key_value(key) or key in seen:
+            continue
+        keys.append(key)
+        seen.add(key)
+    return keys
+
+
+def provider_config_api_keys(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    keys: list[str] = []
+    if provider == "nvidia-hosted":
+        keys.extend(parse_api_key_list(nvidia_api_key()))
+    keys.extend(parse_api_key_list(pcfg.get("api_keys")))
+    keys.extend(parse_api_key_list(pcfg.get("api_key")))
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for key in keys:
+        if key in seen:
+            continue
+        deduped.append(key)
+        seen.add(key)
+    return deduped
+
+
+def provider_has_api_key(provider: str, pcfg: dict[str, Any]) -> bool:
+    return bool(provider_config_api_keys(provider, pcfg))
+
+
+def provider_api_key_count(provider: str, pcfg: dict[str, Any]) -> int:
+    return len(provider_config_api_keys(provider, pcfg))
+
+
+def provider_primary_api_key(provider: str, pcfg: dict[str, Any]) -> str:
+    keys = provider_config_api_keys(provider, pcfg)
+    return keys[0] if keys else ""
+
+
+def provider_api_key_rotation_name(provider: str, pcfg: dict[str, Any]) -> str:
+    return f"{provider}:{str(pcfg.get('base_url') or default_base_url(provider)).rstrip('/')}"
+
+
+def select_provider_api_key(provider: str, pcfg: dict[str, Any], *, rotate: bool = True) -> str:
+    keys = provider_config_api_keys(provider, pcfg)
+    if not keys:
+        return ""
+    if not rotate or len(keys) == 1:
+        return keys[0]
+    name = provider_api_key_rotation_name(provider, pcfg)
+    with _API_KEY_ROTATION_LOCK:
+        idx = _API_KEY_ROTATION_CURSOR.get(name, 0) % len(keys)
+        _API_KEY_ROTATION_CURSOR[name] = idx + 1
+    router_log("DEBUG", f"api_key_round_robin provider={provider} key_index={idx + 1}/{len(keys)}")
+    return keys[idx]
 
 
 def env_bool(value: str | None, default: bool | None = None) -> bool | None:
@@ -4076,16 +4144,15 @@ def append_tool_call_log(event: str, payload: dict[str, Any]) -> None:
 
 
 def model_cache_key(provider: str, pcfg: dict[str, Any]) -> str:
-    api_state = "key" if provider != "nvidia-hosted" and meaningful_key_value(pcfg.get("api_key")) else "nokey"
-    if provider == "nvidia-hosted":
-        api_state = "key" if meaningful_key_value(read_env_file(NCP_ENV).get("NVIDIA_API_KEY")) else "nokey"
+    api_count = provider_api_key_count(provider, pcfg)
+    api_state = "key" if api_count else "nokey"
     return json.dumps(
         {
             "provider": provider,
             "base_url": pcfg.get("base_url", ""),
             "api": api_state,
             "custom": pcfg.get("custom_models", []),
-            "schema": 5,
+            "schema": 6,
         },
         sort_keys=True,
     )
@@ -4557,7 +4624,7 @@ def nvidia_hosted_list_headers() -> dict[str, str]:
 
 def provider_model_list_headers(provider: str, pcfg: dict[str, Any]) -> dict[str, str]:
     headers = with_upstream_user_agent({"content-type": "application/json"})
-    key = pcfg.get("api_key")
+    key = provider_primary_api_key(provider, pcfg)
     if provider == "anthropic" and key:
         headers["anthropic-version"] = "2023-06-01"
         headers["x-api-key"] = str(key)
@@ -5108,10 +5175,10 @@ def ncp_model_id_for_nvidia_hosted(model_id: str) -> str:
 
 def provider_headers(provider: str, pcfg: dict[str, Any], inbound_headers: Any | None = None) -> dict[str, str]:
     headers = with_upstream_user_agent({"content-type": "application/json", "anthropic-version": "2023-06-01"})
-    key = pcfg.get("api_key") or "not-used"
+    key = select_provider_api_key(provider, pcfg) or str(pcfg.get("api_key") or "") or "not-used"
     if provider == "anthropic":
-        if meaningful_key(pcfg.get("api_key")):
-            headers["x-api-key"] = str(pcfg["api_key"])
+        if meaningful_key(key):
+            headers["x-api-key"] = str(key)
         elif inbound_headers is not None:
             for name in (
                 "authorization",
@@ -5131,12 +5198,11 @@ def provider_headers(provider: str, pcfg: dict[str, Any], inbound_headers: Any |
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
     elif provider == "lm-studio":
-        if meaningful_key(str(pcfg.get("api_key") or "")):
-            headers["x-api-key"] = str(pcfg["api_key"])
-            headers["authorization"] = f"Bearer {pcfg['api_key']}"
+        if meaningful_key(key):
+            headers["x-api-key"] = str(key)
+            headers["authorization"] = f"Bearer {key}"
     elif provider == "nvidia-hosted":
-        key = nvidia_api_key() or (str(pcfg.get("api_key") or "") if meaningful_key(pcfg.get("api_key")) else "")
-        if key:
+        if meaningful_key(key):
             headers["authorization"] = f"Bearer {key}"
             headers["x-api-key"] = key
     return headers
@@ -13056,7 +13122,7 @@ def set_provider_choice_config(choice: str) -> list[str]:
                 "Provider set to anthropic (Anthropic routed).",
                 "mode: anthropic-routed",
             ]
-            if not meaningful_key(pcfg.get("api_key")):
+            if not provider_has_api_key("anthropic", pcfg):
                 lines.append("Anthropic routed mode will use Claude Code OAuth/API auth headers when available.")
             return lines
         return [
@@ -13138,16 +13204,43 @@ def store_api_key_config(provider: str, key: str) -> list[str]:
     if provider == "nvidia-hosted":
         store_nvidia_api_key(key)
         cfg = load_config()
+        cfg["providers"][provider].pop("api_keys", None)
         if ensure_nvidia_hosted_base_url(cfg["providers"][provider]):
             save_config(cfg)
         location = str(NCP_ENV)
     else:
         cfg = load_config()
         cfg["providers"][provider]["api_key"] = key
+        cfg["providers"][provider].pop("api_keys", None)
         save_config(cfg)
         location = str(CONFIG_PATH)
     clear_model_cache()
     return [f"Stored API key for {provider}.", f"Saved: {mask_secret(key)} in {location}"]
+
+
+def store_api_keys_config(provider: str, keys: list[str]) -> list[str]:
+    parsed = parse_api_key_list(keys)
+    if not parsed:
+        raise SystemExit("No API keys provided; unchanged.")
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    pcfg["api_key"] = parsed[0]
+    if len(parsed) > 1:
+        pcfg["api_keys"] = parsed
+    else:
+        pcfg.pop("api_keys", None)
+    if provider == "nvidia-hosted":
+        store_nvidia_api_key(parsed[0])
+        ensure_nvidia_hosted_base_url(pcfg)
+    save_config(cfg)
+    clear_model_cache()
+    with _API_KEY_ROTATION_LOCK:
+        _API_KEY_ROTATION_CURSOR.pop(provider_api_key_rotation_name(provider, pcfg), None)
+    return [
+        f"Stored {len(parsed)} API key{'s' if len(parsed) != 1 else ''} for {provider}.",
+        f"Round-robin: {'enabled' if len(parsed) > 1 else 'disabled'}",
+        f"Primary: {mask_secret(parsed[0])}",
+    ]
 
 
 def mask_secret(value: str | None) -> str:
@@ -13183,7 +13276,7 @@ def redact_sensitive_obj(value: Any) -> Any:
     if isinstance(value, dict):
         redacted: dict[str, Any] = {}
         for key, item in value.items():
-            if str(key).lower() in {"api_key", "apikey", "token", "authorization", "bearer_token"}:
+            if str(key).lower() in {"api_key", "api_keys", "apikey", "token", "authorization", "bearer_token"}:
                 redacted[key] = mask_secret(str(item))
             else:
                 redacted[key] = redact_sensitive_obj(item)
@@ -13192,9 +13285,12 @@ def redact_sensitive_obj(value: Any) -> Any:
 
 
 def stored_api_key_mask(provider: str, pcfg: dict[str, Any]) -> str:
-    if provider == "nvidia-hosted":
-        return mask_secret(nvidia_api_key())
-    return mask_secret(str(pcfg.get("api_key") or ""))
+    keys = provider_config_api_keys(provider, pcfg)
+    if not keys:
+        return "not set"
+    if len(keys) == 1:
+        return mask_secret(keys[0])
+    return f"{len(keys)} keys (round-robin; primary {mask_secret(keys[0])})"
 
 
 def read_clipboard_text() -> str:
@@ -13242,21 +13338,29 @@ def cmd_set_api_key(args: argparse.Namespace) -> None:
     for line in store_api_key_config(provider, key):
         print(line)
 
+
+def cmd_set_api_keys(args: argparse.Namespace) -> None:
+    provider = normalize_provider(args.provider)
+    raw = "\n".join(str(item) for item in getattr(args, "keys", []) if str(item).strip())
+    keys = parse_api_key_list(raw)
+    if not keys:
+        raise SystemExit("No API keys provided; unchanged.")
+    for line in store_api_keys_config(provider, keys):
+        print(line)
+
+
 def cmd_api_key(args: argparse.Namespace) -> None:
     cfg = load_config()
     if not args.provider:
         print("API key status:")
         for p, pcfg in cfg["providers"].items():
-            needs = p in ("anthropic",)
-            if p == "nvidia-hosted":
-                nenv = read_env_file(NCP_ENV)
-                set_ = bool(nenv.get("NVIDIA_API_KEY"))
-                print(f" {p:<15} {'set' if set_ else 'missing'} (stored in {NCP_ENV})")
-            else:
-                set_ = bool(pcfg.get("api_key"))
-                label = "set" if set_ else ("missing" if needs else "not required")
-                print(f" {p:<15} {label}")
+            needs = p in ("anthropic", "ollama-cloud", "deepseek", "opencode", "opencode-go", "nvidia-hosted")
+            count = provider_api_key_count(p, pcfg)
+            label = f"{count} keys (round-robin)" if count > 1 else ("set" if count == 1 else ("missing" if needs else "not required"))
+            suffix = f" (primary {mask_secret(provider_primary_api_key(p, pcfg))})" if count else ""
+            print(f" {p:<15} {label}{suffix}")
         print("\nSet securely from terminal: claude-anyctl api-key anthropic")
+        print("Set multiple keys: claude-anyctl set-api-keys deepseek KEY1,KEY2")
         print("For NVIDIA hosted, use: claude-anyctl api-key nvidia-hosted")
         return
     provider = normalize_provider(args.provider)
@@ -17780,8 +17884,9 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
     provider, pcfg = get_current_provider(cfg)
     if direct_native_anthropic_enabled(provider, pcfg):
         env = {"CLAUDE_ANY_PROVIDER": provider}
-        if meaningful_key(pcfg.get("api_key")):
-            env["ANTHROPIC_API_KEY"] = str(pcfg["api_key"])
+        key = provider_primary_api_key(provider, pcfg)
+        if meaningful_key(key):
+            env["ANTHROPIC_API_KEY"] = str(key)
         return env
     alias = current_alias(cfg)
     claude_model = claude_code_context_model_alias(provider, pcfg, alias)
@@ -17808,9 +17913,7 @@ def env_vars(cfg: dict[str, Any] | None = None) -> dict[str, str]:
 def claude_code_router_auth_token(provider: str, pcfg: dict[str, Any]) -> str:
     if provider == "anthropic":
         return ""
-    key = nvidia_api_key() if provider == "nvidia-hosted" else ""
-    if not key:
-        key = str(pcfg.get("api_key") or "")
+    key = provider_primary_api_key(provider, pcfg)
     if meaningful_key(key):
         return key
     if provider == "ollama":
@@ -18352,21 +18455,36 @@ def meaningful_key(value: str | None) -> bool:
 
 
 def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
+    key_count = provider_api_key_count(provider, pcfg)
+    round_robin = f"{key_count} keys, round-robin" if key_count > 1 else ""
     if provider == "nvidia-hosted":
-        key = nvidia_api_key()
-        return "API key: set (NVIDIA)" if meaningful_key(key) else "API key: missing (NVIDIA required)"
+        if key_count > 1:
+            return f"API keys: {round_robin} (NVIDIA)"
+        return "API key: set (NVIDIA)" if key_count else "API key: missing (NVIDIA required)"
     if provider == "anthropic":
         if anthropic_routed_enabled(provider, pcfg):
-            return "API key: set (Anthropic routed)" if meaningful_key(pcfg.get("api_key")) else "API key: not set (uses Claude Code OAuth/API auth headers)"
-        return "API key: set (Anthropic)" if meaningful_key(pcfg.get("api_key")) else "API key: not set (use API key or Claude login)"
+            if key_count > 1:
+                return f"API keys: {round_robin} (Anthropic routed)"
+            return "API key: set (Anthropic routed)" if key_count else "API key: not set (uses Claude Code OAuth/API auth headers)"
+        if key_count > 1:
+            return f"API keys: {round_robin} (Anthropic)"
+        return "API key: set (Anthropic)" if key_count else "API key: not set (use API key or Claude login)"
     if provider == "ollama-cloud":
-        return "API key: set (Ollama Cloud)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (Ollama Cloud required)"
+        if key_count > 1:
+            return f"API keys: {round_robin} (Ollama Cloud)"
+        return "API key: set (Ollama Cloud)" if key_count else "API key: missing (Ollama Cloud required)"
     if provider == "deepseek":
-        return "API key: set (DeepSeek)" if meaningful_key(pcfg.get("api_key")) else "API key: missing (DeepSeek required)"
+        if key_count > 1:
+            return f"API keys: {round_robin} (DeepSeek)"
+        return "API key: set (DeepSeek)" if key_count else "API key: missing (DeepSeek required)"
     if provider in OPENCODE_PROVIDER_NAMES:
         label = PROVIDER_LABELS.get(provider, provider)
-        return f"API key: set ({label})" if meaningful_key(pcfg.get("api_key")) else f"API key: missing ({label} required)"
-    if meaningful_key(pcfg.get("api_key")):
+        if key_count > 1:
+            return f"API keys: {round_robin} ({label})"
+        return f"API key: set ({label})" if key_count else f"API key: missing ({label} required)"
+    if key_count:
+        if key_count > 1:
+            return f"API keys: {round_robin}"
         return "API key: set"
     if provider == "ollama":
         return "API key: not required for Ollama"
@@ -18402,7 +18520,7 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
             return f"Base URL: {label} unreachable ({type(exc).__name__})"
     path = "/api/tags" if provider in ("ollama", "ollama-cloud") else "/v1/models"
     headers: dict[str, str] = {}
-    key = pcfg.get("api_key")
+    key = provider_primary_api_key(provider, pcfg)
     if meaningful_key(key):
         headers = {"x-api-key": key, "authorization": f"Bearer {key}"}
     headers = with_upstream_user_agent(headers)
@@ -18465,13 +18583,13 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
             errors.append("Start LM Studio's Local Server or set a reachable Anthropic-compatible Base URL before launching Claude Code.")
         else:
             errors.append("Set a reachable Base URL before launching Claude Code.")
-    if provider == "nvidia-hosted" and not (nvidia_api_key() or meaningful_key(pcfg.get("api_key"))):
+    if provider == "nvidia-hosted" and not provider_has_api_key(provider, pcfg):
         errors.append("Launch blocked: NVIDIA hosted requires an NVIDIA API key.")
-    if provider == "ollama-cloud" and not meaningful_key(pcfg.get("api_key")):
+    if provider == "ollama-cloud" and not provider_has_api_key(provider, pcfg):
         errors.append("Launch blocked: Ollama Cloud requires an API key.")
-    if provider == "deepseek" and not meaningful_key(pcfg.get("api_key")):
+    if provider == "deepseek" and not provider_has_api_key(provider, pcfg):
         errors.append("Launch blocked: DeepSeek.com requires a DeepSeek API key.")
-    if provider in OPENCODE_PROVIDER_NAMES and not meaningful_key(pcfg.get("api_key")):
+    if provider in OPENCODE_PROVIDER_NAMES and not provider_has_api_key(provider, pcfg):
         label = PROVIDER_LABELS.get(provider, provider)
         errors.append(f"Launch blocked: {label} requires a {label} API key.")
     if claude_code_ultracode_enabled(provider, pcfg):
@@ -18840,7 +18958,7 @@ def provider_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[str]]:
             routed_mark = "*" if current == key and routed else " "
             rows.append(f"{native_mark} {'Claude Native':<16} {'anthropic-native':<17} {compact_text(pcfg.get('base_url', ''), 52)}")
             values.append(ANTHROPIC_NATIVE_PROVIDER_CHOICE)
-            suffix = "router via Claude Code auth" if not meaningful_key(pcfg.get("api_key")) else "router features"
+            suffix = "router via Claude Code auth" if not provider_has_api_key(key, pcfg) else "router features"
             rows.append(f"{routed_mark} {'Anthropic routed':<16} {'anthropic-routed':<17} {suffix}")
             values.append(ANTHROPIC_ROUTED_PROVIDER_CHOICE)
             continue
@@ -19096,13 +19214,15 @@ def channel_delivery_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[st
 def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
     rows = [
         "Type or paste API key as hidden input",
+        "Type or paste multiple API keys (comma/newline separated)",
         "Read API key from an environment variable",
+        "Read API keys from an environment variable",
         "Read API key from clipboard",
         "Back",
     ]
-    values = ["input", "env", "clipboard", "back"]
+    values = ["input", "multi-input", "env", "multi-env", "clipboard", "back"]
     if os.name != "nt":
-        rows[2] = "Read API key from desktop clipboard if available"
+        rows[4] = "Read API key from desktop clipboard if available"
     return rows, values
 
 
@@ -19613,6 +19733,17 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                             messages = store_api_key_config(provider, key_value)
                             refresh_checks()
                         close_panel(3)
+                    elif value == "multi-input":
+                        key_value = prompt_menu_value(
+                            f"API keys for {provider} (comma/newline separated)",
+                            secret=True,
+                            restore_tty=restore_line_mode,
+                            raw_tty=restore_raw_mode,
+                        )
+                        if key_value:
+                            messages = store_api_keys_config(provider, parse_api_key_list(key_value))
+                            refresh_checks()
+                        close_panel(3)
                     elif value == "env":
                         default_env = {
                             "anthropic": "ANTHROPIC_API_KEY",
@@ -19626,6 +19757,23 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         key_value = os.environ.get(env_name, "").strip()
                         if key_value:
                             messages = store_api_key_config(provider, key_value)
+                        else:
+                            messages = [f"Environment variable {env_name} is empty or not set."]
+                        refresh_checks()
+                        close_panel(3)
+                    elif value == "multi-env":
+                        default_env = {
+                            "anthropic": "ANTHROPIC_API_KEYS",
+                            "deepseek": "DEEPSEEK_API_KEYS",
+                            "opencode": "OPENCODE_API_KEYS",
+                            "opencode-go": "OPENCODE_API_KEYS",
+                            "nvidia-hosted": "NVIDIA_API_KEYS",
+                            "ollama-cloud": "OLLAMA_API_KEYS",
+                        }.get(provider, "API_KEYS")
+                        env_name = prompt_menu_value("Environment variable name", default_env, restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
+                        key_value = os.environ.get(env_name, "").strip()
+                        if key_value:
+                            messages = store_api_keys_config(provider, parse_api_key_list(key_value))
                         else:
                             messages = [f"Environment variable {env_name} is empty or not set."]
                         refresh_checks()
@@ -23668,6 +23816,7 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
   claude-any models [PROVIDER]       List models
   claude-any api-key PROVIDER        Store API key securely
   claude-any set-api-key PROVIDER KEY
+  claude-any set-api-keys PROVIDER KEY1,KEY2
   claude-any web-search [on|off]     Auto-attach DuckDuckGo MCP for non-native providers
   claude-any web-fetch [on|off]      Auto-attach fetch MCP for web page content
   claude-any log-level [LEVEL]       Show or set router log level
@@ -23695,8 +23844,13 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
                                       Apply recommended LLM options for MODEL_ID or the saved model
   claude-any --ca-api-key KEY        Set current provider API key, then launch
   claude-any --ca-api-key-env ENVVAR Set current provider API key from env, then launch
+  claude-any --ca-api-keys KEY1,KEY2 Set current provider API keys with round-robin
+  claude-any --ca-api-keys-env ENVVAR
+                                      Set current provider API keys from env, then launch
   claude-any --ca-set-api-key PROVIDER KEY
   claude-any --ca-set-api-key-env PROVIDER ENVVAR
+  claude-any --ca-set-api-keys PROVIDER KEY1,KEY2
+  claude-any --ca-set-api-keys-env PROVIDER ENVVAR
   claude-any --ca-provider-option KEY=VALUE
                                       Set a provider option for the current provider
   claude-any --ca-set-provider-option PROVIDER KEY=VALUE
@@ -23778,8 +23932,19 @@ def apply_headless_env_config() -> tuple[bool, bool | None, bool | None, bool | 
         skip_menu = True
     api_key_env = os.environ.get("CLAUDE_ANY_API_KEY_ENV", "").strip()
     api_key = os.environ.get("CLAUDE_ANY_API_KEY", "").strip()
+    api_keys_env = os.environ.get("CLAUDE_ANY_API_KEYS_ENV", "").strip()
+    api_keys = os.environ.get("CLAUDE_ANY_API_KEYS", "").strip()
     current_provider, _ = get_current_provider(load_config())
-    if api_key_env:
+    if api_keys_env:
+        value = os.environ.get(api_keys_env, "")
+        if not value:
+            raise SystemExit(f"Environment variable {api_keys_env} is empty or not set")
+        cmd_set_api_keys(argparse.Namespace(provider=current_provider, keys=[value]))
+        skip_menu = True
+    elif api_keys:
+        cmd_set_api_keys(argparse.Namespace(provider=current_provider, keys=[api_keys]))
+        skip_menu = True
+    elif api_key_env:
         value = os.environ.get(api_key_env, "")
         if not value:
             raise SystemExit(f"Environment variable {api_key_env} is empty or not set")
@@ -23902,6 +24067,11 @@ def run_cli(argv: list[str]) -> int:
             if len(rest) < 2:
                 raise SystemExit("Usage: claude-any set-api-key PROVIDER KEY")
             cmd_set_api_key(argparse.Namespace(provider=rest[0], key=rest[1]))
+            return 0
+        if head in ("set-api-keys", "set-apikeys"):
+            if len(rest) < 2:
+                raise SystemExit("Usage: claude-any set-api-keys PROVIDER KEY1,KEY2")
+            cmd_set_api_keys(argparse.Namespace(provider=rest[0], keys=rest[1:]))
             return 0
         if head in ("web-search", "websearch"):
             cmd_web_search(argparse.Namespace(value=rest[0] if rest else None))
@@ -24097,6 +24267,33 @@ def run_cli(argv: list[str]) -> int:
             provider, _ = get_current_provider(load_config())
             cmd_set_api_key(argparse.Namespace(provider=provider, key=value))
             skip_menu = True
+        elif arg == "--ca-api-keys" or arg.startswith("--ca-api-keys="):
+            value = arg.split("=", 1)[1] if "=" in arg else None
+            if value is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing key list for --ca-api-keys")
+                value = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            provider, _ = get_current_provider(load_config())
+            cmd_set_api_keys(argparse.Namespace(provider=provider, keys=[value]))
+            skip_menu = True
+        elif arg == "--ca-api-keys-env" or arg.startswith("--ca-api-keys-env="):
+            env_name = arg.split("=", 1)[1] if "=" in arg else None
+            if env_name is None:
+                if i + 1 >= len(argv):
+                    raise SystemExit("Missing env var name for --ca-api-keys-env")
+                env_name = argv[i + 1]
+                i += 2
+            else:
+                i += 1
+            value = os.environ.get(env_name, "")
+            if not value:
+                raise SystemExit(f"Environment variable {env_name} is empty or not set")
+            provider, _ = get_current_provider(load_config())
+            cmd_set_api_keys(argparse.Namespace(provider=provider, keys=[value]))
+            skip_menu = True
         elif arg == "--ca-set-api-key":
             if i + 2 >= len(argv):
                 raise SystemExit("Usage: --ca-set-api-key PROVIDER KEY")
@@ -24110,6 +24307,21 @@ def run_cli(argv: list[str]) -> int:
             if not value:
                 raise SystemExit(f"Environment variable {argv[i + 2]} is empty or not set")
             cmd_set_api_key(argparse.Namespace(provider=argv[i + 1], key=value))
+            skip_menu = True
+            i += 3
+        elif arg == "--ca-set-api-keys":
+            if i + 2 >= len(argv):
+                raise SystemExit("Usage: --ca-set-api-keys PROVIDER KEY1,KEY2")
+            cmd_set_api_keys(argparse.Namespace(provider=argv[i + 1], keys=[argv[i + 2]]))
+            skip_menu = True
+            i += 3
+        elif arg == "--ca-set-api-keys-env":
+            if i + 2 >= len(argv):
+                raise SystemExit("Usage: --ca-set-api-keys-env PROVIDER ENVVAR")
+            value = os.environ.get(argv[i + 2], "")
+            if not value:
+                raise SystemExit(f"Environment variable {argv[i + 2]} is empty or not set")
+            cmd_set_api_keys(argparse.Namespace(provider=argv[i + 1], keys=[value]))
             skip_menu = True
             i += 3
         elif arg in ("--ca-provider-option", "--ca-provider-options") or arg.startswith(
@@ -24446,6 +24658,10 @@ def build_parser() -> argparse.ArgumentParser:
     sak.add_argument("provider")
     sak.add_argument("key")
     sak.set_defaults(func=cmd_set_api_key)
+    saks = sub.add_parser("set-api-keys")
+    saks.add_argument("provider")
+    saks.add_argument("keys", nargs="+")
+    saks.set_defaults(func=cmd_set_api_keys)
     bu = sub.add_parser("base-url")
     bu.add_argument("provider")
     bu.add_argument("url")

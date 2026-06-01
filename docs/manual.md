@@ -238,6 +238,21 @@ ultracode can be enabled. This avoids advertising `xhigh` workflow thinking for
 models that have not been verified to preserve Claude Code's thinking/tool
 round trip.
 
+High-effort ultracode sessions can consume a large number of upstream tokens.
+For routed providers, Claude Any can store multiple API keys for the same
+provider and rotate them per upstream request. This distributes provider-side
+quota/rate usage across those keys; it does not reduce the actual number of
+tokens a task consumes.
+
+```sh
+claude-any set-api-keys opencode KEY1,KEY2,KEY3
+claude-any --ca-provider opencode --ca-api-keys-env OPENCODE_API_KEYS --ca-no-launch
+```
+
+`OPENCODE_API_KEYS` can be comma-, semicolon-, or newline-separated. The first
+key remains the primary key used for Claude Code router authentication and model
+list checks; routed upstream calls use round-robin selection.
+
 - Claude Code docs: https://docs.anthropic.com/en/docs/claude-code
 - Claude Console API keys: https://console.anthropic.com/settings/keys
 
@@ -698,8 +713,12 @@ Common Claude Any setup flags:
 | `--ca-base-url URL` | Set the current provider base URL. |
 | `--ca-api-key KEY` | Store the current provider API key directly. Prefer env vars for scripts. |
 | `--ca-api-key-env ENVVAR` | Store the current provider API key from an environment variable. |
+| `--ca-api-keys KEY1,KEY2` | Store multiple current-provider API keys and rotate them per routed upstream request. |
+| `--ca-api-keys-env ENVVAR` | Store multiple current-provider API keys from a comma-, semicolon-, or newline-separated environment variable. |
 | `--ca-set-api-key PROVIDER KEY` | Store a key for a specific provider. |
 | `--ca-set-api-key-env PROVIDER ENVVAR` | Store a provider key from an environment variable. |
+| `--ca-set-api-keys PROVIDER KEY1,KEY2` | Store multiple API keys for a specific provider. |
+| `--ca-set-api-keys-env PROVIDER ENVVAR` | Store multiple provider keys from an environment variable. |
 | `--ca-provider-option KEY=VALUE` | Set a provider option for the current provider. OpenCode endpoint overrides use `endpoint:<model-id>=messages|chat|responses|gemini`. |
 | `--ca-set-provider-option PROVIDER KEY=VALUE` | Set a provider option for a specific provider without switching the current provider first. |
 | `--ca-max-output-tokens VALUE` | Set provider output-token cap. |
@@ -723,6 +742,8 @@ Common Claude Any setup flags:
 Notes for automation:
 
 - `--ca-api-key-env` avoids putting secrets directly in shell history.
+- `--ca-api-keys-env` is the safer form for multi-key round-robin; set the
+  environment variable to `KEY1,KEY2,KEY3` or one key per line.
 - `--ca-api-key` and `--ca-set-api-key` are available for direct key passing,
   but prefer the environment-variable forms in shared scripts and terminals.
 - `claude-any stop` is safe to run before scripted tests to remove stale

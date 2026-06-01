@@ -189,12 +189,21 @@ claude-any --ca-env-file .env.claude-any -p "Reply with OK only." --output-forma
 `--ca-menu`로 다시 연 인터페이스에서 사용자가 직접 고른 값 순서로 덮어씁니다.
 
 헤드리스 지원 범위: provider, base URL, model, Advisor model, API key 또는
-API-key 환경변수, max output, context window, request timeout, RPM limit,
+API-key 환경변수, 여러 API key 라운드로빈, max output, context window, request timeout, RPM limit,
 RPM status 표시, streaming, web search, web fetch, Claude skills, update check,
 language, Ollama context/options, provider-specific option, 일반 Claude Code
 passthrough 인자를 모두 메뉴 없이 설정할 수 있습니다. API key는
 `--ca-api-key`로 직접 전달할 수 있지만, 스크립트에서는 shell history에
 비밀값이 남지 않는 `--ca-api-key-env`를 권장합니다.
+
+ultracode처럼 고토큰 작업을 routed provider로 실행할 때는 같은 provider 안에
+여러 키를 저장해 upstream 요청마다 라운드로빈할 수 있습니다. 이는 quota/rate
+사용을 여러 키에 분산할 뿐, 작업 자체의 토큰 사용량을 줄이지는 않습니다.
+
+```sh
+export OPENCODE_API_KEYS="KEY1,KEY2,KEY3"
+claude-any --ca-provider opencode --ca-api-keys-env OPENCODE_API_KEYS --ca-no-launch
+```
 
 최근 추가된 provider도 같은 방식으로 한 번에 설정할 수 있습니다:
 

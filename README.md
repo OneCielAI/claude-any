@@ -332,12 +332,23 @@ claude-any --ca-upgrade-and-exit
 ```
 
 Headless coverage checklist: provider, base URL, model, Advisor model, API key
-or API-key environment variable, max output, context window, request timeout,
+or API-key environment variable, multi-key round-robin, max output, context window, request timeout,
 RPM limit, RPM status display, streaming, web search, web fetch, Claude skills,
 update check, language, Ollama context/options, and normal Claude Code
 passthrough arguments are all configurable without opening the menu. API keys
 can be passed directly with `--ca-api-key`, but `--ca-api-key-env` is safer for
 scripts because the secret does not appear in shell history.
+
+For high-token routed sessions such as ultracode, store multiple keys for the
+same provider and Claude Any will rotate them per upstream request:
+
+```sh
+export OPENCODE_API_KEYS="KEY1,KEY2,KEY3"
+claude-any --ca-provider opencode --ca-api-keys-env OPENCODE_API_KEYS --ca-no-launch
+```
+
+This distributes provider quota/rate usage across keys; it does not reduce the
+task's actual token consumption.
 
 More examples are in [Headless Examples](#headless-examples) and
 [the full manual](docs/manual.md#headless-usage).
@@ -562,6 +573,13 @@ steps under that larger model's supervision.
 
 ### Nightly
 
+- **Provider API-key round-robin**: routed providers now support multiple stored
+  API keys per provider (`api_keys`) while preserving the existing single
+  `api_key` config. `--ca-api-keys`, `--ca-api-keys-env`,
+  `--ca-set-api-keys`, and `set-api-keys` configure comma-, semicolon-, or
+  newline-separated key lists. Upstream provider requests rotate through the
+  keys in-process, which is useful for high-token ultracode sessions that need
+  quota/rate distribution across keys.
 - **Claude native model registry refresh**: Anthropic native model refresh now
   prefers the official Claude model documentation before falling back to API
   model-list endpoints, stores the refreshed list in a provider-scoped
