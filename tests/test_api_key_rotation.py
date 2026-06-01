@@ -133,6 +133,26 @@ class ApiKeyRotationTests(unittest.TestCase):
         self.assertIn("invalid key", str(caught.exception))
         self.assertNotIn("sk-secret-one", str(caught.exception))
 
+    def test_compatibility_http_error_message_preserves_type_and_retry_after(self):
+        error = urllib.error.HTTPError(
+            "https://opencode.ai/zen/v1/chat/completions",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "63478"},
+            io.BytesIO(
+                b'{"type":"error","error":{"type":"FreeUsageLimitError",'
+                b'"message":"Rate limit exceeded. Please try again later."},"metadata":{}}'
+            ),
+        )
+
+        message = claude_any.compatibility_http_error_message(error)
+
+        self.assertIn("FreeUsageLimitError", message)
+        self.assertIn("Rate limit exceeded. Please try again later.", message)
+        self.assertIn("Retry-After:", message)
+        self.assertIn("17h", message)
+        self.assertIn("63478s", message)
+
     def test_compatibility_api_key_probe_uses_provider_specific_routes(self):
         cases = [
             ("ollama-cloud", "glm-5.1", "/api/chat"),

@@ -4784,6 +4784,23 @@ def parse_retry_after_seconds(value: str | None) -> float | None:
         return None
 
 
+def format_duration_seconds(seconds: float) -> str:
+    total = max(0, int(round(seconds)))
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days}d")
+    if hours:
+        parts.append(f"{hours}h")
+    if minutes:
+        parts.append(f"{minutes}m")
+    if secs or not parts:
+        parts.append(f"{secs}s")
+    return " ".join(parts)
+
+
 def first_header(headers: Any, names: list[str]) -> str | None:
     for name in names:
         try:
@@ -17536,15 +17553,37 @@ class CompatibilityApiKeyProbeError(Exception):
 def compatibility_http_error_message(exc: urllib.error.HTTPError) -> str:
     raw = exc.read().decode("utf-8", errors="ignore")
     msg = raw.strip()
+    error_type = ""
     try:
         err = json.loads(raw)
         if isinstance(err, dict):
             if isinstance(err.get("error"), dict):
-                msg = err["error"].get("message") or json.dumps(err["error"])
+                error_obj = err["error"]
+                error_type = str(error_obj.get("type") or "").strip()
+                msg = str(error_obj.get("message") or json.dumps(error_obj, ensure_ascii=False))
             elif err.get("message"):
                 msg = str(err["message"])
+                error_type = str(err.get("type") or "").strip()
     except Exception:
         pass
+    if error_type and error_type not in msg:
+        msg = f"{error_type}: {msg}"
+    retry_after = first_header(exc.headers, ["Retry-After", "retry-after"])
+    if retry_after:
+        retry_after_text = retry_after.strip()
+        retry_after_seconds = parse_retry_after_seconds(retry_after_text)
+        if retry_after_seconds is not None:
+            retry_after_display = format_duration_seconds(retry_after_seconds)
+            if retry_after_text:
+                if re.fullmatch(r"\d+(?:\.\d+)?", retry_after_text):
+                    suffix = f"{retry_after_display} ({retry_after_text}s)"
+                else:
+                    suffix = f"{retry_after_display} ({retry_after_text})"
+                msg = f"{msg} Retry-After: {suffix}"
+            else:
+                msg = f"{msg} Retry-After: {retry_after_display}"
+        else:
+            msg = f"{msg} Retry-After: {retry_after_text}"
     return msg
 
 
