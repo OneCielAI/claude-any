@@ -589,6 +589,10 @@ steps under that larger model's supervision.
   API-key status lines include the masked primary key and a short SHA-256
   fingerprint, and single-key entry/clipboard/env paths auto-detect multiple
   pasted keys to avoid silently overwriting a round-robin set.
+- **Rate-limit error surfacing**: routed upstream 429 responses with a
+  `Retry-After` longer than the current request timeout now fail fast and report
+  the provider's real error type/message plus `Retry-After`, instead of sleeping
+  until Claude Code surfaces the situation as a generic timeout.
 - **Claude native model registry refresh**: Anthropic native model refresh now
   prefers the official Claude model documentation before falling back to API
   model-list endpoints, stores the refreshed list in a provider-scoped
