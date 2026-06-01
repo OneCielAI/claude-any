@@ -20227,6 +20227,31 @@ def should_append_compat_prompt(provider: str, cfg: dict[str, Any]) -> bool:
     return provider != "anthropic" and bool(cfg.get("claude_code", {}).get("compat_prompt_for_non_anthropic", True))
 
 
+_CLAUDE_PERMISSION_MODE_SUPPORT_CACHE: dict[str, bool] = {}
+
+
+def claude_supports_permission_mode_arg(claude: str) -> bool:
+    cache_key = str(claude or "")
+    if cache_key in _CLAUDE_PERMISSION_MODE_SUPPORT_CACHE:
+        return _CLAUDE_PERMISSION_MODE_SUPPORT_CACHE[cache_key]
+    supported = False
+    try:
+        proc = subprocess.run(
+            [claude, "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        help_text = proc.stdout or ""
+        supported = "--permission-mode" in help_text and "bypassPermissions" in help_text
+    except Exception:
+        supported = False
+    _CLAUDE_PERMISSION_MODE_SUPPORT_CACHE[cache_key] = supported
+    return supported
+
+
 def has_passthrough_option(passthrough: list[str], *names: str) -> bool:
     return any(arg in names or any(arg.startswith(name + "=") for name in names) for arg in passthrough)
 
@@ -23797,6 +23822,12 @@ def launch_claude(
         claude,
         "--dangerously-skip-permissions",
     ]
+    if (
+        not use_native_anthropic
+        and not has_passthrough_option([*extra_args, *claude_passthrough], "--permission-mode")
+        and claude_supports_permission_mode_arg(claude)
+    ):
+        cmd.extend(["--permission-mode", "bypassPermissions"])
     model = env.get("CLAUDE_ANY_MODEL_ALIAS")
     if model:
         cmd.extend(["--model", model])

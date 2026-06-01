@@ -63,6 +63,7 @@ class DeepSeekProviderTests(unittest.TestCase):
             stack.enter_context(mock.patch.object(claude_any, "cleanup_managed_services_for_provider"))
             stack.enter_context(mock.patch.object(claude_any, "find_executable", return_value="/usr/local/bin/claude"))
             stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
+            stack.enter_context(mock.patch.object(claude_any, "claude_supports_permission_mode_arg", return_value=True))
             stack.enter_context(mock.patch.object(claude_any, "install_claude_any_slash_commands"))
             stack.enter_context(mock.patch.object(claude_any, "install_tool_guard_hooks"))
             stack.enter_context(mock.patch.object(claude_any, "install_claude_any_statusline"))
@@ -82,6 +83,10 @@ class DeepSeekProviderTests(unittest.TestCase):
 
         self.assertEqual(0, rc)
         proxy.assert_called_once()
+        launch_cmd = proxy.call_args.args[0]
+        self.assertIn("--dangerously-skip-permissions", launch_cmd)
+        mode_idx = launch_cmd.index("--permission-mode")
+        self.assertEqual("bypassPermissions", launch_cmd[mode_idx + 1])
         self.assertTrue(proxy.call_args.kwargs["inject_web_chat_only"])
         call.assert_not_called()
         launch_env = proxy.call_args.args[1]
