@@ -91,7 +91,7 @@ class WebChatUiTests(unittest.TestCase):
         html = claude_any.render_web_chat_html(cfg, "anthropic", pcfg)
 
         self.assertIn("anthropic-routed", html)
-        self.assertIn("API key: set (Anthropic routed)", html)
+        self.assertIn("API key: set (Anthropic routed; primary sk-a...real; fp", html)
 
     def test_chat_file_upload_stores_base64_file_with_metadata(self):
         with tempfile.TemporaryDirectory() as td:

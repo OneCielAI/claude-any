@@ -64,11 +64,45 @@ class ApiKeyRotationTests(unittest.TestCase):
         self.assertFalse(any("DeepSeek.com requires" in err for err in errors))
 
     def test_api_key_status_reports_round_robin(self):
-        pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-one", "sk-two"])
+        pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-secret-one", "sk-secret-two"])
 
         status = claude_any.api_key_status_line("deepseek", pcfg)
 
         self.assertIn("2 keys, round-robin", status)
+        self.assertIn(f"primary {claude_any.mask_secret('sk-secret-one')}", status)
+        self.assertIn("fp", status)
+
+    def test_stored_api_key_mask_includes_primary_fingerprint(self):
+        pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-secret-one", "sk-secret-two"])
+
+        status = claude_any.stored_api_key_mask("deepseek", pcfg)
+
+        self.assertIn("2 keys", status)
+        self.assertIn(f"primary {claude_any.mask_secret('sk-secret-one')}", status)
+        self.assertIn(claude_any.secret_fingerprint("sk-secret-one"), status)
+
+    def test_store_api_key_input_detects_multiple_keys(self):
+        cfg = {
+            "providers": {
+                "deepseek": self.deepseek_pcfg(api_key="", api_keys=[]),
+            }
+        }
+        saved = {}
+
+        def fake_save_config(value):
+            saved.update(copy.deepcopy(value))
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config", side_effect=fake_save_config),
+            mock.patch.object(claude_any, "clear_model_cache"),
+        ):
+            messages = claude_any.store_api_key_input_config("deepseek", "sk-one,sk-two")
+
+        pcfg = saved["providers"]["deepseek"]
+        self.assertEqual("sk-one", pcfg["api_key"])
+        self.assertEqual(["sk-one", "sk-two"], pcfg["api_keys"])
+        self.assertIn("Round-robin: enabled", "\n".join(messages))
 
     def test_compatibility_api_key_probe_tests_each_configured_key(self):
         pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-one", "sk-two"])

@@ -13232,7 +13232,10 @@ def store_api_key_config(provider: str, key: str) -> list[str]:
         save_config(cfg)
         location = str(CONFIG_PATH)
     clear_model_cache()
-    return [f"Stored API key for {provider}.", f"Saved: {mask_secret(key)} in {location}"]
+    return [
+        f"Stored API key for {provider}.",
+        f"Saved: {mask_secret(key)}; fp {secret_fingerprint(key)} in {location}",
+    ]
 
 
 def store_api_keys_config(provider: str, keys: list[str]) -> list[str]:
@@ -13256,7 +13259,7 @@ def store_api_keys_config(provider: str, keys: list[str]) -> list[str]:
     return [
         f"Stored {len(parsed)} API key{'s' if len(parsed) != 1 else ''} for {provider}.",
         f"Round-robin: {'enabled' if len(parsed) > 1 else 'disabled'}",
-        f"Primary: {mask_secret(parsed[0])}",
+        f"Primary: {mask_secret(parsed[0])}; fp {secret_fingerprint(parsed[0])}",
     ]
 
 
@@ -13267,6 +13270,14 @@ def mask_secret(value: str | None) -> str:
     if len(text) <= 8:
         return "*" * len(text)
     return f"{text[:4]}...{text[-4:]}"
+
+
+def secret_fingerprint(value: str | None, length: int = 12) -> str:
+    text = value or ""
+    if not text:
+        return "-"
+    digest = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+    return digest[: max(4, length)]
 
 
 SECRET_TEXT_PATTERNS = (
@@ -13305,9 +13316,19 @@ def stored_api_key_mask(provider: str, pcfg: dict[str, Any]) -> str:
     keys = provider_config_api_keys(provider, pcfg)
     if not keys:
         return "not set"
+    primary = f"{mask_secret(keys[0])}; fp {secret_fingerprint(keys[0])}"
     if len(keys) == 1:
-        return mask_secret(keys[0])
-    return f"{len(keys)} keys (round-robin; primary {mask_secret(keys[0])})"
+        return primary
+    return f"{len(keys)} keys (round-robin; primary {primary})"
+
+
+def store_api_key_input_config(provider: str, raw_value: str) -> list[str]:
+    keys = parse_api_key_list(raw_value)
+    if len(keys) > 1:
+        return store_api_keys_config(provider, keys)
+    if len(keys) == 1:
+        return store_api_key_config(provider, keys[0])
+    raise SystemExit("No API key provided; unchanged.")
 
 
 def read_clipboard_text() -> str:
@@ -13352,7 +13373,7 @@ def cmd_set_api_key(args: argparse.Namespace) -> None:
     key = args.key.strip()
     if not key:
         raise SystemExit("No key provided; unchanged.")
-    for line in store_api_key_config(provider, key):
+    for line in store_api_key_input_config(provider, key):
         print(line)
 
 
@@ -13374,7 +13395,8 @@ def cmd_api_key(args: argparse.Namespace) -> None:
             needs = p in ("anthropic", "ollama-cloud", "deepseek", "opencode", "opencode-go", "nvidia-hosted")
             count = provider_api_key_count(p, pcfg)
             label = f"{count} keys (round-robin)" if count > 1 else ("set" if count == 1 else ("missing" if needs else "not required"))
-            suffix = f" (primary {mask_secret(provider_primary_api_key(p, pcfg))})" if count else ""
+            primary = provider_primary_api_key(p, pcfg)
+            suffix = f" (primary {mask_secret(primary)}; fp {secret_fingerprint(primary)})" if count else ""
             print(f" {p:<15} {label}{suffix}")
         print("\nSet securely from terminal: claude-anyctl api-key anthropic")
         print("Set multiple keys: claude-anyctl set-api-keys deepseek KEY1,KEY2")
@@ -13388,7 +13410,7 @@ def cmd_api_key(args: argparse.Namespace) -> None:
     key = getpass.getpass(f"API key for {provider}: ").strip()
     if not key:
         raise SystemExit("No key entered; unchanged.")
-    for line in store_api_key_config(provider, key):
+    for line in store_api_key_input_config(provider, key):
         print(line)
 
 
@@ -18586,35 +18608,37 @@ def meaningful_key(value: str | None) -> bool:
 def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
     key_count = provider_api_key_count(provider, pcfg)
     round_robin = f"{key_count} keys, round-robin" if key_count > 1 else ""
+    primary = provider_primary_api_key(provider, pcfg)
+    primary_detail = f"; primary {mask_secret(primary)}; fp {secret_fingerprint(primary)}" if key_count else ""
     if provider == "nvidia-hosted":
         if key_count > 1:
-            return f"API keys: {round_robin} (NVIDIA)"
-        return "API key: set (NVIDIA)" if key_count else "API key: missing (NVIDIA required)"
+            return f"API keys: {round_robin} (NVIDIA{primary_detail})"
+        return f"API key: set (NVIDIA{primary_detail})" if key_count else "API key: missing (NVIDIA required)"
     if provider == "anthropic":
         if anthropic_routed_enabled(provider, pcfg):
             if key_count > 1:
-                return f"API keys: {round_robin} (Anthropic routed)"
-            return "API key: set (Anthropic routed)" if key_count else "API key: not set (uses Claude Code OAuth/API auth headers)"
+                return f"API keys: {round_robin} (Anthropic routed{primary_detail})"
+            return f"API key: set (Anthropic routed{primary_detail})" if key_count else "API key: not set (uses Claude Code OAuth/API auth headers)"
         if key_count > 1:
-            return f"API keys: {round_robin} (Anthropic)"
-        return "API key: set (Anthropic)" if key_count else "API key: not set (use API key or Claude login)"
+            return f"API keys: {round_robin} (Anthropic{primary_detail})"
+        return f"API key: set (Anthropic{primary_detail})" if key_count else "API key: not set (use API key or Claude login)"
     if provider == "ollama-cloud":
         if key_count > 1:
-            return f"API keys: {round_robin} (Ollama Cloud)"
-        return "API key: set (Ollama Cloud)" if key_count else "API key: missing (Ollama Cloud required)"
+            return f"API keys: {round_robin} (Ollama Cloud{primary_detail})"
+        return f"API key: set (Ollama Cloud{primary_detail})" if key_count else "API key: missing (Ollama Cloud required)"
     if provider == "deepseek":
         if key_count > 1:
-            return f"API keys: {round_robin} (DeepSeek)"
-        return "API key: set (DeepSeek)" if key_count else "API key: missing (DeepSeek required)"
+            return f"API keys: {round_robin} (DeepSeek{primary_detail})"
+        return f"API key: set (DeepSeek{primary_detail})" if key_count else "API key: missing (DeepSeek required)"
     if provider in OPENCODE_PROVIDER_NAMES:
         label = PROVIDER_LABELS.get(provider, provider)
         if key_count > 1:
-            return f"API keys: {round_robin} ({label})"
-        return f"API key: set ({label})" if key_count else f"API key: missing ({label} required)"
+            return f"API keys: {round_robin} ({label}{primary_detail})"
+        return f"API key: set ({label}{primary_detail})" if key_count else f"API key: missing ({label} required)"
     if key_count:
         if key_count > 1:
-            return f"API keys: {round_robin}"
-        return "API key: set"
+            return f"API keys: {round_robin} ({primary_detail.lstrip('; ')})"
+        return f"API key: set ({primary_detail.lstrip('; ')})"
     if provider == "ollama":
         return "API key: not required for Ollama"
     return "API key: optional or not configured"
@@ -19347,11 +19371,13 @@ def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
         "Read API key from an environment variable",
         "Read API keys from an environment variable",
         "Read API key from clipboard",
+        "Read API keys from clipboard",
         "Back",
     ]
-    values = ["input", "multi-input", "env", "multi-env", "clipboard", "back"]
+    values = ["input", "multi-input", "env", "multi-env", "clipboard", "multi-clipboard", "back"]
     if os.name != "nt":
         rows[4] = "Read API key from desktop clipboard if available"
+        rows[5] = "Read API keys from desktop clipboard if available"
     return rows, values
 
 
@@ -19859,7 +19885,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                     elif value == "input":
                         key_value = prompt_menu_value(f"API key for {provider}", secret=True, restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                         if key_value:
-                            messages = store_api_key_config(provider, key_value)
+                            messages = store_api_key_input_config(provider, key_value)
                             refresh_checks()
                         close_panel(3)
                     elif value == "multi-input":
@@ -19885,7 +19911,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         env_name = prompt_menu_value("Environment variable name", default_env, restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                         key_value = os.environ.get(env_name, "").strip()
                         if key_value:
-                            messages = store_api_key_config(provider, key_value)
+                            messages = store_api_key_input_config(provider, key_value)
                         else:
                             messages = [f"Environment variable {env_name} is empty or not set."]
                         refresh_checks()
@@ -19914,9 +19940,27 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         else:
                             confirm = prompt_menu_value(f"Clipboard contains {mask_secret(key_value)}. Store it? y/N", restore_tty=restore_line_mode, raw_tty=restore_raw_mode)
                             if confirm.lower().startswith("y"):
-                                messages = store_api_key_config(provider, key_value)
+                                messages = store_api_key_input_config(provider, key_value)
                             else:
                                 messages = ["Clipboard API key was not stored."]
+                        refresh_checks()
+                        close_panel(3)
+                    elif value == "multi-clipboard":
+                        key_value = read_clipboard_text()
+                        keys = parse_api_key_list(key_value)
+                        if not keys:
+                            messages = ["Clipboard did not contain readable API keys."]
+                        else:
+                            primary = f"{mask_secret(keys[0])}; fp {secret_fingerprint(keys[0])}"
+                            confirm = prompt_menu_value(
+                                f"Clipboard contains {len(keys)} key(s); primary {primary}. Store with round-robin? y/N",
+                                restore_tty=restore_line_mode,
+                                raw_tty=restore_raw_mode,
+                            )
+                            if confirm.lower().startswith("y"):
+                                messages = store_api_keys_config(provider, keys)
+                            else:
+                                messages = ["Clipboard API keys were not stored."]
                         refresh_checks()
                         close_panel(3)
                 elif panel == "base-url":

@@ -348,7 +348,10 @@ claude-any --ca-provider opencode --ca-api-keys-env OPENCODE_API_KEYS --ca-no-la
 ```
 
 This distributes provider quota/rate usage across keys; it does not reduce the
-task's actual token consumption.
+task's actual token consumption. The menu also accepts comma/newline-separated
+keys in the API-key input paths and shows a masked primary key plus a short
+fingerprint so you can confirm which key set is actually active without exposing
+the secret.
 
 More examples are in [Headless Examples](#headless-examples) and
 [the full manual](docs/manual.md#headless-usage).
@@ -583,6 +586,9 @@ steps under that larger model's supervision.
   keys in-process, which is useful for high-token ultracode sessions that need
   quota/rate distribution across keys. Compatibility tests now probe every
   configured key independently before the normal text/tool/tool-result checks.
+  API-key status lines include the masked primary key and a short SHA-256
+  fingerprint, and single-key entry/clipboard/env paths auto-detect multiple
+  pasted keys to avoid silently overwriting a round-robin set.
 - **Claude native model registry refresh**: Anthropic native model refresh now
   prefers the official Claude model documentation before falling back to API
   model-list endpoints, stores the refreshed list in a provider-scoped
