@@ -13,6 +13,30 @@ class InstallDiagnosticsTests(unittest.TestCase):
 
         self.assertEqual(root.resolve(strict=False), claude_any.package_root_from_installed_path(launcher))
 
+    def test_npm_prefix_from_posix_package_roots(self):
+        self.assertEqual(
+            Path("/usr/local"),
+            claude_any.npm_prefix_from_package_root(Path("/usr/local/lib/node_modules/@oneciel-ai/claude-any")),
+        )
+        self.assertEqual(
+            Path("/home/user/.local"),
+            claude_any.npm_prefix_from_package_root(Path("/home/user/.local/lib/node_modules/@oneciel-ai/claude-any")),
+        )
+        self.assertEqual(
+            Path("/home/user/.npm-global"),
+            claude_any.npm_prefix_from_package_root(
+                Path("/home/user/.npm-global/lib/node_modules/@oneciel-ai/claude-any")
+            ),
+        )
+
+    def test_npm_global_install_command_can_pin_prefix(self):
+        self.assertEqual(
+            ["npm", "install", "-g", "--prefix", str(Path("/home/user/.local")), "@oneciel-ai/claude-any@latest"],
+            claude_any.npm_global_install_command(
+                "npm", "@oneciel-ai/claude-any@latest", Path("/home/user/.local")
+            ),
+        )
+
     def test_warns_when_newer_install_is_shadowed(self):
         rows = [
             {

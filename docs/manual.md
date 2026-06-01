@@ -30,9 +30,19 @@ claude-any
 **Upgrade:**
 
 ```sh
-npm update -g @oneciel-ai/claude-any
+npm install -g @oneciel-ai/claude-any@latest
 claude-any version
 ```
+
+When `claude-any` is already running from an npm package, its interactive
+self-update uses the prefix of the currently executing package. For example,
+an executable loaded from `~/.local/lib/node_modules` updates `~/.local`, while
+one loaded from `/usr/local/lib/node_modules` updates `/usr/local`. This avoids
+installing a newer package into a different npm prefix while the shell keeps
+resolving an older executable. If that active prefix is not writable, the
+update fails with the target prefix shown instead of silently writing elsewhere.
+Keep only one visible install prefix when possible; startup diagnostics warn
+when multiple `claude-any` installs are on `PATH`.
 
 **Uninstall:**
 
@@ -718,9 +728,9 @@ Notes for automation:
 - `claude-any stop` is safe to run before scripted tests to remove stale
   router/proxy processes.
 - npm-installed interactive launches check the npm registry for a newer
-  Claude Any version and ask before running `npm update -g
-  @oneciel-ai/claude-any`. Headless/non-TTY launches are not interrupted; set
-  `CLAUDE_ANY_SELF_UPDATE_CHECK=off` or pass `--ca-no-self-update-check` to
+  Claude Any version and ask before running `npm install -g --prefix <active-prefix>
+  @oneciel-ai/claude-any@latest`. Headless/non-TTY launches are not interrupted;
+  set `CLAUDE_ANY_SELF_UPDATE_CHECK=off` or pass `--ca-no-self-update-check` to
   disable it explicitly.
 - Use `claude-any test 60 auto` for a quick readiness check and reserve
   `claude-any test 180 full` for deeper provider validation.

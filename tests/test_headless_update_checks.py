@@ -79,8 +79,9 @@ class HeadlessUpdateCheckTests(unittest.TestCase):
         ):
             self.assertEqual(1, claude_any.run_quiet_upgrade_and_exit())
 
-    def test_self_update_uses_install_latest_not_update_and_restarts_from_fresh_package(self):
+    def test_self_update_uses_active_install_prefix_and_restarts_from_fresh_package(self):
         completed = type("Completed", (), {"returncode": 0, "stdout": ""})()
+        package_root = Path("/home/user/.local/lib/node_modules/@oneciel-ai/claude-any")
         with (
             patch.dict("os.environ", {"CLAUDE_ANY_SKIP_SELF_UPDATE": "0"}, clear=False),
             patch("claude_any.running_from_npm_package", return_value=True),
@@ -89,6 +90,7 @@ class HeadlessUpdateCheckTests(unittest.TestCase):
             patch("claude_any.find_executable", return_value="npm"),
             patch("claude_any.npm_latest_package_version", return_value="999.0.0"),
             patch("claude_any.version_newer", return_value=True),
+            patch("claude_any.current_npm_package_root", return_value=package_root),
             patch("builtins.input", return_value="y"),
             patch("claude_any.subprocess.run", return_value=completed) as run,
             patch("claude_any.restart_claude_any_after_update") as restart,
@@ -97,10 +99,29 @@ class HeadlessUpdateCheckTests(unittest.TestCase):
             claude_any.run_claude_any_update_check()
 
         self.assertEqual(
-            ["npm", "install", "-g", "@oneciel-ai/claude-any@latest"],
+            ["npm", "install", "-g", "--prefix", str(Path("/home/user/.local")), "@oneciel-ai/claude-any@latest"],
             run.call_args.args[0],
         )
-        restart.assert_called_once_with("npm")
+        restart.assert_called_once_with("npm", package_root=package_root)
+
+    def test_quiet_upgrade_uses_active_install_prefix(self):
+        completed = type("Completed", (), {"returncode": 0, "stdout": ""})()
+        package_root = Path("/usr/local/lib/node_modules/@oneciel-ai/claude-any")
+        with (
+            patch("claude_any.find_executable", return_value="npm"),
+            patch("claude_any.npm_latest_package_version", return_value="999.0.0"),
+            patch("claude_any.version_newer", return_value=True),
+            patch("claude_any.current_npm_package_root", return_value=package_root),
+            patch("claude_any.subprocess.run", return_value=completed) as run,
+            patch("builtins.print"),
+        ):
+            rc = claude_any.quiet_upgrade_claude_any()
+
+        self.assertEqual(0, rc)
+        self.assertEqual(
+            ["npm", "install", "-g", "--prefix", str(Path("/usr/local")), "@oneciel-ai/claude-any@latest"],
+            run.call_args.args[0],
+        )
 
     def test_restart_after_update_prefers_npm_global_package_script(self):
         with tempfile.TemporaryDirectory() as td:

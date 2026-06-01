@@ -23004,6 +23004,44 @@ def npm_global_package_root(npm: str, package_name: str = "@oneciel-ai/claude-an
     return package_path
 
 
+def npm_prefix_from_package_root(package_root: Path) -> Path | None:
+    """Infer the npm install prefix from an installed package root.
+
+    npm global installs normally land under either:
+    - <prefix>/lib/node_modules/@scope/name on POSIX
+    - <prefix>/node_modules/@scope/name on Windows
+
+    Updating without this prefix can write to npm's current default global
+    prefix, which may not be the prefix that supplied the running executable.
+    """
+    parts = package_root.parts
+    for idx, part in enumerate(parts):
+        if part != "node_modules":
+            continue
+        try:
+            node_modules = Path(*parts[: idx + 1])
+        except Exception:
+            return None
+        parent = node_modules.parent
+        if parent.name == "lib":
+            return parent.parent
+        return parent
+    return None
+
+
+def current_npm_install_prefix() -> Path | None:
+    root = current_npm_package_root()
+    return npm_prefix_from_package_root(root) if root else None
+
+
+def npm_global_install_command(npm: str, package_spec: str, prefix: Path | None = None) -> list[str]:
+    cmd = [npm, "install", "-g"]
+    if prefix is not None:
+        cmd.extend(["--prefix", str(prefix)])
+    cmd.append(package_spec)
+    return cmd
+
+
 def claude_code_current_version(claude: str) -> str:
     try:
         p = subprocess.run(
@@ -23163,10 +23201,10 @@ def claude_any_restart_user_args() -> list[str]:
     return args
 
 
-def restart_claude_any_after_update(npm: str) -> None:
+def restart_claude_any_after_update(npm: str, package_root: Path | None = None) -> None:
     os.environ["CLAUDE_ANY_SKIP_SELF_UPDATE"] = "1"
     user_args = claude_any_restart_user_args()
-    package_root = npm_global_package_root(npm)
+    package_root = package_root or current_npm_package_root() or npm_global_package_root(npm)
     package_script = package_root / "claude_any.py" if package_root else None
     if package_script and package_script.exists():
         os.execv(sys.executable, [sys.executable, str(package_script), "cli", *user_args])
@@ -23197,9 +23235,14 @@ def run_claude_any_update_check(enabled: bool = True) -> bool:
     answer = input("Update now with npm? [y/N] ").strip().lower()
     if answer not in ("y", "yes"):
         return False
+    package_root = current_npm_package_root()
+    install_prefix = npm_prefix_from_package_root(package_root) if package_root else None
+    update_cmd = npm_global_install_command(npm, "@oneciel-ai/claude-any@latest", install_prefix)
+    if install_prefix is not None:
+        print(f"Updating current Claude Any install prefix: {install_prefix}", flush=True)
     try:
         update = subprocess.run(
-            [npm, "install", "-g", "@oneciel-ai/claude-any@latest"],
+            update_cmd,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -23216,10 +23259,16 @@ def run_claude_any_update_check(enabled: bool = True) -> bool:
         print(out, flush=True)
     if update.returncode != 0:
         print(f"Claude Any update exited with {update.returncode}; continuing with current version.", flush=True)
+        if install_prefix is not None:
+            print(
+                f"Update targeted the active install prefix ({install_prefix}). "
+                "If this prefix is not writable, reinstall or update with the permissions used for that prefix.",
+                flush=True,
+            )
         return False
     print("Claude Any updated. Restarting with the new version...", flush=True)
     try:
-        restart_claude_any_after_update(npm)
+        restart_claude_any_after_update(npm, package_root=package_root)
     except SystemExit:
         raise
     except Exception as exc:
@@ -23254,11 +23303,21 @@ def quiet_upgrade_claude_any() -> int:
         return 0
     target = latest or "latest"
     print(f"Updating Claude Any to {target}...", flush=True)
-    rc, out = run_command_for_upgrade([npm, "install", "-g", "@oneciel-ai/claude-any@latest"], timeout=300)
+    package_root = current_npm_package_root()
+    install_prefix = npm_prefix_from_package_root(package_root) if package_root else None
+    if install_prefix is not None:
+        print(f"Updating current Claude Any install prefix: {install_prefix}", flush=True)
+    rc, out = run_command_for_upgrade(npm_global_install_command(npm, "@oneciel-ai/claude-any@latest", install_prefix), timeout=300)
     if out:
         print(out, flush=True)
     if rc != 0:
         print(f"Claude Any update failed ({rc}).", flush=True)
+        if install_prefix is not None:
+            print(
+                f"Update targeted the active install prefix ({install_prefix}). "
+                "If this prefix is not writable, reinstall or update with the permissions used for that prefix.",
+                flush=True,
+            )
     return rc
 
 

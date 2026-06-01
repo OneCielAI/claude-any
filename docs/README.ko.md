@@ -221,12 +221,22 @@ claude-any --ca-provider opencode-go --ca-base-url https://opencode.ai/zen/go --
 **업그레이드:**
 
 ```sh
-npm update -g @oneciel-ai/claude-any
+npm install -g @oneciel-ai/claude-any@latest
 ```
 
 ```sh
 claude-any version
 ```
+
+npm 패키지에서 실행 중인 `claude-any`의 대화형 self-update는 현재 실행 중인
+패키지가 설치된 prefix를 기준으로 업데이트합니다. 예를 들어
+`~/.local/lib/node_modules`에서 로드된 실행 파일은 `~/.local`만 업데이트하고,
+`/usr/local/lib/node_modules`에서 로드된 실행 파일은 `/usr/local`만 업데이트합니다.
+이렇게 해야 새 패키지가 다른 npm prefix에 설치되어도 셸이 계속 오래된 실행 파일을
+잡는 문제가 생기지 않습니다. 해당 prefix에 쓸 권한이 없으면 다른 곳에 조용히
+설치하지 않고, 대상 prefix와 함께 실패를 표시합니다. 가능하면 `PATH`에 보이는
+`claude-any` npm 설치 prefix는 하나만 유지하세요. 여러 설치본이 보이면 시작 시
+진단 경고가 출력됩니다.
 
 **제거:**
 
@@ -541,9 +551,10 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 ### 0.1.45
 
 - **대화형 npm self-update check**: npm으로 설치된 `claude-any`는 실행 전 npm
-  registry의 최신 버전을 확인합니다. 새 버전이 있으면 `npm update -g
-  @oneciel-ai/claude-any` 실행 여부를 묻고, 업데이트 후 새 버전으로 재시작합니다.
-  non-interactive/headless 실행은 중단하지 않습니다.
+  registry의 최신 버전을 확인합니다. 새 버전이 있으면 현재 실행 중인 패키지의
+  npm prefix를 대상으로 `npm install -g --prefix <active-prefix>
+  @oneciel-ai/claude-any@latest`를 실행할지 묻고, 업데이트 후 새 버전으로
+  재시작합니다. non-interactive/headless 실행은 중단하지 않습니다.
 
 ### 0.1.44
 
