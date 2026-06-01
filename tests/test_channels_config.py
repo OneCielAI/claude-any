@@ -53,6 +53,16 @@ class ChannelConfigTests(unittest.TestCase):
             self.assertTrue(claude_any.should_use_channel_stdin_proxy(True, [], cfg))
             self.assertTrue(claude_any.should_use_channel_llm_delivery(True, [], cfg))
 
+    def test_terminal_winsize_from_fd_uses_real_terminal_size(self):
+        with mock.patch.object(os, "get_terminal_size", return_value=os.terminal_size((132, 43))):
+            self.assertEqual((43, 132), claude_any._terminal_winsize_from_fd(1))
+
+    def test_terminal_winsize_from_fd_never_returns_zero_size(self):
+        with mock.patch.object(os, "get_terminal_size", return_value=os.terminal_size((0, 0))), mock.patch.object(
+            claude_any.shutil, "get_terminal_size", return_value=os.terminal_size((100, 40))
+        ):
+            self.assertEqual((40, 100), claude_any._terminal_winsize_from_fd(1))
+
     def test_channel_specs_always_include_builtin_router(self):
         cfg = {"claude_code": {"channels": []}}
         self.assertEqual(["server:claude-any-router"], claude_any.channel_specs(cfg))

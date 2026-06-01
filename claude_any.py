@@ -2945,6 +2945,35 @@ def has_tool(body: dict[str, Any], name: str) -> bool:
     return name in tool_names_in_body(body)
 
 
+ULTRACODE_ON_RE = re.compile(r"\bUltracode\s+is\s+on\b", re.IGNORECASE)
+ULTRACODE_OFF_RE = re.compile(r"\bUltracode\s+is\s+off\b", re.IGNORECASE)
+
+
+def body_ultracode_runtime_enabled(body: dict[str, Any]) -> bool:
+    """Infer Claude Code's per-session ultracode runtime state from the prompt.
+
+    `/effort ultracode` is session-scoped in Claude Code and is not persisted in
+    claude-any provider config. Claude Code advertises that runtime state via
+    system reminder text, so the router must infer it from the current request
+    body rather than from config alone.
+    """
+    enabled = False
+    system_text = anthropic_content_to_text(body.get("system"))
+    for match in re.finditer(r"\bUltracode\s+is\s+(on|off)\b", system_text, re.IGNORECASE):
+        enabled = bool(ULTRACODE_ON_RE.search(match.group(0))) and not bool(ULTRACODE_OFF_RE.search(match.group(0)))
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        text = anthropic_content_to_text(message.get("content"))
+        for match in re.finditer(r"\bUltracode\s+is\s+(on|off)\b", text, re.IGNORECASE):
+            enabled = bool(ULTRACODE_ON_RE.search(match.group(0))) and not bool(ULTRACODE_OFF_RE.search(match.group(0)))
+    return enabled
+
+
+def ultracode_workflow_preferred(body: dict[str, Any]) -> bool:
+    return body_ultracode_runtime_enabled(body) and has_tool(body, "Workflow")
+
+
 def _message_content_blocks(message: dict[str, Any]) -> list[Any]:
     content = message.get("content")
     if isinstance(content, list):
@@ -3313,6 +3342,9 @@ def plan_mode_tool_name_for_emit(body: dict[str, Any], name: str, tool_input: di
     if name == "EnterPlanMode" and active:
         router_log("WARN", "dropped repeated EnterPlanMode while plan mode is active")
         return None, tool_input
+    if name == "EnterPlanMode" and ultracode_workflow_preferred(body):
+        router_log("WARN", "dropped EnterPlanMode because ultracode workflow is preferred")
+        return None, tool_input
     if name == "ExitPlanMode" and not active:
         router_log("WARN", "dropped ExitPlanMode while plan mode is not active")
         return None, tool_input
@@ -3447,6 +3479,8 @@ def non_actionable_short_response(text: str) -> bool:
 
 def should_auto_enter_plan_mode(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
     if tool_calls:
+        return False
+    if ultracode_workflow_preferred(body):
         return False
     if not has_tool(body, "EnterPlanMode"):
         return False
@@ -3846,6 +3880,10 @@ def filter_blocked_tools(provider: str, pcfg: dict[str, Any], body: dict[str, An
     """Strip Claude-Code self-tools the upstream model shouldn't see (e.g. EnterPlanMode).
     Returns a (possibly new) body dict."""
     blocked = resolve_blocked_tools(provider, pcfg)
+    dynamic_blocked: set[str] = set()
+    if provider != "anthropic" and ultracode_workflow_preferred(body) and not plan_mode_active(body):
+        dynamic_blocked.add("EnterPlanMode")
+    blocked = set(blocked) | dynamic_blocked
     if not blocked:
         return body
     tools = body.get("tools")
@@ -3874,7 +3912,8 @@ def filter_blocked_tools(provider: str, pcfg: dict[str, Any], body: dict[str, An
         new_body.pop("tool_choice", None)
         router_log("WARN", f"removed blocked tool_choice for {provider}: {tool_choice_name}")
         return new_body
-    router_log("INFO", f"filtered upstream tools for {provider}: {', '.join(sorted(set(dropped)))}")
+    reason = " ultracode_workflow_preferred=true" if dynamic_blocked & set(dropped) else ""
+    router_log("INFO", f"filtered upstream tools for {provider}: {', '.join(sorted(set(dropped)))}{reason}")
     new_body = dict(body)
     new_body["tools"] = kept
     if must_drop_tool_choice:
@@ -22213,6 +22252,41 @@ def _channel_llm_summary_file_marker() -> tuple[float, int]:
         return (0.0, 0)
 
 
+def _terminal_winsize_from_fd(fd: int) -> tuple[int, int]:
+    """Return terminal size as (rows, columns), never 0x0."""
+    try:
+        size = os.get_terminal_size(fd)
+        rows = int(size.lines)
+        cols = int(size.columns)
+    except Exception:
+        rows = 0
+        cols = 0
+    if rows > 0 and cols > 0:
+        return rows, cols
+    fallback = shutil.get_terminal_size((80, 24))
+    rows = int(getattr(fallback, "lines", 0) or 0)
+    cols = int(getattr(fallback, "columns", 0) or 0)
+    if rows <= 0:
+        rows = 24
+    if cols <= 0:
+        cols = 80
+    return rows, cols
+
+
+def _apply_pty_winsize(pty_fd: int, rows: int, cols: int) -> bool:
+    if os.name != "posix" or rows <= 0 or cols <= 0:
+        return False
+    try:
+        import fcntl
+        import struct
+        import termios
+
+        fcntl.ioctl(pty_fd, termios.TIOCSWINSZ, struct.pack("HHHH", rows, cols, 0, 0))
+        return True
+    except Exception:
+        return False
+
+
 def subprocess_call_with_channel_wake_proxy(
     cmd: list[str],
     env: dict[str, str],
@@ -22234,18 +22308,37 @@ def subprocess_call_with_channel_wake_proxy(
     last_channel_marker = _chat_messages_file_marker()
     last_summary_marker = _channel_llm_summary_file_marker()
     master_fd, slave_fd = pty.openpty()
+    stdout_fd = sys.stdout.fileno()
+    rows, cols = _terminal_winsize_from_fd(stdout_fd)
+    if _apply_pty_winsize(slave_fd, rows, cols):
+        router_log("INFO", f"channel_stdin_proxy_winsize_init rows={rows} cols={cols}")
     proc = subprocess.Popen(cmd, stdin=slave_fd, stdout=slave_fd, stderr=slave_fd, env=env, close_fds=True)
     os.close(slave_fd)
     stdin_fd = sys.stdin.fileno()
-    stdout_fd = sys.stdout.fileno()
     old_attrs = termios.tcgetattr(stdin_fd)
+    old_sigwinch = None
+    sigwinch_installed = False
     last_channel_poll = 0.0
     channel_enter_bytes = _channel_wake_enter_bytes()
     router_log(
         "INFO",
         f"channel_stdin_proxy_enter_default enter={_channel_enter_label(channel_enter_bytes)} os={os.name} platform={sys.platform}",
     )
+
+    def _handle_sigwinch(signum: int, frame: Any) -> None:
+        new_rows, new_cols = _terminal_winsize_from_fd(stdout_fd)
+        if _apply_pty_winsize(master_fd, new_rows, new_cols):
+            router_log("INFO", f"channel_stdin_proxy_winsize_resize rows={new_rows} cols={new_cols}")
+        if callable(old_sigwinch):
+            old_sigwinch(signum, frame)
+
     try:
+        try:
+            old_sigwinch = signal.getsignal(signal.SIGWINCH)
+            signal.signal(signal.SIGWINCH, _handle_sigwinch)
+            sigwinch_installed = True
+        except Exception:
+            sigwinch_installed = False
         tty.setraw(stdin_fd)
         if print_channel_summaries:
             _print_pending_channel_summaries(stdout_fd)
@@ -22305,6 +22398,11 @@ def subprocess_call_with_channel_wake_proxy(
                 break
         return proc.returncode if proc.returncode is not None else 0
     finally:
+        if sigwinch_installed:
+            try:
+                signal.signal(signal.SIGWINCH, old_sigwinch)
+            except Exception:
+                pass
         try:
             termios.tcsetattr(stdin_fd, termios.TCSADRAIN, old_attrs)
         except Exception:

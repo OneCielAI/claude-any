@@ -30,6 +30,39 @@ class CronToolCompatibilityTests(unittest.TestCase):
         self.assertIn("CronList", names)
         self.assertNotIn("ScheduleWakeup", names)
 
+    def test_filter_hides_enter_plan_mode_when_ultracode_workflow_is_active(self):
+        body = {
+            "system": "Ultracode is on: use the Workflow tool for every substantive task.",
+            "messages": [{"role": "user", "content": "implement a feature"}],
+            "tools": [
+                {"name": "Workflow", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "Read", "input_schema": {"type": "object", "properties": {}}},
+            ],
+        }
+
+        filtered = claude_any.filter_blocked_tools("opencode", {}, body)
+        names = [tool["name"] for tool in filtered["tools"]]
+
+        self.assertIn("Workflow", names)
+        self.assertIn("Read", names)
+        self.assertNotIn("EnterPlanMode", names)
+
+    def test_filter_keeps_enter_plan_mode_for_anthropic_ultracode(self):
+        body = {
+            "system": "Ultracode is on: use the Workflow tool for every substantive task.",
+            "messages": [{"role": "user", "content": "implement a feature"}],
+            "tools": [
+                {"name": "Workflow", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "EnterPlanMode", "input_schema": {"type": "object", "properties": {}}},
+            ],
+        }
+
+        filtered = claude_any.filter_blocked_tools("anthropic", {}, body)
+        names = [tool["name"] for tool in filtered["tools"]]
+
+        self.assertIn("EnterPlanMode", names)
+
     def test_cron_create_aliases_are_normalized(self):
         fixed = claude_any._validate_and_fix_tool_input(
             "CronCreate",
