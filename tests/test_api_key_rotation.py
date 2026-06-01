@@ -1,5 +1,8 @@
 import copy
+import io
 import unittest
+from unittest import mock
+import urllib.error
 
 import claude_any
 
@@ -61,6 +64,69 @@ class ApiKeyRotationTests(unittest.TestCase):
         status = claude_any.api_key_status_line("deepseek", pcfg)
 
         self.assertIn("2 keys, round-robin", status)
+
+    def test_compatibility_api_key_probe_tests_each_configured_key(self):
+        pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-one", "sk-two"])
+        calls = []
+
+        def fake_post_json(url, body, headers=None, timeout=60.0):
+            calls.append((url, body, headers or {}, timeout))
+            return {"content": [{"type": "text", "text": "OK"}]}
+
+        with mock.patch.object(claude_any, "post_json", side_effect=fake_post_json):
+            lines = claude_any.run_compatibility_api_key_probes(
+                "deepseek",
+                pcfg,
+                "claude-any-deepseek-deepseek-v4-pro[1m]",
+                claude_any.compatibility_text_request("claude-any-deepseek-deepseek-v4-pro[1m]"),
+                3.0,
+            )
+
+        self.assertEqual(2, len(calls))
+        self.assertEqual("Bearer sk-one", calls[0][2]["authorization"])
+        self.assertEqual("Bearer sk-two", calls[1][2]["authorization"])
+        self.assertTrue(calls[0][0].endswith("/v1/messages"))
+        self.assertIn("API key 1/2", "\n".join(lines))
+        self.assertIn("API key 2/2", "\n".join(lines))
+
+    def test_compatibility_api_key_probe_skips_single_key(self):
+        pcfg = self.deepseek_pcfg(api_key="sk-one", api_keys=[])
+
+        with mock.patch.object(claude_any, "post_json") as post_json:
+            lines = claude_any.run_compatibility_api_key_probes(
+                "deepseek",
+                pcfg,
+                "claude-any-deepseek-deepseek-v4-pro[1m]",
+                claude_any.compatibility_text_request("claude-any-deepseek-deepseek-v4-pro[1m]"),
+                3.0,
+            )
+
+        self.assertEqual([], lines)
+        post_json.assert_not_called()
+
+    def test_compatibility_api_key_probe_failure_masks_key(self):
+        pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-secret-one", "sk-secret-two"])
+        error = urllib.error.HTTPError(
+            "https://api.deepseek.com/anthropic/v1/messages",
+            401,
+            "Unauthorized",
+            {},
+            io.BytesIO(b'{"error":{"message":"invalid key"}}'),
+        )
+
+        with mock.patch.object(claude_any, "post_json", side_effect=error):
+            with self.assertRaises(claude_any.CompatibilityApiKeyProbeError) as caught:
+                claude_any.run_compatibility_api_key_probes(
+                    "deepseek",
+                    pcfg,
+                    "claude-any-deepseek-deepseek-v4-pro[1m]",
+                    claude_any.compatibility_text_request("claude-any-deepseek-deepseek-v4-pro[1m]"),
+                    3.0,
+                )
+
+        self.assertEqual(401, caught.exception.code)
+        self.assertIn("invalid key", str(caught.exception))
+        self.assertNotIn("sk-secret-one", str(caught.exception))
 
 
 if __name__ == "__main__":

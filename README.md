@@ -448,7 +448,9 @@ Release flow:
 The demo sequence now shows provider selection, Base URL entry, model selection,
 LLM options, and the compatibility test. The compatibility test checks a plain
 text response, a required `tool_use`, and a `tool_result` follow-up before the
-launcher recommends starting Claude Code.
+launcher recommends starting Claude Code. When multiple API keys are configured
+for the selected provider, the test also sends a lightweight text probe with
+each key so a dead key is caught before launch instead of during round-robin use.
 
 Additional current screenshots:
 
@@ -579,7 +581,8 @@ steps under that larger model's supervision.
   `--ca-set-api-keys`, and `set-api-keys` configure comma-, semicolon-, or
   newline-separated key lists. Upstream provider requests rotate through the
   keys in-process, which is useful for high-token ultracode sessions that need
-  quota/rate distribution across keys.
+  quota/rate distribution across keys. Compatibility tests now probe every
+  configured key independently before the normal text/tool/tool-result checks.
 - **Claude native model registry refresh**: Anthropic native model refresh now
   prefers the official Claude model documentation before falling back to API
   model-list endpoints, stores the refreshed list in a provider-scoped

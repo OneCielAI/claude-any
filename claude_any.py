@@ -17526,6 +17526,100 @@ def compatibility_failure_diagnosis(provider: str, code: int | None, msg: str) -
     return None
 
 
+class CompatibilityApiKeyProbeError(Exception):
+    def __init__(self, message: str, code: int | None = None, diagnosis: str = "") -> None:
+        super().__init__(message)
+        self.code = code
+        self.diagnosis = diagnosis
+
+
+def compatibility_http_error_message(exc: urllib.error.HTTPError) -> str:
+    raw = exc.read().decode("utf-8", errors="ignore")
+    msg = raw.strip()
+    try:
+        err = json.loads(raw)
+        if isinstance(err, dict):
+            if isinstance(err.get("error"), dict):
+                msg = err["error"].get("message") or json.dumps(err["error"])
+            elif err.get("message"):
+                msg = str(err["message"])
+    except Exception:
+        pass
+    return msg
+
+
+def provider_config_for_single_api_key(pcfg: dict[str, Any], key: str) -> dict[str, Any]:
+    keyed = dict(pcfg)
+    keyed["api_key"] = key
+    keyed["api_keys"] = []
+    return keyed
+
+
+def compatibility_api_key_probe_request(
+    provider: str,
+    pcfg: dict[str, Any],
+    model: str,
+    request_body: dict[str, Any],
+) -> tuple[str, dict[str, Any], dict[str, str]]:
+    body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, request_body)
+    upstream_model = resolve_requested_model(provider, pcfg, model)
+    headers = provider_headers(provider, pcfg)
+    if provider in ("ollama", "ollama-cloud"):
+        req_body = ollama_chat_request(upstream_model, body, pcfg, stream=False)
+        return join_url(provider_upstream_request_base(provider, pcfg), "/api/chat"), req_body, headers
+    if provider in OPENCODE_PROVIDER_NAMES:
+        endpoint_kind = opencode_endpoint_kind(provider, upstream_model, pcfg)
+        if endpoint_kind == "openai-chat":
+            req_body = openai_compatible_chat_request(provider, upstream_model, body, pcfg, stream=False)
+            return join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions"), req_body, headers
+        if endpoint_kind != "anthropic-messages":
+            raise CompatibilityApiKeyProbeError(
+                f"model {upstream_model!r} uses unsupported endpoint family {endpoint_kind!r} for API-key probing"
+            )
+    if provider in ("lm-studio", "nvidia-hosted") and not provider_native_compat_enabled(provider, pcfg):
+        upstream_model = ncp_model_id_for_nvidia_hosted(upstream_model) if provider == "nvidia-hosted" else upstream_model
+        req_body = openai_compatible_chat_request(provider, upstream_model, body, pcfg, stream=False)
+        return join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions"), req_body, headers
+    body = cap_anthropic_body_for_provider(provider, pcfg, body)
+    body = apply_provider_request_options(provider, pcfg, body)
+    body = dict(body)
+    body["model"] = upstream_model
+    body = resolve_tool_model_references(provider, pcfg, body)
+    base = native_anthropic_base_url(provider, pcfg) if provider_native_compat_enabled(provider, pcfg) else provider_upstream_request_base(provider, pcfg)
+    return join_url(base, "/v1/messages"), body, headers
+
+
+def run_compatibility_api_key_probes(
+    provider: str,
+    pcfg: dict[str, Any],
+    model: str,
+    request_body: dict[str, Any],
+    timeout: float,
+) -> list[str]:
+    keys = provider_config_api_keys(provider, pcfg)
+    if len(keys) <= 1:
+        return []
+    lines = [f"API key checks: running {len(keys)} configured keys"]
+    for index, key in enumerate(keys, start=1):
+        label = f"API key {index}/{len(keys)} ({mask_secret(key)})"
+        keyed_pcfg = provider_config_for_single_api_key(pcfg, key)
+        try:
+            url, probe_body, probe_headers = compatibility_api_key_probe_request(provider, keyed_pcfg, model, request_body)
+            post_json(url, probe_body, headers=probe_headers, timeout=timeout)
+        except CompatibilityApiKeyProbeError:
+            raise
+        except urllib.error.HTTPError as exc:
+            msg = compatibility_http_error_message(exc)
+            diagnosis = compatibility_failure_diagnosis(provider, exc.code, msg) or ""
+            raise CompatibilityApiKeyProbeError(f"{label}: {msg}", exc.code, diagnosis) from exc
+        except TimeoutError as exc:
+            raise CompatibilityApiKeyProbeError(f"{label}: timed out before the {timeout:g}s API-key probe timeout") from exc
+        except Exception as exc:
+            raise CompatibilityApiKeyProbeError(f"{label}: {type(exc).__name__}: {exc}") from exc
+        lines.append(f"{label}: OK")
+    return lines
+
+
 def vllm_tool_parser_hint(model: str) -> str | None:
     normalized = model.lower()
     if "qwen3-coder" in normalized or "qwen3_coder" in normalized:
@@ -17720,17 +17814,7 @@ def _cmd_test(args: argparse.Namespace) -> None:
         try:
             return post_json(url, request_body, headers=headers, timeout=args.timeout)
         except urllib.error.HTTPError as exc:
-            raw = exc.read().decode("utf-8", errors="ignore")
-            msg = raw.strip()
-            try:
-                err = json.loads(raw)
-                if isinstance(err, dict):
-                    if isinstance(err.get("error"), dict):
-                        msg = err["error"].get("message") or json.dumps(err["error"])
-                    elif err.get("message"):
-                        msg = str(err["message"])
-            except Exception:
-                pass
+            msg = compatibility_http_error_message(exc)
             diagnosis = compatibility_failure_diagnosis(provider, exc.code, msg)
             fail(f"{label}: {msg}", exc.code, diagnosis or "")
         except TimeoutError:
@@ -17748,6 +17832,12 @@ def _cmd_test(args: argparse.Namespace) -> None:
                 sys.stdout.flush()
                 sys.exit(1)
             fail(f"{label}: {msg}")
+
+    try:
+        for line in run_compatibility_api_key_probes(provider, pcfg, model, text_body, args.timeout):
+            print(line)
+    except CompatibilityApiKeyProbeError as exc:
+        fail(f"API key check: {exc}", exc.code, exc.diagnosis)
 
     text_data = run_phase("Text response", text_body)
     for line in summarize_compat_response(text_data, "Text response"):

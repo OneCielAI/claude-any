@@ -251,7 +251,10 @@ claude-any --ca-provider opencode --ca-api-keys-env OPENCODE_API_KEYS --ca-no-la
 
 `OPENCODE_API_KEYS` can be comma-, semicolon-, or newline-separated. The first
 key remains the primary key used for Claude Code router authentication and model
-list checks; routed upstream calls use round-robin selection.
+list checks; routed upstream calls use round-robin selection. If more than one
+key is configured, `claude-any test` sends a lightweight text probe with each
+key before the normal compatibility phases, so an expired or invalid secondary
+key fails fast instead of surfacing mid-session.
 
 - Claude Code docs: https://docs.anthropic.com/en/docs/claude-code
 - Claude Console API keys: https://console.anthropic.com/settings/keys
