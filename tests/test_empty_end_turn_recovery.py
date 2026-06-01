@@ -138,12 +138,38 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
 
         self.assertFalse(claude_any.should_auto_enter_plan_mode(body, "", []))
 
+    def test_ultracode_still_on_workflow_prevents_auto_enter_plan_mode(self):
+        body = body_with_tools(
+            "implement the requested feature",
+            ["Workflow", "EnterPlanMode", "TaskList"],
+        )
+        body["messages"].append(
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": "Ultracode is still on — use the Workflow tool; see its Ultracode section."}],
+            }
+        )
+
+        self.assertFalse(claude_any.should_auto_enter_plan_mode(body, "", []))
+
     def test_ultracode_runtime_drops_enter_plan_mode_emit(self):
         body = body_with_tools(
             "implement the requested feature",
             ["Workflow", "EnterPlanMode"],
         )
         body["system"] = "Ultracode is on: use the Workflow tool for every substantive task."
+
+        name, fixed = claude_any.plan_mode_tool_name_for_emit(body, "EnterPlanMode", {})
+
+        self.assertIsNone(name)
+        self.assertEqual({}, fixed)
+
+    def test_ultracode_still_on_runtime_drops_enter_plan_mode_emit(self):
+        body = body_with_tools(
+            "implement the requested feature",
+            ["Workflow", "EnterPlanMode"],
+        )
+        body["system"] = "Ultracode is still on — use the Workflow tool; see its Ultracode section."
 
         name, fixed = claude_any.plan_mode_tool_name_for_emit(body, "EnterPlanMode", {})
 

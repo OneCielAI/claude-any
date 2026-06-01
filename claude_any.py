@@ -2945,8 +2945,9 @@ def has_tool(body: dict[str, Any], name: str) -> bool:
     return name in tool_names_in_body(body)
 
 
-ULTRACODE_ON_RE = re.compile(r"\bUltracode\s+is\s+on\b", re.IGNORECASE)
+ULTRACODE_ON_RE = re.compile(r"\bUltracode\s+is\s+(?:still\s+)?on\b", re.IGNORECASE)
 ULTRACODE_OFF_RE = re.compile(r"\bUltracode\s+is\s+off\b", re.IGNORECASE)
+ULTRACODE_STATE_RE = re.compile(r"\bUltracode\s+is\s+(?:still\s+)?(on|off)\b", re.IGNORECASE)
 
 
 def body_ultracode_runtime_enabled(body: dict[str, Any]) -> bool:
@@ -2959,14 +2960,14 @@ def body_ultracode_runtime_enabled(body: dict[str, Any]) -> bool:
     """
     enabled = False
     system_text = anthropic_content_to_text(body.get("system"))
-    for match in re.finditer(r"\bUltracode\s+is\s+(on|off)\b", system_text, re.IGNORECASE):
-        enabled = bool(ULTRACODE_ON_RE.search(match.group(0))) and not bool(ULTRACODE_OFF_RE.search(match.group(0)))
+    for match in ULTRACODE_STATE_RE.finditer(system_text):
+        enabled = match.group(1).lower() == "on"
     for message in body.get("messages") or []:
         if not isinstance(message, dict):
             continue
         text = anthropic_content_to_text(message.get("content"))
-        for match in re.finditer(r"\bUltracode\s+is\s+(on|off)\b", text, re.IGNORECASE):
-            enabled = bool(ULTRACODE_ON_RE.search(match.group(0))) and not bool(ULTRACODE_OFF_RE.search(match.group(0)))
+        for match in ULTRACODE_STATE_RE.finditer(text):
+            enabled = match.group(1).lower() == "on"
     return enabled
 
 
