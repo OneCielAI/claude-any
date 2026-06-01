@@ -17,6 +17,11 @@ class ApiKeyRotationTests(unittest.TestCase):
         pcfg.update(overrides)
         return pcfg
 
+    def provider_pcfg(self, provider, **overrides):
+        pcfg = copy.deepcopy(claude_any.DEFAULT_CONFIG["providers"][provider])
+        pcfg.update(overrides)
+        return pcfg
+
     def test_parse_api_key_list_filters_placeholders_and_dedupes(self):
         keys = claude_any.parse_api_key_list("sk-a, dummy\nsk-b;sk-a\nnot-used")
 
@@ -127,6 +132,40 @@ class ApiKeyRotationTests(unittest.TestCase):
         self.assertEqual(401, caught.exception.code)
         self.assertIn("invalid key", str(caught.exception))
         self.assertNotIn("sk-secret-one", str(caught.exception))
+
+    def test_compatibility_api_key_probe_uses_provider_specific_routes(self):
+        cases = [
+            ("ollama-cloud", "glm-5.1", "/api/chat"),
+            ("self-hosted-nim", "model", "/v1/messages"),
+            ("opencode", "claude-sonnet-4-6", "/v1/messages"),
+            ("opencode", "deepseek-v4-flash-free", "/v1/chat/completions"),
+            ("opencode-go", "qwen3.6-plus", "/v1/messages"),
+            ("opencode-go", "deepseek-v4-pro", "/v1/chat/completions"),
+        ]
+
+        for provider, model, expected_suffix in cases:
+            with self.subTest(provider=provider, model=model):
+                pcfg = self.provider_pcfg(provider, api_key="", api_keys=["sk-one", "sk-two"], current_model=model)
+                calls = []
+
+                def fake_post_json(url, body, headers=None, timeout=60.0):
+                    calls.append((url, body, headers or {}, timeout))
+                    return {"content": [{"type": "text", "text": "OK"}]}
+
+                with mock.patch.object(claude_any, "post_json", side_effect=fake_post_json):
+                    claude_any.run_compatibility_api_key_probes(
+                        provider,
+                        pcfg,
+                        model,
+                        claude_any.compatibility_text_request(model),
+                        3.0,
+                    )
+
+                self.assertEqual(2, len(calls))
+                self.assertTrue(calls[0][0].endswith(expected_suffix), calls[0][0])
+                self.assertTrue(calls[1][0].endswith(expected_suffix), calls[1][0])
+                self.assertEqual("Bearer sk-one", calls[0][2]["authorization"])
+                self.assertEqual("Bearer sk-two", calls[1][2]["authorization"])
 
 
 if __name__ == "__main__":
