@@ -23027,6 +23027,134 @@ def running_from_npm_package() -> bool:
     return "/node_modules/@oneciel-ai/claude-any/" in path
 
 
+def package_root_from_installed_path(path: Path) -> Path | None:
+    """Return the npm package root when a path lives inside this package."""
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        resolved = path
+    parts = resolved.parts
+    for idx in range(0, max(0, len(parts) - 2)):
+        if parts[idx] == "node_modules" and parts[idx + 1] == "@oneciel-ai" and parts[idx + 2] == "claude-any":
+            try:
+                return Path(*parts[: idx + 3])
+            except Exception:
+                return None
+    return None
+
+
+def current_npm_package_root() -> Path | None:
+    return package_root_from_installed_path(Path(__file__))
+
+
+def claude_any_launcher_candidate_dirs() -> list[Path]:
+    raw_dirs: list[Path] = []
+    for entry in os.environ.get("PATH", "").split(os.pathsep):
+        if entry:
+            raw_dirs.append(Path(entry))
+    raw_dirs.extend([HOME / ".local" / "bin", HOME / ".npm-global" / "bin", HOME / "bin"])
+    if os.name != "nt":
+        raw_dirs.extend([Path("/usr/local/bin"), Path("/usr/bin")])
+    seen: set[str] = set()
+    out: list[Path] = []
+    for directory in raw_dirs:
+        key = str(directory)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(directory)
+    return out
+
+
+def claude_any_launcher_candidates() -> list[Path]:
+    names = ["claude-any"]
+    if os.name == "nt":
+        names.extend(["claude-any.cmd", "claude-any.exe"])
+    out: list[Path] = []
+    seen: set[str] = set()
+    for directory in claude_any_launcher_candidate_dirs():
+        for name in names:
+            candidate = directory / name
+            if not candidate.exists():
+                continue
+            try:
+                key = str(candidate.resolve(strict=False))
+            except Exception:
+                key = str(candidate)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(candidate)
+    return out
+
+
+def claude_any_launcher_version(path: Path, timeout: float = 5.0) -> str:
+    env = os.environ.copy()
+    env["CLAUDE_ANY_SKIP_INSTALL_DIAGNOSTIC"] = "1"
+    env["CLAUDE_ANY_SKIP_SELF_UPDATE"] = "1"
+    env["CLAUDE_ANY_SELF_UPDATE_CHECK"] = "off"
+    try:
+        proc = subprocess.run(
+            [str(path), "--version"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            env=env,
+            timeout=timeout,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    match = re.search(r"claude-any\s+(.+)", proc.stdout or "", re.IGNORECASE)
+    return match.group(1).strip() if match else (proc.stdout or "").strip().splitlines()[-1].strip()
+
+
+def claude_any_install_diagnostics() -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    for launcher in claude_any_launcher_candidates():
+        root = package_root_from_installed_path(launcher)
+        rows.append(
+            {
+                "launcher": str(launcher),
+                "resolved": str(launcher.resolve(strict=False)),
+                "package_root": str(root) if root else "",
+                "version": claude_any_launcher_version(launcher),
+            }
+        )
+    return rows
+
+
+def warn_if_multiple_claude_any_installs() -> None:
+    if os.environ.get("CLAUDE_ANY_SKIP_INSTALL_DIAGNOSTIC") == "1":
+        return
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return
+    rows = claude_any_install_diagnostics()
+    roots = {row["package_root"] for row in rows if row.get("package_root")}
+    if len(roots) <= 1:
+        return
+    current_root = str(current_npm_package_root() or "")
+    first = rows[0] if rows else {}
+    newest = max((row for row in rows if row.get("version")), key=lambda row: parse_version_tuple(row["version"]), default=None)
+    print("Claude Any warning: multiple claude-any npm installs are visible.", file=sys.stderr, flush=True)
+    if first:
+        print(
+            f"  shell resolves claude-any to: {first.get('launcher')} ({first.get('version') or 'unknown version'})",
+            file=sys.stderr,
+            flush=True,
+        )
+    if current_root:
+        print(f"  current package root: {current_root}", file=sys.stderr, flush=True)
+    if newest and newest is not first:
+        print(
+            f"  newer visible install: {newest.get('launcher')} ({newest.get('version')})",
+            file=sys.stderr,
+            flush=True,
+        )
+    print("  Fix by keeping one install prefix: update or uninstall the stale higher-priority install.", file=sys.stderr, flush=True)
+
+
 def claude_any_restart_user_args() -> list[str]:
     args = list(sys.argv[1:])
     if args and args[0] == "cli":
@@ -23175,6 +23303,7 @@ def launch_claude(
     if has_noninteractive_claude_args(passthrough):
         update_check = False
         self_update_check = False
+    warn_if_multiple_claude_any_installs()
     run_claude_any_update_check(enabled=self_update_check)
     auto_import_passthrough_channels(passthrough)
     rc = run_prelaunch_menu(passthrough, skip_menu=skip_menu, force_menu=force_menu)
