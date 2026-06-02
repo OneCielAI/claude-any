@@ -574,15 +574,16 @@ class StopRouterGuaranteeTests(unittest.TestCase):
         stop.assert_not_called()
 
     def test_returns_true_when_kill_brings_router_down(self):
-        states = iter([True, False])  # alive at first, dead after stop
-        def fake_up():
+        health = {"config_dir": str(claude_any.CONFIG_DIR), "pid": 2468}
+        states = iter([health, None])  # alive at first, dead after stop
+        def fake_health():
             try:
                 return next(states)
             except StopIteration:
-                return False
+                return None
 
         with (
-            mock.patch.object(claude_any, "router_up", side_effect=fake_up),
+            mock.patch.object(claude_any, "router_health", side_effect=fake_health),
             mock.patch.object(claude_any, "stop_router_processes") as stop,
             mock.patch.object(claude_any, "router_log"),
         ):
@@ -591,9 +592,10 @@ class StopRouterGuaranteeTests(unittest.TestCase):
         stop.assert_called_once()
 
     def test_raises_when_router_stays_up_past_deadline(self):
-        # router_up always returns True → guarantee should give up and raise.
+        # router_health always returns this config's router -> guarantee should give up and raise.
+        health = {"config_dir": str(claude_any.CONFIG_DIR), "pid": 2468}
         with (
-            mock.patch.object(claude_any, "router_up", return_value=True),
+            mock.patch.object(claude_any, "router_health", return_value=health),
             mock.patch.object(claude_any, "stop_router_processes"),
             mock.patch.object(claude_any, "router_log"),
         ):
@@ -602,19 +604,18 @@ class StopRouterGuaranteeTests(unittest.TestCase):
         self.assertIn("native_anthropic_launch", str(ctx.exception))
         self.assertIn("router", str(ctx.exception).lower())
 
-    def test_stop_router_processes_uses_posix_port_fallback(self):
+    def test_stop_router_processes_skips_foreign_config_router(self):
         with (
-            mock.patch.object(claude_any.os, "name", "posix"),
             mock.patch.object(claude_any, "terminate_pid_file", return_value=False) as pid_file,
-            mock.patch.object(claude_any, "terminate_matching_processes", return_value=False) as match,
-            mock.patch.object(claude_any, "terminate_posix_port", return_value=True) as port,
+            mock.patch.object(claude_any, "router_health", return_value={"config_dir": "/other/config", "pid": 4321}),
+            mock.patch.object(claude_any, "terminate_router_health_pid") as health_pid,
+            mock.patch.object(claude_any, "router_log"),
         ):
             result = claude_any.stop_router_processes(quiet=True)
 
-        self.assertTrue(result)
+        self.assertFalse(result)
         pid_file.assert_called_once()
-        self.assertEqual(2, match.call_count)
-        port.assert_called_once_with(claude_any.ROUTER_PORT, "claude-any router", quiet=True)
+        health_pid.assert_not_called()
 
     def test_posix_pids_on_port_parses_ss_listener_pid(self):
         class FakeProcess:
@@ -646,7 +647,7 @@ class StopRouterGuaranteeTests(unittest.TestCase):
 
     def test_terminate_router_health_pid_uses_health_pid(self):
         with mock.patch.object(claude_any, "terminate_pid", return_value=True) as terminate:
-            result = claude_any.terminate_router_health_pid({"pid": 2468}, quiet=True)
+            result = claude_any.terminate_router_health_pid({"pid": 2468, "config_dir": str(claude_any.CONFIG_DIR)}, quiet=True)
 
         self.assertTrue(result)
         terminate.assert_called_once_with(2468, "claude-any router", quiet=True)
@@ -676,8 +677,138 @@ class StopRouterGuaranteeTests(unittest.TestCase):
         self.assertIn("listener_pids=[777]", str(ctx.exception))
         self.assertIn("version=old", str(ctx.exception))
 
+    def test_ensure_router_port_available_refuses_foreign_config(self):
+        health = {"version": "same", "source_fingerprint": "abc", "pid": 777, "config_dir": "/other/config"}
+        with self.assertRaises(RuntimeError) as ctx:
+            claude_any.ensure_router_port_available_for_spawn("test", health, max_wait_seconds=0.2)
+
+        self.assertIn("another claude-any config", str(ctx.exception))
+        self.assertIn("CLAUDE_ANY_ROUTER_PORT", str(ctx.exception))
+
+    def test_start_router_replaces_matching_router_by_default(self):
+        health = {
+            "version": claude_any.VERSION,
+            "source_fingerprint": claude_any.SOURCE_FINGERPRINT,
+            "pid": 2468,
+            "user": claude_any.getpass.getuser(),
+            "config_dir": str(claude_any.CONFIG_DIR),
+        }
+        with tempfile.TemporaryDirectory() as td:
+            log_path = Path(td) / "router.log"
+            with (
+                mock.patch.dict(os.environ, {"CLAUDE_ANY_REUSE_ROUTER": "0"}, clear=False),
+                mock.patch.object(claude_any, "LOG_PATH", log_path),
+                mock.patch.object(claude_any, "router_health", return_value=health),
+                mock.patch.object(claude_any, "ensure_router_port_available_for_spawn") as ensure,
+                mock.patch.object(claude_any, "router_up", return_value=True),
+                mock.patch.object(claude_any.subprocess, "Popen") as popen,
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                result = claude_any.start_router_if_needed()
+
+        self.assertTrue(result)
+        ensure.assert_called_once_with("prelaunch_replace", health)
+        popen.assert_called_once()
+        popen_env = popen.call_args.kwargs["env"]
+        self.assertEqual("1", popen_env["CLAUDE_ANY_MANAGED_ROUTER"])
+        self.assertEqual(str(os.getpid()), popen_env["CLAUDE_ANY_ROUTER_OWNER_PID"])
+
+    def test_start_router_reuses_matching_router_only_when_env_allows(self):
+        health = {
+            "version": claude_any.VERSION,
+            "source_fingerprint": claude_any.SOURCE_FINGERPRINT,
+            "pid": 2468,
+            "user": claude_any.getpass.getuser(),
+            "config_dir": str(claude_any.CONFIG_DIR),
+        }
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_ANY_REUSE_ROUTER": "1"}, clear=False),
+            mock.patch.object(claude_any, "router_health", return_value=health),
+            mock.patch.object(claude_any, "ensure_router_port_available_for_spawn") as ensure,
+            mock.patch.object(claude_any.subprocess, "Popen") as popen,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            result = claude_any.start_router_if_needed()
+
+        self.assertTrue(result)
+        ensure.assert_not_called()
+        popen.assert_not_called()
+
+    def test_start_router_keeps_matching_router_with_active_clients(self):
+        health = {
+            "version": claude_any.VERSION,
+            "source_fingerprint": claude_any.SOURCE_FINGERPRINT,
+            "pid": 2468,
+            "user": claude_any.getpass.getuser(),
+            "config_dir": str(claude_any.CONFIG_DIR),
+        }
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_ANY_REUSE_ROUTER": "0"}, clear=False),
+            mock.patch.object(claude_any, "router_health", return_value=health),
+            mock.patch.object(claude_any, "active_router_client_pids", return_value=[999999]),
+            mock.patch.object(claude_any, "ensure_router_port_available_for_spawn") as ensure,
+            mock.patch.object(claude_any.subprocess, "Popen") as popen,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            result = claude_any.start_router_if_needed()
+
+        self.assertTrue(result)
+        ensure.assert_not_called()
+        popen.assert_not_called()
+
+    def test_start_router_refuses_foreign_config_router(self):
+        health = {
+            "version": claude_any.VERSION,
+            "source_fingerprint": claude_any.SOURCE_FINGERPRINT,
+            "pid": 2468,
+            "user": claude_any.getpass.getuser(),
+            "config_dir": "/other/config",
+        }
+        with (
+            mock.patch.object(claude_any, "router_health", return_value=health),
+            mock.patch.object(claude_any, "active_router_client_pids", return_value=[]),
+            mock.patch.object(claude_any.subprocess, "Popen") as popen,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            with self.assertRaises(RuntimeError) as ctx:
+                claude_any.start_router_if_needed()
+
+        self.assertIn("another claude-any config", str(ctx.exception))
+        popen.assert_not_called()
+
 
 class RouterLifetimeTests(unittest.TestCase):
+    def test_managed_router_watchdog_stops_when_owner_dead_and_no_clients(self):
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_ANY_MANAGED_ROUTER": "1"}, clear=False),
+            mock.patch.object(claude_any, "active_router_client_pids", return_value=[]),
+            mock.patch.object(claude_any, "pid_is_running", return_value=False),
+        ):
+            reason = claude_any.managed_router_stop_reason(started_at=100.0, owner_pid=2468, idle_seconds=90.0)
+
+        self.assertEqual("owner_dead_no_clients", reason)
+
+    def test_managed_router_watchdog_keeps_active_clients(self):
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_ANY_MANAGED_ROUTER": "1"}, clear=False),
+            mock.patch.object(claude_any, "active_router_client_pids", return_value=[999999]),
+            mock.patch.object(claude_any, "pid_is_running", return_value=False),
+        ):
+            reason = claude_any.managed_router_stop_reason(started_at=0.0, owner_pid=2468, idle_seconds=1.0)
+
+        self.assertIsNone(reason)
+
+    def test_managed_router_watchdog_stops_after_idle_grace(self):
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_ANY_MANAGED_ROUTER": "1"}, clear=False),
+            mock.patch.object(claude_any, "active_router_client_pids", return_value=[]),
+            mock.patch.object(claude_any, "pid_is_running", return_value=True),
+            mock.patch.object(claude_any.time, "time", return_value=200.0),
+        ):
+            reason = claude_any.managed_router_stop_reason(started_at=100.0, owner_pid=2468, idle_seconds=90.0)
+
+        self.assertEqual("idle_no_clients", reason)
+
     def test_runner_exit_stops_router_when_no_other_clients_remain(self):
         with tempfile.TemporaryDirectory() as td:
             clients_dir = Path(td) / "router-clients"
@@ -727,21 +858,21 @@ class RouterLifetimeTests(unittest.TestCase):
         stop.assert_not_called()
 
 
-class CleanupNativeAlwaysKillsTests(unittest.TestCase):
-    def test_native_bypasses_managed_services_toggle(self):
+class CleanupNativeRouterTests(unittest.TestCase):
+    def test_native_bypasses_managed_services_toggle_but_only_idle_router(self):
         # Even when the user turned off managed_services_on_launch, native
-        # mode must still kill the router. This is the hard guarantee the
-        # provider was added to deliver.
+        # mode still cleans this config's idle router. Active sessions are
+        # protected by stop_router_if_no_active_clients().
         cfg = {"cleanup": {"managed_services_on_launch": False}}
         with (
             mock.patch.object(claude_any, "native_anthropic_enabled", return_value=True),
             mock.patch.object(claude_any, "provider_native_compat_enabled", return_value=False),
-            mock.patch.object(claude_any, "stop_router_with_guarantee", return_value=True) as kill,
+            mock.patch.object(claude_any, "stop_router_if_no_active_clients", return_value=True) as stop_idle,
             mock.patch.object(claude_any, "stop_ncp_proxy"),
         ):
             claude_any.cleanup_managed_services_for_provider("anthropic", {}, cfg, quiet=True)
-        kill.assert_called_once()
-        called_reason = kill.call_args.args[0] if kill.call_args.args else kill.call_args.kwargs.get("reason", "")
+        stop_idle.assert_called_once()
+        called_reason = stop_idle.call_args.args[0] if stop_idle.call_args.args else stop_idle.call_args.kwargs.get("reason", "")
         self.assertIn("native", called_reason.lower())
 
     def test_non_native_respects_managed_services_toggle(self):

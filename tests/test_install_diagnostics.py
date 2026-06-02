@@ -1,4 +1,5 @@
 import io
+import json
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -68,6 +69,15 @@ class InstallDiagnosticsTests(unittest.TestCase):
         self.assertIn("/usr/local/bin/claude-any", text)
         self.assertIn("/home/user/.local/bin/claude-any", text)
         self.assertIn("0.1.104-nightly.20260601-012855.916d3dc", text)
+
+    def test_npm_postinstall_best_effort_stops_managed_services(self):
+        root = Path(__file__).resolve().parents[1]
+        package = json.loads((root / "package.json").read_text(encoding="utf-8"))
+
+        self.assertEqual("node npm-bin/postinstall.js", package["scripts"]["postinstall"])
+        postinstall = (root / "npm-bin" / "postinstall.js").read_text(encoding="utf-8")
+        self.assertIn('"cli", "stop"', postinstall)
+        self.assertIn("CLAUDE_ANY_SKIP_POSTINSTALL_STOP", postinstall)
 
 
 if __name__ == "__main__":

@@ -44,6 +44,7 @@
     "docs/"
   ],
   "scripts": {
+    "postinstall": "node npm-bin/postinstall.js",
     "test": "python -m py_compile claude_any.py claude_any_support/__init__.py claude_any_support/observability.py claude_any_support/transcript_filter.py claude-any-menu.py claude-any-tool-guard.py scripts/make_demo_assets.py && python -m unittest discover -s tests -p \"test_*.py\"",
     "lint": "python -m ruff check .",
     "demo:assets": "python scripts/make_demo_assets.py"

@@ -13417,6 +13417,7 @@ def serve(_: argparse.Namespace) -> None:
     )
     sys.stderr.flush()
     server = ThreadingHTTPServer((bind_host, ROUTER_PORT), RouterHandler)
+    start_managed_router_lifetime_watchdog(server)
     channel_start_thread = threading.Thread(
         target=lambda: start_router_managed_channel_sse(cfg),
         daemon=True,
@@ -13454,9 +13455,32 @@ def router_health_matches_current(health: dict[str, Any] | None) -> bool:
         return False
     if str(health.get("user") or "") != getpass.getuser():
         return False
-    if str(health.get("config_dir") or "") != str(CONFIG_DIR):
+    if not router_health_config_matches_current(health):
         return False
     return True
+
+
+def _path_identity_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    try:
+        return str(Path(text).expanduser().resolve(strict=False))
+    except Exception:
+        return text
+
+
+def router_health_config_matches_current(health: dict[str, Any] | None) -> bool:
+    if not isinstance(health, dict):
+        return False
+    return _path_identity_text(health.get("config_dir")) == _path_identity_text(CONFIG_DIR)
+
+
+def router_health_has_foreign_config(health: dict[str, Any] | None) -> bool:
+    if not isinstance(health, dict):
+        return False
+    config_dir = _path_identity_text(health.get("config_dir"))
+    return bool(config_dir) and config_dir != _path_identity_text(CONFIG_DIR)
 
 
 def invalid_nvidia_hosted_base_url(value: str | None) -> bool:
@@ -18681,6 +18705,56 @@ def release_router_client(path: Path | None) -> None:
         router_log("WARN", f"router_client_release_failed path={path} error={type(exc).__name__}: {exc}")
 
 
+def router_managed_idle_exit_seconds() -> float:
+    raw = os.environ.get("CLAUDE_ANY_ROUTER_IDLE_EXIT_SECONDS", "90")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 90.0
+    return max(0.0, value)
+
+
+def managed_router_stop_reason(started_at: float, owner_pid: int, idle_seconds: float) -> str | None:
+    if os.environ.get("CLAUDE_ANY_MANAGED_ROUTER") != "1":
+        return None
+    active = active_router_client_pids()
+    if active:
+        return None
+    if owner_pid > 0 and not pid_is_running(owner_pid):
+        return "owner_dead_no_clients"
+    if idle_seconds > 0 and time.time() - started_at >= idle_seconds:
+        return "idle_no_clients"
+    return None
+
+
+def start_managed_router_lifetime_watchdog(server: ThreadingHTTPServer) -> None:
+    if os.environ.get("CLAUDE_ANY_MANAGED_ROUTER") != "1":
+        return
+    try:
+        owner_pid = int(os.environ.get("CLAUDE_ANY_ROUTER_OWNER_PID") or "0")
+    except ValueError:
+        owner_pid = 0
+    idle_seconds = router_managed_idle_exit_seconds()
+    started_at = time.time()
+
+    def watch() -> None:
+        interval = min(5.0, max(0.5, idle_seconds / 3.0 if idle_seconds else 5.0))
+        while True:
+            time.sleep(interval)
+            reason = managed_router_stop_reason(started_at, owner_pid, idle_seconds)
+            if not reason:
+                continue
+            router_log("INFO", f"router_managed_lifetime_shutdown reason={reason} owner_pid={owner_pid or '-'}")
+            try:
+                server.shutdown()
+            except Exception as exc:
+                router_log("ERROR", f"router_managed_lifetime_shutdown_failed error={type(exc).__name__}: {exc}")
+            return
+
+    thread = threading.Thread(target=watch, daemon=True, name="ca-router-lifetime-watchdog")
+    thread.start()
+
+
 def active_router_client_pids() -> list[int]:
     if not ROUTER_CLIENTS_DIR.exists():
         return []
@@ -18932,6 +19006,13 @@ def router_port_listener_pids() -> list[int]:
 def terminate_router_health_pid(health: dict[str, Any] | None, quiet: bool = True) -> bool:
     if not isinstance(health, dict):
         return False
+    if not router_health_config_matches_current(health):
+        router_log(
+            "INFO",
+            "router_kill_skipped_foreign_config "
+            f"running_config={health.get('config_dir') or '-'} current_config={CONFIG_DIR}",
+        )
+        return False
     try:
         pid = int(health.get("pid") or 0)
     except Exception:
@@ -18947,11 +19028,23 @@ def ensure_router_port_available_for_spawn(
     max_wait_seconds: float = 5.0,
 ) -> None:
     """Clear the local router/MCP port before spawning a replacement router."""
+    if router_health_has_foreign_config(health):
+        raise RuntimeError(
+            f"claude-any router port {ROUTER_PORT} is already used by another claude-any config "
+            f"({health.get('config_dir')}). Set CLAUDE_ANY_ROUTER_PORT or CLAUDE_ANY_CONFIG_DIR "
+            "for this instance instead of killing the other router."
+        )
     stopped = terminate_router_health_pid(health, quiet=True)
     stopped = stop_router_processes(quiet=True) or stopped
     deadline = time.time() + max(0.1, max_wait_seconds)
     while time.time() < deadline:
         current_health = router_health()
+        if router_health_has_foreign_config(current_health):
+            raise RuntimeError(
+                f"claude-any router port {ROUTER_PORT} is already used by another claude-any config "
+                f"({current_health.get('config_dir')}). Set CLAUDE_ANY_ROUTER_PORT or "
+                "CLAUDE_ANY_CONFIG_DIR for this instance instead of killing the other router."
+            )
         if current_health is None and not router_port_listener_pids():
             router_log(
                 "INFO",
@@ -19110,12 +19203,16 @@ def stop_ncp_proxy(quiet: bool = False) -> bool:
 
 def stop_router_processes(quiet: bool = False) -> bool:
     stopped = terminate_pid_file(PID_PATH, "claude-any router", quiet=quiet)
-    if os.name == "nt":
-        stopped = terminate_windows_port(ROUTER_PORT, "claude-any router", quiet=quiet) or stopped
+    health = router_health()
+    if router_health_has_foreign_config(health):
+        router_log(
+            "INFO",
+            "router_stop_skipped_foreign_config "
+            f"running_config={health.get('config_dir') or '-'} current_config={CONFIG_DIR}",
+        )
         return stopped
-    stopped = terminate_matching_processes(["claude_any.py", "serve"], "claude-any router", quiet=quiet) or stopped
-    stopped = terminate_matching_processes(["claude-any", "serve"], "claude-any router", quiet=True) or stopped
-    stopped = terminate_posix_port(ROUTER_PORT, "claude-any router", quiet=quiet) or stopped
+    if router_health_config_matches_current(health):
+        stopped = terminate_router_health_pid(health, quiet=True) or stopped
     return stopped
 
 
@@ -19129,13 +19226,29 @@ def stop_router_with_guarantee(reason: str, max_wait_seconds: float = 5.0, quiet
     Used by Claude Native mode launches so the user has a hard guarantee that
     no claude-any router process can intercept the subsequent ``claude`` call.
     """
-    if not router_up():
+    initial_health = router_health()
+    if initial_health is None:
         router_log("INFO", f"router_kill_guarantee reason={reason} state=already_down")
+        return False
+    if router_health_has_foreign_config(initial_health):
+        router_log(
+            "INFO",
+            "router_kill_guarantee_skipped_foreign_config "
+            f"reason={reason} running_config={initial_health.get('config_dir') or '-'} current_config={CONFIG_DIR}",
+        )
         return False
     stop_router_processes(quiet=quiet)
     deadline = time.time() + max(0.1, max_wait_seconds)
     while time.time() < deadline:
-        if not router_up():
+        health = router_health()
+        if router_health_has_foreign_config(health):
+            router_log(
+                "INFO",
+                "router_kill_guarantee_skipped_foreign_config "
+                f"reason={reason} running_config={health.get('config_dir') or '-'} current_config={CONFIG_DIR}",
+            )
+            return False
+        if health is None:
             elapsed_ms = int((max_wait_seconds - (deadline - time.time())) * 1000)
             router_log("INFO", f"router_kill_guarantee reason={reason} state=killed elapsed_ms={elapsed_ms}")
             return True
@@ -19151,12 +19264,10 @@ def stop_router_with_guarantee(reason: str, max_wait_seconds: float = 5.0, quiet
 
 def cleanup_managed_services_for_provider(provider: str, pcfg: dict[str, Any], cfg: dict[str, Any], quiet: bool = False) -> None:
     if direct_native_anthropic_enabled(provider, pcfg):
-        # Claude Native mode: hard guarantee that the router is not alive when
-        # the subsequent `claude` is spawned. Ignore the
-        # `cleanup.managed_services_on_launch` opt-out: a stale router process
-        # paired with native mode is exactly the cross-contamination pattern
-        # this provider is meant to prevent, so the toggle does not apply here.
-        stop_router_with_guarantee("native_anthropic_launch", quiet=quiet)
+        # Claude Native mode strips claude-any routing env before spawning
+        # `claude`. Clean up only this config's idle router; do not kill a
+        # different folder/config or an active routed session.
+        stop_router_if_no_active_clients("native_anthropic_launch", quiet=quiet)
         if provider != "nvidia-hosted" or provider_native_compat_enabled(provider, pcfg):
             stop_ncp_proxy(quiet=quiet)
         return
@@ -20811,18 +20922,44 @@ def run_prelaunch_menu(passthrough: list[str], skip_menu: bool = False, force_me
 def start_router_if_needed() -> bool:
     health = router_health()
     if health is not None:
+        active_clients = active_router_client_pids()
         if router_health_matches_current(health):
-            router_log("INFO", f"router_check_state running=True spawn=False base={ROUTER_BASE}")
-            return True
-        running_version = str(health.get("version") or "")
-        running_fingerprint = str(health.get("source_fingerprint") or "")
-        router_log(
-            "WARN",
-            "router_version_mismatch_restart "
-            f"running_version={running_version or '-'} current_version={VERSION} "
-            f"running_source={running_fingerprint or '-'} current_source={SOURCE_FINGERPRINT}",
-        )
-        ensure_router_port_available_for_spawn("version_mismatch", health)
+            if active_clients:
+                router_log(
+                    "INFO",
+                    "router_check_state running=True spawn=False "
+                    f"base={ROUTER_BASE} active_clients={','.join(map(str, active_clients))}",
+                )
+                return True
+            if env_bool(os.environ.get("CLAUDE_ANY_REUSE_ROUTER"), False):
+                router_log("INFO", f"router_check_state running=True spawn=False base={ROUTER_BASE} reuse=env")
+                return True
+            router_log(
+                "INFO",
+                "router_prelaunch_replace "
+                f"running_version={health.get('version') or '-'} current_version={VERSION} "
+                f"running_source={health.get('source_fingerprint') or '-'} current_source={SOURCE_FINGERPRINT} "
+                f"pid={health.get('pid') or '-'}",
+            )
+            ensure_router_port_available_for_spawn("prelaunch_replace", health)
+        else:
+            if router_health_config_matches_current(health) and active_clients:
+                raise RuntimeError(
+                    f"claude-any router on {ROUTER_BASE} belongs to this config but has active clients "
+                    f"({','.join(map(str, active_clients))}) and differs from this launch "
+                    f"(running_version={health.get('version') or '-'}, current_version={VERSION}). "
+                    "Stop the other Claude Code session or launch this instance with a different "
+                    "CLAUDE_ANY_ROUTER_PORT."
+                )
+            running_version = str(health.get("version") or "")
+            running_fingerprint = str(health.get("source_fingerprint") or "")
+            router_log(
+                "WARN",
+                "router_version_mismatch_restart "
+                f"running_version={running_version or '-'} current_version={VERSION} "
+                f"running_source={running_fingerprint or '-'} current_source={SOURCE_FINGERPRINT}",
+            )
+            ensure_router_port_available_for_spawn("version_mismatch", health)
     else:
         ensure_router_port_available_for_spawn("pre_spawn", None)
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -20835,8 +20972,11 @@ def start_router_if_needed() -> bool:
     else:
         kwargs["start_new_session"] = True
     router_log("INFO", f"router_check_state running=False spawn=True base={ROUTER_BASE}")
+    router_env = os.environ.copy()
+    router_env["CLAUDE_ANY_MANAGED_ROUTER"] = "1"
+    router_env["CLAUDE_ANY_ROUTER_OWNER_PID"] = str(os.getpid())
     with open(LOG_PATH, "ab", buffering=0) as log:
-        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, **kwargs)
+        subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=log, stderr=log, env=router_env, **kwargs)
     deadline = time.time() + 30
     while time.time() < deadline:
         if router_up():
