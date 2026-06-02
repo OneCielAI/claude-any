@@ -85,6 +85,49 @@ class AdvisorFeedbackTests(unittest.TestCase):
         self.assertIn("Advisor review (trigger):", text)
         self.assertIn("…", text)
 
+    def test_autonomous_claude_code_advisor_server_tool_is_stripped(self):
+        body = {
+            "messages": [{"role": "user", "content": "continue"}],
+            "tools": [
+                {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+                {"type": "advisor_20260301", "name": "advisor", "model": "claude-any-anthropic-claude-opus-4-8"},
+            ],
+        }
+
+        out = claude_any.strip_autonomous_advisor_server_tools(body)
+
+        self.assertIsNot(out, body)
+        self.assertEqual([tool["name"] for tool in out["tools"]], ["Bash"])
+        self.assertEqual(2, len(body["tools"]))
+
+    def test_plain_claude_any_advisor_tool_schema_is_not_stripped(self):
+        body = {
+            "messages": [{"role": "user", "content": "review the plan"}],
+            "tools": [
+                claude_any.advisor_tool_schema(),
+                {"name": "Read", "input_schema": {"type": "object"}},
+            ],
+        }
+
+        out = claude_any.strip_autonomous_advisor_server_tools(body)
+
+        self.assertIs(out, body)
+        self.assertEqual(["advisor", "Read"], [tool["name"] for tool in out["tools"]])
+
+    def test_explicit_advisor_request_keeps_server_tool_for_local_short_circuit(self):
+        body = {
+            "messages": [{"role": "user", "content": "CLAUDE_ANY_ADVISOR_CALL\nFocus: plan"}],
+            "tools": [
+                {"type": "advisor_20260301", "name": "advisor", "model": "claude-any-anthropic-claude-opus-4-8"},
+                {"name": "Bash", "input_schema": {"type": "object"}},
+            ],
+        }
+
+        out = claude_any.strip_autonomous_advisor_server_tools(body)
+
+        self.assertIs(out, body)
+        self.assertEqual(["advisor", "Bash"], [tool["name"] for tool in out["tools"]])
+
 
 if __name__ == "__main__":
     unittest.main()

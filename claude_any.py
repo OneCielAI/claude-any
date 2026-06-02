@@ -9151,6 +9151,38 @@ def body_with_advisor_tool(body: dict[str, Any], pcfg: dict[str, Any]) -> dict[s
     return out
 
 
+def is_claude_code_advisor_server_tool(tool: Any) -> bool:
+    if not isinstance(tool, dict):
+        return False
+    name = str(tool.get("name") or "")
+    tool_type = str(tool.get("type") or "")
+    return name == "advisor" and tool_type.startswith("advisor_")
+
+
+def strip_autonomous_advisor_server_tools(body: dict[str, Any]) -> dict[str, Any]:
+    """Remove Claude Code's routed server-side advisor tool from normal turns.
+
+    Explicit ``/advisor`` calls are handled locally before upstream forwarding.
+    For ordinary routed turns, leaving the ``advisor_...`` server tool exposed
+    lets the model autonomously call Claude Code's built-in advisor path, which
+    can return ``advisor_tool_result`` / ``too_many_requests`` errors that do
+    not occur in native Claude Code sessions.
+    """
+    if is_advisor_request(body) or body_has_advisor_feedback(body):
+        return body
+    tools = body.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return body
+    kept = [tool for tool in tools if not is_claude_code_advisor_server_tool(tool)]
+    removed = len(tools) - len(kept)
+    if not removed:
+        return body
+    out = dict(body)
+    out["tools"] = kept
+    router_log("INFO", f"stripped autonomous advisor server tool count={removed}")
+    return out
+
+
 def advisor_tool_focus_from_message(message: dict[str, Any]) -> str | None:
     content = message.get("content")
     if not isinstance(content, list):
@@ -13144,6 +13176,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         if maybe_handle_advisor_request(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
+        body = strip_autonomous_advisor_server_tools(body)
         body = body_with_pending_channel_messages(body)
         body = body_with_pending_channel_summaries(body)
         body = body_with_channel_tool_result_context(body)
