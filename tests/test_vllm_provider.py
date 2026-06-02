@@ -113,6 +113,25 @@ class VllmProviderTests(unittest.TestCase):
         self.assertEqual("long-context-128k", pcfg["llm_preset"])
         self.assertTrue(any("Long context 128K" in line for line in lines))
 
+    def test_long_context_128k_preset_is_visible_even_when_capacity_lower(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["max_model_len"] = 65536
+
+        rows, values = claude_any.llm_preset_panel_rows("vllm", pcfg, "en")
+
+        self.assertIn("long-context-128k", values)
+        row = rows[values.index("long-context-128k")]
+        self.assertIn("Long context 128K", row)
+        self.assertIn("requires 128K", row)
+        self.assertIn("server", row)
+
+    def test_stored_preset_status_is_preserved_even_when_capacity_lower(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["llm_preset"] = "long-context-128k"
+        pcfg["max_model_len"] = 65536
+
+        self.assertEqual("long-context-128k", claude_any.applied_preset_id("vllm", pcfg))
+
     def test_long_context_128k_preset_configures_ollama_range(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["ollama-cloud"])
 

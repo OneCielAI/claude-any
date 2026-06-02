@@ -16203,7 +16203,7 @@ MODEL_FAMILY_I18N: dict[str, dict[str, str]] = {
 
 def applied_preset_id(provider: str, pcfg: dict[str, Any]) -> str:
     preset_id = str(pcfg.get("llm_preset") or "").strip()
-    if preset_id in LLM_PRESETS and preset_available_for_model(provider, pcfg, preset_id):
+    if preset_id in LLM_PRESETS:
         return preset_id
     inferred = infer_preset_id_from_options(provider, pcfg)
     if inferred and preset_available_for_model(provider, pcfg, inferred):
@@ -16274,11 +16274,14 @@ def llm_preset_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
     ]
     values = ["__info__"]
     for preset_id in LLM_PRESETS:
-        if not preset_available_for_model(provider, pcfg, preset_id):
-            continue
         label, description = llm_preset_text(preset_id, lang)
         mark = "*" if preset_id == applied else " "
-        rows.append(f"{mark} {pad_cells(label, 24)} {description}")
+        suffix = ""
+        required = required_context_for_preset(preset_id, provider)
+        capacity = provider_model_context_capacity(provider, pcfg) if required else None
+        if required and capacity and required > capacity:
+            suffix = f" (requires {format_context_tokens(required)}; server {format_context_tokens(capacity)})"
+        rows.append(f"{mark} {pad_cells(label, 24)} {description}{suffix}")
         values.append(preset_id)
     rows.append(ui_text("back", lang))
     values.append("back")
