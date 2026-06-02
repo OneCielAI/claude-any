@@ -1376,8 +1376,8 @@ PROVIDER_NOTES = {
             "Use this when you want cloud models without relying on the local Ollama daemon's sign-in state.",
         ],
         "vllm": [
-            "vLLM: enter the vLLM server root that implements the Anthropic Messages API.",
-            "Do not enter an OpenAI-only chat completions endpoint; use a compatibility proxy for those servers.",
+            "vLLM: Anthropic Messages API is the default; OpenAI-only chat completions endpoints are auto-detected.",
+            "If auto-detection finds only /v1/chat/completions, claude-any disables Native compatibility and routes through the local converter.",
         ],
         "lm-studio": [
             "LM Studio: uses the local Anthropic-compatible /v1/messages server by default.",
@@ -1406,8 +1406,8 @@ PROVIDER_NOTES = {
             "로컬 Ollama 데몬의 로그인 상태와 무관하게 클라우드 모델을 쓰고 싶을 때 사용합니다.",
         ],
         "vllm": [
-            "vLLM: Anthropic Messages API를 구현한 vLLM 서버 root를 넣으세요.",
-            "OpenAI 전용 chat completions endpoint를 넣지 마세요. 그런 서버는 호환 프록시가 필요합니다.",
+            "vLLM: Anthropic Messages API를 기본값으로 사용합니다. OpenAI 전용 chat completions endpoint는 자동 감지합니다.",
+            "자동 감지가 /v1/chat/completions만 찾으면 Native compatibility를 끄고 로컬 변환 라우터를 사용합니다.",
         ],
         "lm-studio": [
             "LM Studio: 기본적으로 로컬 Anthropic 호환 /v1/messages 서버를 직접 사용합니다.",
@@ -1436,8 +1436,8 @@ PROVIDER_NOTES = {
             "ローカルOllama daemonのサインイン状態に依存せずクラウドモデルを使う場合に選びます。",
         ],
         "vllm": [
-            "vLLM: Anthropic Messages APIを実装したvLLMサーバーrootを入力してください。",
-            "OpenAI専用chat completions endpointは入力しないでください。その場合は互換プロキシが必要です。",
+            "vLLM: Anthropic Messages APIを既定にします。OpenAI専用chat completions endpointは自動検出します。",
+            "自動検出で/v1/chat/completionsのみ見つかった場合、Native compatibilityを無効にしてローカル変換routerを使います。",
         ],
         "lm-studio": [
             "LM Studio: 既定ではローカルのAnthropic互換 /v1/messages サーバーを直接使います。",
@@ -1466,8 +1466,8 @@ PROVIDER_NOTES = {
             "当你想不依赖本地Ollama daemon登录状态使用云端模型时选择它。",
         ],
         "vllm": [
-            "vLLM: 请输入实现Anthropic Messages API的vLLM服务器root。",
-            "不要输入仅OpenAI chat completions的端点；这类服务器需要兼容代理。",
+            "vLLM: 默认使用 Anthropic Messages API。仅 OpenAI chat completions 的端点会自动检测。",
+            "如果自动检测只发现 /v1/chat/completions，claude-any 会关闭 Native compatibility 并使用本地转换路由。",
         ],
         "lm-studio": [
             "LM Studio: 默认直接使用本地 Anthropic-compatible /v1/messages 服务器。",
@@ -5808,9 +5808,54 @@ def provider_upstream_request_base(provider: str, pcfg: dict[str, Any]) -> str:
 
 def native_anthropic_base_url(provider: str, pcfg: dict[str, Any]) -> str:
     base = pcfg.get("base_url", "http://127.0.0.1:8000").rstrip("/")
-    if provider in ("lm-studio", "nvidia-hosted") and base.endswith("/v1"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim") and base.endswith("/v1"):
         return base[:-3].rstrip("/")
     return base
+
+
+OPENAI_COMPATIBLE_ROUTER_PROVIDERS = ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim")
+AUTO_DETECT_NATIVE_COMPAT_PROVIDERS = ("vllm", "lm-studio", "self-hosted-nim")
+
+
+def provider_openai_router_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return provider in OPENAI_COMPATIBLE_ROUTER_PROVIDERS and not provider_native_compat_enabled(provider, pcfg)
+
+
+def endpoint_route_exists(url: str, headers: dict[str, str], timeout: float = 1.5) -> bool | None:
+    req = urllib.request.Request(url, data=b"{}", headers=with_upstream_user_agent(headers), method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True
+    except urllib.error.HTTPError as exc:
+        try:
+            exc.read()
+        except Exception:
+            pass
+        if exc.code == 404:
+            return False
+        if exc.code in (400, 401, 403, 405, 422):
+            return True
+        return None
+    except Exception:
+        return None
+
+
+def auto_detect_native_compat_for_base_url(provider: str, pcfg: dict[str, Any]) -> tuple[bool | None, str]:
+    if provider not in AUTO_DETECT_NATIVE_COMPAT_PROVIDERS:
+        return None, ""
+    base = provider_upstream_request_base(provider, pcfg)
+    if not base:
+        return None, "missing base URL"
+    headers = provider_model_list_headers(provider, pcfg)
+    anthropic_route = endpoint_route_exists(join_url(native_anthropic_base_url(provider, pcfg), "/v1/messages"), headers)
+    openai_route = endpoint_route_exists(join_url(base, "/v1/chat/completions"), headers)
+    if anthropic_route is True:
+        return True, "Anthropic Messages route detected"
+    if openai_route is True and anthropic_route is False:
+        return False, "OpenAI chat completions route detected"
+    if openai_route is True:
+        return None, "OpenAI route detected, Anthropic route inconclusive; keeping Anthropic default"
+    return None, "endpoint family inconclusive; keeping Anthropic default"
 
 
 def write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> None:
@@ -12992,7 +13037,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                         400,
                     )
                     return
-            if provider in ("lm-studio", "nvidia-hosted") and not provider_native_compat_enabled(provider, pcfg):
+            if provider_openai_router_enabled(provider, pcfg):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to OpenAI-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_openai_compatible_chat(self, provider, pcfg, body)
                 return
@@ -13010,7 +13055,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             if not stream_enabled:
                 body["stream"] = False
             data = json.dumps(body).encode("utf-8")
-            base = provider_upstream_request_base(provider, pcfg)
+            base = native_anthropic_base_url(provider, pcfg) if provider_native_compat_enabled(provider, pcfg) else provider_upstream_request_base(provider, pcfg)
             url = join_url(base, "/v1/messages")
             headers = provider_headers(provider, pcfg, self.headers)
             for h in ("anthropic-beta", "anthropic-dangerous-direct-browser-access"):
@@ -13209,11 +13254,20 @@ def set_base_url_config(provider: str, url: str) -> list[str]:
     if reset_model:
         pcfg["current_model"] = ""
         pcfg["custom_models"] = []
-    save_config(cfg)
-    clear_model_cache()
     lines = [f"Base URL for {provider} set to {pcfg['base_url']}."]
     if reset_model:
         lines.append("Model selection was reset because the provider endpoint changed.")
+        detected_native, detect_reason = auto_detect_native_compat_for_base_url(provider, pcfg)
+        if detected_native is None:
+            if provider in AUTO_DETECT_NATIVE_COMPAT_PROVIDERS:
+                pcfg["native_compat"] = True
+                lines.append(f"Endpoint auto-detect inconclusive ({detect_reason}); Native compatibility kept on as the Anthropic default.")
+        else:
+            pcfg["native_compat"] = bool(detected_native)
+            mode = "enabled" if detected_native else "disabled"
+            lines.append(f"Endpoint auto-detected ({detect_reason}); Native compatibility {mode}.")
+    save_config(cfg)
+    clear_model_cache()
     return lines
 
 
@@ -15568,6 +15622,7 @@ LLM_PRESETS: dict[str, tuple[str, str]] = {
     "coding": ("Coding deterministic", "lower randomness for edits, scripts, reviews"),
     "fast": ("Fast short tasks", "shorter output and timeout for quick jobs"),
     "long-context-65k": ("Long context 65K", "65K context target, 4K output reserve"),
+    "long-context-128k": ("Long context 128K", "64K-128K context target, 4K-8K output reserve"),
     "million-context-1m": ("Ultra context 1M", "1M context target for high-capacity models"),
     "large-output": ("Large output/report", "larger 8K output for summaries/reports"),
     "reasoning": ("Reasoning model", "reasoning-friendly sampling"),
@@ -15585,6 +15640,7 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "coding": ("코딩 결정형", "편집, 스크립트, 코드 리뷰용 낮은 무작위성"),
         "fast": ("빠른 짧은 작업", "짧은 출력과 짧은 타임아웃"),
         "long-context-65k": ("긴 컨텍스트 65K", "65K 컨텍스트 목표, 4K 출력 여유"),
+        "long-context-128k": ("긴 컨텍스트 128K", "64K-128K 컨텍스트 목표, 4K-8K 출력 여유"),
         "million-context-1m": ("초장문 컨텍스트 1M", "고용량 모델용 1M 컨텍스트 목표"),
         "large-output": ("긴 출력/리포트", "요약과 리포트용 8K 출력"),
         "reasoning": ("추론 모델", "추론 친화 샘플링"),
@@ -15599,6 +15655,7 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "coding": ("コーディング決定型", "編集、スクリプト、コードレビュー向けの低いランダム性"),
         "fast": ("高速な短い作業", "短い出力と短いタイムアウト"),
         "long-context-65k": ("長いコンテキスト 65K", "65K コンテキスト目標、4K 出力予約"),
+        "long-context-128k": ("長いコンテキスト 128K", "64K-128K コンテキスト目標、4K-8K 出力予約"),
         "million-context-1m": ("超長文コンテキスト 1M", "大容量モデル向けの 1M コンテキスト目標"),
         "large-output": ("長い出力/レポート", "要約とレポート向けの 8K 出力"),
         "reasoning": ("推論モデル", "推論向けサンプリング"),
@@ -15613,6 +15670,7 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "coding": ("编码确定型", "用于编辑、脚本和代码审查的低随机性"),
         "fast": ("快速短任务", "较短输出和较短超时"),
         "long-context-65k": ("长上下文 65K", "65K 上下文目标，4K 输出预留"),
+        "long-context-128k": ("长上下文 128K", "64K-128K 上下文目标，4K-8K 输出预留"),
         "million-context-1m": ("超长上下文 1M", "面向高容量模型的 1M 上下文目标"),
         "large-output": ("长输出/报告", "用于摘要和报告的 8K 输出"),
         "reasoning": ("推理模型", "适合推理的采样"),
@@ -15664,6 +15722,7 @@ LLM_PRESET_TIMEOUT_MS: dict[str, int] = {
     "coding": DEFAULT_REQUEST_TIMEOUT_MS,
     "fast": 120000,
     "long-context-65k": DEFAULT_REQUEST_TIMEOUT_MS,
+    "long-context-128k": DEFAULT_REQUEST_TIMEOUT_MS,
     "million-context-1m": 600000,
     "large-output": 600000,
     "reasoning": 1200000,
@@ -15758,6 +15817,7 @@ def with_preset_timeout_tokens(tokens: list[str], preset_id: str) -> list[str]:
 
 CONTEXT_HEAVY_PRESETS = {
     "long-context-65k",
+    "long-context-128k",
     "million-context-1m",
     "large-output",
     "reasoning",
@@ -15905,6 +15965,8 @@ def required_context_for_preset(preset_id: str, provider: str | None = None) -> 
         if provider in ("ollama", "ollama-cloud"):
             return 131072
         return 65536
+    if preset_id == "long-context-128k":
+        return 131072
     if preset_id == "long-context-65k":
         return 131072 if provider == "nvidia-hosted" else 65536
     return None
@@ -16163,6 +16225,8 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
             return "reasoning"
         if num_ctx_max >= 524288:
             return "million-context-1m"
+        if num_ctx_max >= 131072 and num_predict >= 8192:
+            return "long-context-128k"
         if num_predict >= 8192:
             return "large-output"
         if num_ctx_min >= 65536 or num_ctx_max >= 131072:
@@ -16177,6 +16241,8 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
             return "reasoning"
         if context_window >= 524288:
             return "million-context-1m"
+        if context_window >= 131072 and max_output >= 8192:
+            return "long-context-128k"
         if max_output >= 8192:
             return "large-output"
         if context_window >= 65536:
@@ -16273,6 +16339,18 @@ def apply_llm_preset_to_provider(
                 "num_ctx_min=65536",
                 "num_ctx_max=131072",
                 "num_predict=4096",
+                "temperature=0.3",
+                "top_p=0.9",
+                "top_k=40",
+                "think=false",
+                "keep_alive=10m",
+                "timeout=300000",
+            ],
+            "long-context-128k": [
+                "num_ctx=auto",
+                "num_ctx_min=65536",
+                "num_ctx_max=131072",
+                "num_predict=8192",
                 "temperature=0.3",
                 "top_p=0.9",
                 "top_k=40",
@@ -16388,6 +16466,7 @@ def apply_llm_preset_to_provider(
             "coding": ["max_output_tokens=4096", "timeout=300000"],
             "fast": ["max_output_tokens=2048", "timeout=300000"],
             "long-context-65k": ["max_output_tokens=4096", "timeout=300000"],
+            "long-context-128k": ["max_output_tokens=8192", "timeout=300000"],
             "million-context-1m": ["max_output_tokens=8192", "timeout=300000"],
             "large-output": ["max_output_tokens=8192", "timeout=300000"],
             "reasoning": ["max_output_tokens=4096", "timeout=300000"],
@@ -16438,6 +16517,15 @@ def apply_llm_preset_to_provider(
                     "context_window=131072",
                     "reserve=8192",
                     "max_output_tokens=4096",
+                    "timeout=300000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
+                "long-context-128k": [
+                    "context_window=131072",
+                    "reserve=8192",
+                    "max_output_tokens=8192",
                     "timeout=300000",
                     "temperature=0.3",
                     "unset:top_p",
@@ -16552,6 +16640,16 @@ def apply_llm_preset_to_provider(
                 "context_window=65536",
                 "reserve=4096",
                 "max_output_tokens=4096",
+                "timeout=300000",
+                "temperature=0.3",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
+            "long-context-128k": [
+                "context_window=131072",
+                "reserve=8192",
+                "max_output_tokens=8192",
                 "timeout=300000",
                 "temperature=0.3",
                 "unset:top_p",
@@ -17685,7 +17783,7 @@ def compatibility_api_key_probe_request(
             raise CompatibilityApiKeyProbeError(
                 f"model {upstream_model!r} uses unsupported endpoint family {endpoint_kind!r} for API-key probing"
             )
-    if provider in ("lm-studio", "nvidia-hosted") and not provider_native_compat_enabled(provider, pcfg):
+    if provider_openai_router_enabled(provider, pcfg):
         upstream_model = ncp_model_id_for_nvidia_hosted(upstream_model) if provider == "nvidia-hosted" else upstream_model
         req_body = openai_compatible_chat_request(provider, upstream_model, body, pcfg, stream=False)
         return join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions"), req_body, headers
