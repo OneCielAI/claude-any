@@ -9038,6 +9038,60 @@ def anthropic_system_with_advisor(system: Any, extra_system_texts: list[str] | N
     return blocks
 
 
+def append_anthropic_system_texts(system: Any, extra_system_texts: list[str] | None = None) -> Any:
+    extras = [str(text or "").strip() for text in (extra_system_texts or []) if str(text or "").strip()]
+    if not extras:
+        return system
+    blocks: list[dict[str, Any]] = []
+    if isinstance(system, list):
+        blocks = [block for block in system if isinstance(block, dict)]
+    elif isinstance(system, str):
+        clean = system.strip()
+        if clean:
+            blocks.append({"type": "text", "text": clean})
+    elif system:
+        clean = anthropic_content_to_text(system).strip()
+        if clean:
+            blocks.append({"type": "text", "text": clean})
+    for text in extras:
+        blocks.append({"type": "text", "text": text})
+    return blocks
+
+
+def normalize_anthropic_system_role_messages(body: dict[str, Any]) -> dict[str, Any]:
+    """Move non-standard ``messages[].role == "system"`` entries to top-level system.
+
+    Claude Code can include runtime state as a system-role item in message
+    history. Anthropic-compatible /v1/messages servers such as vLLM accept
+    only user/assistant roles in ``messages`` and expect system context at the
+    top level.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+    next_messages: list[Any] = []
+    system_texts: list[str] = []
+    changed = False
+    for message in messages:
+        if not isinstance(message, dict):
+            next_messages.append(message)
+            continue
+        role = str(message.get("role") or "").strip()
+        if role != "system":
+            next_messages.append(message)
+            continue
+        changed = True
+        text = anthropic_content_to_text(message.get("content")).strip()
+        if text:
+            system_texts.append(text)
+    if not changed:
+        return body
+    out = dict(body)
+    out["messages"] = next_messages
+    out["system"] = append_anthropic_system_texts(body.get("system"), system_texts)
+    return out
+
+
 def anthropic_advisor_messages_and_system(body: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
     messages: list[dict[str, Any]] = []
     system_texts: list[str] = []
@@ -13135,6 +13189,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 forward_openai_compatible_chat(self, provider, pcfg, body)
                 return
             body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
+            body = normalize_anthropic_system_role_messages(body)
             body = cap_anthropic_body_for_provider(provider, pcfg, body)
             body = apply_provider_request_options(provider, pcfg, body)
             body = rehydrate_suppressed_thinking_passback(provider, pcfg, body)

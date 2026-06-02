@@ -1,3 +1,4 @@
+import json
 import unittest
 from unittest import mock
 
@@ -58,6 +59,94 @@ class VllmProviderTests(unittest.TestCase):
 
         self.assertEqual("http://vllm.local:8000/v1/chat/completions", url)
         self.assertEqual("test-model", req_body["model"])
+
+    def test_system_role_messages_move_to_top_level_system(self):
+        body = {
+            "system": "Original system",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "system", "content": [{"type": "text", "text": "Runtime state"}]},
+                {"role": "assistant", "content": "ok"},
+            ],
+        }
+
+        normalized = claude_any.normalize_anthropic_system_role_messages(body)
+
+        self.assertEqual(["user", "assistant"], [message["role"] for message in normalized["messages"]])
+        system_text = claude_any.anthropic_content_to_text(normalized["system"])
+        self.assertIn("Original system", system_text)
+        self.assertIn("Runtime state", system_text)
+
+    def test_vllm_native_router_normalizes_system_role_before_upstream(self):
+        cfg = {
+            "current_provider": "vllm",
+            "providers": {"vllm": dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])},
+            "router_debug_message_preview_chars": 0,
+        }
+        pcfg = cfg["providers"]["vllm"]
+        pcfg["base_url"] = "http://vllm.local:8000"
+        pcfg["native_compat"] = True
+        pcfg["current_model"] = "test-model"
+        handler = object.__new__(claude_any.RouterHandler)
+        handler.path = "/v1/messages"
+        handler.headers = {"content-length": "2"}
+        handler.rfile = mock.Mock()
+        handler.rfile.read.return_value = b"{}"
+        handler.wfile = mock.Mock()
+        handler.send_response = mock.Mock()
+        handler.send_header = mock.Mock()
+        handler.end_headers = mock.Mock()
+
+        captured: dict[str, object] = {}
+
+        class Response:
+            status = 200
+            headers = {"content-type": "application/json"}
+
+            def read(self):
+                return b'{"id":"msg","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}'
+
+        def request_spy(url, data=None, headers=None, method=None):
+            captured["body"] = json.loads(data.decode("utf-8"))
+            return mock.Mock()
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "reject_external_router_request", return_value=False),
+            mock.patch.object(claude_any, "handle_llm_config_post", return_value=False),
+            mock.patch.object(claude_any, "handle_channel_mcp_post", return_value=False),
+            mock.patch.object(claude_any, "handle_chat_post", return_value=False),
+            mock.patch.object(claude_any, "handle_plan_post", return_value=False),
+            mock.patch.object(claude_any, "maybe_handle_plan_mode_tool_choice", return_value=False),
+            mock.patch.object(claude_any, "filter_blocked_tools", side_effect=lambda _p, _c, b: b),
+            mock.patch.object(claude_any, "write_context_usage"),
+            mock.patch.object(claude_any, "maybe_handle_router_debug_request", return_value=False),
+            mock.patch.object(claude_any, "maybe_handle_advisor_request", return_value=False),
+            mock.patch.object(claude_any, "body_with_pending_channel_messages", side_effect=lambda b: b),
+            mock.patch.object(claude_any, "body_with_pending_channel_summaries", side_effect=lambda b: b),
+            mock.patch.object(claude_any, "body_with_channel_tool_result_context", side_effect=lambda b: b),
+            mock.patch.object(claude_any, "dump_request_for_trace"),
+            mock.patch.object(claude_any, "parse_json_body", return_value={
+                "model": "claude-any-vllm-test-model",
+                "max_tokens": 32,
+                "stream": False,
+                "system": "Original system",
+                "messages": [
+                    {"role": "user", "content": "hello"},
+                    {"role": "system", "content": [{"type": "text", "text": "Runtime state"}]},
+                ],
+            }),
+            mock.patch.object(claude_any.urllib.request, "Request", side_effect=request_spy),
+            mock.patch.object(claude_any.urllib.request, "urlopen", return_value=Response()),
+            mock.patch.object(claude_any, "write_anthropic_message_response"),
+        ):
+            handler.do_POST()
+
+        upstream_body = captured["body"]
+        self.assertEqual(["user"], [message["role"] for message in upstream_body["messages"]])
+        system_text = claude_any.anthropic_content_to_text(upstream_body["system"])
+        self.assertIn("Original system", system_text)
+        self.assertIn("Runtime state", system_text)
 
     def test_set_base_url_autodetects_openai_only_endpoint(self):
         cfg = {
