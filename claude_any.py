@@ -9821,6 +9821,109 @@ def anthropic_messages_to_openai(body: dict[str, Any], reasoning_passback: bool 
     return messages
 
 
+def missing_openai_tool_result_message(tool_call: dict[str, Any]) -> dict[str, Any]:
+    tool_id = str(tool_call.get("id") or "call_tool")
+    fn = tool_call.get("function") if isinstance(tool_call.get("function"), dict) else {}
+    name = str(fn.get("name") or "tool")
+    return {
+        "role": "tool",
+        "tool_call_id": tool_id,
+        "id": tool_id,
+        "content": (
+            f"Tool result for historical tool call `{name}` was not present in the retained "
+            "Claude Code transcript. Treat this as missing historical context, not as a "
+            "successful tool execution."
+        ),
+    }
+
+
+def orphan_openai_tool_message_to_user(message: dict[str, Any]) -> dict[str, str]:
+    tool_id = str(message.get("tool_call_id") or message.get("id") or "unknown")
+    content = str(message.get("content") or "")
+    return {
+        "role": "user",
+        "content": (
+            f"Historical tool message without a retained assistant tool call ({tool_id}):\n"
+            f"{content}"
+        ),
+    }
+
+
+def repair_openai_tool_call_adjacency(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Make Anthropic/Claude historical tool turns valid for OpenAI chat APIs.
+
+    OpenAI-compatible providers reject any assistant message with tool_calls unless
+    the immediately following messages contain a tool response for every
+    tool_call_id. Claude Code can send compacted long histories where an old
+    assistant tool_use survives but its tool_result was dropped from the retained
+    transcript. Anthropic tolerates that historical shape better than OpenAI chat
+    does, so we repair only the wire-format sequence here.
+    """
+    repaired: list[dict[str, Any]] = []
+    missing_count = 0
+    orphan_count = 0
+    i = 0
+    while i < len(messages):
+        message = messages[i]
+        tool_calls = message.get("tool_calls") if isinstance(message, dict) else None
+        if not (message.get("role") == "assistant" and isinstance(tool_calls, list) and tool_calls):
+            if message.get("role") == "tool":
+                repaired.append(orphan_openai_tool_message_to_user(message))
+                orphan_count += 1
+            else:
+                repaired.append(message)
+            i += 1
+            continue
+
+        repaired.append(message)
+        i += 1
+
+        immediate_tools: list[dict[str, Any]] = []
+        while i < len(messages) and isinstance(messages[i], dict) and messages[i].get("role") == "tool":
+            immediate_tools.append(messages[i])
+            i += 1
+
+        by_id: dict[str, list[dict[str, Any]]] = {}
+        for tool_message in immediate_tools:
+            tool_id = str(tool_message.get("tool_call_id") or tool_message.get("id") or "")
+            by_id.setdefault(tool_id, []).append(tool_message)
+
+        required_ids: list[str] = []
+        for call in tool_calls:
+            if not isinstance(call, dict):
+                continue
+            tool_id = str(call.get("id") or "")
+            if not tool_id:
+                continue
+            required_ids.append(tool_id)
+            matches = by_id.get(tool_id) or []
+            if matches:
+                repaired.append(matches.pop(0))
+            else:
+                repaired.append(missing_openai_tool_result_message(call))
+                missing_count += 1
+
+        required = set(required_ids)
+        for tool_message in immediate_tools:
+            tool_id = str(tool_message.get("tool_call_id") or tool_message.get("id") or "")
+            if tool_id in required:
+                remaining = by_id.get(tool_id) or []
+                if tool_message in remaining:
+                    remaining.remove(tool_message)
+                    repaired.append(orphan_openai_tool_message_to_user(tool_message))
+                    orphan_count += 1
+            else:
+                repaired.append(orphan_openai_tool_message_to_user(tool_message))
+                orphan_count += 1
+
+    if missing_count or orphan_count:
+        router_log(
+            "WARN",
+            f"openai_tool_call_adjacency_repaired missing_tool_results={missing_count} orphan_tool_messages={orphan_count}",
+        )
+    return repaired
+
+
 def anthropic_tool_choice_to_openai(tool_choice: Any) -> Any:
     if not isinstance(tool_choice, dict):
         return tool_choice
@@ -10274,6 +10377,7 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
     reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
     output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
     messages = compact_ollama_messages_for_budget(messages, tools, max(8192, context_limit - output_reserve - reserve))
+    messages = repair_openai_tool_call_adjacency(messages)
     req: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -15767,16 +15871,7 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
     if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
-        hint_limit = model_context_hint_from_model_id(model)
-        server_limit = (
-            hint_limit
-            or (
-                0
-                if provider == "lm-studio"
-                else upstream_model_context_limit(provider, pcfg, timeout=1.5)
-            )
-        ) or 0
-        ctx = server_limit or positive_int(pcfg.get("context_window")) or 0
+        ctx = provider_model_context_capacity(provider, pcfg) or positive_int(pcfg.get("context_window")) or 0
         if ctx >= 524288:
             return "million-context"
         if ctx >= 65536:
@@ -15799,6 +15894,8 @@ def recommended_preset_id(provider: str, pcfg: dict[str, Any]) -> str:
     if family == "million-context":
         return "million-context-1m"
     if family == "long-context":
+        if (provider_model_context_capacity(provider, pcfg) or 0) >= 131072:
+            return "long-context-128k"
         return "long-context-65k"
     if family == "large":
         return "balanced"
@@ -16058,6 +16155,12 @@ def provider_model_context_capacity(provider: str, pcfg: dict[str, Any]) -> int 
             or model_context_hint_from_model_id(model)
             or positive_int(pcfg.get("context_window"))
         )
+    if provider in ("deepseek", "opencode", "opencode-go"):
+        return (
+            positive_int(pcfg.get("max_model_len"))
+            or model_context_hint_from_model_id(model)
+            or positive_int(pcfg.get("context_window"))
+        )
     hint = model_context_hint_from_model_id(model)
     if hint:
         return hint
@@ -16092,6 +16195,57 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
         if context_window and context_window > capacity:
             pcfg["context_window"] = capacity
             messages.append(f"Context window capped to selected model limit: {capacity:,} tokens.")
+    return messages
+
+
+def cached_current_model_info(provider: str, pcfg: dict[str, Any]) -> dict[str, Any]:
+    info = read_model_info_cache(provider, pcfg)
+    if not info:
+        return {}
+    candidates = [
+        normalize_model_id(provider, current_upstream_model_id(provider, pcfg)),
+        normalize_model_id(provider, str(pcfg.get("current_model") or "")),
+        strip_claude_context_suffix(normalize_model_id(provider, str(pcfg.get("current_model") or ""))),
+    ]
+    for model_id in candidates:
+        if model_id and model_id in info:
+            return info[model_id]
+    current = normalize_model_id(provider, current_upstream_model_id(provider, pcfg)).casefold()
+    for model_id, model_info in info.items():
+        if normalize_model_id(provider, model_id).casefold() == current:
+            return model_info
+    return {}
+
+
+def apply_current_model_specs_to_provider(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    info = cached_current_model_info(provider, pcfg)
+    max_context = positive_int(info.get("max_model_len")) if info else None
+    if not max_context:
+        return []
+    model = normalize_model_id(provider, current_upstream_model_id(provider, pcfg))
+    messages: list[str] = []
+    if provider in ("ollama", "ollama-cloud"):
+        if not ollama_context_model_matches(model, str(pcfg.get("model_context_model") or "")) or positive_int(pcfg.get("model_context_max")) != max_context:
+            pcfg["model_context_max"] = max_context
+            pcfg["model_context_model"] = model
+            messages.append(f"Model context size from provider specs: {format_context_tokens(max_context)} ({max_context:,} tokens).")
+        return messages
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
+        if positive_int(pcfg.get("max_model_len")) != max_context:
+            pcfg["max_model_len"] = max_context
+            messages.append(f"Model context size from provider specs: {format_context_tokens(max_context)} ({max_context:,} tokens).")
+    return messages
+
+
+def refresh_current_model_specs_for_auto_llm(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    messages: list[str] = []
+    try:
+        models = upstream_model_ids(provider, pcfg, force_refresh=True)
+        if models:
+            messages.append(f"Model specs refreshed from provider: {len(models)} model(s).")
+    except Exception as exc:
+        messages.append(f"Model specs refresh failed: {type(exc).__name__}: {exc}")
+    messages.extend(apply_current_model_specs_to_provider(provider, pcfg))
     return messages
 
 
@@ -16999,11 +17153,13 @@ def auto_apply_recommended_llm_preset_for_model(provider: str, pcfg: dict[str, A
 
 
 def apply_auto_llm_options_config(model_id: str | None = None) -> list[str]:
+    lines: list[str] = []
     if model_id and model_id.strip():
-        return set_model_config(model_id.strip())
+        lines.extend(set_model_config(model_id.strip()))
     cfg = load_config()
     provider, pcfg = get_current_provider(cfg)
     model = str(pcfg.get("current_model") or "").strip()
+    lines.extend(refresh_current_model_specs_for_auto_llm(provider, pcfg))
     if model:
         context_msgs = sync_ollama_library_context_limit(provider, pcfg, model)
         context_msgs.extend(cap_context_settings_to_model_capacity(provider, pcfg))
@@ -17013,11 +17169,11 @@ def apply_auto_llm_options_config(model_id: str | None = None) -> list[str]:
     if not preset_available_for_model(provider, pcfg, preset_id):
         preset_id = applied_preset_id(provider, pcfg)
     label = llm_preset_text(preset_id, cfg.get("language", "en"))[0]
-    lines = [f"Auto LLM options applied for {provider}{f' model {model}' if model else ''}: {label}."]
+    lines.append(f"Auto LLM options applied for {provider}{f' model {model}' if model else ''}: {label}.")
     lines.extend(context_msgs)
     lines.extend(apply_llm_preset_to_provider(provider, pcfg, preset_id, cfg.get("language", "en")))
     save_config(cfg)
-    clear_model_cache()
+    invalidate_config_cache()
     return lines
 
 

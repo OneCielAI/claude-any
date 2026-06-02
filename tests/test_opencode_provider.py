@@ -73,7 +73,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=None):
             self.assertEqual(262144, claude_any.model_context_hint_from_model_id("qwen3.6-27b-mtp"))
             self.assertEqual("long-context", claude_any.model_option_family("opencode-go", pcfg))
-            self.assertEqual("long-context-65k", claude_any.recommended_preset_id("opencode-go", pcfg))
+            self.assertEqual("long-context-128k", claude_any.recommended_preset_id("opencode-go", pcfg))
 
     def test_qwen36_plus_auto_preset_applies_one_million_context(self):
         pcfg = self.opencode_go_cfg(current_model="qwen3.6-plus-free", context_window=262144)["providers"]["opencode-go"]
@@ -84,6 +84,65 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("million-context-1m", pcfg["llm_preset"])
         self.assertEqual(1048576, pcfg["context_window"])
         self.assertTrue(any("Ultra context 1M" in message for message in messages))
+
+    def test_provider_capacity_prefers_refreshed_model_specs_over_stale_context_window(self):
+        pcfg = self.opencode_cfg(
+            current_model="sample-model-128k",
+            context_window=32768,
+            max_model_len=131072,
+        )["providers"]["opencode"]
+
+        self.assertEqual(131072, claude_any.provider_model_context_capacity("opencode", pcfg))
+
+    def test_auto_llm_options_refreshes_model_specs_before_applying_preset(self):
+        model = "sample-model-1m"
+        cfg = self.opencode_cfg(current_model=model, context_window=32768)
+        pcfg = cfg["providers"]["opencode"]
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config") as save_config,
+            mock.patch.object(claude_any, "invalidate_config_cache"),
+            mock.patch.object(claude_any, "upstream_model_ids", return_value=[model]) as upstream,
+            mock.patch.object(claude_any, "read_model_info_cache", return_value={model: {"max_model_len": 1048576}}),
+            mock.patch.object(claude_any, "sync_ollama_library_context_limit", return_value=[]),
+        ):
+            messages = claude_any.apply_auto_llm_options_config()
+
+        upstream.assert_called_once_with("opencode", pcfg, force_refresh=True)
+        save_config.assert_called_once()
+        self.assertEqual(1048576, pcfg["max_model_len"])
+        self.assertEqual(1048576, pcfg["context_window"])
+        self.assertEqual("million-context-1m", pcfg["llm_preset"])
+        self.assertTrue(any("Model specs refreshed" in message for message in messages))
+        self.assertTrue(any("Model context size from provider specs" in message for message in messages))
+
+    def test_auto_llm_options_model_argument_reapplies_after_specs_refresh(self):
+        model = "sample-model-128k"
+        cfg = self.opencode_cfg(current_model=model, context_window=32768)
+        pcfg = cfg["providers"]["opencode"]
+
+        def set_model(value: str) -> list[str]:
+            pcfg["current_model"] = value
+            return [f"Model for opencode set to {value}."]
+
+        with (
+            mock.patch.object(claude_any, "set_model_config", side_effect=set_model) as set_model_config,
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config"),
+            mock.patch.object(claude_any, "invalidate_config_cache"),
+            mock.patch.object(claude_any, "upstream_model_ids", return_value=[model]) as upstream,
+            mock.patch.object(claude_any, "read_model_info_cache", return_value={model: {"max_model_len": 131072}}),
+            mock.patch.object(claude_any, "sync_ollama_library_context_limit", return_value=[]),
+        ):
+            messages = claude_any.apply_auto_llm_options_config(model)
+
+        set_model_config.assert_called_once_with(model)
+        upstream.assert_called_once_with("opencode", pcfg, force_refresh=True)
+        self.assertEqual(131072, pcfg["max_model_len"])
+        self.assertEqual(131072, pcfg["context_window"])
+        self.assertEqual("long-context-128k", pcfg["llm_preset"])
+        self.assertTrue(messages[0].startswith("Model for opencode set to"))
 
     def test_migration_updates_old_qwen36_plus_default_context(self):
         cfg = {
@@ -522,6 +581,60 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertIn("reasoning_content", assistant)
         self.assertEqual("", assistant["reasoning_content"])
         self.assertEqual("legacy answer", assistant["content"])
+
+    def test_openai_request_repairs_missing_historical_tool_result(self):
+        pcfg = self.opencode_cfg(
+            api_key="sk-opencode-test",
+            current_model="deepseek-v4-flash-free",
+        )["providers"]["opencode"]
+        body = {
+            "model": "claude-any-opencode-deepseek-v4-flash-free",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "text", "text": "checking"},
+                        {"type": "tool_use", "id": "call_missing", "name": "Read", "input": {"file_path": "a.txt"}},
+                    ],
+                },
+                {"role": "user", "content": "계속"},
+            ],
+            "tools": [
+                {
+                    "name": "Read",
+                    "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+                }
+            ],
+        }
+
+        request = claude_any.openai_compatible_chat_request(
+            "opencode",
+            "deepseek-v4-flash-free",
+            body,
+            pcfg,
+            stream=False,
+        )
+
+        messages = request["messages"]
+        assistant_index = next(i for i, item in enumerate(messages) if item.get("tool_calls"))
+        self.assertEqual("assistant", messages[assistant_index]["role"])
+        self.assertEqual("tool", messages[assistant_index + 1]["role"])
+        self.assertEqual("call_missing", messages[assistant_index + 1]["tool_call_id"])
+        self.assertIn("not present in the retained Claude Code transcript", messages[assistant_index + 1]["content"])
+        self.assertEqual("user", messages[assistant_index + 2]["role"])
+        self.assertEqual("계속", messages[assistant_index + 2]["content"])
+
+    def test_openai_request_demotes_orphan_tool_message(self):
+        messages = claude_any.repair_openai_tool_call_adjacency(
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "tool", "tool_call_id": "call_orphan", "content": "late result"},
+            ]
+        )
+
+        self.assertEqual("user", messages[1]["role"])
+        self.assertIn("Historical tool message without a retained assistant tool call", messages[1]["content"])
+        self.assertIn("late result", messages[1]["content"])
 
     def test_non_deepseek_openai_chat_still_strips_anthropic_thinking(self):
         pcfg = self.opencode_cfg(api_key="sk-opencode-test", current_model="glm-5.1")["providers"]["opencode"]
