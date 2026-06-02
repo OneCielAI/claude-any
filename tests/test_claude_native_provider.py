@@ -12,6 +12,7 @@
 """
 import tempfile
 import io
+import os
 import urllib.error
 import unittest
 from pathlib import Path
@@ -674,6 +675,56 @@ class StopRouterGuaranteeTests(unittest.TestCase):
 
         self.assertIn("listener_pids=[777]", str(ctx.exception))
         self.assertIn("version=old", str(ctx.exception))
+
+
+class RouterLifetimeTests(unittest.TestCase):
+    def test_runner_exit_stops_router_when_no_other_clients_remain(self):
+        with tempfile.TemporaryDirectory() as td:
+            clients_dir = Path(td) / "router-clients"
+
+            with (
+                mock.patch.object(claude_any, "ROUTER_CLIENTS_DIR", clients_dir),
+                mock.patch.object(claude_any, "pid_is_running", side_effect=lambda pid: pid == os.getpid()),
+                mock.patch.object(claude_any, "stop_router_with_guarantee", return_value=True) as stop,
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                rc = claude_any.run_with_router_lifetime(lambda: 7, manage_router=True)
+
+            self.assertEqual(7, rc)
+            stop.assert_called_once_with("claude_exit", quiet=True)
+            self.assertEqual([], list(clients_dir.glob("*.json")))
+
+    def test_runner_exit_keeps_router_when_another_client_is_alive(self):
+        with tempfile.TemporaryDirectory() as td:
+            clients_dir = Path(td) / "router-clients"
+            clients_dir.mkdir()
+            (clients_dir / "999999.json").write_text('{"pid": 999999}', encoding="utf-8")
+
+            def fake_pid_is_running(pid):
+                return pid in (os.getpid(), 999999)
+
+            with (
+                mock.patch.object(claude_any, "ROUTER_CLIENTS_DIR", clients_dir),
+                mock.patch.object(claude_any, "pid_is_running", side_effect=fake_pid_is_running),
+                mock.patch.object(claude_any, "stop_router_with_guarantee") as stop,
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                rc = claude_any.run_with_router_lifetime(lambda: 0, manage_router=True)
+
+            self.assertEqual(0, rc)
+            stop.assert_not_called()
+            self.assertTrue((clients_dir / "999999.json").exists())
+
+    def test_runner_without_router_lifetime_does_not_touch_router(self):
+        with (
+            mock.patch.object(claude_any, "register_router_client") as register,
+            mock.patch.object(claude_any, "stop_router_with_guarantee") as stop,
+        ):
+            rc = claude_any.run_with_router_lifetime(lambda: 3, manage_router=False)
+
+        self.assertEqual(3, rc)
+        register.assert_not_called()
+        stop.assert_not_called()
 
 
 class CleanupNativeAlwaysKillsTests(unittest.TestCase):

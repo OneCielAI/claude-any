@@ -83,6 +83,7 @@ CHAT_FILES_DIR = CONFIG_DIR / "chat-files"
 MENU_KEY_DEBUG_PATH = CONFIG_DIR / "ca-key-debug.log"
 PLAN_ARTIFACTS_DIR = CONFIG_DIR / "plan-artifacts"
 PID_PATH = CONFIG_DIR / "router.pid"
+ROUTER_CLIENTS_DIR = CONFIG_DIR / "router-clients"
 MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
 MODEL_REGISTRY_PATH = CONFIG_DIR / "model-registry.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
@@ -18461,6 +18462,90 @@ def pid_is_running(pid: int) -> bool:
         return False
 
 
+def register_router_client(pid: int | None = None) -> Path:
+    client_pid = int(pid or os.getpid())
+    ROUTER_CLIENTS_DIR.mkdir(parents=True, exist_ok=True)
+    path = ROUTER_CLIENTS_DIR / f"{client_pid}.json"
+    payload = {
+        "pid": client_pid,
+        "started_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "router_port": ROUTER_PORT,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except Exception:
+        pass
+    router_log("INFO", f"router_client_registered pid={client_pid} path={path}")
+    return path
+
+
+def release_router_client(path: Path | None) -> None:
+    if path is None:
+        return
+    try:
+        path.unlink()
+        router_log("INFO", f"router_client_released path={path}")
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        router_log("WARN", f"router_client_release_failed path={path} error={type(exc).__name__}: {exc}")
+
+
+def active_router_client_pids() -> list[int]:
+    if not ROUTER_CLIENTS_DIR.exists():
+        return []
+    active: list[int] = []
+    for path in ROUTER_CLIENTS_DIR.glob("*.json"):
+        pid = 0
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            pid = int(data.get("pid") or path.stem)
+        except Exception:
+            try:
+                pid = int(path.stem)
+            except Exception:
+                pid = 0
+        if pid_is_running(pid):
+            active.append(pid)
+            continue
+        try:
+            path.unlink()
+            router_log("INFO", f"router_client_stale_removed pid={pid or '-'} path={path}")
+        except Exception:
+            pass
+    return sorted(set(active))
+
+
+def stop_router_if_no_active_clients(reason: str, quiet: bool = True) -> bool:
+    active = active_router_client_pids()
+    if active:
+        router_log("INFO", f"router_lifetime_keep_alive reason={reason} active_clients={','.join(map(str, active))}")
+        return False
+    try:
+        stopped = stop_router_with_guarantee(reason, quiet=quiet)
+        router_log("INFO", f"router_lifetime_stopped reason={reason} stopped={stopped}")
+        return stopped
+    except Exception as exc:
+        router_log("ERROR", f"router_lifetime_stop_failed reason={reason} error={type(exc).__name__}: {exc}")
+        return False
+
+
+def run_with_router_lifetime(runner: Callable[[], int], manage_router: bool) -> int:
+    client_path: Path | None = None
+    if manage_router:
+        try:
+            client_path = register_router_client()
+        except Exception as exc:
+            router_log("WARN", f"router_client_register_failed error={type(exc).__name__}: {exc}")
+    try:
+        return runner()
+    finally:
+        if manage_router:
+            release_router_client(client_path)
+            stop_router_if_no_active_clients("claude_exit", quiet=True)
+
+
 def terminate_pid(pid: int, label: str, quiet: bool = False) -> bool:
     if not pid_is_running(pid):
         return False
@@ -20534,12 +20619,12 @@ def run_prelaunch_menu(passthrough: list[str], skip_menu: bool = False, force_me
     return portable_prelaunch_menu(passthrough)
 
 
-def start_router_if_needed() -> None:
+def start_router_if_needed() -> bool:
     health = router_health()
     if health is not None:
         if router_health_matches_current(health):
             router_log("INFO", f"router_check_state running=True spawn=False base={ROUTER_BASE}")
-            return
+            return True
         running_version = str(health.get("version") or "")
         running_fingerprint = str(health.get("source_fingerprint") or "")
         router_log(
@@ -20567,7 +20652,7 @@ def start_router_if_needed() -> None:
     while time.time() < deadline:
         if router_up():
             router_log("INFO", f"router_spawned running=True base={ROUTER_BASE} elapsed={time.time()-(deadline-30):.1f}s")
-            return
+            return True
         time.sleep(0.5)
     raise RuntimeError(f"claude-any router did not start. See {LOG_PATH}")
 
@@ -24046,8 +24131,9 @@ def launch_claude(
     native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
     stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg)
     llm_channel_delivery = should_use_channel_llm_delivery(use_router_mode, launch_passthrough, cfg)
+    manage_router_lifetime = False
     if use_router_mode or native_channel_bridge or llm_channel_delivery:
-        start_router_if_needed()
+        manage_router_lifetime = bool(start_router_if_needed())
     if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge or llm_channel_delivery:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
@@ -24195,13 +24281,16 @@ def launch_claude(
         detected_channel_specs,
         claude_passthrough,
     )
-    if stdin_channel_proxy or screen_summary_proxy:
-        if screen_summary_proxy and not stdin_channel_proxy:
-            return subprocess_call_with_channel_screen_summary_proxy(cmd, env)
-        return subprocess_call_with_channel_wake_proxy(cmd, env, inject_web_chat_only=llm_channel_delivery)
-    if capture_stderr:
-        return _subprocess_call_capturing_stderr(cmd, env)
-    return subprocess.call(cmd, env=env)
+    def run_claude_process() -> int:
+        if stdin_channel_proxy or screen_summary_proxy:
+            if screen_summary_proxy and not stdin_channel_proxy:
+                return subprocess_call_with_channel_screen_summary_proxy(cmd, env)
+            return subprocess_call_with_channel_wake_proxy(cmd, env, inject_web_chat_only=llm_channel_delivery)
+        if capture_stderr:
+            return _subprocess_call_capturing_stderr(cmd, env)
+        return subprocess.call(cmd, env=env)
+
+    return run_with_router_lifetime(run_claude_process, manage_router_lifetime)
 
 
 CLAUDE_CODE_STDERR_LOG = CONFIG_DIR / "claude-code-stderr.log"
