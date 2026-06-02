@@ -132,6 +132,30 @@ class VllmProviderTests(unittest.TestCase):
 
         self.assertEqual("long-context-128k", claude_any.applied_preset_id("vllm", pcfg))
 
+    def test_qwen36_35b_does_not_inherit_27b_65k_hint(self):
+        self.assertIsNone(claude_any.model_context_hint_from_model_id("qwen36-35b-a3b-mtp-nvfp4"))
+
+    def test_vllm_runtime_context_limit_overrides_model_hint(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["current_model"] = "qwen36-35b-a3b-mtp-nvfp4"
+
+        with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=131072):
+            self.assertEqual(131072, claude_any.provider_model_context_capacity("vllm", pcfg))
+            claude_any.apply_llm_preset_to_provider("vllm", pcfg, "long-context-128k", "en")
+
+        self.assertEqual(131072, pcfg["context_window"])
+
+    def test_vllm_saved_max_model_len_overrides_model_hint_when_runtime_unavailable(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["current_model"] = "qwen36-35b-a3b-mtp-nvfp4"
+        pcfg["max_model_len"] = 131072
+
+        with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=None):
+            self.assertEqual(131072, claude_any.provider_model_context_capacity("vllm", pcfg))
+            claude_any.apply_llm_preset_to_provider("vllm", pcfg, "long-context-128k", "en")
+
+        self.assertEqual(131072, pcfg["context_window"])
+
     def test_long_context_128k_preset_configures_ollama_range(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["ollama-cloud"])
 

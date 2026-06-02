@@ -416,7 +416,8 @@ def model_preset(model_id: str) -> dict[str, Any]:
         if candidate in MODEL_PRESETS:
             return MODEL_PRESETS[candidate]
         for key, value in MODEL_PRESETS.items():
-            if candidate.startswith(key) or key.startswith(candidate.split(":", 1)[0]):
+            candidate_base = candidate.split(":", 1)[0]
+            if candidate.startswith(key) or (":" not in candidate and key.startswith(candidate_base)):
                 return value
     return {}
 
@@ -15863,15 +15864,16 @@ def provider_model_context_capacity(provider: str, pcfg: dict[str, Any]) -> int 
         return None
     if provider == "nvidia-hosted":
         return nvidia_hosted_context_default(model)
-    hint = model_context_hint_from_model_id(model)
-    if hint:
-        return hint
     if provider in ("vllm", "self-hosted-nim"):
         return (
             upstream_model_context_limit(provider, pcfg, timeout=1.0)
-            or positive_int(pcfg.get("context_window"))
             or positive_int(pcfg.get("max_model_len"))
+            or model_context_hint_from_model_id(model)
+            or positive_int(pcfg.get("context_window"))
         )
+    hint = model_context_hint_from_model_id(model)
+    if hint:
+        return hint
     if provider in ("ollama", "ollama-cloud"):
         if ollama_context_model_matches(model, str(pcfg.get("model_context_model") or "")):
             cached = positive_int(pcfg.get("model_context_max"))
