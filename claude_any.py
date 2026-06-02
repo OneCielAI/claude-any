@@ -4371,6 +4371,25 @@ def read_model_registry_models(provider: str, pcfg: dict[str, Any], max_age_seco
     return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()]) if isinstance(models, list) else None
 
 
+def read_model_registry_info(provider: str, pcfg: dict[str, Any], max_age_seconds: float = MODEL_CACHE_TTL_SECONDS) -> dict[str, dict[str, Any]]:
+    entry = read_model_registry(provider, pcfg, max_age_seconds=max_age_seconds)
+    metadata = entry.get("metadata") if entry else None
+    model_info = metadata.get("model_info") if isinstance(metadata, dict) else None
+    if not isinstance(model_info, dict):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for raw_id, raw_info in model_info.items():
+        model_id = normalize_model_id(provider, str(raw_id))
+        if not model_id or not isinstance(raw_info, dict):
+            continue
+        info = dict(raw_info)
+        max_context = positive_int(info.get("max_model_len"))
+        if max_context:
+            info["max_model_len"] = max_context
+        out[model_id] = info
+    return out
+
+
 def write_model_registry(provider: str, pcfg: dict[str, Any], models: list[str], source: str = "provider", metadata: dict[str, Any] | None = None) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -4418,15 +4437,39 @@ def read_model_list_cache(provider: str, pcfg: dict[str, Any]) -> list[str] | No
     return unique_model_ids(provider, [str(mid) for mid in models if str(mid).strip()])
 
 
-def write_model_list_cache(provider: str, pcfg: dict[str, Any], models: list[str]) -> None:
+def read_model_info_cache(provider: str, pcfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    try:
+        data = json.loads(MODEL_LIST_CACHE_PATH.read_text())
+    except Exception:
+        return read_model_registry_info(provider, pcfg, max_age_seconds=0)
+    if not isinstance(data, dict) or data.get("key") != model_cache_key(provider, pcfg):
+        return read_model_registry_info(provider, pcfg, max_age_seconds=0)
+    metadata = data.get("metadata")
+    model_info = metadata.get("model_info") if isinstance(metadata, dict) else None
+    if not isinstance(model_info, dict):
+        return read_model_registry_info(provider, pcfg, max_age_seconds=0)
+    out: dict[str, dict[str, Any]] = {}
+    for raw_id, raw_info in model_info.items():
+        model_id = normalize_model_id(provider, str(raw_id))
+        if not model_id or not isinstance(raw_info, dict):
+            continue
+        info = dict(raw_info)
+        max_context = positive_int(info.get("max_model_len"))
+        if max_context:
+            info["max_model_len"] = max_context
+        out[model_id] = info
+    return out
+
+
+def write_model_list_cache(provider: str, pcfg: dict[str, Any], models: list[str], metadata: dict[str, Any] | None = None) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    data = {"time": time.time(), "key": model_cache_key(provider, pcfg), "models": models}
+    data = {"time": time.time(), "key": model_cache_key(provider, pcfg), "models": models, "metadata": metadata or {}}
     try:
         MODEL_LIST_CACHE_PATH.write_text(json.dumps(data, indent=2) + "\n")
         os.chmod(MODEL_LIST_CACHE_PATH, 0o600)
     except Exception:
         pass
-    write_model_registry(provider, pcfg, models, "provider")
+    write_model_registry(provider, pcfg, models, "provider", metadata)
 
 
 def cached_or_configured_model_ids(provider: str, pcfg: dict[str, Any]) -> list[str]:
@@ -4471,6 +4514,48 @@ def model_ids_from_response(data: Any) -> list[str]:
         if mid and str(mid).strip():
             ids.append(str(mid).strip())
     return ids
+
+
+def model_info_from_response(provider: str, data: Any) -> dict[str, dict[str, Any]]:
+    candidates: Any
+    if isinstance(data, dict):
+        candidates = data.get("data")
+        if candidates is None:
+            candidates = data.get("models")
+        if candidates is None:
+            candidates = data.get("model")
+    else:
+        candidates = data
+    if isinstance(candidates, dict):
+        candidates = [candidates]
+    if isinstance(candidates, str):
+        candidates = [candidates]
+    if not isinstance(candidates, list):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for item in candidates:
+        if isinstance(item, str):
+            mid = item
+            raw: dict[str, Any] = {}
+        elif isinstance(item, dict):
+            mid = item.get("id") or item.get("key") or item.get("name") or item.get("model")
+            raw = item
+        else:
+            continue
+        model_id = normalize_model_id(provider, str(mid or "").strip())
+        if not model_id:
+            continue
+        max_context = positive_int(raw.get("max_context_length")) or model_context_field(raw)
+        info: dict[str, Any] = {}
+        if max_context:
+            info["max_model_len"] = max_context
+        for key in ("owned_by", "root", "object"):
+            value = raw.get(key)
+            if value is not None:
+                info[key] = value
+        if info:
+            out[model_id] = info
+    return out
 
 
 ANTHROPIC_PUBLIC_MODEL_ID_RE = re.compile(
@@ -5297,20 +5382,24 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
     else:
         base = provider_upstream_request_base(provider, pcfg)
     ids: list[str] = []
+    model_info: dict[str, dict[str, Any]] = {}
     fetched = False
     try:
         if provider in ("ollama", "ollama-cloud"):
             try:
                 data = http_json(join_url(base, "/api/tags"), headers=provider_model_list_headers(provider, pcfg), timeout=4.0)
                 ids = [normalize_model_id(provider, mid) for mid in model_ids_from_response(data)]
+                model_info.update(model_info_from_response(provider, data))
                 fetched = True
             except Exception:
                 data = http_json(join_url(base, "/v1/models"), headers=provider_model_list_headers(provider, pcfg), timeout=4.0)
                 ids = [normalize_model_id(provider, mid) for mid in model_ids_from_response(data)]
+                model_info.update(model_info_from_response(provider, data))
                 fetched = True
         elif provider == "nvidia-hosted":
             data = http_json(join_url(base, "/v1/models"), headers=nvidia_hosted_list_headers(), timeout=8.0)
             ids = model_ids_from_response(data)
+            model_info.update(model_info_from_response(provider, data))
             fetched = True
         elif provider == "lm-studio":
             headers = provider_model_list_headers(provider, pcfg)
@@ -5318,6 +5407,7 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
                 try:
                     data = http_json(join_url(lm_studio_api_base(pcfg) if path.startswith("/api/") else base, path), headers=headers, timeout=2.0)
                     ids = [normalize_model_id(provider, mid) for mid in model_ids_from_response(data)]
+                    model_info.update(model_info_from_response(provider, data))
                     fetched = True
                     if ids:
                         break
@@ -5329,6 +5419,7 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
                 try:
                     data = http_json(join_url(base, path), headers=headers, timeout=6.0)
                     ids = model_ids_from_response(data)
+                    model_info.update(model_info_from_response(provider, data))
                     fetched = True
                     if ids:
                         break
@@ -5364,7 +5455,8 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
     sorted_ids = unique_model_ids(provider, ids)
     if provider != "anthropic":
         sorted_ids = sorted_model_ids(sorted_ids)
-    write_model_list_cache(provider, pcfg, sorted_ids)
+    metadata = {"model_info": model_info} if model_info else None
+    write_model_list_cache(provider, pcfg, sorted_ids, metadata)
     return sorted_ids
 
 
@@ -13278,6 +13370,10 @@ def set_model_config(value: str) -> list[str]:
     mmap = model_map_for(provider, pcfg, fetch=False)
     model_id = normalize_model_id(provider, unslug_provider_alias(provider, value, mmap) or value)
     pcfg["current_model"] = model_id
+    selected_info = read_model_info_cache(provider, pcfg).get(model_id) or {}
+    selected_context = positive_int(selected_info.get("max_model_len"))
+    if selected_context:
+        pcfg["max_model_len"] = selected_context
     preset = model_preset(model_id)
     if preset.get("num_ctx_min"):
         pcfg["num_ctx_min"] = preset["num_ctx_min"]
@@ -13294,6 +13390,8 @@ def set_model_config(value: str) -> list[str]:
     save_config(cfg)
     clear_model_cache()
     msgs = [f"Model for {provider} set to {model_id}.", f"Claude Code alias: {alias_for(provider, model_id)}"]
+    if selected_context:
+        msgs.append(f"Model context size: {format_context_tokens(selected_context)} ({selected_context:,} tokens).")
     msgs.extend(context_msgs)
     msgs.extend(preset_msgs)
     msgs.extend(timeout_msgs)
@@ -19325,13 +19423,18 @@ def model_panel_rows(
     seen_aliases: set[str] = set()
     deduped_values: list[str] = []
     cache = read_model_list_cache(provider, pcfg)
+    cached_info = read_model_info_cache(provider, pcfg)
     rows.append("Refresh provider model list..." if cache is None else "Refresh provider model list")
     deduped_values.append("__refresh_models__")
     for mid in values:
         alias = alias_for(provider, mid)
         suffix = ""
+        info = cached_info.get(normalize_model_id(provider, mid), {})
+        max_context = positive_int(info.get("max_model_len"))
+        if max_context:
+            suffix += f"  [ctx {format_context_tokens(max_context)}]"
         if provider in OPENCODE_PROVIDER_NAMES:
-            suffix = f"  [{opencode_endpoint_display(provider, mid, pcfg)}]"
+            suffix += f"  [{opencode_endpoint_display(provider, mid, pcfg)}]"
         alias_key = alias.casefold()
         if alias_key in seen_aliases:
             continue

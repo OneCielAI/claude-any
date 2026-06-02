@@ -156,6 +156,57 @@ class VllmProviderTests(unittest.TestCase):
 
         self.assertEqual(131072, pcfg["context_window"])
 
+    def test_model_info_from_response_extracts_context_size(self):
+        data = {
+            "data": [
+                {
+                    "id": "qwen36-35b-a3b-mtp-nvfp4",
+                    "max_model_len": 131072,
+                    "owned_by": "vllm",
+                }
+            ]
+        }
+
+        info = claude_any.model_info_from_response("vllm", data)
+
+        self.assertEqual(131072, info["qwen36-35b-a3b-mtp-nvfp4"]["max_model_len"])
+        self.assertEqual("vllm", info["qwen36-35b-a3b-mtp-nvfp4"]["owned_by"])
+
+    def test_model_panel_shows_cached_context_size(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        model = "qwen36-35b-a3b-mtp-nvfp4"
+
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=[model]),
+            mock.patch.object(claude_any, "read_model_info_cache", return_value={model: {"max_model_len": 131072}}),
+        ):
+            rows, values = claude_any.model_panel_rows("vllm", pcfg, fetch=False)
+
+        row = rows[values.index(model)]
+        self.assertIn("[ctx 128K]", row)
+
+    def test_set_model_config_stores_cached_context_size(self):
+        model = "qwen36-35b-a3b-mtp-nvfp4"
+        cfg = {
+            "current_provider": "vllm",
+            "language": "en",
+            "providers": {"vllm": dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])},
+        }
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config"),
+            mock.patch.object(claude_any, "clear_model_cache"),
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=[model]),
+            mock.patch.object(claude_any, "read_model_info_cache", return_value={model: {"max_model_len": 131072}}),
+            mock.patch.object(claude_any, "upstream_model_context_limit", return_value=None),
+        ):
+            messages = claude_any.set_model_config(model)
+
+        pcfg = cfg["providers"]["vllm"]
+        self.assertEqual(131072, pcfg["max_model_len"])
+        self.assertTrue(any("Model context size: 128K" in message for message in messages))
+
     def test_long_context_128k_preset_configures_ollama_range(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["ollama-cloud"])
 
