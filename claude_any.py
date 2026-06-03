@@ -189,7 +189,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.104"
+VERSION = "0.1.105"
 DEFAULT_UPSTREAM_USER_AGENT = "claude-cli"
 
 

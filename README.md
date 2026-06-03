@@ -26,6 +26,21 @@
 
 ## Today's Top 3 Benefits
 
+### 2026-06-03
+
+1. **Router lifecycle isolation** — Claude Any now distinguishes routers it
+   manages from routers owned by another config directory or active session. It
+   replaces stale same-config routers only when they are idle, and managed
+   routers shut down after their Claude Code child exits.
+2. **OpenAI/vLLM compatibility repairs** — long compacted routed sessions keep
+   required tool-result messages with assistant tool calls, vLLM endpoint
+   routing distinguishes OpenAI-compatible and Anthropic-compatible servers, and
+   128K context presets stay visible instead of collapsing back to 65K.
+3. **Cleaner ultracode, advisor, and channel behavior** — ultracode is gated by
+   verified model capabilities, `/advisor` remains an explicit user action, and
+   external-channel digests stay local so internal `tool_result` or background
+   summary text is not posted back into AI-Net-style rooms.
+
 ### 2026-05-28
 
 1. **Non-native Claude Code workflow prep** — routed providers can opt in to Claude Code dynamic workflows with `workflows_enabled`, which removes Claude Any's experimental-beta disable env for that launch.
@@ -82,7 +97,7 @@ passes normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.104`
+Current version: `0.1.105`
 
 ## Why This Exists
 
@@ -576,8 +591,46 @@ steps under that larger model's supervision.
 
 ## Changelog
 
-### Nightly
+### 0.1.105
 
+- **Router lifecycle isolation**: routed launches now track managed router
+  ownership with the current Claude Any config directory and owner process,
+  replace only idle same-config routers on the same port, refuse foreign-config
+  routers instead of killing unrelated sessions, and ask managed routers to stop
+  after their Claude Code child exits. npm `postinstall` also performs a
+  best-effort managed-router cleanup so upgrades do not leave stale local
+  bridges attached to old code.
+- **Routed transcript repair for OpenAI-compatible providers**: compacted or
+  truncated contexts that still contain an assistant `tool_calls` message are
+  repaired before upstream forwarding by preserving the required matching tool
+  messages. This avoids DeepSeek/OpenAI-compatible errors such as
+  `insufficient tool messages following tool_calls message` after long routed
+  coding sessions.
+- **vLLM and local Anthropic-compatible routing fixes**: vLLM endpoint detection
+  now distinguishes OpenAI-compatible `/v1` URLs from Anthropic-compatible
+  Messages endpoints, normalizes system messages for Anthropic-style vLLM
+  servers, shows model context metadata in the model picker when available, and
+  adds visible 128K presets instead of forcing every long-context choice back to
+  65K.
+- **Claude Code capability and ultracode guards**: workflow/ultracode launch
+  options now use explicit model capability metadata. Claude family IDs exposed
+  through routed gateways can infer supported capabilities, while unverified
+  OpenCode/DeepSeek/local IDs no longer advertise `xhigh_effort` unless the user
+  sets a provider capability override.
+- **Advisor routing hardening**: routed sessions strip Claude Code's autonomous
+  server-side advisor tool from normal turns so `/advisor` remains an explicit
+  user action. Advisor model aliases are resolved through the selected provider,
+  preventing routed advisor requests from sending Claude Any alias names as raw
+  upstream model IDs.
+- **Upstream request identity and install diagnostics**: routed provider calls
+  send a Claude Code oriented user-agent header by default, and startup now warns
+  when another `claude-any` executable shadows the active npm install. Self
+  updates target the npm prefix that owns the running executable instead of a
+  different global install.
+- **External channel summary cleanup**: AI-Net-style channel digest summaries are
+  kept as local status notices and simplified to point users back to the MCP
+  system for details. Internal `tool_result`, background-summary, and
+  no-reply markers are suppressed from outbound external-channel messages.
 - **Provider API-key round-robin**: routed providers now support multiple stored
   API keys per provider (`api_keys`) while preserving the existing single
   `api_key` config. `--ca-api-keys`, `--ca-api-keys-env`,

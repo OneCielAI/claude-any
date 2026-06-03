@@ -26,6 +26,21 @@
 
 ## 오늘 추가된 최고의 3가지 베네핏
 
+### 2026-06-03
+
+1. **라우터 수명주기 격리 강화** — Claude Any가 자신이 관리하는 라우터와 다른
+   폴더/다른 세션의 라우터를 구분합니다. 같은 포트에 오래된 같은-config 라우터가
+   idle 상태일 때만 교체하고, Claude Code 자식 프로세스가 종료되면 관리 라우터도
+   함께 정리합니다.
+2. **OpenAI/vLLM 호환 경로 안정화** — 긴 세션에서 압축된 transcript에
+   `tool_calls`가 남아도 필요한 tool message를 보존해 DeepSeek/OpenAI 호환
+   provider의 `insufficient tool messages` 오류를 줄입니다. vLLM endpoint 감지,
+   Anthropic 호환 system message 정규화, 128K preset 표시도 함께 개선했습니다.
+3. **ultracode/advisor/channel 정리** — ultracode는 확인된 capability가 있을 때만
+   켜지고, `/advisor`는 명시적 호출 중심으로 동작합니다. 외부 채널 digest는 로컬
+   상태 알림으로 유지해 내부 tool_result나 자동 처리 문구가 AI-Net 같은 외부
+   채팅방으로 새는 일을 줄였습니다.
+
 ### 2026-05-28
 
 1. **non-native Claude Code workflow 준비** — router 경유 provider에서도 Claude Code의 dynamic workflow가 동작할 수 있도록 `workflows_enabled` 옵션을 추가했습니다. 이 옵션을 켜면 해당 실행에서 experimental beta 차단 env를 제거합니다.
@@ -80,7 +95,7 @@ DeepSeek.com, OpenCode Zen, OpenCode Go, vLLM, NVIDIA hosted, self-hosted NIM을
 
 Credits: One Ciel LLC
 
-현재 버전: `0.1.104`
+현재 버전: `0.1.105`
 
 ## 왜 만들었나
 
