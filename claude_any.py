@@ -15628,10 +15628,17 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
         key = token.split(":", 1)[1].strip()
         if key in ("num_ctx", "ctx"):
             pcfg["num_ctx"] = "auto"
+        elif key in ("context_window", "context", "max_model_len"):
+            pcfg.pop("context_window", None)
+            pcfg["num_ctx"] = "auto"
+            pcfg.pop("num_ctx_max", None)
         elif key in ("num_ctx_min", "ctx_min", "min"):
             pcfg.pop("num_ctx_min", None)
         elif key in ("num_ctx_max", "ctx_max", "max"):
             pcfg.pop("num_ctx_max", None)
+        elif key in ("max_output_tokens", "max_tokens", "maxtoken", "max_token", "num_predict"):
+            pcfg.pop("max_output_tokens", None)
+            pcfg.setdefault("ollama_options", {}).pop("num_predict", None)
         elif key in ("keep_alive", "keepalive"):
             pcfg.pop("keep_alive", None)
         elif key == "think":
@@ -15664,6 +15671,15 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
                 raise SystemExit("num_ctx must be auto or a positive integer")
             pcfg["num_ctx"] = fixed
         return
+    if key in ("context_window", "context", "max_model_len"):
+        fixed = positive_int(value)
+        if not fixed:
+            raise SystemExit("context_window must be a positive integer")
+        pcfg["context_window"] = fixed
+        pcfg["num_ctx"] = "auto"
+        pcfg["num_ctx_max"] = fixed
+        pcfg["num_ctx_min"] = min(fixed, 32768 if fixed <= 65536 else 65536)
+        return
     if key in ("num_ctx_min", "ctx_min", "min"):
         fixed = positive_int(value)
         if not fixed:
@@ -15694,10 +15710,11 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
             raise SystemExit("stream_idle_timeout_ms must be a positive integer; values above 10000 are treated as milliseconds")
         pcfg["stream_idle_timeout_ms"] = fixed if key.endswith("_ms") or fixed > 10000 else fixed * 1000
         return
-    if key in ("max_tokens", "maxtoken", "max_token", "num_predict"):
+    if key in ("max_output_tokens", "max_tokens", "maxtoken", "max_token", "num_predict"):
         fixed = positive_int(value)
         if not fixed:
             raise SystemExit("max_tokens/num_predict must be a positive integer")
+        pcfg["max_output_tokens"] = fixed
         pcfg.setdefault("ollama_options", {})["num_predict"] = fixed
         return
     if key == "think":
@@ -15837,6 +15854,9 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
             if limit is not None:
                 suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unmanaged)"
                 parts.append(f"rpm_used={suffix}")
+    if provider in ("ollama", "ollama-cloud"):
+        parts.insert(0, f"num_ctx={ollama_num_ctx_status(pcfg)}")
+        parts.append(f"ollama_options={ollama_options_status(pcfg)}")
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
@@ -17710,6 +17730,9 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             endpoints = {}
             pcfg["model_endpoints"] = endpoints
         endpoints[normalize_model_id(provider, model_id)] = endpoint
+        return
+    if provider in ("ollama", "ollama-cloud"):
+        apply_ollama_option(pcfg, token)
         return
     if token.startswith("unset:"):
         key = token.split(":", 1)[1].strip()
