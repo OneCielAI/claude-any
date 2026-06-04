@@ -3756,6 +3756,13 @@ def tasklist_result_has_active_work(text: str) -> bool:
     return False
 
 
+def latest_tasklist_result_has_no_active_work(body: dict[str, Any]) -> bool:
+    latest_names = latest_user_tool_result_names(body)
+    if "TaskList" not in latest_names:
+        return False
+    return not tasklist_result_has_active_work(latest_user_tool_result_text(body))
+
+
 def latest_assistant_text(body: dict[str, Any]) -> str:
     for message in reversed(body.get("messages") or []):
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -3889,6 +3896,15 @@ def empty_end_turn_notice() -> str:
         "[claude-any] Upstream model returned an empty end_turn with no text or "
         "tool call. No work was performed; please retry or ask me to continue."
     )
+
+
+def empty_end_turn_notice_for_body(body: dict[str, Any] | None) -> str:
+    if isinstance(body, dict) and latest_tasklist_result_has_no_active_work(body):
+        return (
+            "[claude-any] TaskList returned no active tasks. No automatic continuation "
+            "is available; provide the next instruction or ask for current status."
+        )
+    return empty_end_turn_notice()
 
 
 def append_synthetic_tasklist_to_message(message: dict[str, Any], model: str, source_body: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -11090,7 +11106,8 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
         )
         emitted_tool_calls.append(content[-1])
     if source_body is not None and not text.strip() and not emitted_tool_calls:
-        text = empty_end_turn_notice()
+        text = empty_end_turn_notice_for_body(source_body)
+        router_log("WARN", f"ollama_empty_end_turn_notice model={model} latest_tool_results={','.join(latest_user_tool_result_names(source_body)) or '-'}")
         content.append({"type": "text", "text": text})
     done_reason = data.get("done_reason")
     stop_reason = "tool_use" if any(block.get("type") == "tool_use" for block in content) else "end_turn"
@@ -11409,7 +11426,7 @@ def _rebatch_anthropic_sse_text(
             f"latest_tool_results={','.join(latest_names) or '-'} synthetic_tasklists={synthetic_count} "
             f"suppressed_blocks={len(suppressed_thinking_passback_blocks)}",
         )
-        notice = empty_end_turn_notice() if source_body is not None else ""
+        notice = empty_end_turn_notice_for_body(source_body) if source_body is not None else ""
         router_log("WARN", f"anthropic_hidden_only_stream provider={provider} model={model}")
         emit_text_block(next_content_index, notice)
         next_content_index += 1
@@ -12124,7 +12141,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             write_router_activity("error", provider, model, error="empty_stream", stream=True)
             empty_index = next_content_index
             next_content_index += 1
-            notice = empty_end_turn_notice() if source_body is not None else ""
+            notice = empty_end_turn_notice_for_body(source_body) if source_body is not None else ""
             if notice:
                 text_so_far = notice
             emit_text_block(empty_index, notice)
@@ -12764,7 +12781,13 @@ def stream_openai_chat_to_anthropic_sse(
             emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
             text_stopped = True
         if not text_started and not tool_calls:
-            text_so_far = empty_end_turn_notice() if source_body is not None else ""
+            text_so_far = empty_end_turn_notice_for_body(source_body) if source_body is not None else ""
+            if source_body is not None:
+                router_log(
+                    "WARN",
+                    f"openai_empty_end_turn_notice provider={provider} model={model} "
+                    f"latest_tool_results={','.join(latest_user_tool_result_names(source_body)) or '-'}",
+                )
             emit_text_delta(text_so_far)
             if text_index is not None:
                 emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
