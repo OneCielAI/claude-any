@@ -24,6 +24,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -86,6 +87,7 @@ PID_PATH = CONFIG_DIR / "router.pid"
 ROUTER_CLIENTS_DIR = CONFIG_DIR / "router-clients"
 MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
 MODEL_REGISTRY_PATH = CONFIG_DIR / "model-registry.json"
+LAUNCH_STATE_PATH = CONFIG_DIR / "launch-state.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
@@ -21071,6 +21073,103 @@ def has_passthrough_option(passthrough: list[str], *names: str) -> bool:
     return any(arg in names or any(arg.startswith(name + "=") for name in names) for arg in passthrough)
 
 
+def claude_session_control_requested(passthrough: list[str]) -> bool:
+    return has_passthrough_option(
+        passthrough,
+        "-c",
+        "--continue",
+        "-r",
+        "--resume",
+        "--session-id",
+        "--fork-session",
+        "--from-pr",
+    )
+
+
+def current_launch_cwd_key() -> str:
+    try:
+        return str(Path.cwd().resolve())
+    except Exception:
+        return os.getcwd()
+
+
+def launch_mode_name(provider: str, pcfg: dict[str, Any], use_native_anthropic: bool) -> str:
+    if use_native_anthropic:
+        return "anthropic-native"
+    if anthropic_routed_enabled(provider, pcfg):
+        return "anthropic-routed"
+    return f"router:{provider}"
+
+
+def read_launch_state() -> dict[str, Any]:
+    try:
+        data = json.loads(LAUNCH_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_launch_state(state: dict[str, Any]) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = LAUNCH_STATE_PATH.with_name(f"{LAUNCH_STATE_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(LAUNCH_STATE_PATH)
+    except Exception as exc:
+        router_log("WARN", f"launch_state_write_failed error={type(exc).__name__}: {exc}")
+
+
+def previous_launch_state_for_cwd(cwd_key: str) -> dict[str, Any]:
+    state = read_launch_state()
+    by_cwd = state.get("by_cwd")
+    if isinstance(by_cwd, dict):
+        item = by_cwd.get(cwd_key)
+        if isinstance(item, dict):
+            return item
+    legacy = state.get("last")
+    if isinstance(legacy, dict) and str(legacy.get("cwd") or "") == cwd_key:
+        return legacy
+    return {}
+
+
+def record_launch_state_for_cwd(cwd_key: str, provider: str, mode: str, model: str) -> None:
+    state = read_launch_state()
+    by_cwd = state.get("by_cwd")
+    if not isinstance(by_cwd, dict):
+        by_cwd = {}
+    item = {
+        "cwd": cwd_key,
+        "provider": provider,
+        "mode": mode,
+        "model": model,
+        "pid": os.getpid(),
+        "time": time.time(),
+    }
+    by_cwd[cwd_key] = item
+    state["by_cwd"] = by_cwd
+    state["last"] = item
+    write_launch_state(state)
+
+
+def should_fork_native_session_after_mode_switch(
+    provider: str,
+    pcfg: dict[str, Any],
+    use_native_anthropic: bool,
+    passthrough: list[str],
+    cwd_key: str,
+) -> tuple[bool, str]:
+    if not use_native_anthropic:
+        return False, ""
+    if claude_session_control_requested(passthrough):
+        return False, "explicit_session_control"
+    previous = previous_launch_state_for_cwd(cwd_key)
+    previous_mode = str(previous.get("mode") or "")
+    if not previous_mode or previous_mode == launch_mode_name(provider, pcfg, use_native_anthropic):
+        return False, previous_mode or "no_previous_mode"
+    return True, previous_mode
+
+
 def normalize_channel_passthrough(passthrough: list[str]) -> list[str]:
     normalized: list[str] = []
     i = 0
@@ -24498,6 +24597,14 @@ def launch_claude(
         return 2
     use_native_anthropic = direct_native_anthropic_enabled(provider, pcfg)
     use_router_mode = not use_native_anthropic
+    launch_cwd_key = current_launch_cwd_key()
+    fork_native_session, previous_launch_mode = should_fork_native_session_after_mode_switch(
+        provider,
+        pcfg,
+        use_native_anthropic,
+        passthrough,
+        launch_cwd_key,
+    )
     cleanup_managed_services_for_provider(provider, pcfg, cfg, quiet=True)
     env = os.environ.copy()
     env["PATH"] = str(HOME / ".local" / "bin") + os.pathsep + env.get("PATH", "")
@@ -24634,6 +24741,13 @@ def launch_claude(
         )
     )
     append_claude_code_runtime_settings_args(extra_args, launch_passthrough, provider, pcfg)
+    if fork_native_session:
+        session_id = str(uuid.uuid4())
+        extra_args.extend(["--session-id", session_id])
+        router_log(
+            "INFO",
+            f"claude_native_session_boundary previous_mode={previous_launch_mode} cwd={launch_cwd_key} session_id={session_id}",
+        )
     cmd = [
         claude,
         "--dangerously-skip-permissions",
@@ -24650,6 +24764,12 @@ def launch_claude(
     cmd.extend(extra_args)
     cmd.extend(claude_passthrough)
     _log_claude_command_for_diagnostics(cmd, env)
+    record_launch_state_for_cwd(
+        launch_cwd_key,
+        provider,
+        launch_mode_name(provider, pcfg, use_native_anthropic),
+        str(pcfg.get("current_model") or env.get("CLAUDE_ANY_MODEL_ALIAS") or ""),
+    )
     capture_stderr = env_bool(os.environ.get("CLAUDE_ANY_CAPTURE_CC_STDERR"), False)
     screen_summary_proxy = should_use_channel_screen_summary_proxy(
         llm_channel_delivery,
