@@ -192,6 +192,48 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertIn("empty end_turn", text_blocks[0]["text"])
         self.assertEqual("end_turn", message["stop_reason"])
 
+    def test_empty_turn_after_empty_tasklist_returns_no_active_task_notice(self):
+        body = body_with_tools("continue implementation", ["TaskList", "Read"])
+        body["messages"].append(
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_tasks",
+                        "name": "TaskList",
+                        "input": {},
+                    }
+                ],
+            }
+        )
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_tasks",
+                        "content": "No tasks found",
+                    }
+                ],
+            }
+        )
+        data = {
+            "message": {"content": ""},
+            "done": True,
+            "done_reason": "stop",
+            "eval_count": 1,
+        }
+
+        message = claude_any.ollama_chat_to_anthropic(data, "deepseek-v4-flash", source_body=body)
+
+        text_blocks = [block for block in message["content"] if block.get("type") == "text"]
+        self.assertTrue(text_blocks)
+        self.assertIn("TaskList returned no active tasks", text_blocks[0]["text"])
+        self.assertNotIn("empty end_turn", text_blocks[0]["text"])
+        self.assertEqual("end_turn", message["stop_reason"])
+
     def test_empty_plain_chat_does_not_synthesize_tasklist(self):
         body = body_with_tools("hi", ["TaskList", "Read"])
         data = {

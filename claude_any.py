@@ -24,6 +24,7 @@ import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -86,6 +87,7 @@ PID_PATH = CONFIG_DIR / "router.pid"
 ROUTER_CLIENTS_DIR = CONFIG_DIR / "router-clients"
 MODEL_LIST_CACHE_PATH = CONFIG_DIR / "model-list-cache.json"
 MODEL_REGISTRY_PATH = CONFIG_DIR / "model-registry.json"
+LAUNCH_STATE_PATH = CONFIG_DIR / "launch-state.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
@@ -3756,6 +3758,13 @@ def tasklist_result_has_active_work(text: str) -> bool:
     return False
 
 
+def latest_tasklist_result_has_no_active_work(body: dict[str, Any]) -> bool:
+    latest_names = latest_user_tool_result_names(body)
+    if "TaskList" not in latest_names:
+        return False
+    return not tasklist_result_has_active_work(latest_user_tool_result_text(body))
+
+
 def latest_assistant_text(body: dict[str, Any]) -> str:
     for message in reversed(body.get("messages") or []):
         if not isinstance(message, dict) or message.get("role") != "assistant":
@@ -3889,6 +3898,15 @@ def empty_end_turn_notice() -> str:
         "[claude-any] Upstream model returned an empty end_turn with no text or "
         "tool call. No work was performed; please retry or ask me to continue."
     )
+
+
+def empty_end_turn_notice_for_body(body: dict[str, Any] | None) -> str:
+    if isinstance(body, dict) and latest_tasklist_result_has_no_active_work(body):
+        return (
+            "[claude-any] TaskList returned no active tasks. No automatic continuation "
+            "is available; provide the next instruction or ask for current status."
+        )
+    return empty_end_turn_notice()
 
 
 def append_synthetic_tasklist_to_message(message: dict[str, Any], model: str, source_body: dict[str, Any], reason: str) -> dict[str, Any]:
@@ -11090,7 +11108,8 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
         )
         emitted_tool_calls.append(content[-1])
     if source_body is not None and not text.strip() and not emitted_tool_calls:
-        text = empty_end_turn_notice()
+        text = empty_end_turn_notice_for_body(source_body)
+        router_log("WARN", f"ollama_empty_end_turn_notice model={model} latest_tool_results={','.join(latest_user_tool_result_names(source_body)) or '-'}")
         content.append({"type": "text", "text": text})
     done_reason = data.get("done_reason")
     stop_reason = "tool_use" if any(block.get("type") == "tool_use" for block in content) else "end_turn"
@@ -11409,7 +11428,7 @@ def _rebatch_anthropic_sse_text(
             f"latest_tool_results={','.join(latest_names) or '-'} synthetic_tasklists={synthetic_count} "
             f"suppressed_blocks={len(suppressed_thinking_passback_blocks)}",
         )
-        notice = empty_end_turn_notice() if source_body is not None else ""
+        notice = empty_end_turn_notice_for_body(source_body) if source_body is not None else ""
         router_log("WARN", f"anthropic_hidden_only_stream provider={provider} model={model}")
         emit_text_block(next_content_index, notice)
         next_content_index += 1
@@ -12124,7 +12143,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
             write_router_activity("error", provider, model, error="empty_stream", stream=True)
             empty_index = next_content_index
             next_content_index += 1
-            notice = empty_end_turn_notice() if source_body is not None else ""
+            notice = empty_end_turn_notice_for_body(source_body) if source_body is not None else ""
             if notice:
                 text_so_far = notice
             emit_text_block(empty_index, notice)
@@ -12764,7 +12783,13 @@ def stream_openai_chat_to_anthropic_sse(
             emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
             text_stopped = True
         if not text_started and not tool_calls:
-            text_so_far = empty_end_turn_notice() if source_body is not None else ""
+            text_so_far = empty_end_turn_notice_for_body(source_body) if source_body is not None else ""
+            if source_body is not None:
+                router_log(
+                    "WARN",
+                    f"openai_empty_end_turn_notice provider={provider} model={model} "
+                    f"latest_tool_results={','.join(latest_user_tool_result_names(source_body)) or '-'}",
+                )
             emit_text_delta(text_so_far)
             if text_index is not None:
                 emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
@@ -15628,10 +15653,17 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
         key = token.split(":", 1)[1].strip()
         if key in ("num_ctx", "ctx"):
             pcfg["num_ctx"] = "auto"
+        elif key in ("context_window", "context", "max_model_len"):
+            pcfg.pop("context_window", None)
+            pcfg["num_ctx"] = "auto"
+            pcfg.pop("num_ctx_max", None)
         elif key in ("num_ctx_min", "ctx_min", "min"):
             pcfg.pop("num_ctx_min", None)
         elif key in ("num_ctx_max", "ctx_max", "max"):
             pcfg.pop("num_ctx_max", None)
+        elif key in ("max_output_tokens", "max_tokens", "maxtoken", "max_token", "num_predict"):
+            pcfg.pop("max_output_tokens", None)
+            pcfg.setdefault("ollama_options", {}).pop("num_predict", None)
         elif key in ("keep_alive", "keepalive"):
             pcfg.pop("keep_alive", None)
         elif key == "think":
@@ -15664,6 +15696,15 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
                 raise SystemExit("num_ctx must be auto or a positive integer")
             pcfg["num_ctx"] = fixed
         return
+    if key in ("context_window", "context", "max_model_len"):
+        fixed = positive_int(value)
+        if not fixed:
+            raise SystemExit("context_window must be a positive integer")
+        pcfg["context_window"] = fixed
+        pcfg["num_ctx"] = "auto"
+        pcfg["num_ctx_max"] = fixed
+        pcfg["num_ctx_min"] = min(fixed, 32768 if fixed <= 65536 else 65536)
+        return
     if key in ("num_ctx_min", "ctx_min", "min"):
         fixed = positive_int(value)
         if not fixed:
@@ -15694,10 +15735,11 @@ def apply_ollama_option(pcfg: dict[str, Any], token: str) -> None:
             raise SystemExit("stream_idle_timeout_ms must be a positive integer; values above 10000 are treated as milliseconds")
         pcfg["stream_idle_timeout_ms"] = fixed if key.endswith("_ms") or fixed > 10000 else fixed * 1000
         return
-    if key in ("max_tokens", "maxtoken", "max_token", "num_predict"):
+    if key in ("max_output_tokens", "max_tokens", "maxtoken", "max_token", "num_predict"):
         fixed = positive_int(value)
         if not fixed:
             raise SystemExit("max_tokens/num_predict must be a positive integer")
+        pcfg["max_output_tokens"] = fixed
         pcfg.setdefault("ollama_options", {})["num_predict"] = fixed
         return
     if key == "think":
@@ -15837,6 +15879,9 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
             if limit is not None:
                 suffix = f"{used}/{limit}" if limit > 0 else f"{used}/min(unmanaged)"
                 parts.append(f"rpm_used={suffix}")
+    if provider in ("ollama", "ollama-cloud"):
+        parts.insert(0, f"num_ctx={ollama_num_ctx_status(pcfg)}")
+        parts.append(f"ollama_options={ollama_options_status(pcfg)}")
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
@@ -17710,6 +17755,9 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             endpoints = {}
             pcfg["model_endpoints"] = endpoints
         endpoints[normalize_model_id(provider, model_id)] = endpoint
+        return
+    if provider in ("ollama", "ollama-cloud"):
+        apply_ollama_option(pcfg, token)
         return
     if token.startswith("unset:"):
         key = token.split(":", 1)[1].strip()
@@ -21023,6 +21071,103 @@ def claude_supports_permission_mode_arg(claude: str) -> bool:
 
 def has_passthrough_option(passthrough: list[str], *names: str) -> bool:
     return any(arg in names or any(arg.startswith(name + "=") for name in names) for arg in passthrough)
+
+
+def claude_session_control_requested(passthrough: list[str]) -> bool:
+    return has_passthrough_option(
+        passthrough,
+        "-c",
+        "--continue",
+        "-r",
+        "--resume",
+        "--session-id",
+        "--fork-session",
+        "--from-pr",
+    )
+
+
+def current_launch_cwd_key() -> str:
+    try:
+        return str(Path.cwd().resolve())
+    except Exception:
+        return os.getcwd()
+
+
+def launch_mode_name(provider: str, pcfg: dict[str, Any], use_native_anthropic: bool) -> str:
+    if use_native_anthropic:
+        return "anthropic-native"
+    if anthropic_routed_enabled(provider, pcfg):
+        return "anthropic-routed"
+    return f"router:{provider}"
+
+
+def read_launch_state() -> dict[str, Any]:
+    try:
+        data = json.loads(LAUNCH_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_launch_state(state: dict[str, Any]) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = LAUNCH_STATE_PATH.with_name(f"{LAUNCH_STATE_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.chmod(tmp, 0o600)
+        tmp.replace(LAUNCH_STATE_PATH)
+    except Exception as exc:
+        router_log("WARN", f"launch_state_write_failed error={type(exc).__name__}: {exc}")
+
+
+def previous_launch_state_for_cwd(cwd_key: str) -> dict[str, Any]:
+    state = read_launch_state()
+    by_cwd = state.get("by_cwd")
+    if isinstance(by_cwd, dict):
+        item = by_cwd.get(cwd_key)
+        if isinstance(item, dict):
+            return item
+    legacy = state.get("last")
+    if isinstance(legacy, dict) and str(legacy.get("cwd") or "") == cwd_key:
+        return legacy
+    return {}
+
+
+def record_launch_state_for_cwd(cwd_key: str, provider: str, mode: str, model: str) -> None:
+    state = read_launch_state()
+    by_cwd = state.get("by_cwd")
+    if not isinstance(by_cwd, dict):
+        by_cwd = {}
+    item = {
+        "cwd": cwd_key,
+        "provider": provider,
+        "mode": mode,
+        "model": model,
+        "pid": os.getpid(),
+        "time": time.time(),
+    }
+    by_cwd[cwd_key] = item
+    state["by_cwd"] = by_cwd
+    state["last"] = item
+    write_launch_state(state)
+
+
+def should_fork_native_session_after_mode_switch(
+    provider: str,
+    pcfg: dict[str, Any],
+    use_native_anthropic: bool,
+    passthrough: list[str],
+    cwd_key: str,
+) -> tuple[bool, str]:
+    if not use_native_anthropic:
+        return False, ""
+    if claude_session_control_requested(passthrough):
+        return False, "explicit_session_control"
+    previous = previous_launch_state_for_cwd(cwd_key)
+    previous_mode = str(previous.get("mode") or "")
+    if not previous_mode or previous_mode == launch_mode_name(provider, pcfg, use_native_anthropic):
+        return False, previous_mode or "no_previous_mode"
+    return True, previous_mode
 
 
 def normalize_channel_passthrough(passthrough: list[str]) -> list[str]:
@@ -24452,6 +24597,14 @@ def launch_claude(
         return 2
     use_native_anthropic = direct_native_anthropic_enabled(provider, pcfg)
     use_router_mode = not use_native_anthropic
+    launch_cwd_key = current_launch_cwd_key()
+    fork_native_session, previous_launch_mode = should_fork_native_session_after_mode_switch(
+        provider,
+        pcfg,
+        use_native_anthropic,
+        passthrough,
+        launch_cwd_key,
+    )
     cleanup_managed_services_for_provider(provider, pcfg, cfg, quiet=True)
     env = os.environ.copy()
     env["PATH"] = str(HOME / ".local" / "bin") + os.pathsep + env.get("PATH", "")
@@ -24588,6 +24741,13 @@ def launch_claude(
         )
     )
     append_claude_code_runtime_settings_args(extra_args, launch_passthrough, provider, pcfg)
+    if fork_native_session:
+        session_id = str(uuid.uuid4())
+        extra_args.extend(["--session-id", session_id])
+        router_log(
+            "INFO",
+            f"claude_native_session_boundary previous_mode={previous_launch_mode} cwd={launch_cwd_key} session_id={session_id}",
+        )
     cmd = [
         claude,
         "--dangerously-skip-permissions",
@@ -24604,6 +24764,12 @@ def launch_claude(
     cmd.extend(extra_args)
     cmd.extend(claude_passthrough)
     _log_claude_command_for_diagnostics(cmd, env)
+    record_launch_state_for_cwd(
+        launch_cwd_key,
+        provider,
+        launch_mode_name(provider, pcfg, use_native_anthropic),
+        str(pcfg.get("current_model") or env.get("CLAUDE_ANY_MODEL_ALIAS") or ""),
+    )
     capture_stderr = env_bool(os.environ.get("CLAUDE_ANY_CAPTURE_CC_STDERR"), False)
     screen_summary_proxy = should_use_channel_screen_summary_proxy(
         llm_channel_delivery,

@@ -430,6 +430,71 @@ class NativeSlashCommandContractTests(unittest.TestCase):
             self.assertEqual(custom, advisor.read_text(encoding="utf-8"))
 
 
+class NativeSessionBoundaryTests(unittest.TestCase):
+    def test_native_launch_forks_after_previous_router_mode_in_same_cwd(self):
+        with tempfile.TemporaryDirectory() as td:
+            config_dir = Path(td)
+            state_path = config_dir / "launch-state.json"
+            cwd = str(config_dir / "project")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", config_dir),
+                mock.patch.object(claude_any, "LAUNCH_STATE_PATH", state_path),
+            ):
+                claude_any.record_launch_state_for_cwd(cwd, "opencode-go", "router:opencode-go", "deepseek-v4-flash")
+                should_fork, previous_mode = claude_any.should_fork_native_session_after_mode_switch(
+                    "anthropic",
+                    {"route_through_router": False},
+                    True,
+                    [],
+                    cwd,
+                )
+
+        self.assertTrue(should_fork)
+        self.assertEqual("router:opencode-go", previous_mode)
+
+    def test_native_launch_respects_explicit_resume_options(self):
+        with tempfile.TemporaryDirectory() as td:
+            config_dir = Path(td)
+            state_path = config_dir / "launch-state.json"
+            cwd = str(config_dir / "project")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", config_dir),
+                mock.patch.object(claude_any, "LAUNCH_STATE_PATH", state_path),
+            ):
+                claude_any.record_launch_state_for_cwd(cwd, "ollama-cloud", "router:ollama-cloud", "deepseek-v4-flash")
+                should_fork, reason = claude_any.should_fork_native_session_after_mode_switch(
+                    "anthropic",
+                    {"route_through_router": False},
+                    True,
+                    ["--continue"],
+                    cwd,
+                )
+
+        self.assertFalse(should_fork)
+        self.assertEqual("explicit_session_control", reason)
+
+    def test_native_launch_does_not_fork_after_previous_native_mode(self):
+        with tempfile.TemporaryDirectory() as td:
+            config_dir = Path(td)
+            state_path = config_dir / "launch-state.json"
+            cwd = str(config_dir / "project")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", config_dir),
+                mock.patch.object(claude_any, "LAUNCH_STATE_PATH", state_path),
+            ):
+                claude_any.record_launch_state_for_cwd(cwd, "anthropic", "anthropic-native", "claude-opus-4-8")
+                should_fork, previous_mode = claude_any.should_fork_native_session_after_mode_switch(
+                    "anthropic",
+                    {"route_through_router": False},
+                    True,
+                    [],
+                    cwd,
+                )
+
+        self.assertFalse(should_fork)
+        self.assertEqual("anthropic-native", previous_mode)
+
+
 class NativeModelListTests(unittest.TestCase):
     def test_public_docs_parser_extracts_current_claude_models_without_footnotes(self):
         html = """
