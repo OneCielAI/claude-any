@@ -430,6 +430,172 @@ class ChannelBridgeTests(unittest.TestCase):
                 claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
                 claude_any._CHAT_NEXT_ID = old_next
 
+    def test_streamable_http_requires_session_before_get_stream(self):
+        seen_posts: list[str | None] = []
+        seen_get_headers: list[str | None] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                seen_posts.append(payload.get("method"))
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "result": {
+                        "protocolVersion": claude_any.MCP_STREAMABLE_HTTP_PROTOCOL_VERSION,
+                        "capabilities": {"experimental": {"claude/channel": True}},
+                        "serverInfo": {"name": "unit-http", "version": "1"},
+                    },
+                }
+                data = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                seen_get_headers.append(self.headers.get("Mcp-Session-Id"))
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+
+        original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_address[1]}/mcp"
+                with mock.patch.object(claude_any, "CONFIG_DIR", root):
+                    claude_any.start_channel_sse_connection(
+                        {
+                            "name": "unit-http-no-session",
+                            "type": "http",
+                            "url": url,
+                            "retry_seconds": 60,
+                            "read_timeout_seconds": 5,
+                        }
+                    )
+                    time.sleep(0.2)
+                    self.assertGreaterEqual(seen_posts.count("initialize"), 1)
+                    self.assertEqual([], seen_get_headers)
+                    with claude_any._CHANNEL_SSE_LOCK:
+                        state = dict(claude_any._CHANNEL_SSE_CONNECTIONS["unit-http-no-session"])
+                    self.assertFalse(state["mcp_initialized"])
+                    self.assertEqual("streamable_http_missing_session_id", state["mcp_last_error"])
+                    claude_any.stop_channel_sse_connection("unit-http-no-session")
+            finally:
+                server.shutdown()
+                server.server_close()
+                claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+                claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
+
+    def test_streamable_http_session_not_found_reinitializes_before_get_retry(self):
+        seen_posts: list[dict[str, object]] = []
+        seen_get_sessions: list[str | None] = []
+        init_count = 0
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                nonlocal init_count
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                method = payload.get("method")
+                if method == "initialize":
+                    init_count += 1
+                seen_posts.append({"method": method, "session": self.headers.get("Mcp-Session-Id")})
+                response = {
+                    "jsonrpc": "2.0",
+                    "id": payload.get("id"),
+                    "result": {
+                        "protocolVersion": claude_any.MCP_STREAMABLE_HTTP_PROTOCOL_VERSION,
+                        "capabilities": {"experimental": {"claude/channel": True}},
+                        "serverInfo": {"name": "unit-http", "version": "1"},
+                    },
+                }
+                data = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                if method == "initialize":
+                    self.send_header("Mcp-Session-Id", "sess-one" if init_count == 1 else "sess-two")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                session = self.headers.get("Mcp-Session-Id")
+                seen_get_sessions.append(session)
+                if session == "sess-one":
+                    body = b'{"error":"session-not-found"}'
+                    self.send_response(404)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(
+                    b'id: stream-2\n'
+                    b'event: message\n'
+                    b'data: {"method":"notifications/message","params":{"content":"after streamable http reinit","room_id":"room_stream"}}\n\n'
+                )
+                self.wfile.flush()
+                time.sleep(0.05)
+
+        original_connections = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
+        old_next = claude_any._CHAT_NEXT_ID
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            chat_log = root / "chat-messages.jsonl"
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                url = f"http://127.0.0.1:{server.server_address[1]}/mcp"
+                with (
+                    mock.patch.object(claude_any, "CONFIG_DIR", root),
+                    mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", chat_log),
+                    mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+                    mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery"),
+                ):
+                    claude_any.start_channel_sse_connection(
+                        {
+                            "name": "unit-http-reinit",
+                            "type": "http",
+                            "url": url,
+                            "retry_seconds": 1,
+                            "read_timeout_seconds": 5,
+                        }
+                    )
+                    deadline = time.time() + 4
+                    while time.time() < deadline:
+                        if chat_log.exists() and "after streamable http reinit" in chat_log.read_text(encoding="utf-8"):
+                            break
+                        time.sleep(0.02)
+                    self.assertTrue(chat_log.exists())
+                    self.assertIn("after streamable http reinit", chat_log.read_text(encoding="utf-8"))
+                    self.assertGreaterEqual(init_count, 2)
+                    self.assertIn("sess-one", seen_get_sessions)
+                    self.assertIn("sess-two", seen_get_sessions)
+                    claude_any.stop_channel_sse_connection("unit-http-reinit")
+            finally:
+                server.shutdown()
+                server.server_close()
+                claude_any._CHANNEL_SSE_CONNECTIONS.clear()
+                claude_any._CHANNEL_SSE_CONNECTIONS.update(original_connections)
+                claude_any._CHAT_NEXT_ID = old_next
+
     def test_sse_reconnect_sends_last_event_id(self):
         seen_headers = []
         second_seen = threading.Event()
