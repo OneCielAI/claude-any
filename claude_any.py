@@ -7533,8 +7533,11 @@ def _channel_sse_status_public(name: str, state: dict[str, Any]) -> dict[str, An
         "read_timeout_seconds": state.get("read_timeout_seconds"),
         "last_sse_event_id": state.get("last_sse_event_id"),
         "sse_reconnects": int(state.get("sse_reconnects") or 0),
+        "transport": state.get("transport") or "sse",
         "mcp_endpoint": state.get("mcp_endpoint"),
         "mcp_initialized": bool(state.get("mcp_initialized")),
+        "mcp_session_id": state.get("mcp_session_id"),
+        "mcp_protocol_version": state.get("mcp_protocol_version"),
         "mcp_last_error": state.get("mcp_last_error"),
         "last_error": state.get("last_error"),
     }
@@ -7787,7 +7790,57 @@ def _channel_sse_absolute_endpoint(stream_url: str, endpoint: str) -> str:
     return urllib.parse.urljoin(stream_url, endpoint)
 
 
-def _mcp_sse_post_json(endpoint: str, headers: dict[str, str], payload: dict[str, Any], timeout: float) -> Any:
+MCP_STREAMABLE_HTTP_PROTOCOL_VERSION = "2025-03-26"
+MCP_LEGACY_SSE_PROTOCOL_VERSION = "2024-11-05"
+
+
+def _read_mcp_sse_json_response(response: Any, request_id: Any | None = None) -> Any:
+    event_name = "message"
+    data_lines: list[str] = []
+    while True:
+        raw = response.readline()
+        if raw == b"":
+            break
+        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+        if not line:
+            if data_lines:
+                data_text = "\n".join(data_lines).strip()
+                try:
+                    msg = json.loads(data_text)
+                except Exception:
+                    msg = None
+                if isinstance(msg, dict):
+                    if request_id is None or msg.get("id") == request_id or "id" not in msg:
+                        return msg
+            event_name = "message"
+            data_lines = []
+            continue
+        if line.startswith(":"):
+            continue
+        field, _, value = line.partition(":")
+        if value.startswith(" "):
+            value = value[1:]
+        if field == "event":
+            event_name = value or "message"
+        elif field == "data":
+            data_lines.append(value)
+    if data_lines:
+        data_text = "\n".join(data_lines).strip()
+        try:
+            msg = json.loads(data_text)
+        except Exception:
+            msg = None
+        if isinstance(msg, dict) and (request_id is None or msg.get("id") == request_id or "id" not in msg):
+            return msg
+    return None
+
+
+def _mcp_post_json_with_response_headers(
+    endpoint: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+) -> tuple[Any, Any]:
     request_headers = {**headers, "Content-Type": "application/json", "Accept": "application/json, text/event-stream"}
     req = urllib.request.Request(
         endpoint,
@@ -7796,13 +7849,54 @@ def _mcp_sse_post_json(endpoint: str, headers: dict[str, str], payload: dict[str
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout) as response:
+        content_type = str(response.headers.get("Content-Type") or "").lower()
+        if "text/event-stream" in content_type:
+            return _read_mcp_sse_json_response(response, payload.get("id")), response.headers
         data = response.read()
         if not data:
-            return None
+            return None, response.headers
         try:
-            return json.loads(data.decode("utf-8"))
+            return json.loads(data.decode("utf-8")), response.headers
         except Exception:
-            return data.decode("utf-8", errors="replace")
+            return data.decode("utf-8", errors="replace"), response.headers
+
+
+def _mcp_sse_post_json(endpoint: str, headers: dict[str, str], payload: dict[str, Any], timeout: float) -> Any:
+    result, _headers = _mcp_post_json_with_response_headers(endpoint, headers, payload, timeout)
+    return result
+
+
+def _mcp_streamable_headers(
+    headers: dict[str, str],
+    protocol_version: str,
+    session_id: str | None = None,
+    *,
+    accept: str = "application/json, text/event-stream",
+) -> dict[str, str]:
+    out = {**headers, "Accept": accept, "MCP-Protocol-Version": protocol_version}
+    if session_id:
+        out["Mcp-Session-Id"] = session_id
+    return out
+
+
+def _mcp_streamable_post_json(
+    endpoint: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+    protocol_version: str,
+    session_id: str | None = None,
+) -> tuple[Any, str | None]:
+    result, response_headers = _mcp_post_json_with_response_headers(
+        endpoint,
+        _mcp_streamable_headers(headers, protocol_version, session_id),
+        payload,
+        timeout,
+    )
+    returned_session = None
+    if response_headers is not None:
+        returned_session = response_headers.get("Mcp-Session-Id") or response_headers.get("MCP-Session-Id")
+    return result, str(returned_session).strip() if returned_session else None
 
 
 def _channel_sse_store_rpc_response(name: str, data_text: str) -> bool:
@@ -7883,12 +7977,27 @@ def _channel_sse_rpc_request(name: str, method: str, params: dict[str, Any] | No
             raise RuntimeError(f"SSE channel {name} is not MCP initialized")
         endpoint = str(state.get("mcp_endpoint") or "")
         headers = dict(state.get("headers") or {})
+        transport = str(state.get("transport") or "sse").strip().lower()
+        protocol_version = str(state.get("mcp_protocol_version") or MCP_LEGACY_SSE_PROTOCOL_VERSION)
+        session_id = str(state.get("mcp_session_id") or "").strip() or None
         effective_timeout = float(timeout if timeout is not None else state.get("mcp_timeout_seconds") or 20.0)
     if not endpoint:
         raise RuntimeError(f"SSE channel {name} has no MCP endpoint")
     request_id = int(time.time_ns() % 9_000_000_000_000_000)
     payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params or {}}
-    posted = _mcp_sse_post_json(endpoint, headers, payload, max(1.0, min(120.0, effective_timeout)))
+    if transport in {"http", "streamable-http"}:
+        posted, returned_session = _mcp_streamable_post_json(
+            endpoint,
+            headers,
+            payload,
+            max(1.0, min(120.0, effective_timeout)),
+            protocol_version,
+            session_id,
+        )
+        if returned_session:
+            _channel_sse_set_state(name, mcp_session_id=returned_session)
+    else:
+        posted = _mcp_sse_post_json(endpoint, headers, payload, max(1.0, min(120.0, effective_timeout)))
     if isinstance(posted, dict) and posted.get("id") == request_id and ("result" in posted or "error" in posted):
         return posted
     response = _channel_sse_take_rpc_response(name, request_id, max(1.0, min(120.0, effective_timeout)))
@@ -7934,6 +8043,63 @@ def _channel_sse_maybe_initialize_mcp(name: str, endpoint_text: str) -> None:
     except Exception as exc:
         _channel_sse_set_state(name, mcp_endpoint=endpoint, mcp_initialized=False, mcp_last_error=f"{type(exc).__name__}: {exc}")
         router_log("WARN", f"channel_sse_mcp_initialize_failed name={name} endpoint={endpoint} error={type(exc).__name__}: {exc}")
+
+
+def _channel_streamable_http_initialize_mcp(name: str) -> None:
+    with _CHANNEL_SSE_LOCK:
+        state = _CHANNEL_SSE_CONNECTIONS.get(name)
+        if not state:
+            return
+        if not bool(state.get("mcp_enabled", True)):
+            return
+        endpoint = str(state.get("url") or "")
+        if bool(state.get("mcp_initialized")) and str(state.get("mcp_endpoint") or "") == endpoint:
+            return
+        headers = dict(state.get("headers") or {})
+        timeout = max(5.0, min(120.0, float(state.get("mcp_timeout_seconds") or 20.0)))
+        protocol_version = str(state.get("mcp_protocol_version") or MCP_STREAMABLE_HTTP_PROTOCOL_VERSION)
+    try:
+        initialize = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": protocol_version,
+                "capabilities": {},
+                "clientInfo": {"name": "claude-any-channel-bridge", "version": VERSION},
+            },
+        }
+        _result, session_id = _mcp_streamable_post_json(endpoint, headers, initialize, timeout, protocol_version)
+        initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+        _mcp_streamable_post_json(endpoint, headers, initialized, timeout, protocol_version, session_id)
+        _channel_sse_set_state(
+            name,
+            mcp_endpoint=endpoint,
+            mcp_initialized=True,
+            mcp_session_id=session_id,
+            mcp_last_error=None,
+            mcp_rpc_results={},
+        )
+        visible_session = session_id or "-"
+        router_log("INFO", f"channel_http_mcp_initialized name={name} endpoint={endpoint} session={visible_session}")
+    except urllib.error.HTTPError as exc:
+        if exc.code == 405:
+            _channel_sse_set_state(
+                name,
+                transport="sse",
+                mcp_endpoint="",
+                mcp_initialized=False,
+                mcp_session_id=None,
+                mcp_protocol_version=MCP_LEGACY_SSE_PROTOCOL_VERSION,
+                mcp_last_error="streamable_http_405_fallback_sse",
+            )
+            router_log("WARN", f"channel_http_fallback_sse name={name} endpoint={endpoint} reason=HTTPError:405")
+            return
+        _channel_sse_set_state(name, mcp_endpoint=endpoint, mcp_initialized=False, mcp_last_error=f"HTTPError: {exc.code} {exc.reason}")
+        router_log("WARN", f"channel_http_mcp_initialize_failed name={name} endpoint={endpoint} error=HTTPError:{exc.code}: {exc.reason}")
+    except Exception as exc:
+        _channel_sse_set_state(name, mcp_endpoint=endpoint, mcp_initialized=False, mcp_last_error=f"{type(exc).__name__}: {exc}")
+        router_log("WARN", f"channel_http_mcp_initialize_failed name={name} endpoint={endpoint} error={type(exc).__name__}: {exc}")
 
 
 def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], event_id: str | None = None) -> None:
@@ -8046,11 +8212,129 @@ def _channel_sse_worker(name: str) -> None:
             time.sleep(retry_seconds)
 
 
+def _channel_streamable_http_worker(name: str) -> None:
+    while True:
+        with _CHANNEL_SSE_LOCK:
+            state = _CHANNEL_SSE_CONNECTIONS.get(name)
+            if not state or not state.get("running"):
+                return
+            if not state.get("mcp_initialized"):
+                needs_initialize = True
+            else:
+                needs_initialize = False
+            url = str(state.get("url") or "")
+            headers = dict(state.get("headers") or {})
+            protocol_version = str(state.get("mcp_protocol_version") or MCP_STREAMABLE_HTTP_PROTOCOL_VERSION)
+            session_id = str(state.get("mcp_session_id") or "").strip() or None
+            last_event_id = state.get("last_sse_event_id")
+            read_timeout = max(5.0, min(3600.0, float(state.get("read_timeout_seconds") or 300.0)))
+            retry_seconds = max(1.0, min(60.0, float(state.get("retry_seconds") or 5.0)))
+        if needs_initialize:
+            _channel_streamable_http_initialize_mcp(name)
+            with _CHANNEL_SSE_LOCK:
+                state = _CHANNEL_SSE_CONNECTIONS.get(name)
+                if not state or not state.get("running"):
+                    return
+                if str(state.get("transport") or "").strip().lower() == "sse":
+                    router_log("INFO", f"channel_http_worker_switching_to_sse name={name}")
+                    break
+                if not state.get("mcp_initialized"):
+                    time.sleep(retry_seconds)
+                    continue
+                session_id = str(state.get("mcp_session_id") or "").strip() or None
+        event_name = "message"
+        event_id: str | None = None
+        data_lines: list[str] = []
+        try:
+            request_headers = _mcp_streamable_headers(
+                headers,
+                protocol_version,
+                session_id,
+                accept="text/event-stream",
+            )
+            if last_event_id is not None and str(last_event_id) != "":
+                request_headers["Last-Event-ID"] = str(last_event_id)
+            req = urllib.request.Request(url, headers=request_headers, method="GET")
+            with urllib.request.urlopen(req, timeout=read_timeout) as response:
+                _channel_sse_set_state(name, last_error=None)
+                resumed = str(last_event_id) if last_event_id is not None and str(last_event_id) != "" else "-"
+                visible_session = session_id or "-"
+                router_log("INFO", f"channel_http_connected name={name} url={url} session={visible_session} last_event_id={resumed}")
+                while True:
+                    with _CHANNEL_SSE_LOCK:
+                        current = _CHANNEL_SSE_CONNECTIONS.get(name)
+                        if not current or not current.get("running"):
+                            return
+                    raw = response.readline()
+                    if raw == b"":
+                        raise ConnectionError("Streamable HTTP SSE stream ended")
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if not line:
+                        if data_lines:
+                            _channel_sse_dispatch(name, event_name, data_lines, event_id=event_id)
+                        event_name = "message"
+                        event_id = None
+                        data_lines = []
+                        continue
+                    if line.startswith(":"):
+                        continue
+                    field, _, value = line.partition(":")
+                    if value.startswith(" "):
+                        value = value[1:]
+                    if field == "event":
+                        event_name = value or "message"
+                    elif field == "data":
+                        data_lines.append(value)
+                    elif field == "id":
+                        event_id = value
+                    elif field == "retry":
+                        try:
+                            retry_seconds = max(1.0, min(60.0, int(value) / 1000.0))
+                        except Exception:
+                            pass
+        except urllib.error.HTTPError as exc:
+            with _CHANNEL_SSE_LOCK:
+                state = _CHANNEL_SSE_CONNECTIONS.get(name)
+                if not state or not state.get("running"):
+                    return
+                if exc.code == 405:
+                    state["transport"] = "sse"
+                    state["mcp_protocol_version"] = MCP_LEGACY_SSE_PROTOCOL_VERSION
+                    state["mcp_initialized"] = False
+                    state["mcp_session_id"] = None
+                    state["last_error"] = "streamable_http_405_fallback_sse"
+                    router_log("WARN", f"channel_http_fallback_sse name={name} url={url} reason=HTTPError:405")
+                    break
+                if exc.code in (400, 404):
+                    state["mcp_initialized"] = False
+                    state["mcp_session_id"] = None
+                state["last_error"] = f"HTTPError: {exc.code} {exc.reason}"
+                state["sse_reconnects"] = int(state.get("sse_reconnects") or 0) + 1
+                last_event_id = state.get("last_sse_event_id")
+            resumed = str(last_event_id) if last_event_id is not None and str(last_event_id) != "" else "-"
+            router_log("WARN", f"channel_http_reconnect name={name} last_event_id={resumed} error=HTTPError:{exc.code}:{exc.reason}")
+            time.sleep(retry_seconds)
+        except Exception as exc:
+            with _CHANNEL_SSE_LOCK:
+                state = _CHANNEL_SSE_CONNECTIONS.get(name)
+                if not state or not state.get("running"):
+                    return
+                state["last_error"] = f"{type(exc).__name__}: {exc}"
+                state["sse_reconnects"] = int(state.get("sse_reconnects") or 0) + 1
+                last_event_id = state.get("last_sse_event_id")
+            resumed = str(last_event_id) if last_event_id is not None and str(last_event_id) != "" else "-"
+            router_log("WARN", f"channel_http_reconnect name={name} last_event_id={resumed} error={type(exc).__name__}: {exc}")
+            time.sleep(retry_seconds)
+    _channel_sse_worker(name)
+
+
 def start_channel_sse_connection(config: dict[str, Any]) -> dict[str, Any]:
     url = str(config.get("url") or "").strip()
     if not url.startswith(("http://", "https://")):
         raise ValueError("SSE url must start with http:// or https://")
     name = _safe_segment(str(config.get("name") or urllib.parse.urlparse(url).netloc or "sse"), "sse")
+    declared_transport = str(config.get("transport") or config.get("type") or "").strip().lower()
+    transport = "streamable-http" if declared_transport in {"http", "streamable-http"} else "sse"
     headers = config.get("headers") if isinstance(config.get("headers"), dict) else {}
     headers = {str(k): str(v) for k, v in headers.items() if str(k).strip()}
     token = str(config.get("bearer_token") or config.get("token") or "").strip()
@@ -8092,13 +8376,19 @@ def start_channel_sse_connection(config: dict[str, Any]) -> dict[str, Any]:
             "mcp_enabled": bool(config.get("mcp", config.get("mcp_enabled", True))),
             "mcp_endpoint": None,
             "mcp_initialized": False,
+            "mcp_session_id": None,
             "mcp_last_error": None,
             "mcp_rpc_results": {},
-            "mcp_protocol_version": str(config.get("mcp_protocol_version") or "2024-11-05"),
+            "transport": transport,
+            "mcp_protocol_version": str(
+                config.get("mcp_protocol_version")
+                or (MCP_STREAMABLE_HTTP_PROTOCOL_VERSION if transport == "streamable-http" else MCP_LEGACY_SSE_PROTOCOL_VERSION)
+            ),
             "mcp_timeout_seconds": float(config.get("mcp_timeout_seconds") or 20.0),
         }
         _CHANNEL_SSE_CONNECTIONS[name] = state
-    thread = threading.Thread(target=_channel_sse_worker, args=(name,), daemon=True, name=f"claude-any-channel-sse-{name}")
+    worker = _channel_streamable_http_worker if transport == "streamable-http" else _channel_sse_worker
+    thread = threading.Thread(target=worker, args=(name,), daemon=True, name=f"claude-any-channel-{transport}-{name}")
     thread.start()
     return _channel_sse_status_public(name, state)
 
@@ -14640,6 +14930,132 @@ def probe_sse_mcp_for_channel_capability_detailed(
     }
 
 
+def _channel_probe_initialize_payload_dict(protocol_version: str) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": protocol_version,
+            "capabilities": {},
+            "clientInfo": {"name": "claude-any-channel-probe", "version": VERSION},
+        },
+    }
+
+
+def probe_streamable_http_mcp_for_channel_capability_detailed(
+    server_name: str,
+    server: dict[str, Any],
+    timeout: float | None = None,
+) -> dict[str, Any]:
+    """Probe a Streamable HTTP MCP server with initialize/initialized.
+
+    MCP Streamable HTTP (2025-03-26) uses one endpoint for POST JSON-RPC
+    and GET server-sent events. Unlike legacy SSE transport, it does not
+    emit an `endpoint` event; the client must initialize by POSTing to the
+    configured URL and then attach the returned Mcp-Session-Id to follow-up
+    requests.
+    """
+    started = time.time()
+    url = str(server.get("url") or server.get("endpoint") or "").strip()
+    if not url:
+        return {
+            "capable": False,
+            "reason": "no_url",
+            "response_bytes": 0,
+            "response_received": False,
+            "elapsed_ms": 0,
+            "exit_code": None,
+            "stderr_bytes": 0,
+            "stderr_preview": "",
+            "stdout_preview": "",
+        }
+    effective_timeout = timeout if timeout is not None else channel_probe_default_timeout()
+    protocol_version = str(server.get("protocolVersion") or server.get("protocol_version") or MCP_STREAMABLE_HTTP_PROTOCOL_VERSION)
+    headers: dict[str, str] = {}
+    custom_headers = server.get("headers")
+    if isinstance(custom_headers, dict):
+        for key, value in custom_headers.items():
+            if key and value is not None:
+                headers[str(key)] = str(value)
+
+    bytes_seen = 0
+    response_received = False
+    capable = False
+    reason = ""
+    stderr_preview = ""
+    stdout_preview = ""
+    initialized_failed = False
+    try:
+        initialize = _channel_probe_initialize_payload_dict(protocol_version)
+        response, session_id = _mcp_streamable_post_json(
+            url,
+            headers,
+            initialize,
+            max(1.0, min(120.0, effective_timeout)),
+            protocol_version,
+        )
+        preview_source = json.dumps(response, ensure_ascii=False) if isinstance(response, (dict, list)) else str(response or "")
+        bytes_seen = len(preview_source.encode("utf-8", errors="replace"))
+        if isinstance(response, dict) and response.get("id") == 1 and "result" in response:
+            response_received = True
+            capable = _channel_probe_capability_present(response)
+            if not capable:
+                stdout_preview = _decode_preview(preview_source.encode("utf-8"), CHANNEL_PROBE_STDOUT_PREVIEW_BYTES)
+        else:
+            stdout_preview = _decode_preview(preview_source.encode("utf-8"), CHANNEL_PROBE_STDOUT_PREVIEW_BYTES)
+        if response_received:
+            initialized = {"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}
+            try:
+                _mcp_streamable_post_json(
+                    url,
+                    headers,
+                    initialized,
+                    max(1.0, min(120.0, effective_timeout)),
+                    protocol_version,
+                    session_id,
+                )
+            except Exception as exc:
+                initialized_failed = True
+                capable = False
+                stderr_preview = f"{type(exc).__name__}: {exc}"[:CHANNEL_PROBE_STDERR_PREVIEW_CHARS]
+        if initialized_failed:
+            reason = "streamable_http_initialized_post_failed"
+        else:
+            reason = "capable" if capable else ("no_experimental_claude_channel" if response_received else "no_initialize_response")
+    except urllib.error.HTTPError as exc:
+        reason = "streamable_http_405_fallback_sse" if exc.code == 405 else f"streamable_http_open_failed:HTTPError:{exc.code}"
+        try:
+            data = exc.read()
+        except Exception:
+            data = b""
+        bytes_seen = len(data)
+        stderr_preview = (data.decode("utf-8", errors="replace") or str(exc))[:CHANNEL_PROBE_STDERR_PREVIEW_CHARS]
+    except Exception as exc:
+        reason = f"streamable_http_open_failed:{type(exc).__name__}"
+        stderr_preview = str(exc)[:CHANNEL_PROBE_STDERR_PREVIEW_CHARS]
+
+    elapsed_ms = int((time.time() - started) * 1000)
+    router_log(
+        "INFO",
+        "channel_probe_result server=%s channel_capable=%s reason=%s transport=streamable-http url=%s bytes=%d elapsed_ms=%d timeout_s=%.1f"
+        % (server_name, capable, reason, url, bytes_seen, elapsed_ms, effective_timeout),
+    )
+    if stderr_preview:
+        router_log("INFO", f"channel_probe_streamable_http_error server={server_name} preview={stderr_preview!r}")
+    return {
+        "capable": capable,
+        "reason": reason,
+        "response_bytes": bytes_seen,
+        "response_received": response_received,
+        "elapsed_ms": elapsed_ms,
+        "exit_code": None,
+        "stderr_bytes": len(stderr_preview),
+        "stderr_preview": stderr_preview,
+        "stdout_preview": stdout_preview,
+    }
+
+
 def _decode_preview(buf: bytes | bytearray, limit_chars: int) -> str:
     text = bytes(buf).decode("utf-8", errors="replace")
     text = text.replace("\x00", " ")
@@ -14889,35 +15305,13 @@ def detect_channel_capable_mcp_servers(
     timeout_per_server: float = 3.0,
 ) -> list[str]:
     """Probe MCP servers declared in given config files; return names that declare experimental['claude/channel']."""
-    capable: list[str] = []
-    seen: set[str] = set()
-    if include_router_self:
-        capable.append("claude-any-router")
-        seen.add("claude-any-router")
-    for path_str in mcp_config_paths:
-        if not path_str:
-            continue
-        path = Path(path_str)
-        if not path.exists():
-            continue
-        for name, server in _read_mcp_servers_from_json(path, cwd):
-            if name in seen:
-                continue
-            seen.add(name)
-            if name == "claude-any-router":
-                continue
-            if not _mcp_server_is_stdio(server):
-                # Non-stdio (sse/http) probing not implemented; skip silently.
-                continue
-            try:
-                if probe_stdio_mcp_for_channel_capability(name, server, timeout=timeout_per_server):
-                    capable.append(name)
-            except Exception as exc:
-                router_log(
-                    "WARN",
-                    f"channel_probe_exception server={name} error={type(exc).__name__}: {exc}",
-                )
-    return capable
+    records = _probe_mcp_servers_to_records(
+        mcp_config_paths,
+        cwd,
+        include_router_self=include_router_self,
+        timeout_per_server=timeout_per_server,
+    )
+    return [str(record.get("name")) for record in records if record.get("capable") and record.get("name")]
 
 
 def _mcp_config_passthrough_values(passthrough: list[str]) -> list[str]:
@@ -15034,6 +15428,8 @@ def _server_transport_label(server: dict[str, Any]) -> str:
     if not isinstance(server, dict):
         return "unknown"
     declared = str(server.get("type") or "").strip().lower()
+    if declared in {"http", "streamable-http"}:
+        return "streamable-http"
     if declared:
         return declared
     if server.get("url"):
@@ -15092,6 +15488,8 @@ def _probe_mcp_servers_to_records(
                 probe_fn = probe_stdio_mcp_for_channel_capability_detailed
             elif transport == "sse" and isinstance(server.get("url"), str):
                 probe_fn = probe_sse_mcp_for_channel_capability_detailed
+            elif transport == "streamable-http" and isinstance(server.get("url"), str):
+                probe_fn = probe_streamable_http_mcp_for_channel_capability_detailed
             else:
                 record["reason"] = "transport_not_probed"
                 records.append(record)
@@ -15382,11 +15780,14 @@ def _mcp_sse_servers_from_mapping(mapping: Any) -> list[dict[str, Any]]:
             server_type = str(raw_server.get("type") or "").strip().lower()
             if server_type and server_type not in ("sse", "http", "streamable-http"):
                 continue
+            transport = "streamable-http" if server_type in ("http", "streamable-http") else "sse"
             headers = raw_server.get("headers") if isinstance(raw_server.get("headers"), dict) else {}
             found.append(
                 {
                     "name": f"mcp-{name}",
                     "url": url,
+                    "type": server_type or transport,
+                    "transport": transport,
                     "headers": {str(k): str(v) for k, v in headers.items() if str(k).strip()},
                     "channel": name,
                     "sender_id": name,

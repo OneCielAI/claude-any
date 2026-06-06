@@ -111,6 +111,34 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertEqual("mcp-ai-net", start.call_args.args[0]["name"])
         self.assertEqual("http://example.test/sse", start.call_args.args[0]["url"])
 
+    def test_auto_starts_streamable_http_servers_from_mcp_config(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp_config = root / "mcp.json"
+            mcp_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ai-net-http": {
+                                "type": "http",
+                                "url": "http://example.test/mcp",
+                                "headers": {"Authorization": "Bearer test"},
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "start_channel_sse_connection", return_value={"name": "mcp-ai-net-http"}) as start:
+                started = claude_any.auto_start_sse_channels_from_mcp_configs(["--mcp-config", str(mcp_config)], cwd=root, home=root)
+        self.assertEqual([{"name": "mcp-ai-net-http"}], started)
+        config = start.call_args.args[0]
+        self.assertEqual("mcp-ai-net-http", config["name"])
+        self.assertEqual("http://example.test/mcp", config["url"])
+        self.assertEqual("http", config["type"])
+        self.assertEqual("streamable-http", config["transport"])
+        self.assertEqual({"Authorization": "Bearer test"}, config["headers"])
+
     def test_auto_starts_sse_servers_from_extra_mcp_config_paths(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -1061,6 +1089,41 @@ class ChannelProbeDetailedReasonTests(unittest.TestCase):
         self.assertEqual("timeout", slow["reason"])
         self.assertEqual(15000, slow["elapsed_ms"])
         self.assertFalse(slow["response_received"])
+
+    def test_http_transport_is_probed_as_streamable_http(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp_config = root / ".mcp.json"
+            mcp_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ai-net-http": {
+                                "type": "http",
+                                "url": "http://example.test/mcp",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(
+                claude_any,
+                "probe_streamable_http_mcp_for_channel_capability_detailed",
+                return_value={
+                    "capable": True,
+                    "reason": "capable",
+                    "response_bytes": 128,
+                    "response_received": True,
+                    "elapsed_ms": 25,
+                },
+            ) as probe:
+                records = claude_any._probe_mcp_servers_to_records([str(mcp_config)], root)
+        http_record = next(r for r in records if r["name"] == "ai-net-http")
+        self.assertEqual("streamable-http", http_record["transport"])
+        self.assertTrue(http_record["capable"])
+        self.assertEqual("capable", http_record["reason"])
+        probe.assert_called_once()
 
 
 class ChannelProbeStdioStrategyTests(unittest.TestCase):
