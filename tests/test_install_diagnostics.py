@@ -16,19 +16,21 @@ class InstallDiagnosticsTests(unittest.TestCase):
         }
 
         with mock.patch.object(claude_any.os, "name", "nt"), mock.patch.dict(claude_any.os.environ, env, clear=False):
+            appdata = claude_any.platform_path(env["APPDATA"])
+            local_appdata = claude_any.platform_path(env["LOCALAPPDATA"])
             self.assertEqual(
-                Path(env["APPDATA"]) / "claude-any",
+                appdata / "claude-any",
                 claude_any.platform_config_dir("claude-any"),
             )
             self.assertEqual(
-                Path(env["LOCALAPPDATA"]) / "claude-any" / "bin",
+                local_appdata / "claude-any" / "bin",
                 claude_any.claude_any_user_bin_dir(),
             )
             extra_dirs = claude_any.executable_extra_dirs()
-            self.assertIn(Path(env["APPDATA"]) / "npm", extra_dirs)
-            self.assertIn(Path(env["LOCALAPPDATA"]) / "Programs" / "nodejs", extra_dirs)
+            self.assertIn(appdata / "npm", extra_dirs)
+            self.assertIn(local_appdata / "Programs" / "nodejs", extra_dirs)
             prefixed_path = claude_any.path_with_claude_any_user_dirs(dict(env))
-            self.assertTrue(prefixed_path.startswith(str(Path(env["LOCALAPPDATA"]) / "claude-any" / "bin")))
+            self.assertTrue(prefixed_path.startswith(str(local_appdata / "claude-any" / "bin")))
 
     def test_package_root_from_installed_path(self):
         root = Path("/usr/local/lib/node_modules/@oneciel-ai/claude-any")

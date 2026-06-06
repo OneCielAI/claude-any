@@ -27,7 +27,7 @@ import urllib.request
 import uuid
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Callable, Iterable
 
 from claude_any_support.observability import EventBus, render_events_html
@@ -44,18 +44,24 @@ except Exception:
 HOME = Path.home()
 
 
+def platform_path(value: str | os.PathLike[str]) -> Any:
+    if os.name == "nt" and sys.platform != "win32":
+        return PureWindowsPath(value)
+    return Path(value)
+
+
 def windows_appdata_root() -> Path:
     for env_name in ("APPDATA", "LOCALAPPDATA"):
         raw = os.environ.get(env_name)
         if raw:
-            return Path(raw)
+            return platform_path(raw)
     return HOME / "AppData" / "Roaming"
 
 
 def windows_local_appdata_root() -> Path:
     raw = os.environ.get("LOCALAPPDATA")
     if raw:
-        return Path(raw)
+        return platform_path(raw)
     return HOME / "AppData" / "Local"
 
 
@@ -76,10 +82,10 @@ def path_with_claude_any_user_dirs(env: dict[str, str]) -> str:
     if os.name == "nt":
         appdata = env.get("APPDATA") or os.environ.get("APPDATA")
         if appdata:
-            dirs.append(Path(appdata) / "npm")
+            dirs.append(platform_path(appdata) / "npm")
         local_appdata = env.get("LOCALAPPDATA") or os.environ.get("LOCALAPPDATA")
         if local_appdata:
-            dirs.append(Path(local_appdata) / "Programs" / "nodejs")
+            dirs.append(platform_path(local_appdata) / "Programs" / "nodejs")
     existing = env.get("PATH", "")
     prefix = os.pathsep.join(str(path) for path in dirs if str(path))
     return prefix + (os.pathsep + existing if existing else "")
@@ -2150,7 +2156,7 @@ def load_dotenv_into_environ(path: Path, *, override: bool = True) -> None:
 
 
 def executable_candidates(name: str) -> list[str]:
-    if os.name == "nt" and not Path(name).suffix:
+    if os.name == "nt" and not platform_path(name).suffix:
         return [f"{name}.exe", f"{name}.cmd", f"{name}.bat", name]
     return [name]
 
@@ -2165,22 +2171,22 @@ def executable_extra_dirs() -> list[Path]:
     if os.name == "nt":
         appdata = os.environ.get("APPDATA")
         if appdata:
-            dirs.append(Path(appdata) / "npm")
+            dirs.append(platform_path(appdata) / "npm")
         local_appdata = os.environ.get("LOCALAPPDATA")
         if local_appdata:
-            dirs.append(Path(local_appdata) / "Programs" / "nodejs")
+            dirs.append(platform_path(local_appdata) / "Programs" / "nodejs")
         pyver = f"Python{sys.version_info.major}{sys.version_info.minor}"
         for env_name in ("APPDATA", "LOCALAPPDATA"):
             root = os.environ.get(env_name)
             if root:
-                dirs.append(Path(root) / "Python" / pyver / "Scripts")
+                dirs.append(platform_path(root) / "Python" / pyver / "Scripts")
         try:
             import site
 
-            dirs.append(Path(site.getuserbase()) / "Scripts")
+            dirs.append(platform_path(site.getuserbase()) / "Scripts")
         except Exception:
             pass
-        dirs.append(Path(sys.executable).resolve().parent / "Scripts")
+        dirs.append(platform_path(sys.executable).parent / "Scripts")
     else:
         dirs.extend(
             [
