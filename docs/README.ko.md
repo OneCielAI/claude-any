@@ -26,6 +26,19 @@
 
 ## 오늘 추가된 최고의 3가지 베네핏
 
+### 2026-06-05
+
+1. **Windows 전용 설치 경로 정리** — Windows 기본 config는
+   `%APPDATA%\claude-any`, helper/statusline script는
+   `%LOCALAPPDATA%\claude-any\bin`을 사용합니다. `claude` 실행 시
+   `%APPDATA%\npm` 같은 Windows npm shim 경로도 함께 검색합니다.
+2. **DeepSeek V4 thinking 호환성** — DeepSeek.com V4 요청은 tool 목록은
+   유지하되 upstream 호출과 compatibility test 전에 forced `tool_choice`를
+   제거합니다. 이는 DeepSeek 공식 V4 thinking-mode agent 호환 가이드의
+   `supportsToolChoice: false` 요구사항을 따른 것입니다.
+3. **설치 진단 경로 개선** — 여러 npm prefix나 예전 설치본이 섞인 환경에서도
+   실제 실행 경로와 같은 OS-aware 검색 후보를 사용해 shadowing 진단을 수행합니다.
+
 ### 2026-06-03
 
 1. **라우터 수명주기 격리 강화** — Claude Any가 자신이 관리하는 라우터와 다른

@@ -26,6 +26,20 @@
 
 ## Today's Top 3 Benefits
 
+### 2026-06-05
+
+1. **Windows-aware install paths** — Claude Any now uses `%APPDATA%\claude-any`
+   for its default config on Windows, installs helper/statusline scripts under
+   `%LOCALAPPDATA%\claude-any\bin`, and searches Windows npm shims such as
+   `%APPDATA%\npm` when launching `claude`.
+2. **DeepSeek V4 thinking compatibility** — DeepSeek.com V4 requests keep tools
+   available but remove forced `tool_choice` before upstream calls and
+   compatibility tests, matching DeepSeek's official V4 thinking-mode agent
+   compatibility guidance.
+3. **More reliable install diagnostics** — multiple-install checks now reuse the
+   same OS-aware executable search paths, so Windows and mixed npm-prefix
+   machines report the launcher that will actually run.
+
 ### 2026-06-03
 
 1. **Router lifecycle isolation** — Claude Any now distinguishes routers it

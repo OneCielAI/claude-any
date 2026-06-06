@@ -8,6 +8,28 @@ import claude_any
 
 
 class InstallDiagnosticsTests(unittest.TestCase):
+    def test_windows_default_paths_use_appdata_locations(self):
+        env = {
+            "APPDATA": r"C:\Users\alice\AppData\Roaming",
+            "LOCALAPPDATA": r"C:\Users\alice\AppData\Local",
+            "PATH": r"C:\Windows\System32",
+        }
+
+        with mock.patch.object(claude_any.os, "name", "nt"), mock.patch.dict(claude_any.os.environ, env, clear=False):
+            self.assertEqual(
+                Path(env["APPDATA"]) / "claude-any",
+                claude_any.platform_config_dir("claude-any"),
+            )
+            self.assertEqual(
+                Path(env["LOCALAPPDATA"]) / "claude-any" / "bin",
+                claude_any.claude_any_user_bin_dir(),
+            )
+            extra_dirs = claude_any.executable_extra_dirs()
+            self.assertIn(Path(env["APPDATA"]) / "npm", extra_dirs)
+            self.assertIn(Path(env["LOCALAPPDATA"]) / "Programs" / "nodejs", extra_dirs)
+            prefixed_path = claude_any.path_with_claude_any_user_dirs(dict(env))
+            self.assertTrue(prefixed_path.startswith(str(Path(env["LOCALAPPDATA"]) / "claude-any" / "bin")))
+
     def test_package_root_from_installed_path(self):
         root = Path("/usr/local/lib/node_modules/@oneciel-ai/claude-any")
         launcher = root / "npm-bin" / "claude-any.js"

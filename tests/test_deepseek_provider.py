@@ -131,6 +131,34 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertEqual("2023-06-01", headers["anthropic-version"])
         self.assertEqual("claude-cli", headers["user-agent"])
 
+    def test_deepseek_v4_removes_forced_tool_choice(self):
+        pcfg = self.deepseek_cfg(current_model="deepseek-v4-pro[1m]")["providers"]["deepseek"]
+        body = claude_any.compatibility_tool_request("claude-any-deepseek-deepseek-v4-pro[1m]")
+
+        out = claude_any.normalize_tool_choice_for_provider("deepseek", pcfg, body)
+
+        self.assertIn("tool_choice", body)
+        self.assertNotIn("tool_choice", out)
+        self.assertIn("tools", out)
+
+    def test_deepseek_non_v4_keeps_forced_tool_choice(self):
+        pcfg = self.deepseek_cfg(current_model="deepseek-chat")["providers"]["deepseek"]
+        body = claude_any.compatibility_tool_request("deepseek-chat")
+
+        out = claude_any.normalize_tool_choice_for_provider("deepseek", pcfg, body)
+
+        self.assertIs(out, body)
+        self.assertIn("tool_choice", out)
+
+    def test_deepseek_tool_choice_override_is_respected(self):
+        pcfg = self.deepseek_cfg(current_model="deepseek-v4-pro[1m]", supports_tool_choice=True)["providers"]["deepseek"]
+        body = claude_any.compatibility_tool_request("deepseek-v4-pro[1m]")
+
+        out = claude_any.normalize_tool_choice_for_provider("deepseek", pcfg, body)
+
+        self.assertIs(out, body)
+        self.assertIn("tool_choice", out)
+
 
 if __name__ == "__main__":
     unittest.main()

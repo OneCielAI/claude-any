@@ -44,6 +44,47 @@ except Exception:
 HOME = Path.home()
 
 
+def windows_appdata_root() -> Path:
+    for env_name in ("APPDATA", "LOCALAPPDATA"):
+        raw = os.environ.get(env_name)
+        if raw:
+            return Path(raw)
+    return HOME / "AppData" / "Roaming"
+
+
+def windows_local_appdata_root() -> Path:
+    raw = os.environ.get("LOCALAPPDATA")
+    if raw:
+        return Path(raw)
+    return HOME / "AppData" / "Local"
+
+
+def platform_config_dir(app_name: str) -> Path:
+    if os.name == "nt":
+        return windows_appdata_root() / app_name
+    return HOME / ".config" / app_name
+
+
+def claude_any_user_bin_dir() -> Path:
+    if os.name == "nt":
+        return windows_local_appdata_root() / "claude-any" / "bin"
+    return HOME / ".local" / "bin"
+
+
+def path_with_claude_any_user_dirs(env: dict[str, str]) -> str:
+    dirs = [claude_any_user_bin_dir()]
+    if os.name == "nt":
+        appdata = env.get("APPDATA") or os.environ.get("APPDATA")
+        if appdata:
+            dirs.append(Path(appdata) / "npm")
+        local_appdata = env.get("LOCALAPPDATA") or os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            dirs.append(Path(local_appdata) / "Programs" / "nodejs")
+    existing = env.get("PATH", "")
+    prefix = os.pathsep.join(str(path) for path in dirs if str(path))
+    return prefix + (os.pathsep + existing if existing else "")
+
+
 def default_router_port() -> int:
     configured = str(os.environ.get("CLAUDE_ANY_ROUTER_PORT") or "").strip()
     if configured:
@@ -68,7 +109,7 @@ def default_router_port() -> int:
     return base + (int(digest[:8], 16) % 1000)
 
 
-CONFIG_DIR = Path(os.environ.get("CLAUDE_ANY_CONFIG_DIR") or (HOME / ".config" / "claude-any"))
+CONFIG_DIR = Path(os.environ.get("CLAUDE_ANY_CONFIG_DIR") or platform_config_dir("claude-any"))
 CONFIG_PATH = CONFIG_DIR / "config.json"
 LOG_PATH = CONFIG_DIR / "router.log"
 LOG_LEVEL_PATH = CONFIG_DIR / "log-level"
@@ -103,9 +144,9 @@ ROUTER_BASE = f"http://{ROUTER_HOST}:{ROUTER_PORT}"
 CLAUDE_GATEWAY_CACHE = HOME / ".claude" / "cache" / "gateway-models.json"
 CLAUDE_SETTINGS_PATH = HOME / ".claude" / "settings.json"
 CLAUDE_COMMANDS_DIR = HOME / ".claude" / "commands"
-CLAUDE_ANY_STATUSLINE_PATH = HOME / ".local" / "bin" / "claude-any-statusline.py"
-NCP_ENV = HOME / ".config" / "nvd-claude-proxy" / ".env"
-NCP_LOG = HOME / ".config" / "nvd-claude-proxy" / "proxy.log"
+CLAUDE_ANY_STATUSLINE_PATH = claude_any_user_bin_dir() / "claude-any-statusline.py"
+NCP_ENV = platform_config_dir("nvd-claude-proxy") / ".env"
+NCP_LOG = platform_config_dir("nvd-claude-proxy") / "proxy.log"
 MODEL_CACHE_TTL_SECONDS = 300
 OLLAMA_MODEL_CATALOG_URL = "https://ollama.com/api/tags"
 OLLAMA_MODEL_CATALOG_TTL_SECONDS = 24 * 60 * 60
@@ -2115,13 +2156,19 @@ def executable_candidates(name: str) -> list[str]:
 
 
 def executable_extra_dirs() -> list[Path]:
-    dirs = [HOME / ".local" / "bin"]
+    dirs = [claude_any_user_bin_dir()]
     for env_name in ("UV_INSTALL_DIR", "CARGO_HOME"):
         root = os.environ.get(env_name)
         if root:
             path = Path(root)
             dirs.append(path if path.name == "bin" else path / "bin")
     if os.name == "nt":
+        appdata = os.environ.get("APPDATA")
+        if appdata:
+            dirs.append(Path(appdata) / "npm")
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            dirs.append(Path(local_appdata) / "Programs" / "nodejs")
         pyver = f"Python{sys.version_info.major}{sys.version_info.minor}"
         for env_name in ("APPDATA", "LOCALAPPDATA"):
             root = os.environ.get(env_name)
@@ -2137,6 +2184,7 @@ def executable_extra_dirs() -> list[Path]:
     else:
         dirs.extend(
             [
+                HOME / ".local" / "bin",
                 HOME / ".cargo" / "bin",
                 HOME / ".npm-global" / "bin",
                 HOME / ".bun" / "bin",
@@ -2217,6 +2265,8 @@ def shell_command_string(args: list[str]) -> str:
 def find_tool_guard_script() -> Path | None:
     candidates = [
         Path(__file__).resolve().with_name("claude-any-tool-guard.py"),
+        claude_any_user_bin_dir() / "claude-any-tool-guard.py",
+        claude_any_user_bin_dir() / "claude-any-tool-guard",
         HOME / ".local" / "bin" / "claude-any-tool-guard.py",
         HOME / ".local" / "bin" / "claude-any-tool-guard",
     ]
@@ -2349,7 +2399,21 @@ import time
 from pathlib import Path
 
 HOME = Path.home()
-CONFIG_DIR = Path(os.environ.get("CLAUDE_ANY_CONFIG_DIR") or (HOME / ".config" / "claude-any"))
+
+
+def default_config_dir():
+    configured = os.environ.get("CLAUDE_ANY_CONFIG_DIR")
+    if configured:
+        return Path(configured)
+    if os.name == "nt":
+        root = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
+        if root:
+            return Path(root) / "claude-any"
+        return HOME / "AppData" / "Roaming" / "claude-any"
+    return HOME / ".config" / "claude-any"
+
+
+CONFIG_DIR = default_config_dir()
 CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
 ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
@@ -3194,6 +3258,34 @@ def normalize_thinking_for_non_anthropic_provider(provider: str, pcfg: dict[str,
 
 def normalize_thinking_for_non_anthropic_native_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     return normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
+
+
+def provider_supports_tool_choice(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> bool:
+    configured = pcfg.get("supports_tool_choice")
+    if configured is not None:
+        return bool(configured)
+    if provider != "deepseek":
+        return True
+    model_hint = strip_claude_context_suffix(str(body.get("model") or pcfg.get("current_model") or "")).lower()
+    # DeepSeek's own V4 thinking-mode integration notes require
+    # supportsToolChoice=false for agent tools. V4 thinking is enabled by
+    # default, so treat forced tool_choice as unsupported for V4 models unless
+    # the user explicitly overrides supports_tool_choice in provider options.
+    return "deepseek-v4" not in model_hint
+
+
+def normalize_tool_choice_for_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    if body.get("tool_choice") is None:
+        return body
+    if provider_supports_tool_choice(provider, pcfg, body):
+        return body
+    out = dict(body)
+    removed = out.pop("tool_choice", None)
+    router_log(
+        "WARN",
+        f"removed unsupported tool_choice for {provider}: model={body.get('model')} tool_choice={removed}",
+    )
+    return out
 
 
 def normalize_response_thinking_for_non_anthropic_provider(provider: str, pcfg: dict[str, Any], message: dict[str, Any], model: str | None = None) -> dict[str, Any]:
@@ -10637,6 +10729,7 @@ def advisor_visible_summary(advisor_text: str, trigger: str, limit: int = 700) -
 
 def call_provider_chat_once(provider: str, pcfg: dict[str, Any], body: dict[str, Any], model: str) -> dict[str, Any]:
     body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
+    body = normalize_tool_choice_for_provider(provider, pcfg, body)
     if provider in ("ollama", "ollama-cloud"):
         base = pcfg.get("base_url", "").rstrip("/")
         req_body = ollama_chat_request(model, body, pcfg, stream=False)
@@ -13298,6 +13391,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             EVENT_BUS.publish(level="info", category="plan_mode.short_circuit", message="plan mode tool choice handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
         body = filter_blocked_tools(provider, pcfg, body)
+        body = normalize_tool_choice_for_provider(provider, pcfg, body)
         write_context_usage(provider, pcfg, body, "messages")
         if maybe_handle_router_debug_request(self, body):
             EVENT_BUS.publish(level="info", category="router_debug.short_circuit", message="router debug request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
@@ -13310,6 +13404,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         body = body_with_pending_channel_summaries(body)
         body = body_with_channel_tool_result_context(body)
         body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
+        body = normalize_tool_choice_for_provider(provider, pcfg, body)
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
         try:
             if provider in ("ollama", "ollama-cloud"):
@@ -18189,6 +18284,7 @@ def compatibility_api_key_probe_request(
     request_body: dict[str, Any],
 ) -> tuple[str, dict[str, Any], dict[str, str]]:
     body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, request_body)
+    body = normalize_tool_choice_for_provider(provider, pcfg, body)
     upstream_model = resolve_requested_model(provider, pcfg, model)
     headers = provider_headers(provider, pcfg)
     if provider in ("ollama", "ollama-cloud"):
@@ -18378,8 +18474,16 @@ def _cmd_test(args: argparse.Namespace) -> None:
             "x-api-key": "ollama",
             COMPATIBILITY_TEST_HEADER: "1",
         }
-    text_body = compatibility_text_request(model)
-    tool_body = compatibility_tool_request(model)
+    text_body = normalize_tool_choice_for_provider(
+        provider,
+        pcfg,
+        normalize_thinking_for_non_anthropic_provider(provider, pcfg, compatibility_text_request(model)),
+    )
+    tool_body = normalize_tool_choice_for_provider(
+        provider,
+        pcfg,
+        normalize_thinking_for_non_anthropic_provider(provider, pcfg, compatibility_tool_request(model)),
+    )
     print(f"Testing provider: {provider}")
     print(f"Test mode: {effective_mode}")
     if ollama_native:
@@ -24135,8 +24239,7 @@ def run_claude_update_check(claude: str, enabled: bool = True) -> None:
     if answer not in ("y", "yes"):
         return
     update_env = os.environ.copy()
-    local_bin = str(HOME / ".local" / "bin")
-    update_env["PATH"] = local_bin + os.pathsep + update_env.get("PATH", "")
+    update_env["PATH"] = path_with_claude_any_user_dirs(update_env)
     try:
         p = subprocess.run(
             [claude, "update"],
@@ -24307,7 +24410,8 @@ def claude_any_launcher_candidate_dirs() -> list[Path]:
     for entry in os.environ.get("PATH", "").split(os.pathsep):
         if entry:
             raw_dirs.append(Path(entry))
-    raw_dirs.extend([HOME / ".local" / "bin", HOME / ".npm-global" / "bin", HOME / "bin"])
+    raw_dirs.extend(executable_extra_dirs())
+    raw_dirs.extend([HOME / ".npm-global" / "bin", HOME / "bin"])
     if os.name != "nt":
         raw_dirs.extend([Path("/usr/local/bin"), Path("/usr/bin")])
     seen: set[str] = set()
@@ -24607,7 +24711,7 @@ def launch_claude(
     )
     cleanup_managed_services_for_provider(provider, pcfg, cfg, quiet=True)
     env = os.environ.copy()
-    env["PATH"] = str(HOME / ".local" / "bin") + os.pathsep + env.get("PATH", "")
+    env["PATH"] = path_with_claude_any_user_dirs(env)
     launch_env = env_vars(cfg)
     launch_passthrough = normalize_channel_passthrough(passthrough)
     native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
@@ -24671,7 +24775,7 @@ def launch_claude(
         install_claude_any_statusline()
     claude = find_executable("claude")
     if not claude:
-        raise RuntimeError("claude executable was not found in PATH or ~/.local/bin")
+        raise RuntimeError("claude executable was not found in PATH or the Claude Any user bin directories")
     run_claude_update_check(claude, enabled=update_check)
     claude = find_executable("claude") or claude
     if native_channel_bridge:

@@ -77,6 +77,13 @@ cd claude-any
 claude-any
 ```
 
+On Windows, Claude Any's default config directory is
+`%APPDATA%\claude-any`. Helper scripts such as the statusline and tool guard
+are installed under `%LOCALAPPDATA%\claude-any\bin`, and the launcher also
+searches Windows npm shims such as `%APPDATA%\npm`. Set
+`CLAUDE_ANY_CONFIG_DIR` only when you intentionally want a separate config and
+router identity.
+
 ### Releasing (maintainers)
 
 The `Publish to npm` workflow is the only supported publish path. It
@@ -323,9 +330,16 @@ Claude Code integration, and keeps `ANTHROPIC_API_KEY` unset to avoid Claude
 Code's auth-conflict path. Avoid setting both variables manually in your shell;
 let Claude Any prepare the auth environment for the selected provider.
 
+DeepSeek V4 thinking-mode agent integrations require `supportsToolChoice:
+false` in DeepSeek's own compatibility notes. Claude Any follows that behavior
+for the DeepSeek.com provider: the model still receives the available tool
+schemas, but forced `tool_choice` is removed before upstream calls and
+compatibility tests for DeepSeek V4 models.
+
 Links:
 
 - DeepSeek Claude Code integration: https://api-docs.deepseek.com/quick_start/agent_integrations/claude_code
+- DeepSeek V4 thinking compatibility notes: https://api-docs.deepseek.com/quick_start/agent_integrations/oh_my_pi
 - DeepSeek API keys: https://platform.deepseek.com/api_keys
 
 ### OpenCode Zen
