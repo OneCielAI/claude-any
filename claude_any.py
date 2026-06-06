@@ -303,6 +303,8 @@ _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID: int | None = None
 _CHANNEL_LLM_DIRECT_LOCK = threading.Lock()
 _CHANNEL_LLM_DIRECT_INFLIGHT: set[int] = set()
 _CHANNEL_LLM_DIRECT_DELIVERED: set[int] = set()
+_CHANNEL_LLM_DIRECT_QUEUE: queue.Queue[dict[str, Any]] = queue.Queue()
+_CHANNEL_LLM_DIRECT_WORKERS_STARTED = 0
 _CHANNEL_STDIN_WAKE_LOCK = threading.Lock()
 _CHANNEL_STDIN_WAKE_DELIVERED: set[int] = set()
 _NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
@@ -22363,6 +22365,29 @@ def _anthropic_message_text(message: dict[str, Any]) -> str:
     return "".join(parts).strip()
 
 
+def _channel_direct_worker_limit() -> int:
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_DIRECT_WORKERS", "1")
+    try:
+        return max(1, min(8, int(str(raw).strip())))
+    except Exception:
+        return 1
+
+
+def _ensure_channel_direct_workers_locked() -> None:
+    global _CHANNEL_LLM_DIRECT_WORKERS_STARTED
+    wanted = _channel_direct_worker_limit()
+    while _CHANNEL_LLM_DIRECT_WORKERS_STARTED < wanted:
+        _CHANNEL_LLM_DIRECT_WORKERS_STARTED += 1
+        worker_no = _CHANNEL_LLM_DIRECT_WORKERS_STARTED
+        thread = threading.Thread(
+            target=_channel_direct_llm_queue_worker,
+            daemon=True,
+            name=f"ca-channel-llm-worker-{worker_no}",
+        )
+        thread.start()
+        router_log("INFO", f"channel_llm_direct_worker_started worker={worker_no} limit={wanted}")
+
+
 def schedule_channel_direct_llm_delivery(message: dict[str, Any]) -> bool:
     try:
         message_id = int(message.get("id") or 0)
@@ -22385,10 +22410,20 @@ def schedule_channel_direct_llm_delivery(message: dict[str, Any]) -> bool:
         if message_id in _CHANNEL_LLM_DIRECT_INFLIGHT or message_id in _CHANNEL_LLM_DIRECT_DELIVERED:
             return False
         _CHANNEL_LLM_DIRECT_INFLIGHT.add(message_id)
-    thread = threading.Thread(target=_channel_direct_llm_worker, args=(message,), daemon=True, name=f"ca-channel-llm-{message_id}")
-    thread.start()
-    router_log("INFO", f"channel_llm_direct_queued message_id={message_id} channel={message.get('channel')}")
+        _CHANNEL_LLM_DIRECT_QUEUE.put(dict(message))
+        queue_depth = _CHANNEL_LLM_DIRECT_QUEUE.qsize()
+        _ensure_channel_direct_workers_locked()
+    router_log("INFO", f"channel_llm_direct_queued message_id={message_id} channel={message.get('channel')} queue_depth={queue_depth}")
     return True
+
+
+def _channel_direct_llm_queue_worker() -> None:
+    while True:
+        message = _CHANNEL_LLM_DIRECT_QUEUE.get()
+        try:
+            _channel_direct_llm_worker(message)
+        finally:
+            _CHANNEL_LLM_DIRECT_QUEUE.task_done()
 
 
 def _channel_direct_source_state_name(message: dict[str, Any]) -> str | None:

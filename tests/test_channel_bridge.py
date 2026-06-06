@@ -1746,6 +1746,55 @@ class ChannelBridgeTests(unittest.TestCase):
         append_summary.assert_called_once_with(message, "분석 완료", "end_turn", tool_turns=1)
         append.assert_not_called()
 
+    def test_channel_direct_delivery_queues_burst_without_spawning_per_message_threads(self):
+        processed: list[int] = []
+
+        def fake_worker(message):
+            message_id = int(message.get("id") or 0)
+            processed.append(message_id)
+            with claude_any._CHANNEL_LLM_DIRECT_LOCK:
+                claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.discard(message_id)
+
+        while not claude_any._CHANNEL_LLM_DIRECT_QUEUE.empty():
+            try:
+                claude_any._CHANNEL_LLM_DIRECT_QUEUE.get_nowait()
+                claude_any._CHANNEL_LLM_DIRECT_QUEUE.task_done()
+            except Exception:
+                break
+        old_started = claude_any._CHANNEL_LLM_DIRECT_WORKERS_STARTED
+        claude_any._CHANNEL_LLM_DIRECT_WORKERS_STARTED = 0
+        claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.clear()
+        claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+        try:
+            with (
+                mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_DIRECT_WORKERS": "1"}),
+                mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+                mock.patch.object(claude_any, "_channel_direct_llm_worker", side_effect=fake_worker),
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                for message_id in range(1, 4):
+                    self.assertTrue(
+                        claude_any.schedule_channel_direct_llm_delivery(
+                            {
+                                "id": message_id,
+                                "channel": "room",
+                                "sender_id": "external",
+                                "message": f"event {message_id}",
+                                "delivery": ["llm"],
+                            }
+                        )
+                    )
+                deadline = time.time() + 3
+                while len(processed) < 3 and time.time() < deadline:
+                    time.sleep(0.01)
+        finally:
+            claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.clear()
+            claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+            claude_any._CHANNEL_LLM_DIRECT_WORKERS_STARTED = max(old_started, claude_any._CHANNEL_LLM_DIRECT_WORKERS_STARTED)
+
+        self.assertEqual([1, 2, 3], processed)
+        self.assertEqual(1, claude_any._CHANNEL_LLM_DIRECT_WORKERS_STARTED)
+
     def test_channel_direct_deferred_action_detector_matches_future_promises(self):
         self.assertTrue(
             claude_any._channel_direct_text_is_deferred_action(
