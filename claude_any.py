@@ -384,6 +384,7 @@ DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC: tuple[str, ...] = (
     "SendMessage",
     "SendMessageTool",
     "ScheduleWakeup",
+    "WaitForMcpServers",
     "RemoteTrigger",
     "PushNotification",
 )
@@ -407,6 +408,8 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "TaskList: no input. TaskUpdate: taskId (string), optional status enum exactly one of pending, in_progress, completed, deleted. "
     "CronCreate: cron (standard 5-field local-time cron string), prompt (string), optional recurring (boolean), optional durable (boolean). "
     "CronDelete: id (string returned by CronCreate). CronList: no input. "
+    "Do not call WaitForMcpServers; it is a Claude Code lifecycle tool that may exist but is often not enabled in the current routed context. "
+    "If an MCP server appears disconnected, use only tools present in the current tool list, retry ordinary MCP tools when available, or report the concrete connection state. "
     "Never write pseudo tool calls, partial JSON, or markdown code fences when a real Claude Code tool call is required."
 )
 LANGUAGES = {

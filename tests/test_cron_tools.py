@@ -11,6 +11,7 @@ class CronToolCompatibilityTests(unittest.TestCase):
         self.assertNotIn("CronDelete", blocked)
         self.assertNotIn("CronList", blocked)
         self.assertIn("ScheduleWakeup", blocked)
+        self.assertIn("WaitForMcpServers", blocked)
 
     def test_filter_preserves_cron_tools_for_non_anthropic_provider(self):
         body = {
@@ -19,6 +20,7 @@ class CronToolCompatibilityTests(unittest.TestCase):
                 {"name": "CronDelete", "input_schema": {"type": "object", "properties": {}}},
                 {"name": "CronList", "input_schema": {"type": "object", "properties": {}}},
                 {"name": "ScheduleWakeup", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "WaitForMcpServers", "input_schema": {"type": "object", "properties": {}}},
             ]
         }
 
@@ -29,6 +31,7 @@ class CronToolCompatibilityTests(unittest.TestCase):
         self.assertIn("CronDelete", names)
         self.assertIn("CronList", names)
         self.assertNotIn("ScheduleWakeup", names)
+        self.assertNotIn("WaitForMcpServers", names)
 
     def test_filter_hides_enter_plan_mode_when_ultracode_workflow_is_active(self):
         body = {
