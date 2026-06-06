@@ -14675,6 +14675,16 @@ def _mcp_server_is_stdio(server: dict[str, Any]) -> bool:
     return "mcp-proxy" not in args
 
 
+def _mcp_server_is_streamable_http(server: dict[str, Any]) -> bool:
+    if not isinstance(server, dict):
+        return False
+    server_type = str(server.get("type") or server.get("transport") or "").strip().lower()
+    if server_type not in {"http", "streamable-http"}:
+        return False
+    url = str(server.get("url") or server.get("endpoint") or "").strip()
+    return url.startswith(("http://", "https://"))
+
+
 def _channel_probe_strategy_for(server: dict[str, Any]) -> str:
     """How to frame the initialize request we send to this stdio server.
 
@@ -21960,7 +21970,7 @@ def write_mcp_proxy_config(
             if name in seen:
                 continue
             seen.add(name)
-            if _mcp_server_is_stdio(server):
+            if _mcp_server_is_stdio(server) or _mcp_server_is_streamable_http(server):
                 server_dir.mkdir(parents=True, exist_ok=True)
                 server_path = server_dir / f"{_safe_mcp_proxy_name(name)}.json"
                 server_path.write_text(json.dumps(server, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -24579,6 +24589,71 @@ def _mcp_proxy_write_stdout_frame(body: bytes) -> None:
     sys.stdout.buffer.flush()
 
 
+def _mcp_proxy_write_json_response(payload: dict[str, Any]) -> None:
+    _mcp_proxy_write_stdout_frame(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+
+
+def _mcp_proxy_error_response(request_id: Any, message: str, code: int = -32000) -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {"code": code, "message": str(message)},
+    }
+
+
+def _mcp_proxy_drain_input_messages(buffer: bytearray, *, final: bool = False) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+    while buffer:
+        data = bytes(buffer)
+        stripped = data.lstrip()
+        if len(stripped) != len(data):
+            del buffer[: len(data) - len(stripped)]
+            data = stripped
+        frame = _mcp_proxy_frame_header(data)
+        if frame:
+            header_end, delimiter_len, length = frame
+            body_start = header_end + delimiter_len
+            body_end = body_start + length
+            if len(data) < body_end:
+                return messages
+            body = data[body_start:body_end]
+            del buffer[:body_end]
+        elif data.startswith(b"{"):
+            newline_idx = data.find(b"\n")
+            if newline_idx < 0:
+                if not final:
+                    return messages
+                body = bytes(data)
+                del buffer[:]
+            else:
+                body = data[:newline_idx]
+                del buffer[: newline_idx + 1]
+        else:
+            content_idx = data.lower().find(b"content-length:")
+            json_idx = data.find(b"{")
+            candidates = [idx for idx in (content_idx, json_idx) if idx >= 0]
+            if candidates:
+                keep_from = min(candidates)
+                if keep_from > 0:
+                    del buffer[:keep_from]
+                continue
+            newline_idx = data.find(b"\n")
+            if newline_idx >= 0:
+                del buffer[: newline_idx + 1]
+                continue
+            if len(buffer) > 1024 * 1024:
+                del buffer[:-4096]
+            return messages
+        try:
+            payload = json.loads(body.decode("utf-8", errors="replace"))
+        except Exception as exc:
+            _mcp_proxy_write_json_response(_mcp_proxy_error_response(None, f"invalid JSON-RPC payload: {type(exc).__name__}", -32700))
+            continue
+        if isinstance(payload, dict):
+            messages.append(payload)
+    return messages
+
+
 def _mcp_proxy_emit_jsonl_stdout_line(server_name: str, line: bytes) -> None:
     body = line.strip()
     if not body:
@@ -24628,6 +24703,155 @@ def _mcp_proxy_forward_stderr(proc: subprocess.Popen[bytes]) -> None:
             sys.stderr.buffer.flush()
     except Exception:
         pass
+
+
+def _mcp_proxy_streamable_http_request(
+    endpoint: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: float,
+    protocol_version: str,
+    session_id: str | None,
+) -> tuple[Any, str | None]:
+    return _mcp_streamable_post_json(endpoint, headers, payload, timeout, protocol_version, session_id)
+
+
+def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) -> int:
+    try:
+        server = json.loads(server_config_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        router_log("ERROR", f"mcp_http_proxy_config_read_failed server={server_name} error={type(exc).__name__}: {exc}")
+        print(f"claude-any mcp-proxy: cannot read server config: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return 2
+    if not isinstance(server, dict) or not _mcp_server_is_streamable_http(server):
+        router_log("ERROR", f"mcp_http_proxy_invalid_config server={server_name}")
+        print("claude-any mcp-proxy: server config is not a Streamable HTTP MCP server", file=sys.stderr, flush=True)
+        return 2
+    endpoint = str(server.get("url") or server.get("endpoint") or "").strip()
+    custom_headers = server.get("headers") if isinstance(server.get("headers"), dict) else {}
+    headers = {str(k): str(v) for k, v in custom_headers.items() if str(k).strip()}
+    token = str(server.get("bearer_token") or server.get("token") or "").strip()
+    if token and "Authorization" not in headers:
+        headers["Authorization"] = f"Bearer {token}"
+    protocol_version = str(server.get("mcp_protocol_version") or server.get("protocolVersion") or server.get("protocol_version") or MCP_STREAMABLE_HTTP_PROTOCOL_VERSION)
+    timeout = max(5.0, min(120.0, float(server.get("mcp_timeout_seconds") or server.get("timeout") or 20.0)))
+    requires_session = parse_bool(server.get("streamable_requires_session", server.get("require_session", server.get("mcp_session_required", True))), True)
+    session_id: str | None = None
+    initialize_payload: dict[str, Any] | None = None
+    initialized_payload: dict[str, Any] | None = None
+    router_log("INFO", f"mcp_http_proxy_started server={server_name} endpoint={endpoint}")
+
+    def ensure_session_for_retry() -> None:
+        nonlocal session_id
+        if not initialize_payload:
+            return
+        result, returned_session = _mcp_proxy_streamable_http_request(
+            endpoint,
+            headers,
+            initialize_payload,
+            timeout,
+            protocol_version,
+            None,
+        )
+        if isinstance(result, dict):
+            _mcp_proxy_observe_json_message(server_name, result)
+        session_id = returned_session or session_id
+        if initialized_payload:
+            _mcp_proxy_streamable_http_request(
+                endpoint,
+                headers,
+                initialized_payload,
+                timeout,
+                protocol_version,
+                session_id,
+            )
+
+    buffer = bytearray()
+    try:
+        stdin_fd = sys.stdin.fileno()
+        while True:
+            chunk = os.read(stdin_fd, 65536)
+            if not chunk:
+                break
+            buffer.extend(chunk)
+            for payload in _mcp_proxy_drain_input_messages(buffer):
+                request_id = payload.get("id")
+                method = str(payload.get("method") or "")
+                if method == "initialize":
+                    initialize_payload = payload
+                elif method == "notifications/initialized":
+                    initialized_payload = payload
+                try:
+                    if requires_session and method not in {"initialize"} and not session_id:
+                        if initialize_payload:
+                            ensure_session_for_retry()
+                        if requires_session and method not in {"initialize"} and not session_id:
+                            raise RuntimeError("Streamable HTTP MCP session is not initialized")
+                    result, returned_session = _mcp_proxy_streamable_http_request(
+                        endpoint,
+                        headers,
+                        payload,
+                        timeout,
+                        protocol_version,
+                        session_id if method != "initialize" else None,
+                    )
+                    if returned_session:
+                        session_id = returned_session
+                    if isinstance(result, dict):
+                        _mcp_proxy_observe_json_message(server_name, result)
+                    if payload.get("id") is not None:
+                        if isinstance(result, dict):
+                            _mcp_proxy_write_json_response(result)
+                        else:
+                            _mcp_proxy_write_json_response(
+                                {
+                                    "jsonrpc": "2.0",
+                                    "id": request_id,
+                                    "result": result if result is not None else {},
+                                }
+                            )
+                except urllib.error.HTTPError as exc:
+                    body_text = _http_error_body_text(exc)
+                    if _streamable_http_session_not_found(exc, body_text) and initialize_payload:
+                        router_log("WARN", f"mcp_http_proxy_session_lost server={server_name} method={method} error=HTTPError:{exc.code}:{exc.reason}")
+                        session_id = None
+                        try:
+                            ensure_session_for_retry()
+                            result, returned_session = _mcp_proxy_streamable_http_request(
+                                endpoint,
+                                headers,
+                                payload,
+                                timeout,
+                                protocol_version,
+                                session_id if method != "initialize" else None,
+                            )
+                            if returned_session:
+                                session_id = returned_session
+                            if payload.get("id") is not None:
+                                _mcp_proxy_write_json_response(result if isinstance(result, dict) else {"jsonrpc": "2.0", "id": request_id, "result": result if result is not None else {}})
+                            continue
+                        except Exception as retry_exc:
+                            _mcp_proxy_write_json_response(_mcp_proxy_error_response(request_id, f"{type(retry_exc).__name__}: {retry_exc}"))
+                            continue
+                    _mcp_proxy_write_json_response(_mcp_proxy_error_response(request_id, f"HTTPError:{exc.code}: {exc.reason}; {body_text}".strip()))
+                except Exception as exc:
+                    _mcp_proxy_write_json_response(_mcp_proxy_error_response(request_id, f"{type(exc).__name__}: {exc}"))
+        for payload in _mcp_proxy_drain_input_messages(buffer, final=True):
+            request_id = payload.get("id")
+            try:
+                result, returned_session = _mcp_proxy_streamable_http_request(endpoint, headers, payload, timeout, protocol_version, session_id)
+                if returned_session:
+                    session_id = returned_session
+                if payload.get("id") is not None:
+                    _mcp_proxy_write_json_response(result if isinstance(result, dict) else {"jsonrpc": "2.0", "id": request_id, "result": result if result is not None else {}})
+            except Exception as exc:
+                _mcp_proxy_write_json_response(_mcp_proxy_error_response(request_id, f"{type(exc).__name__}: {exc}"))
+        router_log("INFO", f"mcp_http_proxy_exited server={server_name}")
+        return 0
+    except Exception as exc:
+        router_log("ERROR", f"mcp_http_proxy_failed server={server_name} error={type(exc).__name__}: {exc}")
+        print(f"claude-any mcp-proxy: Streamable HTTP bridge failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+        return 1
 
 
 def run_mcp_stdio_proxy(server_name: str, server_config_path: Path) -> int:
@@ -24698,7 +24922,14 @@ def cmd_mcp_proxy(argv: list[str]) -> int:
     parser.add_argument("--server-name", required=True)
     parser.add_argument("--server-config", required=True)
     args = parser.parse_args(argv)
-    return run_mcp_stdio_proxy(args.server_name, Path(args.server_config).expanduser())
+    server_config_path = Path(args.server_config).expanduser()
+    try:
+        server = json.loads(server_config_path.read_text(encoding="utf-8"))
+    except Exception:
+        server = None
+    if isinstance(server, dict) and _mcp_server_is_streamable_http(server):
+        return run_mcp_streamable_http_proxy(args.server_name, server_config_path)
+    return run_mcp_stdio_proxy(args.server_name, server_config_path)
 
 
 def run_claude_update_check(claude: str, enabled: bool = True) -> None:

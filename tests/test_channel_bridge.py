@@ -3316,6 +3316,111 @@ class ChannelBridgeTests(unittest.TestCase):
             self.assertTrue(chat_log.exists())
             self.assertIn("wake from jsonl subprocess", chat_log.read_text(encoding="utf-8"))
 
+    def test_mcp_proxy_subcommand_bridges_streamable_http_server(self):
+        seen_posts: list[dict[str, object]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                seen_posts.append({"method": payload.get("method"), "session": self.headers.get("Mcp-Session-Id")})
+                if payload.get("method") == "initialize":
+                    result = {
+                        "protocolVersion": claude_any.MCP_STREAMABLE_HTTP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "streamable-test", "version": "1"},
+                    }
+                    response = {"jsonrpc": "2.0", "id": payload.get("id"), "result": result}
+                    data = json.dumps(response).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Mcp-Session-Id", "sess-proxy")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if payload.get("method") == "notifications/initialized":
+                    response = {"jsonrpc": "2.0", "result": {}}
+                elif payload.get("method") == "tools/list":
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id"),
+                        "result": {
+                            "tools": [
+                                {
+                                    "name": "echo",
+                                    "description": "Echo test",
+                                    "inputSchema": {"type": "object", "properties": {}},
+                                }
+                            ]
+                        },
+                    }
+                else:
+                    response = {"jsonrpc": "2.0", "id": payload.get("id"), "result": {}}
+                data = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        def frame(payload: dict[str, object]) -> bytes:
+            body = json.dumps(payload).encode("utf-8")
+            return b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+
+        with tempfile.TemporaryDirectory(prefix="ca-mcp-http-proxy-test-") as td:
+            root = Path(td)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                config = root / "server.json"
+                config.write_text(
+                    json.dumps({"type": "http", "url": f"http://127.0.0.1:{server.server_address[1]}/mcp"}),
+                    encoding="utf-8",
+                )
+                input_frames = b"".join(
+                    [
+                        frame({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
+                        frame({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
+                        frame({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
+                    ]
+                )
+                env = os.environ.copy()
+                env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
+                proc = subprocess.run(
+                    [
+                        sys.executable,
+                        str(Path(claude_any.__file__).resolve()),
+                        "mcp-proxy",
+                        "--server-name",
+                        "fake-http",
+                        "--server-config",
+                        str(config),
+                    ],
+                    input=input_frames,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(0, proc.returncode, proc.stderr.decode("utf-8", errors="replace"))
+                self.assertIn(b"Content-Length:", proc.stdout)
+                self.assertIn(b'"id":1', proc.stdout)
+                self.assertIn(b'"id":2', proc.stdout)
+                self.assertIn(b'"tools"', proc.stdout)
+                self.assertEqual(["initialize", "notifications/initialized", "tools/list"], [item["method"] for item in seen_posts])
+                self.assertIsNone(seen_posts[0]["session"])
+                self.assertEqual("sess-proxy", seen_posts[1]["session"])
+                self.assertEqual("sess-proxy", seen_posts[2]["session"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_channel_mcp_config_points_to_router_sse(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "channel-mcp.json"

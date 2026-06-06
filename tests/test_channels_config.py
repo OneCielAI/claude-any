@@ -183,6 +183,35 @@ class ChannelConfigTests(unittest.TestCase):
             saved_server = json.loads(server_config_path.read_text(encoding="utf-8"))
             self.assertEqual("node", saved_server["command"])
 
+    def test_mcp_proxy_config_wraps_streamable_http_server(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp_config = root / "mcp.json"
+            proxy_config = root / "mcp-proxy.json"
+            mcp_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ai-net-http": {"type": "http", "url": "http://example.test/mcp"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "CONFIG_DIR", root), mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config):
+                written = claude_any.write_mcp_proxy_config(["--mcp-config", str(mcp_config)], cwd=root, home=root)
+
+            self.assertEqual(proxy_config, written)
+            data = json.loads(proxy_config.read_text(encoding="utf-8"))
+            wrapped = data["mcpServers"]["ai-net-http"]
+            self.assertEqual(claude_any.sys.executable, wrapped["command"])
+            self.assertIn("mcp-proxy", wrapped["args"])
+            self.assertNotIn("type", wrapped)
+            server_config_path = Path(wrapped["args"][wrapped["args"].index("--server-config") + 1])
+            saved_server = json.loads(server_config_path.read_text(encoding="utf-8"))
+            self.assertEqual("http", saved_server["type"])
+            self.assertEqual("http://example.test/mcp", saved_server["url"])
+
     def test_web_fetch_mcp_config_marks_jsonl_stdio(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
