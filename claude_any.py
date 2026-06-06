@@ -7795,7 +7795,6 @@ MCP_LEGACY_SSE_PROTOCOL_VERSION = "2024-11-05"
 
 
 def _read_mcp_sse_json_response(response: Any, request_id: Any | None = None) -> Any:
-    event_name = "message"
     data_lines: list[str] = []
     while True:
         raw = response.readline()
@@ -7812,7 +7811,6 @@ def _read_mcp_sse_json_response(response: Any, request_id: Any | None = None) ->
                 if isinstance(msg, dict):
                     if request_id is None or msg.get("id") == request_id or "id" not in msg:
                         return msg
-            event_name = "message"
             data_lines = []
             continue
         if line.startswith(":"):
@@ -7820,9 +7818,7 @@ def _read_mcp_sse_json_response(response: Any, request_id: Any | None = None) ->
         field, _, value = line.partition(":")
         if value.startswith(" "):
             value = value[1:]
-        if field == "event":
-            event_name = value or "message"
-        elif field == "data":
+        if field == "data":
             data_lines.append(value)
     if data_lines:
         data_text = "\n".join(data_lines).strip()
