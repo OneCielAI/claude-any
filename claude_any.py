@@ -24620,8 +24620,9 @@ def _mcp_proxy_forward_stdin_jsonl(proc: subprocess.Popen[bytes]) -> None:
 
 
 def _mcp_proxy_write_stdout_frame(body: bytes) -> None:
-    sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
-    sys.stdout.buffer.flush()
+    with _CHANNEL_MCP_LOCK:
+        sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
+        sys.stdout.buffer.flush()
 
 
 def _mcp_proxy_write_json_response(payload: dict[str, Any]) -> None:
@@ -24774,7 +24775,118 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
     session_id: str | None = None
     initialize_payload: dict[str, Any] | None = None
     initialized_payload: dict[str, Any] | None = None
+    session_lock = threading.Lock()
+    stream_stop = threading.Event()
+    stream_thread: threading.Thread | None = None
+    stream_session_id: str | None = None
     router_log("INFO", f"mcp_http_proxy_started server={server_name} endpoint={endpoint}")
+
+    def emit_streamable_sse_message(data_lines: list[str]) -> None:
+        if not data_lines:
+            return
+        data_text = "\n".join(data_lines).strip()
+        if not data_text:
+            return
+        try:
+            payload = json.loads(data_text)
+        except Exception as exc:
+            router_log("WARN", f"mcp_http_proxy_stream_json_failed server={server_name} error={type(exc).__name__}")
+            return
+        if not isinstance(payload, dict):
+            return
+        _mcp_proxy_observe_json_message(server_name, payload)
+        _mcp_proxy_write_json_response(payload)
+
+    def stream_worker(worker_session_id: str) -> None:
+        nonlocal session_id
+        last_event_id: str | None = None
+        retry_seconds = max(1.0, min(60.0, float(server.get("retry_seconds") or 5.0)))
+        read_timeout = max(5.0, min(3600.0, float(server.get("read_timeout_seconds") or server.get("stream_timeout") or 300.0)))
+        while not stream_stop.is_set():
+            with session_lock:
+                current_session = session_id
+            if not current_session or current_session != worker_session_id:
+                return
+            event_name = "message"
+            data_lines: list[str] = []
+            try:
+                request_headers = _mcp_streamable_headers(
+                    headers,
+                    protocol_version,
+                    worker_session_id,
+                    accept="text/event-stream",
+                )
+                if last_event_id:
+                    request_headers["Last-Event-ID"] = last_event_id
+                req = urllib.request.Request(endpoint, headers=request_headers, method="GET")
+                with urllib.request.urlopen(req, timeout=read_timeout) as response:
+                    router_log("INFO", f"mcp_http_proxy_stream_connected server={server_name} session={worker_session_id} last_event_id={last_event_id or '-'}")
+                    while not stream_stop.is_set():
+                        raw = response.readline()
+                        if raw == b"":
+                            raise ConnectionError("Streamable HTTP MCP notification stream ended")
+                        line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                        if not line:
+                            emit_streamable_sse_message(data_lines)
+                            data_lines = []
+                            event_name = "message"
+                            continue
+                        if line.startswith(":"):
+                            continue
+                        field, _, value = line.partition(":")
+                        if value.startswith(" "):
+                            value = value[1:]
+                        if field == "event":
+                            event_name = value or "message"
+                        elif field == "data":
+                            data_lines.append(value)
+                        elif field == "id":
+                            last_event_id = value
+                        elif field == "retry":
+                            try:
+                                retry_seconds = max(1.0, min(60.0, int(value) / 1000.0))
+                            except Exception:
+                                pass
+                    return
+            except urllib.error.HTTPError as exc:
+                body_text = _http_error_body_text(exc)
+                if _streamable_http_session_not_found(exc, body_text):
+                    with session_lock:
+                        if session_id == worker_session_id:
+                            session_id = None
+                    router_log("WARN", f"mcp_http_proxy_stream_session_lost server={server_name} error=HTTPError:{exc.code}:{exc.reason}")
+                    return
+                router_log("WARN", f"mcp_http_proxy_stream_reconnect server={server_name} event={event_name} error=HTTPError:{exc.code}:{exc.reason}")
+            except Exception as exc:
+                router_log("WARN", f"mcp_http_proxy_stream_reconnect server={server_name} event={event_name} error={type(exc).__name__}: {exc}")
+            stream_stop.wait(retry_seconds)
+
+    def start_stream_if_needed() -> None:
+        nonlocal stream_thread, stream_session_id
+        with session_lock:
+            current_session = session_id
+        if not current_session:
+            return
+        if stream_thread and stream_thread.is_alive() and stream_session_id == current_session:
+            return
+        stream_session_id = current_session
+        stream_thread = threading.Thread(
+            target=stream_worker,
+            args=(current_session,),
+            daemon=True,
+            name=f"ca-mcp-http-stream-{server_name}",
+        )
+        stream_thread.start()
+        router_log("INFO", f"mcp_http_proxy_stream_started server={server_name} session={current_session}")
+
+    def current_session_id() -> str | None:
+        with session_lock:
+            return session_id
+
+    def set_session_id(value: str | None) -> None:
+        nonlocal session_id
+        with session_lock:
+            session_id = value
 
     def ensure_session_for_retry() -> None:
         nonlocal session_id
@@ -24790,7 +24902,9 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
         )
         if isinstance(result, dict):
             _mcp_proxy_observe_json_message(server_name, result)
-        session_id = returned_session or session_id
+        with session_lock:
+            session_id = returned_session or session_id
+        start_stream_if_needed()
         if initialized_payload:
             _mcp_proxy_streamable_http_request(
                 endpoint,
@@ -24817,10 +24931,12 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                 elif method == "notifications/initialized":
                     initialized_payload = payload
                 try:
-                    if requires_session and method not in {"initialize"} and not session_id:
+                    active_session = current_session_id()
+                    if requires_session and method not in {"initialize"} and not active_session:
                         if initialize_payload:
                             ensure_session_for_retry()
-                        if requires_session and method not in {"initialize"} and not session_id:
+                        active_session = current_session_id()
+                        if requires_session and method not in {"initialize"} and not active_session:
                             raise RuntimeError("Streamable HTTP MCP session is not initialized")
                     result, returned_session = _mcp_proxy_streamable_http_request(
                         endpoint,
@@ -24828,10 +24944,11 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                         payload,
                         timeout,
                         protocol_version,
-                        session_id if method != "initialize" else None,
+                        active_session if method != "initialize" else None,
                     )
                     if returned_session:
-                        session_id = returned_session
+                        set_session_id(returned_session)
+                        start_stream_if_needed()
                     if isinstance(result, dict):
                         _mcp_proxy_observe_json_message(server_name, result)
                     if payload.get("id") is not None:
@@ -24849,19 +24966,21 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                     body_text = _http_error_body_text(exc)
                     if _streamable_http_session_not_found(exc, body_text) and initialize_payload:
                         router_log("WARN", f"mcp_http_proxy_session_lost server={server_name} method={method} error=HTTPError:{exc.code}:{exc.reason}")
-                        session_id = None
+                        set_session_id(None)
                         try:
                             ensure_session_for_retry()
+                            active_session = current_session_id()
                             result, returned_session = _mcp_proxy_streamable_http_request(
                                 endpoint,
                                 headers,
                                 payload,
                                 timeout,
                                 protocol_version,
-                                session_id if method != "initialize" else None,
+                                active_session if method != "initialize" else None,
                             )
                             if returned_session:
-                                session_id = returned_session
+                                set_session_id(returned_session)
+                                start_stream_if_needed()
                             if payload.get("id") is not None:
                                 _mcp_proxy_write_json_response(result if isinstance(result, dict) else {"jsonrpc": "2.0", "id": request_id, "result": result if result is not None else {}})
                             continue
@@ -24874,9 +24993,10 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
         for payload in _mcp_proxy_drain_input_messages(buffer, final=True):
             request_id = payload.get("id")
             try:
-                result, returned_session = _mcp_proxy_streamable_http_request(endpoint, headers, payload, timeout, protocol_version, session_id)
+                result, returned_session = _mcp_proxy_streamable_http_request(endpoint, headers, payload, timeout, protocol_version, current_session_id())
                 if returned_session:
-                    session_id = returned_session
+                    set_session_id(returned_session)
+                    start_stream_if_needed()
                 if payload.get("id") is not None:
                     _mcp_proxy_write_json_response(result if isinstance(result, dict) else {"jsonrpc": "2.0", "id": request_id, "result": result if result is not None else {}})
             except Exception as exc:
@@ -24887,6 +25007,8 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
         router_log("ERROR", f"mcp_http_proxy_failed server={server_name} error={type(exc).__name__}: {exc}")
         print(f"claude-any mcp-proxy: Streamable HTTP bridge failed: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
         return 1
+    finally:
+        stream_stop.set()
 
 
 def run_mcp_stdio_proxy(server_name: str, server_config_path: Path) -> int:

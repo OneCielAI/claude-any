@@ -3367,6 +3367,7 @@ class ChannelBridgeTests(unittest.TestCase):
 
     def test_mcp_proxy_subcommand_bridges_streamable_http_server(self):
         seen_posts: list[dict[str, object]] = []
+        seen_gets: list[dict[str, object]] = []
 
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *_args):
@@ -3416,6 +3417,19 @@ class ChannelBridgeTests(unittest.TestCase):
                 self.end_headers()
                 self.wfile.write(data)
 
+            def do_GET(self):
+                seen_gets.append({"session": self.headers.get("Mcp-Session-Id"), "accept": self.headers.get("Accept")})
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(
+                    b'id: notify-1\n'
+                    b'event: message\n'
+                    b'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"content":"stream notice"}}\n\n'
+                )
+                self.wfile.flush()
+                time.sleep(0.2)
+
         def frame(payload: dict[str, object]) -> bytes:
             body = json.dumps(payload).encode("utf-8")
             return b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
@@ -3431,16 +3445,9 @@ class ChannelBridgeTests(unittest.TestCase):
                     json.dumps({"type": "http", "url": f"http://127.0.0.1:{server.server_address[1]}/mcp"}),
                     encoding="utf-8",
                 )
-                input_frames = b"".join(
-                    [
-                        frame({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}),
-                        frame({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}),
-                        frame({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}),
-                    ]
-                )
                 env = os.environ.copy()
                 env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
-                proc = subprocess.run(
+                proc = subprocess.Popen(
                     [
                         sys.executable,
                         str(Path(claude_any.__file__).resolve()),
@@ -3450,22 +3457,43 @@ class ChannelBridgeTests(unittest.TestCase):
                         "--server-config",
                         str(config),
                     ],
-                    input=input_frames,
+                    stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
                     env=env,
-                    timeout=10,
-                    check=False,
                 )
-                self.assertEqual(0, proc.returncode, proc.stderr.decode("utf-8", errors="replace"))
-                self.assertIn(b"Content-Length:", proc.stdout)
-                self.assertIn(b'"id":1', proc.stdout)
-                self.assertIn(b'"id":2', proc.stdout)
-                self.assertIn(b'"tools"', proc.stdout)
+                assert proc.stdin is not None
+                assert proc.stdout is not None
+                assert proc.stderr is not None
+                proc.stdin.write(frame({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+                proc.stdin.write(frame({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}))
+                proc.stdin.flush()
+                deadline = time.time() + 3
+                while time.time() < deadline and not seen_gets:
+                    time.sleep(0.02)
+                proc.stdin.write(frame({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}}))
+                proc.stdin.flush()
+                time.sleep(0.1)
+                proc.stdin.close()
+                stdout = proc.stdout.read()
+                stderr = proc.stderr.read()
+                proc.wait(timeout=10)
+                proc.stdout.close()
+                proc.stderr.close()
+                self.assertEqual(0, proc.returncode, stderr.decode("utf-8", errors="replace"))
+                self.assertIn(b"Content-Length:", stdout)
+                self.assertIn(b'"id":1', stdout)
+                self.assertIn(b'"id":2', stdout)
+                self.assertIn(b'"tools"', stdout)
+                self.assertIn(b"notifications/message", stdout)
+                self.assertIn(b"stream notice", stdout)
                 self.assertEqual(["initialize", "notifications/initialized", "tools/list"], [item["method"] for item in seen_posts])
                 self.assertIsNone(seen_posts[0]["session"])
                 self.assertEqual("sess-proxy", seen_posts[1]["session"])
                 self.assertEqual("sess-proxy", seen_posts[2]["session"])
+                self.assertTrue(seen_gets)
+                self.assertEqual("sess-proxy", seen_gets[0]["session"])
+                self.assertIn("text/event-stream", str(seen_gets[0]["accept"]))
             finally:
                 server.shutdown()
                 server.server_close()
