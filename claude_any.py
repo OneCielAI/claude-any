@@ -14690,6 +14690,18 @@ def _mcp_server_is_streamable_http(server: dict[str, Any]) -> bool:
     return url.startswith(("http://", "https://"))
 
 
+def _mcp_server_force_proxy(server: dict[str, Any]) -> bool:
+    if not isinstance(server, dict):
+        return False
+    return parse_bool(
+        server.get(
+            "claude_any_mcp_proxy",
+            server.get("claude_any_force_mcp_proxy", server.get("force_mcp_proxy", False)),
+        ),
+        False,
+    )
+
+
 def _channel_probe_strategy_for(server: dict[str, Any]) -> str:
     """How to frame the initialize request we send to this stdio server.
 
@@ -21975,7 +21987,7 @@ def write_mcp_proxy_config(
             if name in seen:
                 continue
             seen.add(name)
-            if _mcp_server_is_stdio(server) or _mcp_server_is_streamable_http(server):
+            if _mcp_server_is_stdio(server) or (_mcp_server_is_streamable_http(server) and _mcp_server_force_proxy(server)):
                 server_dir.mkdir(parents=True, exist_ok=True)
                 server_path = server_dir / f"{_safe_mcp_proxy_name(name)}.json"
                 server_path.write_text(json.dumps(server, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
