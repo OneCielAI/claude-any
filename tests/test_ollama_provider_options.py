@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import claude_any
 
@@ -61,6 +62,42 @@ class OllamaProviderOptionTests(unittest.TestCase):
         self.assertNotIn("num_ctx_max", pcfg)
         self.assertNotIn("max_output_tokens", pcfg)
         self.assertNotIn("num_predict", pcfg["ollama_options"])
+
+    def test_ollama_output_cap_uses_runtime_context(self):
+        pcfg = {
+            "current_model": "gemma4:12b",
+            "ollama_options": {"num_predict": 8192},
+            "max_output_tokens": 8192,
+        }
+
+        with mock.patch.object(
+            claude_any,
+            "ollama_runtime_info",
+            return_value={"runtime_model": "gemma4:12b", "loaded_context_len": 65536},
+        ):
+            messages = claude_any.apply_ollama_runtime_output_guard("ollama", pcfg)
+
+        self.assertEqual(4096, pcfg["ollama_options"]["num_predict"])
+        self.assertEqual(4096, pcfg["max_output_tokens"])
+        self.assertTrue(any("runtime context 64K" in message for message in messages))
+
+    def test_ollama_output_cap_keeps_128k_runtime_at_8k(self):
+        pcfg = {
+            "current_model": "large-model",
+            "ollama_options": {"num_predict": 8192},
+            "max_output_tokens": 8192,
+        }
+
+        with mock.patch.object(
+            claude_any,
+            "ollama_runtime_info",
+            return_value={"runtime_model": "large-model", "loaded_context_len": 131072},
+        ):
+            messages = claude_any.apply_ollama_runtime_output_guard("ollama", pcfg)
+
+        self.assertEqual(8192, pcfg["ollama_options"]["num_predict"])
+        self.assertEqual(8192, pcfg["max_output_tokens"])
+        self.assertEqual([], messages)
 
 
 if __name__ == "__main__":

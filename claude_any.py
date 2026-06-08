@@ -5587,7 +5587,103 @@ def model_context_field(item: dict[str, Any]) -> int | None:
         value = positive_int(item.get(key))
         if value:
             return value
+    details = item.get("details")
+    if isinstance(details, dict):
+        for key in ("max_model_len", "max_context_length", "context_length", "max_context_tokens", "max_position_embeddings"):
+            value = positive_int(details.get(key))
+            if value:
+                return value
     return None
+
+
+def ollama_api_base(pcfg: dict[str, Any]) -> str:
+    base = provider_upstream_request_base("ollama", pcfg)
+    if base.endswith("/api"):
+        return base[:-4].rstrip("/")
+    return base.rstrip("/")
+
+
+def ollama_model_id_matches(left: str, right: str) -> bool:
+    lhs = (left or "").strip().lower()
+    rhs = (right or "").strip().lower()
+    if lhs == rhs:
+        return True
+    if ":" not in lhs:
+        lhs = f"{lhs}:latest"
+    if ":" not in rhs:
+        rhs = f"{rhs}:latest"
+    return lhs == rhs
+
+
+def ollama_runtime_info(pcfg: dict[str, Any], timeout: float = 1.5) -> dict[str, Any] | None:
+    base = ollama_api_base(pcfg)
+    current = current_upstream_model_id("ollama", pcfg)
+    if not base or not current:
+        return None
+    data = http_json(join_url(base, "/api/ps"), headers=provider_model_list_headers("ollama", pcfg), timeout=timeout)
+    items = data.get("models") if isinstance(data, dict) else None
+    if not isinstance(items, list):
+        return None
+    selected = None
+    fallback = None
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        if fallback is None:
+            fallback = item
+        names = (
+            str(item.get("name") or ""),
+            str(item.get("model") or ""),
+            str(item.get("id") or ""),
+        )
+        if any(ollama_model_id_matches(name, current) for name in names):
+            selected = item
+            break
+    if selected is None and not current:
+        selected = fallback
+    if not isinstance(selected, dict):
+        return None
+    details = selected.get("details") if isinstance(selected.get("details"), dict) else {}
+    return {
+        "requested_model": current,
+        "runtime_model": str(selected.get("name") or selected.get("model") or ""),
+        "loaded_context_len": positive_int(selected.get("context_length")) or model_context_field(selected),
+        "size_vram": positive_int(selected.get("size_vram")),
+        "parameter_size": details.get("parameter_size"),
+        "quantization_level": details.get("quantization_level"),
+        "family": details.get("family"),
+        "families": details.get("families"),
+    }
+
+
+def ollama_output_cap_for_context(context_length: int | None) -> int | None:
+    context = positive_int(context_length)
+    if not context:
+        return None
+    return max(2048, min(8192, context // 16))
+
+
+def apply_ollama_runtime_output_guard(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    if provider != "ollama":
+        return []
+    try:
+        info = ollama_runtime_info(pcfg)
+    except Exception:
+        return []
+    loaded_context = positive_int((info or {}).get("loaded_context_len"))
+    cap = ollama_output_cap_for_context(loaded_context)
+    if not cap:
+        return []
+    opts = pcfg.setdefault("ollama_options", {})
+    configured = positive_int(opts.get("num_predict")) or positive_int(pcfg.get("max_output_tokens"))
+    if not configured or configured <= cap:
+        return []
+    opts["num_predict"] = cap
+    pcfg["max_output_tokens"] = cap
+    model = str((info or {}).get("runtime_model") or pcfg.get("current_model") or "")
+    return [
+        f"Ollama runtime context {format_context_tokens(loaded_context)} for {model or 'current model'}; output capped to {cap:,} tokens."
+    ]
 
 
 def lm_studio_api_base(pcfg: dict[str, Any]) -> str:
@@ -17489,6 +17585,7 @@ def apply_llm_preset_to_provider(
         model_id = str(pcfg.get("current_model") or "").strip()
         if model_id and sync_ollama_context:
             context_msgs = sync_ollama_library_context_limit(provider, pcfg, model_id)
+        context_msgs.extend(apply_ollama_runtime_output_guard(provider, pcfg))
     elif provider == "anthropic":
         tokens_by_preset = {
             "balanced": ["max_output_tokens=4096", "timeout=300000"],
