@@ -13,9 +13,11 @@ import mimetypes
 import os
 import queue
 import re
+import select
 import signal
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -10889,6 +10891,86 @@ def set_upstream_stream_read_timeout(resp: Any, timeout: float) -> None:
         pass
 
 
+class UpstreamClientDisconnected(Exception):
+    """Raised when the downstream Claude Code client closes while upstream is still streaming."""
+
+
+def router_client_connection_closed(handler: BaseHTTPRequestHandler) -> bool:
+    conn = getattr(handler, "connection", None)
+    if conn is None:
+        return False
+    try:
+        readable, _, _ = select.select([conn], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    except Exception:
+        return False
+    if not readable:
+        return False
+    try:
+        flags = getattr(socket, "MSG_PEEK", 0)
+        data = conn.recv(1, flags)
+        return data == b""
+    except BlockingIOError:
+        return False
+    except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError):
+        return True
+
+
+def upstream_stream_poll_timeout_seconds(idle_timeout: float) -> float:
+    try:
+        idle = float(idle_timeout)
+    except Exception:
+        idle = 30.0
+    return max(0.2, min(1.0, idle))
+
+
+def upstream_read_timed_out(exc: BaseException) -> bool:
+    if isinstance(exc, TimeoutError):
+        return True
+    return "timed out" in f"{type(exc).__name__}: {exc}".lower()
+
+
+def iter_upstream_lines_until_client_disconnect(
+    handler: BaseHTTPRequestHandler,
+    resp: Any,
+    idle_timeout: float,
+) -> Iterable[bytes]:
+    try:
+        idle = max(1.0, float(idle_timeout))
+    except Exception:
+        idle = 30.0
+    poll_timeout = upstream_stream_poll_timeout_seconds(idle)
+    set_upstream_stream_read_timeout(resp, poll_timeout)
+    idle_deadline = time.monotonic() + idle
+    while True:
+        if router_client_connection_closed(handler):
+            raise UpstreamClientDisconnected("downstream client disconnected")
+        try:
+            raw = resp.readline()
+        except (TimeoutError, OSError) as exc:
+            if router_client_connection_closed(handler):
+                raise UpstreamClientDisconnected("downstream client disconnected during upstream read") from exc
+            if upstream_read_timed_out(exc) and time.monotonic() < idle_deadline:
+                continue
+            raise
+        if raw in (b"", ""):
+            return
+        idle_deadline = time.monotonic() + idle
+        yield raw
+
+
+def sleep_until_or_client_disconnect(handler: BaseHTTPRequestHandler, seconds: float) -> bool:
+    deadline = time.monotonic() + max(0.0, seconds)
+    while True:
+        if router_client_connection_closed(handler):
+            return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return True
+        time.sleep(min(0.25, remaining))
+
+
 def cap_anthropic_body_for_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     capped = dict(body)
     if provider not in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
@@ -12339,7 +12421,15 @@ def _rebatch_anthropic_sse_text(
             pass
 
 
-def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, model: str, word_chunking: bool = False, provider: str = "ollama", source_body: dict[str, Any] | None = None) -> None:
+def _ollama_stream_to_anthropic_sse(
+    handler: BaseHTTPRequestHandler,
+    resp: Any,
+    model: str,
+    word_chunking: bool = False,
+    provider: str = "ollama",
+    source_body: dict[str, Any] | None = None,
+    idle_timeout: float = 30.0,
+) -> None:
     """Stream Ollama NDJSON /api/chat response as Anthropic SSE /v1/messages format."""
     handler.send_response(200)
     handler.send_header("content-type", "text/event-stream")
@@ -12365,8 +12455,11 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
     last_activity_update = 0.0
 
     def emit(event_name: str, payload: dict[str, Any]) -> None:
-        handler.wfile.write(f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
-        handler.wfile.flush()
+        try:
+            handler.wfile.write(f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
+            handler.wfile.flush()
+        except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as exc:
+            raise UpstreamClientDisconnected(f"downstream write failed: {type(exc).__name__}: {exc}") from exc
 
     def ensure_message_started() -> None:
         nonlocal started
@@ -12412,7 +12505,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
         )
 
     try:
-        for line in resp:
+        for line in iter_upstream_lines_until_client_disconnect(handler, resp, idle_timeout):
             chunks_seen += 1
             line = line.decode("utf-8", errors="ignore").strip()
             if not line:
@@ -12447,8 +12540,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                         "index": text_index,
                         "content_block": {"type": "text", "text": ""},
                     }
-                    handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-                    handler.wfile.flush()
+                    emit("content_block_start", event)
                     if word_chunking:
                         text_buffer += pending_text
                         to_flush, text_buffer = _split_word_buffer(text_buffer, force=False)
@@ -12458,16 +12550,14 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                                 "index": text_index,
                                 "delta": {"type": "text_delta", "text": to_flush},
                             }
-                            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-                            handler.wfile.flush()
+                            emit("content_block_delta", event)
                     else:
                         event = {
                             "type": "content_block_delta",
                             "index": text_index,
                             "delta": {"type": "text_delta", "text": pending_text},
                         }
-                        handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-                        handler.wfile.flush()
+                        emit("content_block_delta", event)
                     update_stream_activity()
                     continue
                 if not text_started:
@@ -12479,8 +12569,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                         "index": text_index,
                         "content_block": {"type": "text", "text": ""},
                     }
-                    handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-                    handler.wfile.flush()
+                    emit("content_block_start", event)
                 text_so_far += text_chunk
                 if word_chunking:
                     text_buffer += text_chunk
@@ -12491,16 +12580,14 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                             "index": text_index,
                             "delta": {"type": "text_delta", "text": to_flush},
                         }
-                        handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-                        handler.wfile.flush()
+                        emit("content_block_delta", event)
                 else:
                     event = {
                         "type": "content_block_delta",
                         "index": text_index,
                         "delta": {"type": "text_delta", "text": text_chunk},
                     }
-                    handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-                    handler.wfile.flush()
+                    emit("content_block_delta", event)
                 update_stream_activity()
             # Handle tool calls
             for call in message.get("tool_calls") or []:
@@ -12544,8 +12631,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                         "input": {},
                     },
                 }
-                handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
-                handler.wfile.flush()
+                emit("content_block_start", tool_event)
                 delta_event = {
                     "type": "content_block_delta",
                     "index": tool_index,
@@ -12554,8 +12640,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                         "partial_json": json.dumps(fixed_input, ensure_ascii=False),
                     },
                 }
-                handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
-                handler.wfile.flush()
+                emit("content_block_delta", delta_event)
                 update_stream_activity()
             update_stream_activity()
         update_stream_activity(force=True)
@@ -12578,15 +12663,13 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                     "input": {},
                 },
             }
-            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_start", tool_event)
             delta_event = {
                 "type": "content_block_delta",
                 "index": tool_index,
                 "delta": {"type": "input_json_delta", "partial_json": "{}"},
             }
-            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_delta", delta_event)
         elif source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls):
             ensure_message_started()
             router_log("WARN", "auto-synthesized TaskList from empty upstream end_turn stream")
@@ -12605,15 +12688,13 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                     "input": {},
                 },
             }
-            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_start", tool_event)
             delta_event = {
                 "type": "content_block_delta",
                 "index": tool_index,
                 "delta": {"type": "input_json_delta", "partial_json": "{}"},
             }
-            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_delta", delta_event)
         elif text_suppressed_for_plan and not text_started and text_so_far:
             text_started = True
             text_index = next_content_index
@@ -12623,15 +12704,13 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 "index": text_index,
                 "content_block": {"type": "text", "text": ""},
             }
-            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_start", event)
             event = {
                 "type": "content_block_delta",
                 "index": text_index,
                 "delta": {"type": "text_delta", "text": text_so_far},
             }
-            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_delta", event)
         if word_chunking and text_started and text_buffer:
             to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
             if to_flush:
@@ -12640,8 +12719,7 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                     "index": text_index,
                     "delta": {"type": "text_delta", "text": to_flush},
                 }
-                handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(event, ensure_ascii=False)}\n\n".encode())
-                handler.wfile.flush()
+                emit("content_block_delta", event)
         if source_body is not None and should_keep_work_alive_with_tasklist(source_body, text_so_far, tool_calls):
             ensure_message_started()
             router_log("WARN", "auto-synthesized TaskList to keep work moving after tool result stream")
@@ -12660,15 +12738,13 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                     "input": {},
                 },
             }
-            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_start", tool_event)
             delta_event = {
                 "type": "content_block_delta",
                 "index": tool_index,
                 "delta": {"type": "input_json_delta", "partial_json": "{}"},
             }
-            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_delta", delta_event)
         if source_body is not None and should_auto_continue_choice_question_with_tasklist(source_body, text_so_far, tool_calls):
             ensure_message_started()
             router_log("WARN", "auto-synthesized TaskList after clarification question stream")
@@ -12687,15 +12763,13 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                     "input": {},
                 },
             }
-            handler.wfile.write(f"event: content_block_start\ndata: {json.dumps(tool_event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_start", tool_event)
             delta_event = {
                 "type": "content_block_delta",
                 "index": tool_index,
                 "delta": {"type": "input_json_delta", "partial_json": "{}"},
             }
-            handler.wfile.write(f"event: content_block_delta\ndata: {json.dumps(delta_event, ensure_ascii=False)}\n\n".encode())
-            handler.wfile.flush()
+            emit("content_block_delta", delta_event)
         # Send content_block_stop for text if any
         if text_started:
             event = {"type": "content_block_stop", "index": text_index}
@@ -12740,6 +12814,22 @@ def _ollama_stream_to_anthropic_sse(handler: BaseHTTPRequestHandler, resp: Any, 
                 chunks=chunks_seen,
                 stream=True,
             )
+    except UpstreamClientDisconnected as exc:
+        router_log(
+            "WARN",
+            f"ollama_stream_client_disconnected provider={provider} model={model} "
+            f"chunks={chunks_seen} text_len={len(text_so_far)} error={exc}",
+        )
+        write_router_activity(
+            "cancel",
+            provider,
+            model,
+            error=type(exc).__name__,
+            tokens=input_tokens,
+            output_tokens=output_tokens or max(0, len(text_so_far) // 4),
+            chunks=chunks_seen,
+            stream=True,
+        )
     except Exception as exc:
         router_log("ERROR", f"ollama_stream_error provider={provider} model={model} error={type(exc).__name__}: {exc}")
         write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
@@ -12814,6 +12904,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
         gateway_retries = configured_gateway_retries(pcfg)
         max_attempts = max(1, gateway_retries + 1)
         resp = None
+        stream_idle_timeout = provider_stream_idle_timeout_seconds(pcfg)
         for attempt in range(max_attempts):
             req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
             try:
@@ -12830,7 +12921,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                 )
                 router_log("INFO", f"ollama_stream_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={req_tokens} bytes={req_bytes}")
                 resp = urllib.request.urlopen(req, timeout=ollama_request_timeout_seconds(pcfg))
-                set_upstream_stream_read_timeout(resp, provider_stream_idle_timeout_seconds(pcfg))
+                set_upstream_stream_read_timeout(resp, upstream_stream_poll_timeout_seconds(stream_idle_timeout))
                 learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
                 break
             except urllib.error.HTTPError as exc:
@@ -12841,14 +12932,24 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                     wait = register_router_rate_limit_backoff(provider, pcfg, model, exc.headers.get("Retry-After"))
                     write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, wait=wait, tokens=req_tokens, bytes=req_bytes, stream=True)
                     router_log("WARN", f"ollama_stream_rate_limit_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} wait={wait:.2f}s tokens={req_tokens} bytes={req_bytes}")
-                    time.sleep(wait)
+                    if not sleep_until_or_client_disconnect(handler, wait):
+                        write_router_activity("cancel", provider, model, stage="rate_limit_retry_wait", tokens=req_tokens, bytes=req_bytes, stream=True)
+                        router_log("WARN", f"ollama_stream_cancelled_before_rate_limit_retry provider={provider} model={model} tokens={req_tokens} bytes={req_bytes}")
+                        return
                     continue
                 if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
                     retry_no = attempt + 1
                     write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, tokens=req_tokens, bytes=req_bytes, stream=True)
                     router_log("WARN", f"ollama_stream_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} code={exc.code} tokens={req_tokens} bytes={req_bytes}")
-                    time.sleep(upstream_retry_wait_seconds(retry_no))
+                    if not sleep_until_or_client_disconnect(handler, upstream_retry_wait_seconds(retry_no)):
+                        write_router_activity("cancel", provider, model, stage="http_retry_wait", tokens=req_tokens, bytes=req_bytes, stream=True)
+                        router_log("WARN", f"ollama_stream_cancelled_before_http_retry provider={provider} model={model} tokens={req_tokens} bytes={req_bytes}")
+                        return
                     continue
+                if router_client_connection_closed(handler):
+                    write_router_activity("cancel", provider, model, stage="http_error", code=exc.code, tokens=req_tokens, bytes=req_bytes, stream=True)
+                    router_log("WARN", f"ollama_stream_client_gone_before_error_response provider={provider} model={model} code={exc.code}")
+                    return
                 write_router_activity("error", provider, model, code=exc.code, tokens=req_tokens, bytes=req_bytes, stream=True)
                 write_json(
                     handler,
@@ -12861,8 +12962,15 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                     retry_no = attempt + 1
                     write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes, stream=True)
                     router_log("WARN", f"ollama_stream_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} error={type(exc).__name__} tokens={req_tokens} bytes={req_bytes}")
-                    time.sleep(upstream_retry_wait_seconds(retry_no))
+                    if not sleep_until_or_client_disconnect(handler, upstream_retry_wait_seconds(retry_no)):
+                        write_router_activity("cancel", provider, model, stage="exception_retry_wait", error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes, stream=True)
+                        router_log("WARN", f"ollama_stream_cancelled_before_exception_retry provider={provider} model={model} error={type(exc).__name__}")
+                        return
                     continue
+                if router_client_connection_closed(handler):
+                    write_router_activity("cancel", provider, model, stage="exception_error", error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes, stream=True)
+                    router_log("WARN", f"ollama_stream_client_gone_before_exception_response provider={provider} model={model} error={type(exc).__name__}")
+                    return
                 write_router_activity("error", provider, model, error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes, stream=True)
                 write_json(
                     handler,
@@ -12881,12 +12989,21 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
         # Check if Claude Code requested SSE streaming
         accept = handler.headers.get("accept", "")
         if "text/event-stream" in accept or stream_requested:
-            _ollama_stream_to_anthropic_sse(handler, resp, model, word_chunking=word_chunking, provider=provider, source_body=original_body)
+            _ollama_stream_to_anthropic_sse(handler, resp, model, word_chunking=word_chunking, provider=provider, source_body=original_body, idle_timeout=stream_idle_timeout)
         else:
             # Non-SSE client but streaming from Ollama: collect full response
             chunks = []
-            for line in resp:
-                chunks.append(line)
+            try:
+                for line in iter_upstream_lines_until_client_disconnect(handler, resp, stream_idle_timeout):
+                    chunks.append(line)
+            except UpstreamClientDisconnected as exc:
+                write_router_activity("cancel", provider, model, stage="collect_stream", error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes, stream=True)
+                router_log("WARN", f"ollama_stream_collect_client_disconnected provider={provider} model={model} error={exc}")
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                return
             resp.close()
             full = b"".join(chunks).decode("utf-8", errors="ignore")
             data = None
@@ -12941,14 +13058,24 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                 wait = register_router_rate_limit_backoff(provider, pcfg, model, exc.headers.get("Retry-After"))
                 write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, wait=wait, tokens=req_tokens, bytes=req_bytes)
                 router_log("WARN", f"ollama_rate_limit_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} wait={wait:.2f}s tokens={req_tokens} bytes={req_bytes}")
-                time.sleep(wait)
+                if not sleep_until_or_client_disconnect(handler, wait):
+                    write_router_activity("cancel", provider, model, stage="rate_limit_retry_wait", tokens=req_tokens, bytes=req_bytes)
+                    router_log("WARN", f"ollama_cancelled_before_rate_limit_retry provider={provider} model={model} tokens={req_tokens} bytes={req_bytes}")
+                    return
                 continue
             if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
                 retry_no = attempt + 1
                 write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, tokens=req_tokens, bytes=req_bytes)
                 router_log("WARN", f"ollama_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} code={exc.code} tokens={req_tokens} bytes={req_bytes}")
-                time.sleep(upstream_retry_wait_seconds(retry_no))
+                if not sleep_until_or_client_disconnect(handler, upstream_retry_wait_seconds(retry_no)):
+                    write_router_activity("cancel", provider, model, stage="http_retry_wait", tokens=req_tokens, bytes=req_bytes)
+                    router_log("WARN", f"ollama_cancelled_before_http_retry provider={provider} model={model} tokens={req_tokens} bytes={req_bytes}")
+                    return
                 continue
+            if router_client_connection_closed(handler):
+                write_router_activity("cancel", provider, model, stage="http_error", code=exc.code, tokens=req_tokens, bytes=req_bytes)
+                router_log("WARN", f"ollama_client_gone_before_error_response provider={provider} model={model} code={exc.code}")
+                return
             write_router_activity("error", provider, model, code=exc.code, tokens=req_tokens, bytes=req_bytes)
             write_json(
                 handler,
@@ -12961,8 +13088,15 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                 retry_no = attempt + 1
                 write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes)
                 router_log("WARN", f"ollama_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} error={type(exc).__name__} tokens={req_tokens} bytes={req_bytes}")
-                time.sleep(upstream_retry_wait_seconds(retry_no))
+                if not sleep_until_or_client_disconnect(handler, upstream_retry_wait_seconds(retry_no)):
+                    write_router_activity("cancel", provider, model, stage="exception_retry_wait", error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes)
+                    router_log("WARN", f"ollama_cancelled_before_exception_retry provider={provider} model={model} error={type(exc).__name__}")
+                    return
                 continue
+            if router_client_connection_closed(handler):
+                write_router_activity("cancel", provider, model, stage="exception_error", error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes)
+                router_log("WARN", f"ollama_client_gone_before_exception_response provider={provider} model={model} error={type(exc).__name__}")
+                return
             write_router_activity("error", provider, model, error=type(exc).__name__, tokens=req_tokens, bytes=req_bytes)
             write_json(
                 handler,
