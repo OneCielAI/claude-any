@@ -25107,29 +25107,33 @@ def _mcp_proxy_should_skip_duplicate_notification(server_name: str, chat_payload
     return False, None
 
 
-def _mcp_proxy_observe_json_message(server_name: str, payload: Any) -> None:
+def _mcp_proxy_observe_json_message(server_name: str, payload: Any, *, schedule_direct: bool = True) -> dict[str, Any] | None:
     if not isinstance(payload, dict):
-        return
+        return None
     chat_payload = _mcp_proxy_notification_payload(server_name, payload)
     if not chat_payload:
-        return
+        return None
     skip_duplicate, previous_method = _mcp_proxy_should_skip_duplicate_notification(server_name, chat_payload)
     if skip_duplicate:
         router_log(
             "INFO",
             f"mcp_proxy_notification_skipped_duplicate server={server_name} method={payload.get('method')} previous_method={previous_method}",
         )
-        return
+        return None
     try:
-        chat_payload = _mark_channel_payload_direct_llm_pending(chat_payload)
+        if schedule_direct:
+            chat_payload = _mark_channel_payload_direct_llm_pending(chat_payload)
         saved = append_chat_message(chat_payload)
         router_log(
             "INFO",
             f"mcp_proxy_notification server={server_name} method={payload.get('method')} message_id={saved.get('id')}",
         )
-        schedule_channel_direct_llm_delivery(saved)
+        if schedule_direct:
+            schedule_channel_direct_llm_delivery(saved)
+        return saved
     except Exception as exc:
         router_log("WARN", f"mcp_proxy_notification_failed server={server_name} error={type(exc).__name__}: {exc}")
+    return None
 
 
 def _mcp_proxy_observe_stdout_line(server_name: str, line: bytes) -> None:
@@ -25373,6 +25377,108 @@ def _mcp_proxy_error_response(request_id: Any, message: str, code: int = -32000)
     }
 
 
+def _mcp_proxy_tool_call_name(payload: dict[str, Any]) -> str:
+    if str(payload.get("method") or "") != "tools/call":
+        return ""
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    return str(params.get("name") or "").strip()
+
+
+def _mcp_proxy_tool_call_arguments(payload: dict[str, Any]) -> dict[str, Any]:
+    params = payload.get("params") if isinstance(payload.get("params"), dict) else {}
+    arguments = params.get("arguments") if isinstance(params.get("arguments"), dict) else {}
+    return arguments
+
+
+def _mcp_proxy_tool_is_notification_wait(tool_name: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(tool_name or "").strip().lower()).strip("_")
+    if not normalized:
+        return False
+    waits = normalized.startswith(("wait_", "watch_")) or normalized in {"wait", "watch"}
+    if not waits:
+        return False
+    return any(
+        term in normalized
+        for term in (
+            "notification",
+            "notifications",
+            "message",
+            "messages",
+            "event",
+            "events",
+            "response",
+            "responses",
+            "inbox",
+            "mailbox",
+            "channel",
+            "channels",
+        )
+    )
+
+
+def _mcp_proxy_wait_timeout_seconds(arguments: dict[str, Any]) -> float:
+    def _float_env(name: str, default: float) -> float:
+        try:
+            return float(str(os.environ.get(name, default)).strip())
+        except Exception:
+            return default
+
+    default_timeout = max(0.0, min(60.0, _float_env("CLAUDE_ANY_MCP_WAIT_DEFAULT_SECONDS", 10.0)))
+    max_timeout = max(1.0, min(120.0, _float_env("CLAUDE_ANY_MCP_WAIT_MAX_SECONDS", 30.0)))
+    value: Any = None
+    scale = 1.0
+    for key in ("timeout_ms", "wait_ms", "poll_ms"):
+        if key in arguments:
+            value = arguments.get(key)
+            scale = 0.001
+            break
+    if value is None:
+        for key in ("timeout_seconds", "wait_seconds"):
+            if key in arguments:
+                value = arguments.get(key)
+                scale = 1.0
+                break
+    if value is None and "timeout" in arguments:
+        value = arguments.get("timeout")
+        scale = 0.001 if isinstance(value, (int, float)) and float(value) > 1000 else 1.0
+    if value is None:
+        return min(default_timeout, max_timeout)
+    try:
+        timeout = float(value) * scale
+    except Exception:
+        timeout = default_timeout
+    return max(0.0, min(max_timeout, timeout))
+
+
+def _mcp_proxy_notification_wait_response(
+    request_id: Any,
+    server_name: str,
+    notifications: list[dict[str, Any]],
+    *,
+    timed_out: bool,
+) -> dict[str, Any]:
+    status = "timeout" if timed_out and not notifications else "ok"
+    body = {
+        "status": status,
+        "source": server_name,
+        "count": len(notifications),
+        "notifications": notifications,
+    }
+    return {
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {
+            "content": [
+                {
+                    "type": "text",
+                    "text": json.dumps(body, ensure_ascii=False, separators=(",", ":"), default=str),
+                }
+            ],
+            "isError": False,
+        },
+    }
+
+
 def _mcp_proxy_drain_input_messages(buffer: bytearray, *, final: bool = False) -> list[dict[str, Any]]:
     messages: list[dict[str, Any]] = []
     while buffer:
@@ -25516,7 +25622,48 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
     stream_stop = threading.Event()
     stream_thread: threading.Thread | None = None
     stream_session_id: str | None = None
+    pending_notifications: list[dict[str, Any]] = []
+    pending_wait_count = 0
+    notification_condition = threading.Condition()
     router_log("INFO", f"mcp_http_proxy_started server={server_name} endpoint={endpoint}")
+
+    def queue_proxy_notification(payload: dict[str, Any], saved: dict[str, Any] | None) -> None:
+        queued = _json_safe_metadata(payload)
+        if saved and saved.get("id") is not None:
+            queued["claude_any_message_id"] = saved.get("id")
+        with notification_condition:
+            pending_notifications.append(queued)
+            if len(pending_notifications) > 200:
+                del pending_notifications[:-200]
+            notification_condition.notify_all()
+
+    def has_pending_notification_wait() -> bool:
+        with notification_condition:
+            return pending_wait_count > 0
+
+    def wait_for_proxy_notifications(payload: dict[str, Any]) -> dict[str, Any]:
+        nonlocal pending_wait_count
+        request_id = payload.get("id")
+        timeout_seconds = _mcp_proxy_wait_timeout_seconds(_mcp_proxy_tool_call_arguments(payload))
+        deadline = time.time() + timeout_seconds
+        with notification_condition:
+            pending_wait_count += 1
+            try:
+                while not pending_notifications:
+                    remaining = deadline - time.time()
+                    if remaining <= 0:
+                        break
+                    notification_condition.wait(timeout=min(1.0, remaining))
+                notifications = list(pending_notifications)
+                pending_notifications.clear()
+            finally:
+                pending_wait_count -= 1
+        timed_out = not notifications
+        router_log(
+            "INFO",
+            f"mcp_http_proxy_wait_resolved server={server_name} request_id={request_id} count={len(notifications)} timed_out={timed_out}",
+        )
+        return _mcp_proxy_notification_wait_response(request_id, server_name, notifications, timed_out=timed_out)
 
     def emit_streamable_sse_message(data_lines: list[str]) -> None:
         if not data_lines:
@@ -25530,6 +25677,16 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
             router_log("WARN", f"mcp_http_proxy_stream_json_failed server={server_name} error={type(exc).__name__}")
             return
         if not isinstance(payload, dict):
+            return
+        if _mcp_proxy_notification_payload(server_name, payload):
+            saved = _mcp_proxy_observe_json_message(server_name, payload, schedule_direct=False)
+            if saved:
+                queue_proxy_notification(payload, saved)
+                pending_wait = has_pending_notification_wait()
+                router_log(
+                    "INFO",
+                    f"mcp_http_proxy_notification_queued server={server_name} message_id={saved.get('id')} pending_wait={pending_wait}",
+                )
             return
         _mcp_proxy_observe_json_message(server_name, payload)
         _mcp_proxy_write_json_response(payload)
@@ -25670,6 +25827,9 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                 elif method == "notifications/initialized":
                     initialized_payload = payload
                 try:
+                    if _mcp_proxy_tool_is_notification_wait(_mcp_proxy_tool_call_name(payload)):
+                        _mcp_proxy_write_json_response(wait_for_proxy_notifications(payload))
+                        continue
                     active_session = current_session_id()
                     if requires_session and method not in {"initialize"} and not active_session:
                         if initialize_payload:
@@ -25732,6 +25892,9 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
         for payload in _mcp_proxy_drain_input_messages(buffer, final=True):
             request_id = payload.get("id")
             try:
+                if _mcp_proxy_tool_is_notification_wait(_mcp_proxy_tool_call_name(payload)):
+                    _mcp_proxy_write_json_response(wait_for_proxy_notifications(payload))
+                    continue
                 result, returned_session = _mcp_proxy_streamable_http_request(endpoint, headers, payload, timeout, protocol_version, current_session_id())
                 if returned_session:
                     set_session_id(returned_session)

@@ -3651,8 +3651,10 @@ class ChannelBridgeTests(unittest.TestCase):
                 self.assertIn(b'"id":1', stdout)
                 self.assertIn(b'"id":2', stdout)
                 self.assertIn(b'"tools"', stdout)
-                self.assertIn(b"notifications/message", stdout)
-                self.assertIn(b"stream notice", stdout)
+                self.assertNotIn(b"stream notice", stdout)
+                chat_log = root / "config" / "chat-messages.jsonl"
+                self.assertTrue(chat_log.exists())
+                self.assertIn("stream notice", chat_log.read_text(encoding="utf-8"))
                 self.assertEqual(["initialize", "notifications/initialized", "tools/list"], [item["method"] for item in seen_posts])
                 self.assertIsNone(seen_posts[0]["session"])
                 self.assertEqual("sess-proxy", seen_posts[1]["session"])
@@ -3660,6 +3662,121 @@ class ChannelBridgeTests(unittest.TestCase):
                 self.assertTrue(seen_gets)
                 self.assertEqual("sess-proxy", seen_gets[0]["session"])
                 self.assertIn("text/event-stream", str(seen_gets[0]["accept"]))
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_mcp_proxy_streamable_http_wait_tool_receives_queued_notification(self):
+        seen_posts: list[str] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                seen_posts.append(str(payload.get("method") or ""))
+                if payload.get("method") == "initialize":
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id"),
+                        "result": {
+                            "protocolVersion": claude_any.MCP_STREAMABLE_HTTP_PROTOCOL_VERSION,
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "streamable-test", "version": "1"},
+                        },
+                    }
+                    data = json.dumps(response).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Mcp-Session-Id", "sess-wait")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                response = {"jsonrpc": "2.0", "id": payload.get("id"), "result": {}}
+                data = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(
+                    b'id: notify-wait\n'
+                    b'event: message\n'
+                    b'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"content":"queued wait notice","room_id":"room_1"}}\n\n'
+                )
+                self.wfile.flush()
+                time.sleep(0.2)
+
+        def frame(payload: dict[str, object]) -> bytes:
+            body = json.dumps(payload).encode("utf-8")
+            return b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+
+        with tempfile.TemporaryDirectory(prefix="ca-mcp-http-wait-test-") as td:
+            root = Path(td)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                config = root / "server.json"
+                config.write_text(
+                    json.dumps({"type": "http", "url": f"http://127.0.0.1:{server.server_address[1]}/mcp"}),
+                    encoding="utf-8",
+                )
+                env = os.environ.copy()
+                env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(claude_any.__file__).resolve()),
+                        "mcp-proxy",
+                        "--server-name",
+                        "fake-http",
+                        "--server-config",
+                        str(config),
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+                assert proc.stdin is not None
+                assert proc.stdout is not None
+                assert proc.stderr is not None
+                proc.stdin.write(frame({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+                proc.stdin.write(frame({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}))
+                proc.stdin.write(
+                    frame(
+                        {
+                            "jsonrpc": "2.0",
+                            "id": 2,
+                            "method": "tools/call",
+                            "params": {"name": "wait_for_notifications", "arguments": {"timeout_ms": 2000}},
+                        }
+                    )
+                )
+                proc.stdin.flush()
+                time.sleep(0.3)
+                proc.stdin.close()
+                stdout = proc.stdout.read()
+                stderr = proc.stderr.read()
+                proc.wait(timeout=10)
+                proc.stdout.close()
+                proc.stderr.close()
+                self.assertEqual(0, proc.returncode, stderr.decode("utf-8", errors="replace"))
+                self.assertIn(b'"id":2', stdout)
+                self.assertIn(b"queued wait notice", stdout)
+                self.assertNotIn("tools/call", seen_posts)
+                chat_log = root / "config" / "chat-messages.jsonl"
+                self.assertTrue(chat_log.exists())
+                self.assertIn("queued wait notice", chat_log.read_text(encoding="utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()
