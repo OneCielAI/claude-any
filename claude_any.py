@@ -3062,11 +3062,45 @@ def _match_available_tool_name(name: str, available: set[str]) -> str | None:
     for candidate in sorted(available):
         if candidate.lower() == low:
             return candidate
+    mcp_key = _mcp_tool_name_server_normalized_key(name)
+    if mcp_key is not None:
+        matches = [
+            candidate
+            for candidate in sorted(available)
+            if _mcp_tool_name_server_normalized_key(candidate) == mcp_key
+        ]
+        if len(matches) == 1:
+            return matches[0]
     for candidate in sorted(available):
         candidate_low = candidate.lower()
         if low and (low in candidate_low or candidate_low in low):
             return candidate
     return None
+
+
+def _mcp_tool_name_server_normalized_key(name: str) -> tuple[str, str] | None:
+    """Return a safe comparison key for MCP tool names.
+
+    Some non-native models rewrite the MCP server segment, e.g.
+    ``mcp__ai-net-http__get_messages`` becomes
+    ``mcp__ai-net_http__get_messages``. Only the server segment is normalized;
+    the tool name segment must still match exactly case-insensitively.
+    """
+    if not isinstance(name, str) or not name.startswith("mcp__"):
+        return None
+    rest = name[5:]
+    if "__" not in rest:
+        return None
+    server_name, tool_name = rest.split("__", 1)
+    if not server_name or not tool_name:
+        return None
+    normalized_server = re.sub(r"[-_]+", "", server_name).lower()
+    return normalized_server, tool_name.lower()
+
+
+def resolve_emitted_tool_name(raw_name: str, source_body: dict[str, Any] | None) -> str:
+    available = tool_names_in_body(source_body or {}) if isinstance(source_body, dict) else set()
+    return _match_available_tool_name(raw_name, available) or _fuzzy_match_tool_name(raw_name) or raw_name
 
 
 def synthetic_tool_use_response(model: str, tool_name: str, tool_input: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -11703,7 +11737,7 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
         if not isinstance(fn, dict) or not fn.get("name"):
             continue
         name = str(fn["name"])
-        matched_name = _fuzzy_match_tool_name(name) or name
+        matched_name = resolve_emitted_tool_name(name, source_body)
         raw_args = fn.get("arguments")
         normalized_args = normalize_tool_arguments(matched_name, raw_args)
         fixed_input = _validate_and_fix_tool_input(matched_name, normalized_args)
@@ -12106,8 +12140,7 @@ def _rebatch_anthropic_sse_text(
         parsed_args = normalize_tool_arguments(raw_name, raw_args)
         if not raw_name:
             raw_name = infer_tool_name_from_args(parsed_args)
-        available = tool_names_in_body(source_body or {}) if isinstance(source_body, dict) else set()
-        matched_name = _match_available_tool_name(raw_name, available) or _fuzzy_match_tool_name(raw_name) or raw_name
+        matched_name = resolve_emitted_tool_name(raw_name, source_body)
         if not matched_name:
             matched_name = infer_tool_name_from_args(parsed_args)
         fixed_input = _validate_and_fix_tool_input(matched_name, parsed_args)
@@ -12595,7 +12628,7 @@ def _ollama_stream_to_anthropic_sse(
                 if not isinstance(fn, dict) or not fn.get("name"):
                     continue
                 raw_name = str(fn["name"])
-                matched_name = _fuzzy_match_tool_name(raw_name) or raw_name
+                matched_name = resolve_emitted_tool_name(raw_name, source_body)
                 raw_args = fn.get("arguments")
                 normalized_args = normalize_tool_arguments(matched_name, raw_args)
                 fixed_input = _validate_and_fix_tool_input(matched_name, normalized_args)
@@ -13377,7 +13410,7 @@ def stream_openai_chat_to_anthropic_sse(
             raw_name = str(fragment.get("name") or "")
             if not raw_name:
                 continue
-            matched_name = _fuzzy_match_tool_name(raw_name) or raw_name
+            matched_name = resolve_emitted_tool_name(raw_name, source_body)
             normalized_args = normalize_tool_arguments(matched_name, fragment.get("arguments") or {})
             fixed_input = _validate_and_fix_tool_input(matched_name, normalized_args)
             if source_body is not None:
