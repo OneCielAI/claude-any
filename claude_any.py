@@ -22048,7 +22048,6 @@ def should_append_compat_prompt(provider: str, cfg: dict[str, Any]) -> bool:
 
 
 _CLAUDE_PERMISSION_MODE_SUPPORT_CACHE: dict[str, bool] = {}
-_CLAUDE_STRICT_MCP_CONFIG_SUPPORT_CACHE: dict[str, bool] = {}
 
 
 def claude_supports_permission_mode_arg(claude: str) -> bool:
@@ -22070,27 +22069,6 @@ def claude_supports_permission_mode_arg(claude: str) -> bool:
     except Exception:
         supported = False
     _CLAUDE_PERMISSION_MODE_SUPPORT_CACHE[cache_key] = supported
-    return supported
-
-
-def claude_supports_strict_mcp_config_arg(claude: str) -> bool:
-    cache_key = str(claude or "")
-    if cache_key in _CLAUDE_STRICT_MCP_CONFIG_SUPPORT_CACHE:
-        return _CLAUDE_STRICT_MCP_CONFIG_SUPPORT_CACHE[cache_key]
-    supported = False
-    try:
-        proc = subprocess.run(
-            [claude, "--help"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=5,
-            check=False,
-        )
-        supported = "--strict-mcp-config" in (proc.stdout or "")
-    except Exception:
-        supported = False
-    _CLAUDE_STRICT_MCP_CONFIG_SUPPORT_CACHE[cache_key] = supported
     return supported
 
 
@@ -26223,12 +26201,6 @@ def launch_claude(
         claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
     if mcp_config_paths:
         extra_args.extend(["--mcp-config", *mcp_config_paths])
-        if (
-            claude_supports_strict_mcp_config_arg(claude)
-            and not has_passthrough_option([*extra_args, *claude_passthrough], "--strict-mcp-config")
-        ):
-            extra_args.append("--strict-mcp-config")
-            router_log("INFO", "mcp_strict_config_enabled source=generated")
     if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
         extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
     extra_args.extend(
