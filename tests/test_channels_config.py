@@ -291,6 +291,45 @@ class ChannelConfigTests(unittest.TestCase):
             self.assertEqual("http://example.test/mcp", saved_server["url"])
             self.assertTrue(saved_server["claude_any_mcp_proxy"])
 
+    def test_mcp_proxy_config_wraps_router_owned_streamable_http_without_notification_stream(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp_config = root / "mcp.json"
+            proxy_config = root / "mcp-proxy.json"
+            mcp_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "team-channel": {
+                                "type": "http",
+                                "url": "http://example.test/mcp",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "CONFIG_DIR", root), mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config):
+                written = claude_any.write_mcp_proxy_config(
+                    ["--mcp-config", str(mcp_config)],
+                    force_proxy_server_names={"team-channel"},
+                    disable_proxy_notification_stream_names={"team-channel"},
+                    cwd=root,
+                    home=root,
+                )
+
+            self.assertEqual(proxy_config, written)
+            data = json.loads(proxy_config.read_text(encoding="utf-8"))
+            wrapped = data["mcpServers"]["team-channel"]
+            self.assertEqual(claude_any.sys.executable, wrapped["command"])
+            self.assertIn("mcp-proxy", wrapped["args"])
+            server_config_path = Path(wrapped["args"][wrapped["args"].index("--server-config") + 1])
+            saved_server = json.loads(server_config_path.read_text(encoding="utf-8"))
+            self.assertEqual("http", saved_server["type"])
+            self.assertEqual("http://example.test/mcp", saved_server["url"])
+            self.assertTrue(saved_server["claude_any_disable_notification_stream"])
+            self.assertTrue(claude_any._mcp_server_disable_proxy_notification_stream(saved_server))
+
     def test_web_fetch_mcp_config_marks_jsonl_stdio(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -539,6 +578,8 @@ class ChannelConfigTests(unittest.TestCase):
         write_channel.assert_called_once()
         auto_start.assert_not_called()
         self.assertEqual([channel_path, source_path], write_proxy.call_args.kwargs["extra_config_paths"])
+        self.assertEqual({"claude-any-router", "ai-net-sse"}, write_proxy.call_args.kwargs["force_proxy_server_names"])
+        self.assertEqual({"claude-any-router", "ai-net-sse"}, write_proxy.call_args.kwargs["disable_proxy_notification_stream_names"])
         launch_cmd = call.call_args.args[0]
         self.assertIn(str(proxy_path), launch_cmd)
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)

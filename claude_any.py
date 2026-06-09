@@ -14985,6 +14985,18 @@ def _mcp_server_force_proxy(server: dict[str, Any]) -> bool:
     )
 
 
+def _mcp_server_disable_proxy_notification_stream(server: dict[str, Any]) -> bool:
+    if not isinstance(server, dict):
+        return False
+    return parse_bool(
+        server.get(
+            "claude_any_disable_notification_stream",
+            server.get("claude_any_disable_mcp_notifications", False),
+        ),
+        False,
+    )
+
+
 def _channel_probe_strategy_for(server: dict[str, Any]) -> str:
     """How to frame the initialize request we send to this stdio server.
 
@@ -22339,10 +22351,14 @@ def write_mcp_proxy_config(
     passthrough: list[str],
     *,
     extra_config_paths: list[Path | str] | None = None,
+    force_proxy_server_names: set[str] | None = None,
+    disable_proxy_notification_stream_names: set[str] | None = None,
     cwd: Path | None = None,
     home: Path | None = None,
 ) -> Path | None:
     cwd = cwd or Path.cwd()
+    force_proxy_server_names = set(force_proxy_server_names or set())
+    disable_proxy_notification_stream_names = set(disable_proxy_notification_stream_names or set())
     extra = [Path(item).expanduser() for item in (extra_config_paths or [])]
     paths = [*extra, *claude_mcp_config_paths(passthrough, cwd, home)]
     servers: dict[str, Any] = {}
@@ -22355,10 +22371,15 @@ def write_mcp_proxy_config(
             if name in seen:
                 continue
             seen.add(name)
-            if _mcp_server_is_stdio(server) or (_mcp_server_is_streamable_http(server) and _mcp_server_force_proxy(server)):
+            streamable_http = _mcp_server_is_streamable_http(server)
+            force_streamable_proxy = streamable_http and (name in force_proxy_server_names or _mcp_server_force_proxy(server))
+            if _mcp_server_is_stdio(server) or force_streamable_proxy:
                 server_dir.mkdir(parents=True, exist_ok=True)
                 server_path = server_dir / f"{_safe_mcp_proxy_name(name)}.json"
-                server_path.write_text(json.dumps(server, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                saved_server = dict(server)
+                if streamable_http and name in disable_proxy_notification_stream_names:
+                    saved_server["claude_any_disable_notification_stream"] = True
+                server_path.write_text(json.dumps(saved_server, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 try:
                     os.chmod(server_path, 0o600)
                 except Exception:
@@ -25205,6 +25226,7 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
     protocol_version = str(server.get("mcp_protocol_version") or server.get("protocolVersion") or server.get("protocol_version") or MCP_STREAMABLE_HTTP_PROTOCOL_VERSION)
     timeout = max(5.0, min(120.0, float(server.get("mcp_timeout_seconds") or server.get("timeout") or 20.0)))
     requires_session = parse_bool(server.get("streamable_requires_session", server.get("require_session", server.get("mcp_session_required", True))), True)
+    notification_stream_enabled = not _mcp_server_disable_proxy_notification_stream(server)
     session_id: str | None = None
     initialize_payload: dict[str, Any] | None = None
     initialized_payload: dict[str, Any] | None = None
@@ -25296,6 +25318,8 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
 
     def start_stream_if_needed() -> None:
         nonlocal stream_thread, stream_session_id
+        if not notification_stream_enabled:
+            return
         with session_lock:
             current_session = session_id
         if not current_session:
@@ -26127,11 +26151,13 @@ def launch_claude(
         if native_mcp_config:
             native_direct_mcp_config_paths = [str(native_mcp_config)]
     detected_channel_specs: list[str] = []
+    detected_channel_capable_names: list[str] = []
     channel_probe_source_paths: list[Path] = []
     if stdin_channel_proxy or native_channel_bridge or llm_channel_delivery:
         try:
             ensure_channel_probe_cache_for_launch(cfg, launch_passthrough)
             capable_names = cached_channel_capable_server_names()
+            detected_channel_capable_names = list(capable_names)
             detected_channel_specs = [f"server:{name}" for name in capable_names]
             channel_launch_specs = channel_specs_for_launch(cfg, launch_passthrough, detected_channel_specs)
             channel_probe_source_paths = cached_channel_source_paths_for_specs(channel_launch_specs)
@@ -26164,6 +26190,8 @@ def launch_claude(
         proxy_config = write_mcp_proxy_config(
             launch_passthrough,
             extra_config_paths=[Path(path) for path in mcp_config_paths],
+            force_proxy_server_names=set(detected_channel_capable_names) if (stdin_channel_proxy or llm_channel_delivery) else None,
+            disable_proxy_notification_stream_names=set(detected_channel_capable_names) if (stdin_channel_proxy or llm_channel_delivery) else None,
         )
         if proxy_config:
             mcp_config_paths = [str(proxy_config)]
