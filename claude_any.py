@@ -25121,11 +25121,13 @@ def _mcp_proxy_observe_json_message(server_name: str, payload: Any) -> None:
         )
         return
     try:
+        chat_payload = _mark_channel_payload_direct_llm_pending(chat_payload)
         saved = append_chat_message(chat_payload)
         router_log(
             "INFO",
             f"mcp_proxy_notification server={server_name} method={payload.get('method')} message_id={saved.get('id')}",
         )
+        schedule_channel_direct_llm_delivery(saved)
     except Exception as exc:
         router_log("WARN", f"mcp_proxy_notification_failed server={server_name} error={type(exc).__name__}: {exc}")
 

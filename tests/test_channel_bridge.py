@@ -3278,6 +3278,38 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual("notifications/message", payload["meta"]["mcp_method"])
         self.assertEqual("wake from server", payload["meta"]["mcp_json"]["params"]["data"]["payload"]["message"]["content"])
 
+    def test_mcp_proxy_observer_marks_direct_pending_and_schedules_background_delivery(self):
+        captured: list[dict[str, object]] = []
+        message = {
+            "jsonrpc": "2.0",
+            "method": "notifications/message",
+            "params": {"content": "wake from proxy mcp", "room_id": "room_phase1sim", "sender_id": "robert"},
+        }
+
+        def fake_append(payload):
+            captured.append(payload)
+            saved = dict(payload)
+            saved["id"] = 23
+            return saved
+
+        claude_any._MCP_NOTIFICATION_DEDUP_RECENT.clear()
+        try:
+            with (
+                mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+                mock.patch.object(claude_any, "append_chat_message", side_effect=fake_append),
+                mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery") as schedule,
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                claude_any._mcp_proxy_observe_json_message("ai-net-http", message)
+        finally:
+            claude_any._MCP_NOTIFICATION_DEDUP_RECENT.clear()
+
+        self.assertEqual(1, len(captured))
+        self.assertTrue(captured[0]["meta"]["llm_direct_pending"])
+        schedule.assert_called_once()
+        self.assertEqual(23, schedule.call_args.args[0]["id"])
+        self.assertTrue(schedule.call_args.args[0]["meta"]["llm_direct_pending"])
+
     def test_mcp_proxy_observer_deduplicates_generic_and_native_channel_notifications(self):
         generic = {
             "jsonrpc": "2.0",
@@ -3293,6 +3325,7 @@ class ChannelBridgeTests(unittest.TestCase):
         try:
             with (
                 mock.patch.object(claude_any, "append_chat_message", return_value={"id": 21}) as append,
+                mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery"),
                 mock.patch.object(claude_any, "router_log") as router_log,
             ):
                 claude_any._mcp_proxy_observe_json_message("ai-net", generic)
@@ -3311,7 +3344,10 @@ class ChannelBridgeTests(unittest.TestCase):
         }
         claude_any._MCP_NOTIFICATION_DEDUP_RECENT.clear()
         try:
-            with mock.patch.object(claude_any, "append_chat_message", return_value={"id": 22}) as append:
+            with (
+                mock.patch.object(claude_any, "append_chat_message", return_value={"id": 22}) as append,
+                mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery"),
+            ):
                 claude_any._mcp_proxy_observe_json_message("ai-net", message)
                 claude_any._mcp_proxy_observe_json_message("ai-net", message)
             self.assertEqual(2, append.call_count)
@@ -3334,7 +3370,10 @@ class ChannelBridgeTests(unittest.TestCase):
             ensure_ascii=False,
         ).encode("utf-8")
         frame = f"Content-Length: {len(body)}\r\n\r\n".encode("ascii") + body
-        with mock.patch.object(claude_any, "append_chat_message", return_value={"id": 11}) as append:
+        with (
+            mock.patch.object(claude_any, "append_chat_message", return_value={"id": 11}) as append,
+            mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery"),
+        ):
             observer = claude_any._McpStdoutObserver("ai-net")
             observer.feed(frame[:10])
             observer.feed(frame[10:])
