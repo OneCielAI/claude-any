@@ -140,6 +140,7 @@ LAUNCH_STATE_PATH = CONFIG_DIR / "launch-state.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
+NATIVE_MCP_CONFIG = CONFIG_DIR / "native-mcp.json"
 CHANNEL_MCP_CURSOR_PATH = CONFIG_DIR / "channel-mcp-cursor.json"
 CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
 CHANNEL_LLM_SUMMARY_QUEUE_PATH = CONFIG_DIR / "channel-llm-summary-queue.jsonl"
@@ -15786,6 +15787,44 @@ def existing_claude_mcp_config_paths(
     ]
 
 
+def discovered_claude_mcp_servers(
+    passthrough: list[str] | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+) -> dict[str, dict[str, Any]]:
+    cwd = cwd or Path.cwd()
+    servers: dict[str, dict[str, Any]] = {}
+    for path in existing_claude_mcp_config_paths(passthrough, cwd, home):
+        for name, server in _read_mcp_servers_from_json(path, cwd):
+            servers.setdefault(name, server)
+    return servers
+
+
+def write_native_mcp_config_from_discovery(
+    passthrough: list[str] | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+) -> Path | None:
+    """Write a Claude Code --mcp-config compatible file for native launches.
+
+    Discovery may read files that are not directly valid --mcp-config inputs
+    (notably ~/.claude/settings.json and project-scoped ~/.claude.json).  Claude
+    Code expects a top-level mcpServers record, so native launches receive this
+    normalized generated file instead of the source files.
+    """
+    servers = discovered_claude_mcp_servers(passthrough, cwd, home)
+    if not servers:
+        return None
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    NATIVE_MCP_CONFIG.write_text(json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(NATIVE_MCP_CONFIG, 0o600)
+    except Exception:
+        pass
+    router_log("INFO", f"native_mcp_config_written servers={','.join(sorted(servers))}")
+    return NATIVE_MCP_CONFIG
+
+
 def auto_discovered_mcp_channel_specs(
     passthrough: list[str] | None = None,
     cwd: Path | None = None,
@@ -25970,9 +26009,9 @@ def launch_claude(
         mcp_config_paths.append(str(write_channel_mcp_config()))
     native_direct_mcp_config_paths: list[str] = []
     if use_native_anthropic and not native_channel_bridge:
-        native_direct_mcp_config_paths = [
-            str(path) for path in existing_claude_mcp_config_paths(launch_passthrough)
-        ]
+        native_mcp_config = write_native_mcp_config_from_discovery(launch_passthrough)
+        if native_mcp_config:
+            native_direct_mcp_config_paths = [str(native_mcp_config)]
     detected_channel_specs: list[str] = []
     channel_probe_source_paths: list[Path] = []
     if stdin_channel_proxy or native_channel_bridge or llm_channel_delivery:

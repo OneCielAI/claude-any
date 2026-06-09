@@ -117,6 +117,35 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertIn(settings, paths)
         self.assertFalse(any(path.name == ".claude.json" for path in paths))
 
+    def test_native_mcp_config_writer_normalizes_discovered_sources(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "work"
+            project.mkdir()
+            config_dir = root / "config"
+            project_mcp = project / ".mcp.json"
+            settings = root / ".claude" / "settings.json"
+            claude_json = root / ".claude.json"
+            settings.parent.mkdir()
+            project_mcp.write_text(json.dumps({"mcpServers": {"project": {"command": "node"}}}), encoding="utf-8")
+            settings.write_text(json.dumps({"permissions": {}, "mcpServers": {"settings": {"command": "python"}}}), encoding="utf-8")
+            claude_json.write_text(
+                json.dumps({"projects": {str(project): {"mcpServers": {"scoped": {"type": "http", "url": "http://example.test/mcp"}}}}}),
+                encoding="utf-8",
+            )
+            native_config = config_dir / "native-mcp.json"
+
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", config_dir),
+                mock.patch.object(claude_any, "NATIVE_MCP_CONFIG", native_config),
+            ):
+                written = claude_any.write_native_mcp_config_from_discovery([], cwd=project, home=root)
+                data = json.loads(native_config.read_text(encoding="utf-8"))
+
+            self.assertEqual(native_config, written)
+        self.assertEqual({"project", "settings", "scoped"}, set(data["mcpServers"]))
+        self.assertNotIn("permissions", data)
+
     def test_auto_starts_sse_servers_from_mcp_config(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -667,9 +696,9 @@ class ChannelConfigTests(unittest.TestCase):
         cfg = {"providers": {"anthropic": {}}, "claude_code": {"channel_delivery": "llm"}}
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
-            project_mcp = root / "project.mcp.json"
+            native_mcp = root / "native-mcp.json"
             explicit_mcp = root / "explicit.mcp.json"
-            project_mcp.write_text(json.dumps({"mcpServers": {"project": {"command": "node"}}}), encoding="utf-8")
+            native_mcp.write_text(json.dumps({"mcpServers": {"project": {"command": "node"}}}), encoding="utf-8")
             explicit_mcp.write_text(json.dumps({"mcpServers": {"explicit": {"command": "node"}}}), encoding="utf-8")
             with ExitStack() as stack:
                 stack.enter_context(mock.patch.object(claude_any, "run_prelaunch_menu", return_value=0))
@@ -688,20 +717,19 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
                 stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
-                existing = stack.enter_context(
-                    mock.patch.object(claude_any, "existing_claude_mcp_config_paths", return_value=[project_mcp, explicit_mcp])
+                write_native = stack.enter_context(
+                    mock.patch.object(claude_any, "write_native_mcp_config_from_discovery", return_value=native_mcp)
                 )
                 call = stack.enter_context(mock.patch.object(claude_any.subprocess, "call", return_value=0))
                 rc = claude_any.launch_claude(["--mcp-config", str(explicit_mcp), "--verbose"])
 
         self.assertEqual(0, rc)
         start_router.assert_not_called()
-        existing.assert_called_once()
+        write_native.assert_called_once()
         launch_cmd = call.call_args.args[0]
         self.assertIn("--mcp-config", launch_cmd)
-        self.assertIn(str(project_mcp), launch_cmd)
-        self.assertIn(str(explicit_mcp), launch_cmd)
-        self.assertEqual(1, launch_cmd.count(str(explicit_mcp)))
+        self.assertIn(str(native_mcp), launch_cmd)
+        self.assertNotIn(str(explicit_mcp), launch_cmd)
         self.assertIn("--verbose", launch_cmd)
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
         launch_env = call.call_args.kwargs["env"]
