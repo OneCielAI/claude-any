@@ -19875,16 +19875,52 @@ def stop_router_if_no_active_clients(reason: str, quiet: bool = True) -> bool:
         return False
 
 
+def router_client_supervisor_interval_seconds() -> float:
+    raw = os.environ.get("CLAUDE_ANY_ROUTER_SUPERVISOR_SECONDS", "2")
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = 2.0
+    return max(0.5, min(30.0, value))
+
+
+def ensure_managed_router_running_for_client() -> bool:
+    if router_up():
+        return True
+    router_log("WARN", f"router_lifetime_restart reason=router_down_active_client base={ROUTER_BASE}")
+    try:
+        return bool(start_router_if_needed())
+    except Exception as exc:
+        router_log("ERROR", f"router_lifetime_restart_failed error={type(exc).__name__}: {exc}")
+        return False
+
+
+def start_router_client_supervisor(stop_event: threading.Event) -> threading.Thread:
+    def watch() -> None:
+        interval = router_client_supervisor_interval_seconds()
+        while not stop_event.wait(interval):
+            ensure_managed_router_running_for_client()
+
+    thread = threading.Thread(target=watch, daemon=True, name="ca-router-client-supervisor")
+    thread.start()
+    return thread
+
+
 def run_with_router_lifetime(runner: Callable[[], int], manage_router: bool) -> int:
     client_path: Path | None = None
+    supervisor_stop: threading.Event | None = None
     if manage_router:
         try:
             client_path = register_router_client()
+            supervisor_stop = threading.Event()
+            start_router_client_supervisor(supervisor_stop)
         except Exception as exc:
             router_log("WARN", f"router_client_register_failed error={type(exc).__name__}: {exc}")
     try:
         return runner()
     finally:
+        if supervisor_stop is not None:
+            supervisor_stop.set()
         if manage_router:
             release_router_client(client_path)
             stop_router_if_no_active_clients("claude_exit", quiet=True)

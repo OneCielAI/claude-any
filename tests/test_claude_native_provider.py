@@ -922,6 +922,39 @@ class RouterLifetimeTests(unittest.TestCase):
         register.assert_not_called()
         stop.assert_not_called()
 
+    def test_router_client_supervisor_restarts_when_router_disappears(self):
+        with (
+            mock.patch.object(claude_any, "router_up", return_value=False),
+            mock.patch.object(claude_any, "start_router_if_needed", return_value=True) as start,
+            mock.patch.object(claude_any, "router_log") as log,
+        ):
+            self.assertTrue(claude_any.ensure_managed_router_running_for_client())
+
+        start.assert_called_once()
+        self.assertTrue(any("router_down_active_client" in call.args[1] for call in log.call_args_list))
+
+    def test_runner_starts_and_stops_router_supervisor(self):
+        supervisor_events = []
+
+        def fake_supervisor(stop_event):
+            supervisor_events.append(stop_event)
+            return mock.Mock()
+
+        with (
+            mock.patch.object(claude_any, "register_router_client", return_value=Path("client.json")) as register,
+            mock.patch.object(claude_any, "release_router_client") as release,
+            mock.patch.object(claude_any, "stop_router_if_no_active_clients", return_value=True),
+            mock.patch.object(claude_any, "start_router_client_supervisor", side_effect=fake_supervisor) as supervisor,
+        ):
+            rc = claude_any.run_with_router_lifetime(lambda: 11, manage_router=True)
+
+        self.assertEqual(11, rc)
+        register.assert_called_once()
+        supervisor.assert_called_once()
+        release.assert_called_once_with(Path("client.json"))
+        self.assertEqual(1, len(supervisor_events))
+        self.assertTrue(supervisor_events[0].is_set())
+
 
 class CleanupNativeRouterTests(unittest.TestCase):
     def test_native_bypasses_managed_services_toggle_but_only_idle_router(self):
