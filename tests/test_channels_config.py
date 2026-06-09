@@ -160,7 +160,7 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertEqual("mcp-ai-net", start.call_args.args[0]["name"])
         self.assertEqual("http://example.test/sse", start.call_args.args[0]["url"])
 
-    def test_auto_start_delegates_streamable_http_servers_to_claude_code(self):
+    def test_auto_starts_streamable_http_servers_from_mcp_config(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             mcp_config = root / "mcp.json"
@@ -180,8 +180,13 @@ class ChannelConfigTests(unittest.TestCase):
             )
             with mock.patch.object(claude_any, "start_channel_sse_connection", return_value={"name": "mcp-ai-net-http"}) as start:
                 started = claude_any.auto_start_sse_channels_from_mcp_configs(["--mcp-config", str(mcp_config)], cwd=root, home=root)
-        self.assertEqual([], started)
-        start.assert_not_called()
+        self.assertEqual([{"name": "mcp-ai-net-http"}], started)
+        config = start.call_args.args[0]
+        self.assertEqual("mcp-ai-net-http", config["name"])
+        self.assertEqual("http://example.test/mcp", config["url"])
+        self.assertEqual("http", config["type"])
+        self.assertEqual("streamable-http", config["transport"])
+        self.assertEqual({"Authorization": "Bearer test"}, config["headers"])
 
     def test_external_mcp_channel_names_include_sse_and_streamable_http(self):
         with tempfile.TemporaryDirectory() as td:
@@ -272,7 +277,7 @@ class ChannelConfigTests(unittest.TestCase):
             self.assertEqual("http://example.test/mcp", preserved["url"])
             self.assertNotIn("command", preserved)
 
-    def test_mcp_proxy_config_preserves_streamable_http_server_even_when_forced(self):
+    def test_mcp_proxy_config_wraps_streamable_http_server_when_forced(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             mcp_config = root / "mcp.json"
@@ -296,11 +301,15 @@ class ChannelConfigTests(unittest.TestCase):
 
             self.assertEqual(proxy_config, written)
             data = json.loads(proxy_config.read_text(encoding="utf-8"))
-            preserved = data["mcpServers"]["ai-net-http"]
-            self.assertEqual("http", preserved["type"])
-            self.assertEqual("http://example.test/mcp", preserved["url"])
-            self.assertTrue(preserved["claude_any_mcp_proxy"])
-            self.assertNotIn("command", preserved)
+            wrapped = data["mcpServers"]["ai-net-http"]
+            self.assertEqual(claude_any.sys.executable, wrapped["command"])
+            self.assertIn("mcp-proxy", wrapped["args"])
+            self.assertNotIn("type", wrapped)
+            server_config_path = Path(wrapped["args"][wrapped["args"].index("--server-config") + 1])
+            saved_server = json.loads(server_config_path.read_text(encoding="utf-8"))
+            self.assertEqual("http", saved_server["type"])
+            self.assertEqual("http://example.test/mcp", saved_server["url"])
+            self.assertTrue(saved_server["claude_any_mcp_proxy"])
 
     def test_web_fetch_mcp_config_marks_jsonl_stdio(self):
         with tempfile.TemporaryDirectory() as td:
@@ -553,8 +562,8 @@ class ChannelConfigTests(unittest.TestCase):
         write_channel.assert_called_once()
         auto_start.assert_not_called()
         self.assertEqual([channel_path, source_path], write_proxy.call_args.kwargs["extra_config_paths"])
-        self.assertNotIn("force_proxy_server_names", write_proxy.call_args.kwargs)
-        self.assertNotIn("disable_proxy_notification_stream_names", write_proxy.call_args.kwargs)
+        self.assertEqual({"claude-any-router", "ai-net-sse"}, write_proxy.call_args.kwargs["force_proxy_server_names"])
+        self.assertEqual({"claude-any-router", "ai-net-sse"}, write_proxy.call_args.kwargs["disable_proxy_notification_stream_names"])
         launch_cmd = call.call_args.args[0]
         self.assertIn(str(proxy_path), launch_cmd)
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
@@ -1162,16 +1171,15 @@ class ChannelProbeCacheTests(unittest.TestCase):
         self.assertIn("claude-any-router", names)
         self.assertIn("ai-net", names)
         self.assertIn("sse-only", names)
-        # Non-router stdio server is probed via stdio. SSE/HTTP transports
-        # are delegated to Claude Code native development channels.
+        # Non-router stdio server is probed via stdio, sse-only via SSE.
         self.assertEqual(1, stdio_probe.call_count)
-        self.assertEqual(0, sse_probe.call_count)
+        self.assertEqual(1, sse_probe.call_count)
         ai_net_record = next(r for r in records if r["name"] == "ai-net")
         self.assertTrue(ai_net_record["capable"])
         self.assertEqual("capable", ai_net_record["reason"])
         sse_record = next(r for r in records if r["name"] == "sse-only")
         self.assertTrue(sse_record["capable"])
-        self.assertEqual("native_channel_delegated", sse_record["reason"])
+        self.assertEqual("capable", sse_record["reason"])
 
     def test_refresh_writes_cache_with_capable_server(self):
         with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
@@ -1352,7 +1360,7 @@ class ChannelProbeDetailedReasonTests(unittest.TestCase):
         self.assertEqual(15000, slow["elapsed_ms"])
         self.assertFalse(slow["response_received"])
 
-    def test_http_transport_is_delegated_to_native_channel(self):
+    def test_http_transport_is_probed_as_streamable_http(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             mcp_config = root / ".mcp.json"
@@ -1384,8 +1392,8 @@ class ChannelProbeDetailedReasonTests(unittest.TestCase):
         http_record = next(r for r in records if r["name"] == "ai-net-http")
         self.assertEqual("streamable-http", http_record["transport"])
         self.assertTrue(http_record["capable"])
-        self.assertEqual("native_channel_delegated", http_record["reason"])
-        probe.assert_not_called()
+        self.assertEqual("capable", http_record["reason"])
+        probe.assert_called_once()
 
 
 class ChannelProbeStdioStrategyTests(unittest.TestCase):

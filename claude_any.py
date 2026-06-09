@@ -15950,11 +15950,10 @@ def _probe_mcp_servers_to_records(
             probe_fn: Callable[..., dict[str, Any]] | None = None
             if _mcp_server_is_stdio(server):
                 probe_fn = probe_stdio_mcp_for_channel_capability_detailed
-            elif transport in {"sse", "streamable-http"} and isinstance(server.get("url"), str):
-                record["capable"] = True
-                record["reason"] = "native_channel_delegated"
-                records.append(record)
-                continue
+            elif transport == "sse" and isinstance(server.get("url"), str):
+                probe_fn = probe_sse_mcp_for_channel_capability_detailed
+            elif transport == "streamable-http" and isinstance(server.get("url"), str):
+                probe_fn = probe_streamable_http_mcp_for_channel_capability_detailed
             else:
                 record["reason"] = "transport_not_probed"
                 records.append(record)
@@ -16372,9 +16371,6 @@ def auto_start_sse_channels_from_mcp_configs(
         if not path.exists() or not path.is_file():
             continue
         for server in _read_mcp_sse_servers_from_json(path, cwd):
-            if str(server.get("transport") or "").strip().lower() == "streamable-http":
-                router_log("INFO", f"channel_streamable_http_native_delegated name={server.get('channel') or server.get('name')}")
-                continue
             public_name = _channel_sse_public_mcp_name(str(server.get("name") or ""))
             if allowed is not None and public_name not in allowed:
                 continue
@@ -22421,10 +22417,14 @@ def write_mcp_proxy_config(
     passthrough: list[str],
     *,
     extra_config_paths: list[Path | str] | None = None,
+    force_proxy_server_names: set[str] | None = None,
+    disable_proxy_notification_stream_names: set[str] | None = None,
     cwd: Path | None = None,
     home: Path | None = None,
 ) -> Path | None:
     cwd = cwd or Path.cwd()
+    force_proxy_server_names = set(force_proxy_server_names or set())
+    disable_proxy_notification_stream_names = set(disable_proxy_notification_stream_names or set())
     extra = [Path(item).expanduser() for item in (extra_config_paths or [])]
     paths = [*extra, *claude_mcp_config_paths(passthrough, cwd, home)]
     servers: dict[str, Any] = {}
@@ -22437,10 +22437,14 @@ def write_mcp_proxy_config(
             if name in seen:
                 continue
             seen.add(name)
-            if _mcp_server_is_stdio(server):
+            streamable_http = _mcp_server_is_streamable_http(server)
+            force_streamable_proxy = streamable_http and (name in force_proxy_server_names or _mcp_server_force_proxy(server))
+            if _mcp_server_is_stdio(server) or force_streamable_proxy:
                 server_dir.mkdir(parents=True, exist_ok=True)
                 server_path = server_dir / f"{_safe_mcp_proxy_name(name)}.json"
                 saved_server = dict(server)
+                if streamable_http and name in disable_proxy_notification_stream_names:
+                    saved_server["claude_any_disable_notification_stream"] = True
                 server_path.write_text(json.dumps(saved_server, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 try:
                     os.chmod(server_path, 0o600)
@@ -26119,8 +26123,11 @@ def launch_claude(
     env["PATH"] = path_with_claude_any_user_dirs(env)
     launch_env = env_vars(cfg)
     launch_passthrough = normalize_channel_passthrough(passthrough)
+    native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
+    stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg)
+    llm_channel_delivery = should_use_channel_llm_delivery(use_router_mode, launch_passthrough, cfg)
     native_auto_channel_specs: list[str] = []
-    if not native_channel_passthrough_requested(launch_passthrough):
+    if use_native_anthropic and not native_channel_bridge and not native_channel_passthrough_requested(launch_passthrough):
         try:
             auto_channel_names = external_mcp_channel_server_names_from_configs(launch_passthrough)
             native_auto_channel_specs = [f"server:{name}" for name in auto_channel_names]
@@ -26131,9 +26138,6 @@ def launch_claude(
                 )
         except Exception as exc:
             router_log("WARN", f"channel_native_auto_probe_failed error={type(exc).__name__}: {exc}")
-    native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
-    stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg) and not native_auto_channel_specs
-    llm_channel_delivery = should_use_channel_llm_delivery(use_router_mode, launch_passthrough, cfg) and not native_auto_channel_specs
     manage_router_lifetime = False
     if use_router_mode or llm_channel_delivery:
         manage_router_lifetime = bool(start_router_if_needed())
@@ -26218,11 +26222,13 @@ def launch_claude(
         if native_mcp_config:
             native_direct_mcp_config_paths = [str(native_mcp_config)]
     detected_channel_specs: list[str] = []
+    detected_channel_capable_names: list[str] = []
     channel_probe_source_paths: list[Path] = []
     if stdin_channel_proxy or llm_channel_delivery:
         try:
             ensure_channel_probe_cache_for_launch(cfg, launch_passthrough)
             capable_names = cached_channel_capable_server_names()
+            detected_channel_capable_names = list(capable_names)
             detected_channel_specs = [f"server:{name}" for name in capable_names]
             channel_launch_specs = channel_specs_for_launch(cfg, launch_passthrough, detected_channel_specs)
             channel_probe_source_paths = cached_channel_source_paths_for_specs(channel_launch_specs)
@@ -26259,6 +26265,8 @@ def launch_claude(
         proxy_config = write_mcp_proxy_config(
             launch_passthrough,
             extra_config_paths=[Path(path) for path in mcp_config_paths],
+            force_proxy_server_names=set(detected_channel_capable_names) if (stdin_channel_proxy or llm_channel_delivery) else None,
+            disable_proxy_notification_stream_names=set(detected_channel_capable_names) if (stdin_channel_proxy or llm_channel_delivery) else None,
         )
         if proxy_config:
             mcp_config_paths = [str(proxy_config)]

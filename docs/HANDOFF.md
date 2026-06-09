@@ -160,21 +160,19 @@ Behavior:
 
 ### 0.1.105 follow-up
 
-Reduced claude-any's MCP transport ownership for HTTP/SSE channel servers.
-
 Behavior:
 
-- MCP config entries with `type: "sse"`, `type: "http"`, or `type: "streamable-http"` are treated as Claude Code native development-channel servers.
-- claude-any auto-adds `--dangerously-load-development-channels server:<mcp-server-name>` for those entries when no explicit channel passthrough was supplied.
-- claude-any no longer wraps Streamable HTTP MCP servers into its own `mcp-proxy` command, even when `claude_any_mcp_proxy` is set.
-- Channel probing no longer opens SSE or Streamable HTTP network sessions; those transports are recorded as `native_channel_delegated`.
+- In Claude Native mode, MCP config entries with `type: "sse"`, `type: "http"`, or `type: "streamable-http"` are passed to Claude Code and claude-any auto-adds `--dangerously-load-development-channels server:<mcp-server-name>` when no explicit channel passthrough was supplied.
+- In routed/non-native modes, claude-any owns external channel delivery again: SSE and Streamable HTTP MCP channel servers are probed and started by the claude-any router channel workers.
+- Router-owned Streamable HTTP channels keep their own initialize/Mcp-Session-Id state, GET notification stream, Last-Event-ID resume, reconnect, and session-not-found reinitialize handling.
+- When a router-owned Streamable HTTP server is also exposed to Claude Code for MCP tool calls, claude-any wraps it with `mcp-proxy` and disables the proxy notification stream for that server to avoid double-consuming the same channel events.
 - The built-in `claude-any-router` channel is filtered out of native development-channel flags to avoid `server:claude-any-router · no MCP server configured with that name`.
 
 Design boundary:
 
-- Claude Code owns SSE and Streamable HTTP MCP session lifecycle.
-- claude-any only preserves/passes MCP config and injects native development-channel flags for external HTTP/SSE MCP servers.
-- stdio MCP entries can still be wrapped by claude-any when needed for proxying/normalization.
+- Claude Native remains pass-through for external MCP channel lifecycle.
+- Routed/non-native launches use claude-any-owned channel delivery for durable agent runtimes.
+- stdio and router-owned Streamable HTTP MCP entries can be wrapped by claude-any when needed for proxying/normalization.
 
 ### 0.1.98
 
