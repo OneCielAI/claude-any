@@ -26299,7 +26299,6 @@ def launch_claude(
         proxy_config = write_mcp_proxy_config(
             launch_passthrough,
             extra_config_paths=[Path(path) for path in mcp_config_paths],
-            force_proxy_server_names=set(detected_channel_capable_names) if (stdin_channel_proxy or llm_channel_delivery) else None,
             disable_proxy_notification_stream_names=set(detected_channel_capable_names) if (stdin_channel_proxy or llm_channel_delivery) else None,
         )
         if proxy_config:

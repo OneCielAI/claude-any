@@ -562,7 +562,7 @@ class ChannelConfigTests(unittest.TestCase):
         write_channel.assert_called_once()
         auto_start.assert_not_called()
         self.assertEqual([channel_path, source_path], write_proxy.call_args.kwargs["extra_config_paths"])
-        self.assertEqual({"claude-any-router", "ai-net-sse"}, write_proxy.call_args.kwargs["force_proxy_server_names"])
+        self.assertNotIn("force_proxy_server_names", write_proxy.call_args.kwargs)
         self.assertEqual({"claude-any-router", "ai-net-sse"}, write_proxy.call_args.kwargs["disable_proxy_notification_stream_names"])
         launch_cmd = call.call_args.args[0]
         self.assertIn(str(proxy_path), launch_cmd)
