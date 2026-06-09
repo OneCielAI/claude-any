@@ -97,6 +97,26 @@ class ChannelConfigTests(unittest.TestCase):
             specs = claude_any.auto_discovered_mcp_channel_specs([], cwd=project, home=root)
         self.assertEqual(["server:ai-net"], specs)
 
+    def test_existing_mcp_config_paths_filters_missing_files(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "work"
+            project.mkdir()
+            project_mcp = project / ".mcp.json"
+            home_mcp = root / ".mcp.json"
+            settings = root / ".claude" / "settings.json"
+            settings.parent.mkdir()
+            project_mcp.write_text(json.dumps({"mcpServers": {"project": {"command": "node"}}}), encoding="utf-8")
+            home_mcp.write_text(json.dumps({"mcpServers": {"home": {"command": "node"}}}), encoding="utf-8")
+            settings.write_text(json.dumps({"mcpServers": {"settings": {"command": "node"}}}), encoding="utf-8")
+
+            paths = claude_any.existing_claude_mcp_config_paths([], cwd=project, home=root)
+
+        self.assertIn(project_mcp, paths)
+        self.assertIn(home_mcp, paths)
+        self.assertIn(settings, paths)
+        self.assertFalse(any(path.name == ".claude.json" for path in paths))
+
     def test_auto_starts_sse_servers_from_mcp_config(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -640,6 +660,50 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertIn("--dangerously-load-development-channels", launch_cmd)
         self.assertIn("server:claude-any-router", launch_cmd)
         self.assertIn("server:ai-net", launch_cmd)
+        launch_env = call.call_args.kwargs["env"]
+        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
+
+    def test_native_launch_passes_discovered_mcp_configs_without_router_or_channels(self):
+        cfg = {"providers": {"anthropic": {}}, "claude_code": {"channel_delivery": "llm"}}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project_mcp = root / "project.mcp.json"
+            explicit_mcp = root / "explicit.mcp.json"
+            project_mcp.write_text(json.dumps({"mcpServers": {"project": {"command": "node"}}}), encoding="utf-8")
+            explicit_mcp.write_text(json.dumps({"mcpServers": {"explicit": {"command": "node"}}}), encoding="utf-8")
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(claude_any, "run_prelaunch_menu", return_value=0))
+                stack.enter_context(mock.patch.object(claude_any, "load_config", return_value=cfg))
+                stack.enter_context(mock.patch.object(claude_any, "get_current_provider", return_value=("anthropic", {"route_through_router": False})))
+                stack.enter_context(mock.patch.object(claude_any, "launch_readiness_errors", return_value=[]))
+                stack.enter_context(mock.patch.object(claude_any, "native_anthropic_enabled", return_value=True))
+                stack.enter_context(mock.patch.object(claude_any, "ollama_native_compat_enabled", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "provider_native_compat_enabled", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "cleanup_managed_services_for_provider"))
+                start_router = stack.enter_context(mock.patch.object(claude_any, "start_router_if_needed"))
+                stack.enter_context(mock.patch.object(claude_any, "auto_import_passthrough_channels"))
+                stack.enter_context(mock.patch.object(claude_any, "env_vars", return_value={"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"}))
+                stack.enter_context(mock.patch.object(claude_any, "disable_claude_any_slash_commands_for_native"))
+                stack.enter_context(mock.patch.object(claude_any, "find_executable", return_value="claude"))
+                stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
+                stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
+                existing = stack.enter_context(
+                    mock.patch.object(claude_any, "existing_claude_mcp_config_paths", return_value=[project_mcp, explicit_mcp])
+                )
+                call = stack.enter_context(mock.patch.object(claude_any.subprocess, "call", return_value=0))
+                rc = claude_any.launch_claude(["--mcp-config", str(explicit_mcp), "--verbose"])
+
+        self.assertEqual(0, rc)
+        start_router.assert_not_called()
+        existing.assert_called_once()
+        launch_cmd = call.call_args.args[0]
+        self.assertIn("--mcp-config", launch_cmd)
+        self.assertIn(str(project_mcp), launch_cmd)
+        self.assertIn(str(explicit_mcp), launch_cmd)
+        self.assertEqual(1, launch_cmd.count(str(explicit_mcp)))
+        self.assertIn("--verbose", launch_cmd)
+        self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
         launch_env = call.call_args.kwargs["env"]
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
 

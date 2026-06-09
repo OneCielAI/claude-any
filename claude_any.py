@@ -15768,6 +15768,24 @@ def claude_mcp_config_paths(passthrough: list[str] | None = None, cwd: Path | No
     return out
 
 
+def existing_claude_mcp_config_paths(
+    passthrough: list[str] | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+) -> list[Path]:
+    """Return existing Claude MCP config files that should be passed to Claude.
+
+    This is intentionally transport-agnostic. Channel-capable MCP servers are
+    discovered separately by the channel probe cache; this helper is only for
+    preserving Claude Code's normal MCP tool surface when claude-any launches it.
+    """
+    return [
+        path
+        for path in claude_mcp_config_paths(passthrough, cwd, home)
+        if path.exists() and path.is_file()
+    ]
+
+
 def auto_discovered_mcp_channel_specs(
     passthrough: list[str] | None = None,
     cwd: Path | None = None,
@@ -25911,6 +25929,7 @@ def launch_claude(
             "CLAUDE_ANY_MODEL_ALIAS",
         ):
             env.pop(key, None)
+            launch_env.pop(key, None)
         if "ANTHROPIC_API_KEY" in launch_env:
             env.pop("ANTHROPIC_AUTH_TOKEN", None)
         router_log(
@@ -25949,6 +25968,11 @@ def launch_claude(
         mcp_config_paths.append(str(write_duckduckgo_mcp_config(cfg)))
     if native_channel_bridge or llm_channel_delivery:
         mcp_config_paths.append(str(write_channel_mcp_config()))
+    native_direct_mcp_config_paths: list[str] = []
+    if use_native_anthropic and not native_channel_bridge:
+        native_direct_mcp_config_paths = [
+            str(path) for path in existing_claude_mcp_config_paths(launch_passthrough)
+        ]
     detected_channel_specs: list[str] = []
     channel_probe_source_paths: list[Path] = []
     if stdin_channel_proxy or native_channel_bridge or llm_channel_delivery:
@@ -25991,6 +26015,9 @@ def launch_claude(
         if proxy_config:
             mcp_config_paths = [str(proxy_config)]
             claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
+    elif native_direct_mcp_config_paths:
+        mcp_config_paths.extend(native_direct_mcp_config_paths)
+        claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
     if mcp_config_paths:
         extra_args.extend(["--mcp-config", *mcp_config_paths])
     if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
