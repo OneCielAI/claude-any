@@ -15950,10 +15950,11 @@ def _probe_mcp_servers_to_records(
             probe_fn: Callable[..., dict[str, Any]] | None = None
             if _mcp_server_is_stdio(server):
                 probe_fn = probe_stdio_mcp_for_channel_capability_detailed
-            elif transport == "sse" and isinstance(server.get("url"), str):
-                probe_fn = probe_sse_mcp_for_channel_capability_detailed
-            elif transport == "streamable-http" and isinstance(server.get("url"), str):
-                probe_fn = probe_streamable_http_mcp_for_channel_capability_detailed
+            elif transport in {"sse", "streamable-http"} and isinstance(server.get("url"), str):
+                record["capable"] = True
+                record["reason"] = "native_channel_delegated"
+                records.append(record)
+                continue
             else:
                 record["reason"] = "transport_not_probed"
                 records.append(record)
@@ -16318,6 +16319,32 @@ def _read_mcp_sse_servers_from_json(path: Path, cwd: Path) -> list[dict[str, Any
     return out
 
 
+def external_mcp_channel_server_names_from_configs(
+    passthrough: list[str] | None = None,
+    cwd: Path | None = None,
+    home: Path | None = None,
+    extra_config_paths: list[Path | str] | None = None,
+) -> list[str]:
+    cwd = cwd or Path.cwd()
+    paths = [Path(path).expanduser() for path in extra_config_paths or []]
+    paths.extend(claude_mcp_config_paths(passthrough, cwd, home))
+    names: list[str] = []
+    seen_paths: set[str] = set()
+    for path in paths:
+        key = _path_for_compare(path)
+        if key in seen_paths:
+            continue
+        seen_paths.add(key)
+        if not path.exists() or not path.is_file():
+            continue
+        for server in _read_mcp_sse_servers_from_json(path, cwd):
+            name = str(server.get("channel") or "").strip()
+            if not name or name.strip().lower() in _NATIVE_ROUTER_CHANNEL_NAMES:
+                continue
+            names.append(name)
+    return _dedupe_strings(names)
+
+
 def auto_start_sse_channels_from_mcp_configs(
     passthrough: list[str] | None = None,
     cwd: Path | None = None,
@@ -16345,6 +16372,9 @@ def auto_start_sse_channels_from_mcp_configs(
         if not path.exists() or not path.is_file():
             continue
         for server in _read_mcp_sse_servers_from_json(path, cwd):
+            if str(server.get("transport") or "").strip().lower() == "streamable-http":
+                router_log("INFO", f"channel_streamable_http_native_delegated name={server.get('channel') or server.get('name')}")
+                continue
             public_name = _channel_sse_public_mcp_name(str(server.get("name") or ""))
             if allowed is not None and public_name not in allowed:
                 continue
@@ -22213,7 +22243,11 @@ def claude_channel_args(
         return []
     if native_channel_passthrough_requested(passthrough):
         return []
-    specs = list(channel_specs_for_launch(cfg, passthrough, extra_specs))
+    specs = [
+        spec
+        for spec in channel_specs_for_launch(cfg, passthrough, extra_specs)
+        if not (str(spec).startswith("server:") and str(spec).split(":", 1)[1].strip().lower() in _NATIVE_ROUTER_CHANNEL_NAMES)
+    ]
     if not specs:
         return []
     return ["--dangerously-load-development-channels", *specs]
@@ -22367,9 +22401,7 @@ def write_mcp_proxy_config(
             if name in seen:
                 continue
             seen.add(name)
-            streamable_http = _mcp_server_is_streamable_http(server)
-            force_streamable_proxy = streamable_http and _mcp_server_force_proxy(server)
-            if _mcp_server_is_stdio(server) or force_streamable_proxy:
+            if _mcp_server_is_stdio(server):
                 server_dir.mkdir(parents=True, exist_ok=True)
                 server_path = server_dir / f"{_safe_mcp_proxy_name(name)}.json"
                 saved_server = dict(server)
@@ -26045,24 +26077,23 @@ def launch_claude(
     env["PATH"] = path_with_claude_any_user_dirs(env)
     launch_env = env_vars(cfg)
     launch_passthrough = normalize_channel_passthrough(passthrough)
-    native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
-    stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg)
-    llm_channel_delivery = should_use_channel_llm_delivery(use_router_mode, launch_passthrough, cfg)
     native_auto_channel_specs: list[str] = []
-    if use_native_anthropic and not native_channel_bridge and not native_channel_passthrough_requested(launch_passthrough):
+    if not native_channel_passthrough_requested(launch_passthrough):
         try:
-            ensure_channel_probe_cache_for_launch(cfg, launch_passthrough)
-            native_auto_names = native_auto_channel_capable_server_names(launch_passthrough)
-            native_auto_channel_specs = [f"server:{name}" for name in native_auto_names]
+            auto_channel_names = external_mcp_channel_server_names_from_configs(launch_passthrough)
+            native_auto_channel_specs = [f"server:{name}" for name in auto_channel_names]
             if native_auto_channel_specs:
                 router_log(
                     "INFO",
-                    "channel_native_auto_specs servers=%s" % ",".join(native_auto_names),
+                    "channel_native_auto_specs servers=%s" % ",".join(auto_channel_names),
                 )
         except Exception as exc:
             router_log("WARN", f"channel_native_auto_probe_failed error={type(exc).__name__}: {exc}")
+    native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
+    stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg) and not native_auto_channel_specs
+    llm_channel_delivery = should_use_channel_llm_delivery(use_router_mode, launch_passthrough, cfg) and not native_auto_channel_specs
     manage_router_lifetime = False
-    if use_router_mode or native_channel_bridge or llm_channel_delivery:
+    if use_router_mode or llm_channel_delivery:
         manage_router_lifetime = bool(start_router_if_needed())
     if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge or llm_channel_delivery or native_auto_channel_specs:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
@@ -26137,16 +26168,16 @@ def launch_claude(
     mcp_config_paths: list[str] = []
     if should_attach_web_search(provider, cfg, web_search_override):
         mcp_config_paths.append(str(write_duckduckgo_mcp_config(cfg)))
-    if native_channel_bridge or llm_channel_delivery:
+    if llm_channel_delivery:
         mcp_config_paths.append(str(write_channel_mcp_config()))
     native_direct_mcp_config_paths: list[str] = []
-    if use_native_anthropic and not native_channel_bridge:
+    if use_native_anthropic:
         native_mcp_config = write_native_mcp_config_from_discovery(launch_passthrough)
         if native_mcp_config:
             native_direct_mcp_config_paths = [str(native_mcp_config)]
     detected_channel_specs: list[str] = []
     channel_probe_source_paths: list[Path] = []
-    if stdin_channel_proxy or native_channel_bridge or llm_channel_delivery:
+    if stdin_channel_proxy or llm_channel_delivery:
         try:
             ensure_channel_probe_cache_for_launch(cfg, launch_passthrough)
             capable_names = cached_channel_capable_server_names()
@@ -26169,7 +26200,11 @@ def launch_claude(
         except Exception as exc:
             router_log("WARN", f"channel_probe_cache_load_failed error={type(exc).__name__}: {exc}")
     claude_passthrough = list(launch_passthrough)
-    if stdin_channel_proxy or native_channel_bridge or llm_channel_delivery:
+    if use_native_anthropic:
+        if native_direct_mcp_config_paths:
+            mcp_config_paths.extend(native_direct_mcp_config_paths)
+            claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
+    elif stdin_channel_proxy or llm_channel_delivery or native_auto_channel_specs:
         if llm_channel_delivery:
             ensure_channel_llm_delivery_cursor_initialized()
         if should_launch_process_start_channel_sse(stdin_channel_proxy, native_channel_bridge, llm_channel_delivery):
@@ -26186,9 +26221,6 @@ def launch_claude(
         if proxy_config:
             mcp_config_paths = [str(proxy_config)]
             claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
-    elif native_direct_mcp_config_paths:
-        mcp_config_paths.extend(native_direct_mcp_config_paths)
-        claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
     if mcp_config_paths:
         extra_args.extend(["--mcp-config", *mcp_config_paths])
     if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
@@ -26197,12 +26229,10 @@ def launch_claude(
         claude_channel_args(
             cfg,
             launch_passthrough,
-            extra_specs=detected_channel_specs,
-            native_channel_bridge=native_channel_bridge,
+            extra_specs=native_auto_channel_specs if native_auto_channel_specs else detected_channel_specs,
+            native_channel_bridge=bool(native_channel_bridge or native_auto_channel_specs),
         )
     )
-    if native_auto_channel_specs:
-        extra_args.extend(["--dangerously-load-development-channels", *native_auto_channel_specs])
     append_claude_code_runtime_settings_args(extra_args, launch_passthrough, provider, pcfg)
     if fork_native_session:
         session_id = str(uuid.uuid4())
