@@ -1,5 +1,7 @@
 import io
+import os
 import unittest
+from unittest import mock
 
 import claude_any
 
@@ -482,6 +484,85 @@ class ThinkingPassthroughTests(unittest.TestCase):
         self.assertEqual("Bash", tool_starts[0]["content_block"]["name"])
         emitted_input = claude_any.json.loads(tool_deltas[0]["delta"]["partial_json"])
         self.assertEqual("echo hello", emitted_input["command"])
+
+    def test_rebatch_caps_wait_tool_timeout_in_anthropic_passthrough_stream(self):
+        self.addCleanup(claude_any._MCP_NOTIFICATION_WAIT_RECENT.clear)
+
+        class FakeHandler:
+            def __init__(self):
+                self.wfile = io.BytesIO()
+
+        def sse(event_name, payload):
+            return f"event: {event_name}\ndata: {claude_any.json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+        chunks = [
+            sse("message_start", {"type": "message_start", "message": {"id": "msg", "type": "message", "role": "assistant", "content": [], "model": "model"}}),
+            sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "toolu_wait",
+                        "name": "mcp__ai-net-http__wait_for_notifications",
+                        "input": {},
+                    },
+                },
+            ),
+            sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "input_json_delta", "partial_json": '{"timeout_ms":300000}'},
+                },
+            ),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": 3}}),
+            sse("message_stop", {"type": "message_stop"}),
+        ]
+        handler = FakeHandler()
+
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_ANY_MCP_NOTIFICATION_WAIT_TIMEOUT_MS": "1000"}, clear=False),
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            claude_any._MCP_NOTIFICATION_WAIT_RECENT.clear()
+            claude_any._rebatch_anthropic_sse_text(
+                handler,
+                io.BytesIO(b"".join(chunks)),
+                "model",
+                source_body={
+                    "tools": [
+                        {
+                            "name": "mcp__ai-net-http__wait_for_notifications",
+                            "input_schema": {
+                                "type": "object",
+                                "properties": {"timeout_ms": {"type": "number"}},
+                            },
+                        }
+                    ]
+                },
+                preserve_thinking=True,
+                normalize_tool_use=False,
+            )
+
+        payloads = []
+        for event_block in handler.wfile.getvalue().decode("utf-8").split("\n\n"):
+            data_lines = [line[5:].strip() for line in event_block.splitlines() if line.startswith("data:")]
+            if data_lines:
+                payloads.append(claude_any.json.loads("\n".join(data_lines)))
+        tool_deltas = [
+            payload
+            for payload in payloads
+            if payload.get("type") == "content_block_delta"
+            and isinstance(payload.get("delta"), dict)
+            and payload["delta"].get("type") == "input_json_delta"
+        ]
+
+        emitted_input = claude_any.json.loads(tool_deltas[0]["delta"]["partial_json"])
+        self.assertEqual({"timeout_ms": 1000}, emitted_input)
 
     def test_openai_conversion_does_not_leak_thinking_text(self):
         body = {

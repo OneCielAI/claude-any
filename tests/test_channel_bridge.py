@@ -193,6 +193,21 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(["three", "four"], [item["message"] for item in latest])
         self.assertEqual(["one", "three"], [item["message"] for item in older])
 
+    def test_append_chat_message_resyncs_id_from_file_when_cached_stale(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            path.write_text(json.dumps({"id": 41, "message": "existing"}) + "\n", encoding="utf-8")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", 5),
+            ):
+                saved = claude_any.append_chat_message({"message": "new", "channel": "room"})
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(42, saved["id"])
+        self.assertEqual([41, 42], [row["id"] for row in rows])
+
     def test_mcp_endpoint_event_initializes_sse_session(self):
         name = "unit-mcp"
         original = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
@@ -2842,6 +2857,61 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("filtered=3" in item for item in log_messages))
 
+    def test_mcp_notification_wait_tool_timeout_is_capped(self):
+        self.addCleanup(claude_any._MCP_NOTIFICATION_WAIT_RECENT.clear)
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_ANY_MCP_NOTIFICATION_WAIT_TIMEOUT_MS": "1000"}, clear=False),
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            claude_any._MCP_NOTIFICATION_WAIT_RECENT.clear()
+            out = claude_any.cap_mcp_notification_wait_tool_input(
+                "mcp__ai-net-http__wait_for_notifications",
+                {"timeout_ms": 30000},
+            )
+
+        self.assertEqual({"timeout_ms": 1000}, out)
+
+    def test_mcp_notification_wait_tool_empty_input_gets_short_timeout(self):
+        self.addCleanup(claude_any._MCP_NOTIFICATION_WAIT_RECENT.clear)
+        with (
+            mock.patch.dict(os.environ, {"CLAUDE_ANY_MCP_NOTIFICATION_WAIT_TIMEOUT_MS": "1000"}, clear=False),
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            claude_any._MCP_NOTIFICATION_WAIT_RECENT.clear()
+            out = claude_any.cap_mcp_notification_wait_tool_input(
+                "mcp__generic__wait_for_events",
+                {},
+            )
+
+        self.assertEqual({"timeout_ms": 1000}, out)
+
+    def test_mcp_notification_wait_tool_duplicate_timeout_is_capped_harder(self):
+        self.addCleanup(claude_any._MCP_NOTIFICATION_WAIT_RECENT.clear)
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "CLAUDE_ANY_MCP_NOTIFICATION_WAIT_TIMEOUT_MS": "1000",
+                    "CLAUDE_ANY_MCP_NOTIFICATION_WAIT_DUPLICATE_TIMEOUT_MS": "100",
+                    "CLAUDE_ANY_MCP_NOTIFICATION_WAIT_DUPLICATE_WINDOW_SECONDS": "90",
+                },
+                clear=False,
+            ),
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            claude_any._MCP_NOTIFICATION_WAIT_RECENT.clear()
+            first = claude_any.cap_mcp_notification_wait_tool_input(
+                "mcp__ai-net-http__wait_for_notifications",
+                {"timeout_ms": 30000},
+            )
+            second = claude_any.cap_mcp_notification_wait_tool_input(
+                "mcp__ai-net-http__wait_for_notifications",
+                {"timeout_ms": 30000},
+            )
+
+        self.assertEqual({"timeout_ms": 1000}, first)
+        self.assertEqual({"timeout_ms": 100}, second)
+
     def test_channel_direct_execute_tool_allows_collaboration_tools(self):
         with (
             mock.patch.object(claude_any, "_channel_sse_state_name_for_mcp_server", return_value="mcp-ai-net-sse"),
@@ -3234,7 +3304,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 mock.patch.object(claude_any, "CONFIG_DIR", root),
                 mock.patch.object(claude_any, "CHANNEL_MCP_CURSOR_PATH", cursor_path),
                 mock.patch.object(claude_any, "_CHANNEL_MCP_CURSOR_LAST_ID", None),
-                mock.patch.object(claude_any, "_chat_init_next_id", return_value=42),
+                mock.patch.object(claude_any, "_chat_scan_max_id", return_value=41),
             ):
                 last_id = claude_any._channel_mcp_ensure_cursor_initialized()
                 self.assertEqual(41, last_id)
@@ -3330,6 +3400,36 @@ class ChannelBridgeTests(unittest.TestCase):
             ):
                 claude_any._mcp_proxy_observe_json_message("ai-net", generic)
                 claude_any._mcp_proxy_observe_json_message("ai-net", native)
+            append.assert_called_once()
+            log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+            self.assertTrue(any("mcp_proxy_notification_skipped_duplicate" in item for item in log_messages))
+        finally:
+            claude_any._MCP_NOTIFICATION_DEDUP_RECENT.clear()
+
+    def test_mcp_proxy_observer_deduplicates_stable_event_across_writers(self):
+        first = {
+            "jsonrpc": "2.0",
+            "method": "notifications/claude/channel",
+            "params": {
+                "content": "task completed",
+                "meta": {
+                    "kind": "assignment_completed",
+                    "room_id": "room_phase1sim",
+                    "assignment_id": "tasgn_same",
+                    "stream_id": "1781045186019-0",
+                },
+            },
+        }
+        second = json.loads(json.dumps(first))
+        claude_any._MCP_NOTIFICATION_DEDUP_RECENT.clear()
+        try:
+            with (
+                mock.patch.object(claude_any, "append_chat_message", return_value={"id": 24}) as append,
+                mock.patch.object(claude_any, "schedule_channel_direct_llm_delivery"),
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                claude_any._mcp_proxy_observe_json_message("ai-net", first)
+                claude_any._mcp_proxy_observe_json_message("ai-net-http", second)
             append.assert_called_once()
             log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
             self.assertTrue(any("mcp_proxy_notification_skipped_duplicate" in item for item in log_messages))

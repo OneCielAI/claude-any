@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import getpass
 import hashlib
 import html as html_lib
@@ -243,7 +244,7 @@ OFFICIAL_CHANNEL_PLUGINS = {
     "fakechat": "plugin:fakechat@claude-plugins-official",
 }
 APP_NAME = "Claude Any"
-VERSION = "0.1.105"
+VERSION = "0.1.106"
 DEFAULT_UPSTREAM_USER_AGENT = "claude-cli"
 
 
@@ -941,6 +942,8 @@ def sync_ollama_library_context_limit(provider: str, pcfg: dict[str, Any], model
 # ---------------------------------------------------------------------------
 
 _TOOL_SCHEMA_REGISTRY: dict[str, dict[str, Any]] = {}
+_MCP_NOTIFICATION_WAIT_RECENT: dict[str, float] = {}
+_MCP_NOTIFICATION_WAIT_RECENT_LOCK = threading.Lock()
 
 _BUILTIN_TOOL_SCHEMAS: dict[str, dict[str, Any]] = {
     "Bash": {
@@ -1321,6 +1324,134 @@ def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> 
     if injected:
         router_log("WARN", f"tool_guard: {matched_name}: injected missing required fields: {', '.join(injected)}")
 
+    return fixed
+
+
+MCP_NOTIFICATION_WAIT_TOOL_NAMES = {
+    "wait_for_notification",
+    "wait_for_notifications",
+    "wait_for_message",
+    "wait_for_messages",
+    "wait_for_event",
+    "wait_for_events",
+    "wait_for_response",
+    "wait_for_responses",
+}
+
+
+def _mcp_tool_leaf_name(tool_name: str) -> str:
+    text = str(tool_name or "").strip()
+    if "__" in text:
+        return text.rsplit("__", 1)[-1].strip().lower()
+    return text.lower()
+
+
+def _is_mcp_notification_wait_tool(tool_name: str) -> bool:
+    text = str(tool_name or "").strip().lower()
+    if not text.startswith("mcp__"):
+        return False
+    return _mcp_tool_leaf_name(text) in MCP_NOTIFICATION_WAIT_TOOL_NAMES
+
+
+def _mcp_notification_wait_timeout_cap_ms() -> int:
+    raw = os.environ.get("CLAUDE_ANY_MCP_NOTIFICATION_WAIT_TIMEOUT_MS")
+    if raw is None:
+        return 1000
+    try:
+        value = int(float(str(raw).strip()))
+    except Exception:
+        return 1000
+    if value <= 0:
+        return 0
+    return max(100, min(10_000, value))
+
+
+def _mcp_notification_wait_duplicate_cap_ms() -> int:
+    raw = os.environ.get("CLAUDE_ANY_MCP_NOTIFICATION_WAIT_DUPLICATE_TIMEOUT_MS")
+    if raw is None:
+        return 100
+    try:
+        value = int(float(str(raw).strip()))
+    except Exception:
+        return 100
+    if value <= 0:
+        return 0
+    return max(50, min(5000, value))
+
+
+def _mcp_notification_wait_duplicate_window_seconds() -> float:
+    raw = os.environ.get("CLAUDE_ANY_MCP_NOTIFICATION_WAIT_DUPLICATE_WINDOW_SECONDS")
+    if raw is None:
+        return 90.0
+    try:
+        value = float(str(raw).strip())
+    except Exception:
+        return 90.0
+    return max(0.0, min(600.0, value))
+
+
+def _mcp_notification_wait_effective_cap_ms(tool_name: str) -> tuple[int, bool]:
+    cap_ms = _mcp_notification_wait_timeout_cap_ms()
+    if cap_ms <= 0:
+        return 0, False
+    duplicate_cap_ms = _mcp_notification_wait_duplicate_cap_ms()
+    window = _mcp_notification_wait_duplicate_window_seconds()
+    if duplicate_cap_ms <= 0 or window <= 0:
+        return cap_ms, False
+    key = str(tool_name or "").strip().lower()
+    now = time.time()
+    duplicate = False
+    with _MCP_NOTIFICATION_WAIT_RECENT_LOCK:
+        stale = [item_key for item_key, seen_at in _MCP_NOTIFICATION_WAIT_RECENT.items() if now - seen_at > window]
+        for item_key in stale:
+            _MCP_NOTIFICATION_WAIT_RECENT.pop(item_key, None)
+        previous = _MCP_NOTIFICATION_WAIT_RECENT.get(key)
+        duplicate = previous is not None and now - previous <= window
+        _MCP_NOTIFICATION_WAIT_RECENT[key] = now
+    if duplicate:
+        return min(cap_ms, duplicate_cap_ms), True
+    return cap_ms, False
+
+
+def cap_mcp_notification_wait_tool_input(tool_name: str, tool_input: dict[str, Any]) -> dict[str, Any]:
+    if not _is_mcp_notification_wait_tool(tool_name):
+        return tool_input
+    cap_ms, duplicate = _mcp_notification_wait_effective_cap_ms(tool_name)
+    if cap_ms <= 0:
+        return tool_input
+    fixed = dict(tool_input) if isinstance(tool_input, dict) else {}
+    schema = _lookup_tool_schema(tool_name) or {}
+    properties = schema.get("properties") if isinstance(schema.get("properties"), dict) else {}
+    changed: list[str] = []
+
+    def set_if_lower(key: str, value: int | float) -> None:
+        old = fixed.get(key)
+        try:
+            numeric = float(old)
+        except Exception:
+            fixed[key] = int(value) if float(value).is_integer() else value
+            changed.append(f"{key}=missing->{value:g}")
+            return
+        if numeric > float(value):
+            fixed[key] = int(value) if float(value).is_integer() else value
+            changed.append(f"{key}={numeric:g}->{value:g}")
+
+    for key in list(fixed):
+        key_l = str(key).strip().lower()
+        if key_l in {"timeout_ms", "timeoutms", "wait_ms", "waitms", "max_wait_ms", "maxwaitms"}:
+            set_if_lower(key, cap_ms)
+        elif key_l in {"timeout", "wait_seconds", "wait_s", "max_wait_seconds"}:
+            set_if_lower(key, max(0.1, cap_ms / 1000.0))
+
+    if not changed:
+        if "timeout_ms" in properties or "timeout_ms" in fixed or not properties:
+            set_if_lower("timeout_ms", cap_ms)
+        elif "timeout" in properties:
+            set_if_lower("timeout", max(0.1, cap_ms / 1000.0))
+
+    if changed:
+        duplicate_label = " duplicate=true" if duplicate else ""
+        router_log("INFO", f"mcp_notification_wait_timeout_capped tool={tool_name}{duplicate_label} {' '.join(changed)}")
     return fixed
 
 
@@ -7700,6 +7831,11 @@ def _chat_init_next_id() -> int:
     global _CHAT_NEXT_ID
     if _CHAT_NEXT_ID is not None:
         return _CHAT_NEXT_ID
+    _CHAT_NEXT_ID = _chat_scan_max_id() + 1
+    return _CHAT_NEXT_ID
+
+
+def _chat_scan_max_id() -> int:
     max_id = 0
     try:
         if CHAT_MESSAGES_PATH.exists():
@@ -7712,8 +7848,36 @@ def _chat_init_next_id() -> int:
                         continue
     except Exception:
         pass
-    _CHAT_NEXT_ID = max_id + 1
-    return _CHAT_NEXT_ID
+    return max_id
+
+
+@contextlib.contextmanager
+def _chat_messages_file_lock() -> Iterable[None]:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = CHAT_MESSAGES_PATH.with_name(CHAT_MESSAGES_PATH.name + ".lock")
+    with lock_path.open("a+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+
+            lock_file.seek(0, os.SEEK_END)
+            if lock_file.tell() == 0:
+                lock_file.write(b"\0")
+                lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+            try:
+                yield
+            finally:
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _message_visible_to(message: dict[str, Any], recipient: str | None) -> bool:
@@ -7792,30 +7956,31 @@ def read_chat_messages_before(before_id: int = 0, channel: str | None = None, re
 def append_chat_message(payload: dict[str, Any]) -> dict[str, Any]:
     global _CHAT_NEXT_ID
     with _CHAT_CONDITION:
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        if CHAT_MESSAGES_PATH.exists() and CHAT_MESSAGES_PATH.stat().st_size > CHAT_MESSAGES_MAX_BYTES:
-            CHAT_MESSAGES_PATH.replace(CHAT_MESSAGES_PATH.with_suffix(".jsonl.1"))
-            _CHAT_NEXT_ID = 1
-        next_id = _chat_init_next_id()
-        _CHAT_NEXT_ID = next_id + 1
-        message = {
-            "id": next_id,
-            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
-            "channel": str(payload.get("channel") or "default"),
-            "sender_id": str(payload.get("sender_id") or payload.get("sender") or "anonymous"),
-            "recipients": _as_string_list(payload.get("recipients", payload.get("recipient_id"))),
-            "thread_id": str(payload.get("thread_id") or payload.get("parent_id") or next_id),
-            "parent_id": payload.get("parent_id"),
-            "message": str(payload.get("message") or payload.get("text") or ""),
-            "kind": str(payload.get("kind") or "message"),
-            "meta": payload.get("meta") if isinstance(payload.get("meta"), dict) else {},
-        }
-        if payload.get("visibility") is not None:
-            message["visibility"] = str(payload.get("visibility") or "user")
-        if payload.get("delivery") is not None:
-            message["delivery"] = _as_string_list(payload.get("delivery"))
-        with CHAT_MESSAGES_PATH.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
+        with _chat_messages_file_lock():
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            if CHAT_MESSAGES_PATH.exists() and CHAT_MESSAGES_PATH.stat().st_size > CHAT_MESSAGES_MAX_BYTES:
+                CHAT_MESSAGES_PATH.replace(CHAT_MESSAGES_PATH.with_suffix(".jsonl.1"))
+                _CHAT_NEXT_ID = 1
+            next_id = _chat_scan_max_id() + 1
+            _CHAT_NEXT_ID = next_id + 1
+            message = {
+                "id": next_id,
+                "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "channel": str(payload.get("channel") or "default"),
+                "sender_id": str(payload.get("sender_id") or payload.get("sender") or "anonymous"),
+                "recipients": _as_string_list(payload.get("recipients", payload.get("recipient_id"))),
+                "thread_id": str(payload.get("thread_id") or payload.get("parent_id") or next_id),
+                "parent_id": payload.get("parent_id"),
+                "message": str(payload.get("message") or payload.get("text") or ""),
+                "kind": str(payload.get("kind") or "message"),
+                "meta": payload.get("meta") if isinstance(payload.get("meta"), dict) else {},
+            }
+            if payload.get("visibility") is not None:
+                message["visibility"] = str(payload.get("visibility") or "user")
+            if payload.get("delivery") is not None:
+                message["delivery"] = _as_string_list(payload.get("delivery"))
+            with CHAT_MESSAGES_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
         _CHAT_CONDITION.notify_all()
         return message
 
@@ -7903,11 +8068,16 @@ def _event_meta_from_sources(*sources: Any) -> dict[str, Any]:
             "thread_id",
             "parent_id",
             "message_id",
+            "source_message_id",
             "event_id",
+            "stream_id",
+            "sse_id",
             "cursor",
+            "assignment_id",
+            "poll_id",
+            "task_id",
             "sequence",
             "seq",
-            "task_id",
             "round_id",
             "conversation_id",
             "session_id",
@@ -9183,7 +9353,7 @@ def _channel_mcp_read_cursor_locked() -> int:
             return _CHANNEL_MCP_CURSOR_LAST_ID
         except Exception as exc:
             router_log("WARN", f"channel_mcp_cursor_read_failed error={type(exc).__name__}: {exc}")
-    _CHANNEL_MCP_CURSOR_LAST_ID = max(0, _chat_init_next_id() - 1)
+    _CHANNEL_MCP_CURSOR_LAST_ID = max(0, _chat_scan_max_id())
     try:
         _channel_mcp_write_cursor_locked(_CHANNEL_MCP_CURSOR_LAST_ID)
     except Exception as exc:
@@ -11904,6 +12074,7 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
             matched_name, fixed_input = plan_mode_tool_name_for_emit(source_body, matched_name, fixed_input)
             if matched_name is None:
                 continue
+        fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
         append_tool_call_log(
             "ollama_nonstream_tool_call",
             {
@@ -12312,6 +12483,7 @@ def _rebatch_anthropic_sse_text(
                 )
                 return
             matched_name, fixed_input = mapped_name, mapped_input
+        fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
         tool_id = str(tool_state.get("id") or f"toolu_anthropic_{int(time.time() * 1000)}_{index}")
         _remember_channel_injected_tool_use(source_body, tool_id, matched_name, fixed_input)
         append_tool_call_log(
@@ -12391,10 +12563,15 @@ def _rebatch_anthropic_sse_text(
                 data_str = json.dumps(event, ensure_ascii=False)
             if content_block.get("type") == "tool_use":
                 saw_tool_use = True
-                if normalize_tool_use and mapped_index is not None:
+                tool_name = str(content_block.get("name") or "")
+                should_buffer_tool_use = bool(
+                    mapped_index is not None
+                    and (normalize_tool_use or _is_mcp_notification_wait_tool(tool_name))
+                )
+                if should_buffer_tool_use and mapped_index is not None:
                     buffered_tool_uses[mapped_index] = {
                         "id": str(content_block.get("id") or ""),
-                        "name": str(content_block.get("name") or ""),
+                        "name": tool_name,
                         "partial_json": "",
                     }
                     initial_input = content_block.get("input")
@@ -12410,7 +12587,7 @@ def _rebatch_anthropic_sse_text(
                 return
             if mapped_index is not None:
                 open_content_blocks.discard(mapped_index)
-                if normalize_tool_use and mapped_index in buffered_tool_uses:
+                if mapped_index in buffered_tool_uses:
                     emit_normalized_tool_use(mapped_index, buffered_tool_uses.pop(mapped_index))
                     return
                 patched = dict(event)
@@ -12478,7 +12655,7 @@ def _rebatch_anthropic_sse_text(
             if not preserve_thinking and delta.get("type") in {"thinking_delta", "signature_delta"}:
                 emit_suppressed_keepalive()
                 return
-            if normalize_tool_use and isinstance(mapped_index, int) and mapped_index in buffered_tool_uses:
+            if isinstance(mapped_index, int) and mapped_index in buffered_tool_uses:
                 if delta.get("type") == "input_json_delta":
                     append_tool_partial(buffered_tool_uses[mapped_index], delta.get("partial_json"))
                 return
@@ -12507,7 +12684,7 @@ def _rebatch_anthropic_sse_text(
                 finish_suppressed_thinking_block(index)
                 return
             if mapped_index is not None:
-                if normalize_tool_use and mapped_index in buffered_tool_uses:
+                if mapped_index in buffered_tool_uses:
                     emit_normalized_tool_use(mapped_index, buffered_tool_uses.pop(mapped_index))
                     return
                 patched = dict(event)
@@ -12799,6 +12976,7 @@ def _ollama_stream_to_anthropic_sse(
                     matched_name, fixed_input = plan_mode_tool_name_for_emit(source_body, matched_name, fixed_input)
                     if matched_name is None:
                         continue
+                fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
                 tool_calls.append({"function": {"name": matched_name, "arguments": fixed_input}})
                 tool_id = f"toolu_ollama_{int(time.time() * 1000)}_{len(tool_calls) - 1}"
                 tool_index = next_content_index
@@ -13594,6 +13772,7 @@ def stream_openai_chat_to_anthropic_sse(
                 matched_name, fixed_input = plan_mode_tool_name_for_emit(source_body, matched_name, fixed_input)
                 if matched_name is None:
                     continue
+            fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
             tool_calls.append({"function": {"name": matched_name, "arguments": fixed_input}})
             tool_index = next_content_index
             next_content_index += 1
@@ -24188,7 +24367,7 @@ def _channel_llm_read_cursor_locked() -> int:
             return _CHANNEL_LLM_CURSOR_LAST_ID
         except Exception as exc:
             router_log("WARN", f"channel_llm_cursor_read_failed error={type(exc).__name__}: {exc}")
-    _CHANNEL_LLM_CURSOR_LAST_ID = max(0, _chat_init_next_id() - 1)
+    _CHANNEL_LLM_CURSOR_LAST_ID = max(0, _chat_scan_max_id())
     try:
         _channel_llm_write_cursor_locked(_CHANNEL_LLM_CURSOR_LAST_ID)
     except Exception:
@@ -24199,7 +24378,7 @@ def _channel_llm_read_cursor_locked() -> int:
 def reset_channel_llm_delivery_cursor(last_id: int | None = None) -> int:
     global _CHANNEL_LLM_CURSOR_LAST_ID
     with _CHANNEL_LLM_CURSOR_LOCK:
-        _CHANNEL_LLM_CURSOR_LAST_ID = max(0, int(last_id if last_id is not None else _chat_init_next_id() - 1))
+        _CHANNEL_LLM_CURSOR_LAST_ID = max(0, int(last_id if last_id is not None else _chat_scan_max_id()))
         try:
             _channel_llm_write_cursor_locked(_CHANNEL_LLM_CURSOR_LAST_ID)
         except Exception as exc:
@@ -24896,7 +25075,7 @@ def subprocess_call_with_channel_wake_proxy(
     import termios
     import tty
 
-    last_id = _chat_init_next_id() - 1
+    last_id = _chat_scan_max_id()
     last_channel_marker = _chat_messages_file_marker()
     last_summary_marker = _channel_llm_summary_file_marker()
     master_fd, slave_fd = pty.openpty()
@@ -25061,24 +25240,51 @@ def _mcp_proxy_notification_payload(server_name: str, message: dict[str, Any]) -
     }
 
 
-def _mcp_proxy_notification_dedupe_key(server_name: str, chat_payload: dict[str, Any]) -> str:
+def _mcp_proxy_stable_event_identity(chat_payload: dict[str, Any]) -> tuple[str, str] | None:
+    meta = chat_payload.get("meta") if isinstance(chat_payload.get("meta"), dict) else {}
+    for key in (
+        "stream_id",
+        "sse_id",
+        "message_id",
+        "source_message_id",
+        "event_id",
+        "cursor",
+        "assignment_id",
+        "poll_id",
+        "task_id",
+        "sequence",
+        "seq",
+    ):
+        value = meta.get(key)
+        if value is not None and str(value).strip():
+            return key, str(value).strip()
+    return None
+
+
+def _mcp_proxy_notification_dedupe_key(server_name: str, chat_payload: dict[str, Any]) -> tuple[str, bool]:
     meta = chat_payload.get("meta") if isinstance(chat_payload.get("meta"), dict) else {}
     body = re.sub(r"\s+", " ", str(chat_payload.get("message") or "")).strip()
     room = str(meta.get("room_id") or meta.get("room") or chat_payload.get("channel") or server_name)
+    kind = str(meta.get("kind") or chat_payload.get("kind") or "")
+    stable_identity = _mcp_proxy_stable_event_identity(chat_payload)
+    if stable_identity:
+        stable_key, stable_value = stable_identity
+        return (
+            json.dumps(
+                ["stable", room, kind, stable_key, stable_value],
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            True,
+        )
     sender = str(chat_payload.get("sender_id") or meta.get("sender_id") or meta.get("agent_id") or server_name)
     thread = str(chat_payload.get("thread_id") or meta.get("thread_id") or "")
     parent = str(chat_payload.get("parent_id") or meta.get("parent_id") or "")
-    event_id = ""
-    for key in ("message_id", "event_id", "cursor", "sequence", "seq"):
-        value = meta.get(key)
-        if value is not None and str(value).strip():
-            event_id = str(value).strip()
-            break
     return json.dumps(
-        [server_name, room, sender, thread, parent, event_id, body],
+        [server_name, room, sender, thread, parent, body],
         ensure_ascii=False,
         separators=(",", ":"),
-    )
+    ), False
 
 
 def _mcp_proxy_should_skip_duplicate_notification(server_name: str, chat_payload: dict[str, Any]) -> tuple[bool, str | None]:
@@ -25086,7 +25292,7 @@ def _mcp_proxy_should_skip_duplicate_notification(server_name: str, chat_payload
     method = str(meta.get("mcp_method") or "")
     if not method.startswith("notifications/"):
         return False, None
-    key = _mcp_proxy_notification_dedupe_key(server_name, chat_payload)
+    key, has_stable_identity = _mcp_proxy_notification_dedupe_key(server_name, chat_payload)
     now = time.time()
     with _MCP_NOTIFICATION_DEDUP_LOCK:
         stale = [
@@ -25101,6 +25307,8 @@ def _mcp_proxy_should_skip_duplicate_notification(server_name: str, chat_payload
     if not previous:
         return False, None
     previous_method, previous_seen_at = previous
+    if has_stable_identity and now - previous_seen_at <= _MCP_NOTIFICATION_DEDUP_TTL_SECONDS:
+        return True, previous_method
     is_native_pair = _NATIVE_CHANNEL_NOTIFICATION_METHOD in {previous_method, method}
     if previous_method != method and is_native_pair and now - previous_seen_at <= _MCP_NOTIFICATION_DEDUP_TTL_SECONDS:
         return True, previous_method

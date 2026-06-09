@@ -111,7 +111,7 @@ passes normal Claude Code arguments through unchanged.
 
 Credits: One Ciel LLC
 
-Current version: `0.1.105`
+Current version: `0.1.106`
 
 ## Why This Exists
 
@@ -604,6 +604,22 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.106
+
+- **MCP notification wait guard**: routed streams now cap MCP
+  `wait_for_notifications` / `wait_for_response`-style tool calls in every
+  provider conversion path, including Anthropic-compatible SSE passthrough.
+  Empty wait-tool inputs also receive a short timeout. This prevents long
+  polling tool calls from occupying Claude Code while mailbox/SSE notifications
+  pile up behind them.
+- **Mailbox delivery hardening**: chat mailbox writes now rescan the persisted
+  JSONL tail under an inter-process file lock before assigning the next id, so
+  concurrent MCP writers cannot reuse the same local message id.
+- **Stable notification de-duplication**: MCP notification observers now
+  de-duplicate repeated delivery of the same stable event id
+  (`stream_id`, `message_id`, `assignment_id`, `poll_id`, and similar generic
+  metadata) across multiple MCP writer names without hard-coding any product.
 
 ### 0.1.105
 
