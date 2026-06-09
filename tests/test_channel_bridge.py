@@ -1519,6 +1519,49 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual({"last_id": 12}, cursor_payload)
         self.assertTrue(any("channel_llm_summary_injected" in str(call.args[1]) for call in router_log.call_args_list))
 
+    def test_channel_summary_injection_skips_plan_mode_without_advancing_cursor(self):
+        original_cursor = claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+        with tempfile.TemporaryDirectory() as td:
+            queue_path = Path(td) / "channel-llm-summary-queue.jsonl"
+            cursor_path = Path(td) / "channel-llm-summary-cursor.json"
+            queue_path.write_text(
+                json.dumps(
+                    {
+                        "message_id": 13,
+                        "channel": "room_team",
+                        "source": "mcp-ai-net-http",
+                        "sender": "Robert",
+                        "stop_reason": "end_turn",
+                        "incoming": "New message from Robert",
+                        "summary": "Robert mentioned Frank.",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            try:
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = None
+                body = {
+                    "messages": [
+                        {"role": "user", "content": [{"type": "text", "text": "continue"}]},
+                        {"role": "user", "attachment": {"type": "plan_mode"}, "content": []},
+                    ]
+                }
+                with (
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_QUEUE_PATH", queue_path),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_CURSOR_PATH", cursor_path),
+                    mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+                    mock.patch.object(claude_any, "router_log") as router_log,
+                ):
+                    out = claude_any.body_with_pending_channel_summaries(body)
+            finally:
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = original_cursor
+
+        self.assertIs(out, body)
+        self.assertFalse(cursor_path.exists())
+        self.assertTrue(any("plan_mode_active" in str(call.args[1]) for call in router_log.call_args_list))
+
     def test_body_with_pending_channel_messages_skips_persisted_direct_pending_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
         messages = [

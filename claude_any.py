@@ -24254,6 +24254,9 @@ def body_with_pending_channel_summaries(body: dict[str, Any]) -> dict[str, Any]:
         return body
     if metadata.get("claude_any_channel_summary_injected"):
         return body
+    if plan_mode_active(body):
+        router_log("INFO", "channel_llm_summary_inject_skipped reason=plan_mode_active")
+        return body
     cfg = load_config()
     if channel_delivery_mode(cfg) != "llm":
         return body
@@ -24289,6 +24292,9 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     global _CHANNEL_LLM_CURSOR_LAST_ID
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     if body.get("claude_any_channel_direct") or metadata.get("claude_any_channel_direct"):
+        return body
+    if plan_mode_active(body):
+        router_log("INFO", "channel_llm_inject_skipped reason=plan_mode_active")
         return body
     cfg = load_config()
     if channel_delivery_mode(cfg) != "llm":
