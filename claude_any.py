@@ -6215,6 +6215,14 @@ def write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> 
     handler.wfile.write(body)
 
 
+def _handler_response_status(handler: BaseHTTPRequestHandler) -> int | None:
+    status = getattr(handler, "_claude_any_response_status", None)
+    try:
+        return int(status)
+    except Exception:
+        return None
+
+
 def write_empty_response(handler: BaseHTTPRequestHandler, status: int = 202) -> None:
     handler.send_response(status)
     handler.send_header("content-length", "0")
@@ -13911,6 +13919,13 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
 class RouterHandler(BaseHTTPRequestHandler):
     server_version = "claude-any/0.1"
 
+    def send_response(self, code: int, message: str | None = None) -> None:
+        try:
+            self._claude_any_response_status = int(code)
+        except Exception:
+            self._claude_any_response_status = None
+        super().send_response(code, message)
+
     def log_message(self, fmt: str, *args: Any) -> None:
         try:
             router_log("INFO", "access " + (fmt % args))
@@ -14055,6 +14070,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             if provider in ("ollama", "ollama-cloud"):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to Ollama-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_ollama_api_chat(self, provider, pcfg, body)
+                commit_pending_channel_delivery_cursors(body, self)
                 return
             if provider in OPENCODE_PROVIDER_NAMES:
                 upstream_model = resolve_requested_model(provider, pcfg, body.get("model"))
@@ -14070,6 +14086,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                         model=upstream_model,
                     )
                     forward_openai_compatible_chat(self, provider, pcfg, body)
+                    commit_pending_channel_delivery_cursors(body, self)
                     return
                 if endpoint_kind not in ("anthropic-messages",):
                     write_json(
@@ -14090,6 +14107,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             if provider_openai_router_enabled(provider, pcfg):
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to OpenAI-compatible provider", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
                 forward_openai_compatible_chat(self, provider, pcfg, body)
+                commit_pending_channel_delivery_cursors(body, self)
                 return
             body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
             body = normalize_anthropic_system_role_messages(body)
@@ -14156,6 +14174,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                             pass
                     self.wfile.write(raw_resp)
                     self.wfile.flush()
+                commit_pending_channel_delivery_cursors(body, self)
             except urllib.error.HTTPError as e:
                 err = e.read()
                 EVENT_BUS.publish(level="error", category="upstream.error", message=f"upstream HTTP {e.code}", request_id=request_id, provider=provider, model=upstream_model, data={"status": e.code})
@@ -16051,6 +16070,14 @@ def cached_external_channel_capable_server_names() -> list[str]:
             continue
         names.append(name)
     return _dedupe_strings(names)
+
+
+def native_auto_channel_capable_server_names(passthrough: list[str] | None = None) -> list[str]:
+    """External channel-capable servers that are also in current MCP discovery."""
+    discovered = set(discovered_claude_mcp_servers(passthrough or []).keys())
+    if not discovered:
+        return []
+    return [name for name in cached_external_channel_capable_server_names() if name in discovered]
 
 
 def cached_channel_source_paths_for_specs(specs: Iterable[str]) -> list[Path]:
@@ -23928,6 +23955,64 @@ def ensure_channel_llm_delivery_cursor_initialized() -> int:
         return _channel_llm_read_cursor_locked()
 
 
+def _metadata_int(metadata: dict[str, Any], key: str) -> int | None:
+    try:
+        value = metadata.get(key)
+        if value is None or value == "":
+            return None
+        return max(0, int(value))
+    except Exception:
+        return None
+
+
+def _commit_channel_llm_cursor_if_newer(last_id: int | None) -> None:
+    global _CHANNEL_LLM_CURSOR_LAST_ID
+    if last_id is None:
+        return
+    with _CHANNEL_LLM_CURSOR_LOCK:
+        current = _channel_llm_read_cursor_locked()
+        if last_id <= current:
+            return
+        _CHANNEL_LLM_CURSOR_LAST_ID = last_id
+        try:
+            _channel_llm_write_cursor_locked(last_id)
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_cursor_write_failed error={type(exc).__name__}: {exc}")
+
+
+def _commit_channel_llm_summary_cursor_if_newer(last_id: int | None) -> None:
+    global _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+    if last_id is None:
+        return
+    with _CHANNEL_LLM_SUMMARY_LOCK:
+        current = _channel_llm_summary_read_cursor_locked()
+        if last_id <= current:
+            return
+        _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = last_id
+        try:
+            _channel_llm_summary_write_cursor_locked(last_id)
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
+
+
+def commit_pending_channel_delivery_cursors(body: dict[str, Any], handler: BaseHTTPRequestHandler | None = None) -> None:
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    if not metadata:
+        return
+    if handler is not None:
+        status = _handler_response_status(handler)
+        if status is None or status < 200 or status >= 400:
+            router_log(
+                "INFO",
+                f"channel_delivery_cursor_deferred status={status if status is not None else '-'}",
+            )
+            return
+    message_cursor = _metadata_int(metadata, "claude_any_channel_cursor_last_id")
+    summary_cursor = _metadata_int(metadata, "claude_any_channel_summary_cursor_last_id")
+    _commit_channel_llm_cursor_if_newer(message_cursor)
+    _commit_channel_llm_summary_cursor_if_newer(summary_cursor)
+
+
 def _channel_llm_summary_write_cursor_locked(last_id: int) -> None:
     CHANNEL_LLM_SUMMARY_CURSOR_PATH.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = CHANNEL_LLM_SUMMARY_CURSOR_PATH.with_suffix(".json.tmp")
@@ -24136,13 +24221,9 @@ def body_with_pending_channel_summaries(body: dict[str, Any]) -> dict[str, Any]:
                 max_seen = max(max_seen, int(item.get("message_id") or 0))
             except Exception:
                 pass
-        _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = max_seen
-        try:
-            _channel_llm_summary_write_cursor_locked(max_seen)
-        except Exception as exc:
-            router_log("WARN", f"channel_llm_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
     prompt = format_channel_llm_summary_prompt(records)
     if not prompt.strip():
+        _commit_channel_llm_summary_cursor_if_newer(max_seen)
         return body
     out = dict(body)
     messages = [m for m in body.get("messages", []) if isinstance(m, dict)]
@@ -24151,6 +24232,7 @@ def body_with_pending_channel_summaries(body: dict[str, Any]) -> dict[str, Any]:
     out_metadata = dict(metadata)
     out_metadata["claude_any_channel_summary_injected"] = True
     out_metadata["claude_any_channel_summary_message_ids"] = ",".join(str(item.get("message_id") or "") for item in records)
+    out_metadata["claude_any_channel_summary_cursor_last_id"] = str(max_seen)
     out["metadata"] = out_metadata
     router_log("INFO", f"channel_llm_summary_injected count={len(records)} message_ids={out_metadata['claude_any_channel_summary_message_ids']}")
     return out
@@ -24209,13 +24291,13 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                 )
                 continue
             pending.append(message)
-        if max_seen != last_id:
-            _CHANNEL_LLM_CURSOR_LAST_ID = max_seen
-            try:
-                _channel_llm_write_cursor_locked(max_seen)
-            except Exception as exc:
-                router_log("WARN", f"channel_llm_cursor_write_failed error={type(exc).__name__}: {exc}")
         if not pending:
+            if max_seen != last_id:
+                _CHANNEL_LLM_CURSOR_LAST_ID = max_seen
+                try:
+                    _channel_llm_write_cursor_locked(max_seen)
+                except Exception as exc:
+                    router_log("WARN", f"channel_llm_cursor_write_failed error={type(exc).__name__}: {exc}")
             return body
     messages = [m for m in body.get("messages", []) if isinstance(m, dict)]
     messages.append({"role": "user", "content": [{"type": "text", "text": format_channel_llm_batch_prompt(pending)}]})
@@ -24226,6 +24308,7 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     out_metadata = dict(out.get("metadata") if isinstance(out.get("metadata"), dict) else {})
     out_metadata["claude_any_channel_injected"] = True
     out_metadata["claude_any_channel_message_ids"] = ids
+    out_metadata["claude_any_channel_cursor_last_id"] = str(max_seen)
     out["metadata"] = out_metadata
     router_log("INFO", f"channel_llm_injected count={len(pending)} message_ids={ids} channels={channels}")
     return out
@@ -24402,18 +24485,15 @@ def _inject_pending_channel_summaries(master_fd: int, enter_bytes: bytes | None 
                 max_seen = max(max_seen, int(item.get("message_id") or 0))
             except Exception:
                 pass
-        _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = max_seen
-        try:
-            _channel_llm_summary_write_cursor_locked(max_seen)
-        except Exception as exc:
-            router_log("WARN", f"channel_stdin_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
     prompt = format_channel_llm_summary_prompt(records)
     if not prompt.strip():
         ids = ",".join(str(item.get("message_id") or "") for item in records)
         router_log("INFO", f"channel_stdin_summary_skipped_quiet count={len(records)} message_ids={ids}")
+        _commit_channel_llm_summary_cursor_if_newer(max_seen)
         return max_seen
     submit_bytes = _channel_wake_enter_bytes(enter_bytes)
     _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
+    _commit_channel_llm_summary_cursor_if_newer(max_seen)
     ids = ",".join(str(item.get("message_id") or "") for item in records)
     router_log(
         "INFO",
@@ -24435,17 +24515,14 @@ def _print_pending_channel_summaries(stdout_fd: int) -> int:
                 max_seen = max(max_seen, int(item.get("message_id") or 0))
             except Exception:
                 pass
-        _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = max_seen
-        try:
-            _channel_llm_summary_write_cursor_locked(max_seen)
-        except Exception as exc:
-            router_log("WARN", f"channel_screen_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
     ids = ",".join(str(item.get("message_id") or "") for item in records)
     notice = format_channel_llm_summary_notice(records)
     if not notice.strip():
         router_log("INFO", f"channel_screen_summary_skipped_quiet count={len(records)} message_ids={ids}")
+        _commit_channel_llm_summary_cursor_if_newer(max_seen)
         return max_seen
     _write_fd_all(stdout_fd, notice.encode("utf-8", errors="replace"))
+    _commit_channel_llm_summary_cursor_if_newer(max_seen)
     router_log("INFO", f"channel_screen_summary_printed count={len(records)} message_ids={ids}")
     return max_seen
 
@@ -25957,7 +26034,7 @@ def launch_claude(
     if use_native_anthropic and not native_channel_bridge and not native_channel_passthrough_requested(launch_passthrough):
         try:
             ensure_channel_probe_cache_for_launch(cfg, launch_passthrough)
-            native_auto_names = cached_external_channel_capable_server_names()
+            native_auto_names = native_auto_channel_capable_server_names(launch_passthrough)
             native_auto_channel_specs = [f"server:{name}" for name in native_auto_names]
             if native_auto_channel_specs:
                 router_log(

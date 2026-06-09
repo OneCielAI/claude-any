@@ -1247,7 +1247,15 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("Robert, can you check this?", injected)
         self.assertNotIn("ai-net.sse.connected", injected)
         self.assertNotIn("SSE MCP initialized", injected)
-        write_cursor.assert_called_with(4)
+        write_cursor.assert_not_called()
+        self.assertEqual("4", out["metadata"]["claude_any_channel_cursor_last_id"])
+        handler = type("Handler", (), {"_claude_any_response_status": 200})()
+        with (
+            mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as commit_cursor,
+        ):
+            claude_any.commit_pending_channel_delivery_cursors(out, handler)  # type: ignore[arg-type]
+        commit_cursor.assert_called_with(4)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
         self.assertTrue(any("channel_llm_inject_skipped" in item and "initialized" in item for item in log_messages))
@@ -1266,6 +1274,25 @@ class ChannelBridgeTests(unittest.TestCase):
                     self.assertEqual(3, claude_any.ensure_channel_llm_delivery_cursor_initialized())
             finally:
                 claude_any._CHANNEL_LLM_CURSOR_LAST_ID = original_cursor
+
+    def test_commit_pending_channel_delivery_cursors_skips_failed_response(self):
+        body = {
+            "metadata": {
+                "claude_any_channel_cursor_last_id": "9",
+                "claude_any_channel_summary_cursor_last_id": "12",
+            }
+        }
+        handler = type("Handler", (), {"_claude_any_response_status": 500})()
+        with (
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+            mock.patch.object(claude_any, "_channel_llm_summary_write_cursor_locked") as write_summary_cursor,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            claude_any.commit_pending_channel_delivery_cursors(body, handler)  # type: ignore[arg-type]
+
+        write_cursor.assert_not_called()
+        write_summary_cursor.assert_not_called()
+        self.assertTrue(any("channel_delivery_cursor_deferred" in str(call.args[1]) for call in router_log.call_args_list))
 
     def test_body_with_pending_channel_messages_keeps_ai_net_write_tools(self):
         body = {
@@ -1472,6 +1499,9 @@ class ChannelBridgeTests(unittest.TestCase):
                     out = claude_any.body_with_pending_channel_summaries(
                         {"messages": [{"role": "user", "content": "continue"}]}
                     )
+                    self.assertFalse(cursor_path.exists())
+                    handler = type("Handler", (), {"_claude_any_response_status": 200})()
+                    claude_any.commit_pending_channel_delivery_cursors(out, handler)  # type: ignore[arg-type]
                     cursor_payload = json.loads(cursor_path.read_text(encoding="utf-8"))
             finally:
                 claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = original_cursor
@@ -1485,6 +1515,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn("Sarah에게 업무를 배정", injected)
         self.assertTrue(out["metadata"]["claude_any_channel_summary_injected"])
         self.assertEqual("12", out["metadata"]["claude_any_channel_summary_message_ids"])
+        self.assertEqual("12", out["metadata"]["claude_any_channel_summary_cursor_last_id"])
         self.assertEqual({"last_id": 12}, cursor_payload)
         self.assertTrue(any("channel_llm_summary_injected" in str(call.args[1]) for call in router_log.call_args_list))
 

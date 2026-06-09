@@ -718,7 +718,7 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=False))
-                stack.enter_context(mock.patch.object(claude_any, "cached_external_channel_capable_server_names", return_value=[]))
+                stack.enter_context(mock.patch.object(claude_any, "native_auto_channel_capable_server_names", return_value=[]))
                 write_native = stack.enter_context(
                     mock.patch.object(claude_any, "write_native_mcp_config_from_discovery", return_value=native_mcp)
                 )
@@ -761,7 +761,7 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
                 ensure_probe = stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=True))
-                stack.enter_context(mock.patch.object(claude_any, "cached_external_channel_capable_server_names", return_value=["ai-net-http"]))
+                stack.enter_context(mock.patch.object(claude_any, "native_auto_channel_capable_server_names", return_value=["ai-net-http"]))
                 write_channel = stack.enter_context(mock.patch.object(claude_any, "write_channel_mcp_config"))
                 write_proxy = stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config"))
                 write_native = stack.enter_context(
@@ -966,6 +966,27 @@ class ChannelProbeCacheTests(unittest.TestCase):
             })
             names = claude_any.cached_external_channel_capable_server_names()
         self.assertEqual(["ai-net-http"], names)
+
+    def test_native_auto_channel_names_require_current_mcp_discovery(self):
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            self._isolate_cache(stack, td)
+            claude_any._write_channel_probe_cache({
+                "version": 1,
+                "probed_at": 1700000000.0,
+                "servers": [
+                    {"name": "stale-http", "capable": True, "transport": "streamable-http"},
+                    {"name": "current-http", "capable": True, "transport": "streamable-http"},
+                ],
+            })
+            stack.enter_context(
+                mock.patch.object(
+                    claude_any,
+                    "discovered_claude_mcp_servers",
+                    return_value={"current-http": {"type": "http", "url": "http://example.test/mcp"}},
+                )
+            )
+            names = claude_any.native_auto_channel_capable_server_names([])
+        self.assertEqual(["current-http"], names)
 
     def test_cached_source_paths_for_selected_sse_channel(self):
         with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
