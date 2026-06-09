@@ -562,6 +562,7 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "install_claude_any_statusline"))
                 stack.enter_context(mock.patch.object(claude_any, "find_executable", return_value="claude"))
                 stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
+                stack.enter_context(mock.patch.object(claude_any, "claude_supports_strict_mcp_config_arg", return_value=True))
                 stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
                 ensure_probe = stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=True))
@@ -582,6 +583,7 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertEqual({"claude-any-router", "ai-net-sse"}, write_proxy.call_args.kwargs["disable_proxy_notification_stream_names"])
         launch_cmd = call.call_args.args[0]
         self.assertIn(str(proxy_path), launch_cmd)
+        self.assertIn("--strict-mcp-config", launch_cmd)
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
         self.assertNotIn("server:claude-any-router", launch_cmd)
         self.assertNotIn("server:ai-net-sse", launch_cmd)
