@@ -123,6 +123,8 @@ LOG_PATH = CONFIG_DIR / "router.log"
 LOG_LEVEL_PATH = CONFIG_DIR / "log-level"
 REQUEST_DUMP_PATH = CONFIG_DIR / "requests.jsonl"
 RESPONSE_DUMP_PATH = CONFIG_DIR / "responses.jsonl"
+SSE_TRACE_PATH = CONFIG_DIR / "router-sse-trace.jsonl"
+SSE_LAST_PATH = CONFIG_DIR / "router-last-sse.json"
 TOOL_CALL_LOG_PATH = CONFIG_DIR / "tool-calls.jsonl"
 RATE_LIMIT_STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
 ROUTER_ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
@@ -284,6 +286,9 @@ ROUTER_LOG_MAX_BYTES = 1_000_000
 REQUEST_DUMP_MAX_BYTES = 5_000_000
 RESPONSE_DUMP_MAX_BYTES = 5_000_000
 RESPONSE_DUMP_TEXT_LIMIT = 16_000
+SSE_TRACE_MAX_BYTES = 2 * 1024 * 1024
+SSE_TRACE_EVENT_LIMIT = 240
+SSE_TRACE_PAYLOAD_LIMIT = 4_000
 CHAT_MESSAGES_MAX_BYTES = 20_000_000
 DEFAULT_REQUEST_TIMEOUT_MS = 300000
 _LOG_LEVEL_CACHE: dict[str, Any] = {"value": None, "checked_at": 0.0, "file_mtime": 0.0}
@@ -4283,6 +4288,151 @@ def dump_response_for_trace(provider: str, model: str, text_so_far: str, tool_ca
         }
         with RESPONSE_DUMP_PATH.open("a", encoding="utf-8") as f:
             f.write(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
+def sse_trace_enabled() -> bool:
+    value = os.environ.get("CLAUDE_ANY_SSE_TRACE", "").strip().lower()
+    if value in {"1", "true", "yes", "on", "trace"}:
+        return True
+    return current_log_level() >= LOG_LEVELS["TRACE"]
+
+
+def _summarize_sse_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    summary: dict[str, Any] = {
+        "type": payload.get("type"),
+    }
+    if "index" in payload:
+        summary["index"] = payload.get("index")
+    if payload.get("type") == "message_start":
+        message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        summary["message"] = {
+            "id": message.get("id"),
+            "model": message.get("model"),
+            "role": message.get("role"),
+            "content_len": len(message.get("content") or []),
+            "usage": message.get("usage"),
+        }
+    elif payload.get("type") == "message_delta":
+        summary["delta"] = payload.get("delta")
+        summary["usage"] = payload.get("usage")
+    elif payload.get("type") == "content_block_start":
+        block = payload.get("content_block") if isinstance(payload.get("content_block"), dict) else {}
+        block_summary = {
+            "type": block.get("type"),
+        }
+        if block.get("type") == "tool_use":
+            block_summary.update(
+                {
+                    "id": block.get("id"),
+                    "name": block.get("name"),
+                    "input": block.get("input"),
+                }
+            )
+        elif block.get("type") == "text":
+            block_summary["text_len"] = len(str(block.get("text") or ""))
+        else:
+            block_summary["keys"] = sorted(str(k) for k in block.keys())
+        summary["content_block"] = block_summary
+    elif payload.get("type") == "content_block_delta":
+        delta = payload.get("delta") if isinstance(payload.get("delta"), dict) else {}
+        delta_type = delta.get("type")
+        delta_summary: dict[str, Any] = {"type": delta_type}
+        if delta_type == "text_delta":
+            text = str(delta.get("text") or "")
+            delta_summary["text_len"] = len(text)
+            delta_summary["text"] = _truncate_for_dump(text, 500)
+        elif delta_type == "input_json_delta":
+            partial_json = str(delta.get("partial_json") or "")
+            delta_summary["partial_json_len"] = len(partial_json)
+            delta_summary["partial_json"] = _truncate_for_dump(partial_json, 1000)
+        else:
+            delta_summary["keys"] = sorted(str(k) for k in delta.keys())
+        summary["delta"] = delta_summary
+    else:
+        summary["keys"] = sorted(str(k) for k in payload.keys())
+    return summary
+
+
+def make_outgoing_sse_trace(provider: str, model: str, source: str, source_body: dict[str, Any] | None = None) -> dict[str, Any]:
+    return {
+        "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "provider": provider,
+        "model": model,
+        "source": source,
+        "stream": True,
+        "messages_count": len(source_body.get("messages") or []) if isinstance(source_body, dict) else None,
+        "tools_count": len(source_body.get("tools") or []) if isinstance(source_body, dict) else None,
+        "metadata_keys": sorted(str(k) for k in (source_body.get("metadata") or {}).keys()) if isinstance(source_body, dict) and isinstance(source_body.get("metadata"), dict) else [],
+        "event_count": 0,
+        "events_truncated": False,
+        "events": [],
+    }
+
+
+def record_outgoing_sse_event(trace: dict[str, Any] | None, event_name: str, payload: dict[str, Any]) -> None:
+    if not isinstance(trace, dict):
+        return
+    try:
+        trace["event_count"] = int(trace.get("event_count") or 0) + 1
+        events = trace.get("events")
+        if not isinstance(events, list):
+            events = []
+            trace["events"] = events
+        if len(events) >= SSE_TRACE_EVENT_LIMIT:
+            trace["events_truncated"] = True
+            return
+        payload_summary = _summarize_sse_payload(payload)
+        raw = ""
+        if sse_trace_enabled():
+            try:
+                raw = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+                raw = _truncate_for_dump(raw, SSE_TRACE_PAYLOAD_LIMIT)
+            except Exception:
+                raw = ""
+        event = {
+            "n": trace["event_count"],
+            "event": event_name,
+            "payload": payload_summary,
+        }
+        if raw:
+            event["raw"] = raw
+        events.append(event)
+    except Exception:
+        pass
+
+
+def finish_outgoing_sse_trace(
+    trace: dict[str, Any] | None,
+    *,
+    outcome: str,
+    text_len: int = 0,
+    tool_call_count: int = 0,
+    chunks: int = 0,
+    stop_reason: str | None = None,
+    error: str | None = None,
+) -> None:
+    if not isinstance(trace, dict):
+        return
+    try:
+        trace["finished_at"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+        trace["outcome"] = outcome
+        trace["text_len"] = text_len
+        trace["tool_call_count"] = tool_call_count
+        trace["chunks"] = chunks
+        trace["stop_reason"] = stop_reason
+        if error:
+            trace["error"] = error
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        tmp = SSE_LAST_PATH.with_name(f"{SSE_LAST_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
+        tmp.write_text(json.dumps(trace, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(SSE_LAST_PATH)
+        if sse_trace_enabled():
+            if SSE_TRACE_PATH.exists() and SSE_TRACE_PATH.stat().st_size > SSE_TRACE_MAX_BYTES:
+                SSE_TRACE_PATH.replace(SSE_TRACE_PATH.with_suffix(".jsonl.1"))
+            with SSE_TRACE_PATH.open("a", encoding="utf-8") as f:
+                f.write(json.dumps(trace, ensure_ascii=False, separators=(",", ":")) + "\n")
     except Exception:
         pass
 
@@ -12495,9 +12645,13 @@ def _ollama_stream_to_anthropic_sse(
     chunks_seen = 0
     text_stopped = False
     last_activity_update = 0.0
+    sse_trace = make_outgoing_sse_trace(provider, model, "ollama_stream", source_body)
+    sse_trace_outcome = "started"
+    sse_trace_error: str | None = None
 
     def emit(event_name: str, payload: dict[str, Any]) -> None:
         try:
+            record_outgoing_sse_event(sse_trace, event_name, payload)
             handler.wfile.write(f"event: {event_name}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode())
             handler.wfile.flush()
         except (BrokenPipeError, ConnectionAbortedError, ConnectionResetError, OSError) as exc:
@@ -12846,6 +13000,7 @@ def _ollama_stream_to_anthropic_sse(
         emit("message_delta", event)
         # Send message_stop
         emit("message_stop", {"type": "message_stop"})
+        sse_trace_outcome = "success"
         if text_started or tool_indices:
             write_router_activity(
                 "success",
@@ -12857,6 +13012,8 @@ def _ollama_stream_to_anthropic_sse(
                 stream=True,
             )
     except UpstreamClientDisconnected as exc:
+        sse_trace_outcome = "client_disconnected"
+        sse_trace_error = f"{type(exc).__name__}: {exc}"
         router_log(
             "WARN",
             f"ollama_stream_client_disconnected provider={provider} model={model} "
@@ -12873,6 +13030,8 @@ def _ollama_stream_to_anthropic_sse(
             stream=True,
         )
     except Exception as exc:
+        sse_trace_outcome = "error"
+        sse_trace_error = f"{type(exc).__name__}: {exc}"
         router_log("ERROR", f"ollama_stream_error provider={provider} model={model} error={type(exc).__name__}: {exc}")
         write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
         try:
@@ -12901,6 +13060,15 @@ def _ollama_stream_to_anthropic_sse(
             pass
         try:
             final_stop_reason = locals().get("stop_reason")
+            finish_outgoing_sse_trace(
+                sse_trace,
+                outcome=sse_trace_outcome,
+                text_len=len(text_so_far),
+                tool_call_count=len(tool_calls),
+                chunks=chunks_seen,
+                stop_reason=final_stop_reason if isinstance(final_stop_reason, str) else None,
+                error=sse_trace_error,
+            )
             dump_response_for_trace(
                 provider=provider,
                 model=model,
@@ -23978,19 +24146,20 @@ def _channel_direct_llm_worker(message: dict[str, Any]) -> None:
         model = current_alias(cfg)
         prompt = format_channel_llm_batch_prompt([message])
         text, stop_reason, tool_turns = _channel_direct_llm_router_response(message_id, prompt, message, provider, pcfg, model)
-        with _CHANNEL_LLM_DIRECT_LOCK:
-            _CHANNEL_LLM_DIRECT_DELIVERED.add(message_id)
-            if len(_CHANNEL_LLM_DIRECT_DELIVERED) > 1000:
-                for old_id in sorted(_CHANNEL_LLM_DIRECT_DELIVERED)[:500]:
-                    _CHANNEL_LLM_DIRECT_DELIVERED.discard(old_id)
-        with _CHANNEL_LLM_CURSOR_LOCK:
-            current = _channel_llm_read_cursor_locked()
-            if message_id > current:
-                _CHANNEL_LLM_CURSOR_LAST_ID = message_id
-                _channel_llm_write_cursor_locked(message_id)
         if stop_reason == "no_tools":
+            router_log("WARN", f"channel_llm_direct_unhandled message_id={message_id} reason=no_tools")
             router_log("INFO", f"channel_llm_summary_skipped message_id={message_id} reason=no_tools")
         else:
+            with _CHANNEL_LLM_DIRECT_LOCK:
+                _CHANNEL_LLM_DIRECT_DELIVERED.add(message_id)
+                if len(_CHANNEL_LLM_DIRECT_DELIVERED) > 1000:
+                    for old_id in sorted(_CHANNEL_LLM_DIRECT_DELIVERED)[:500]:
+                        _CHANNEL_LLM_DIRECT_DELIVERED.discard(old_id)
+            with _CHANNEL_LLM_CURSOR_LOCK:
+                current = _channel_llm_read_cursor_locked()
+                if message_id > current:
+                    _CHANNEL_LLM_CURSOR_LAST_ID = message_id
+                    _channel_llm_write_cursor_locked(message_id)
             _channel_direct_append_summary(message, text, stop_reason, tool_turns=tool_turns)
         router_log("INFO", f"channel_llm_direct_response message_id={message_id} chars={len(text)} stop_reason={stop_reason} tool_turns={tool_turns}")
         _channel_direct_terminal_notice(message, text, stop_reason)
@@ -24389,12 +24558,6 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                     f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
                 )
                 continue
-            if _channel_message_is_direct_llm_owned(message):
-                router_log(
-                    "INFO",
-                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
-                )
-                continue
             try:
                 message_id = int(message.get("id") or 0)
             except Exception:
@@ -24402,13 +24565,24 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
             with _CHANNEL_LLM_DIRECT_LOCK:
                 direct_inflight = message_id in _CHANNEL_LLM_DIRECT_INFLIGHT
                 direct_delivered = message_id in _CHANNEL_LLM_DIRECT_DELIVERED
-            if direct_inflight or direct_delivered:
-                reason = "llm_direct_inflight" if direct_inflight else "llm_direct_delivered"
+            meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+            persisted_direct_delivered = bool(meta.get("llm_direct_delivered"))
+            if direct_inflight or direct_delivered or persisted_direct_delivered:
+                reason = (
+                    "llm_direct_inflight"
+                    if direct_inflight
+                    else "llm_direct_delivered"
+                )
                 router_log(
                     "INFO",
                     f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={reason}",
                 )
                 continue
+            if meta.get("llm_direct_pending"):
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_fallback message_id={message.get('id')} channel={message.get('channel')} reason=stale_llm_direct_pending",
+                )
             with _CHANNEL_STDIN_WAKE_LOCK:
                 stdin_wake_delivered = message_id in _CHANNEL_STDIN_WAKE_DELIVERED
             if stdin_wake_delivered:

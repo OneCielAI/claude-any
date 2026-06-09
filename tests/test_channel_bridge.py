@@ -1609,7 +1609,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertFalse(cursor_path.exists())
         self.assertTrue(any("plan_mode_active" in str(call.args[1]) for call in router_log.call_args_list))
 
-    def test_body_with_pending_channel_messages_skips_persisted_direct_pending_messages(self):
+    def test_body_with_pending_channel_messages_recovers_stale_direct_pending_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
         messages = [
             {
@@ -1629,10 +1629,13 @@ class ChannelBridgeTests(unittest.TestCase):
         ):
             out = claude_any.body_with_pending_channel_messages(body)
 
-        self.assertIs(out, body)
-        write_cursor.assert_called_with(3)
+        self.assertIsNot(out, body)
+        write_cursor.assert_not_called()
+        injected = out["messages"][-1]["content"][0]["text"]
+        self.assertIn("direct marked before scheduling", injected)
+        self.assertEqual("3", out["metadata"]["claude_any_channel_message_ids"])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
-        self.assertTrue(any("llm_direct_pending" in item for item in log_messages))
+        self.assertTrue(any("stale_llm_direct_pending" in item for item in log_messages))
 
     def test_body_with_pending_channel_messages_skips_direct_delivered_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
@@ -2923,7 +2926,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 mock.patch.object(claude_any, "get_current_provider", return_value=("ollama-cloud", {"request_timeout_ms": 300000})),
                 mock.patch.object(claude_any, "current_alias", return_value="claude-any-ollama-cloud-test"),
                 mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=0),
-                mock.patch.object(claude_any, "_channel_llm_write_cursor_locked"),
+                mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
                 mock.patch.object(
                     claude_any,
                     "_channel_direct_llm_router_response",
@@ -2938,7 +2941,10 @@ class ChannelBridgeTests(unittest.TestCase):
             claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
 
         append_summary.assert_not_called()
+        write_cursor.assert_not_called()
+        self.assertNotIn(17, claude_any._CHANNEL_LLM_DIRECT_DELIVERED)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_llm_direct_unhandled" in item and "reason=no_tools" in item for item in log_messages))
         self.assertTrue(any("channel_llm_summary_skipped" in item and "reason=no_tools" in item for item in log_messages))
 
     def test_channel_direct_terminal_notice_is_quiet_by_default(self):
