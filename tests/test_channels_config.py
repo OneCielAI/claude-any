@@ -717,6 +717,8 @@ class ChannelConfigTests(unittest.TestCase):
                 stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
                 stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
                 stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "cached_external_channel_capable_server_names", return_value=[]))
                 write_native = stack.enter_context(
                     mock.patch.object(claude_any, "write_native_mcp_config_from_discovery", return_value=native_mcp)
                 )
@@ -732,6 +734,54 @@ class ChannelConfigTests(unittest.TestCase):
         self.assertNotIn(str(explicit_mcp), launch_cmd)
         self.assertIn("--verbose", launch_cmd)
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
+        launch_env = call.call_args.kwargs["env"]
+        self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
+
+    def test_native_launch_auto_loads_external_channel_capable_servers(self):
+        cfg = {"providers": {"anthropic": {}}, "claude_code": {"channel_delivery": "llm", "channels": []}}
+        with tempfile.TemporaryDirectory() as td:
+            native_mcp = Path(td) / "native-mcp.json"
+            native_mcp.write_text(json.dumps({"mcpServers": {"ai-net-http": {"type": "http", "url": "http://example/mcp"}}}), encoding="utf-8")
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(claude_any, "run_prelaunch_menu", return_value=0))
+                stack.enter_context(mock.patch.object(claude_any, "load_config", return_value=cfg))
+                stack.enter_context(mock.patch.object(claude_any, "get_current_provider", return_value=("anthropic", {"route_through_router": False})))
+                stack.enter_context(mock.patch.object(claude_any, "launch_readiness_errors", return_value=[]))
+                stack.enter_context(mock.patch.object(claude_any, "native_anthropic_enabled", return_value=True))
+                stack.enter_context(mock.patch.object(claude_any, "ollama_native_compat_enabled", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "provider_native_compat_enabled", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "cleanup_managed_services_for_provider"))
+                start_router = stack.enter_context(mock.patch.object(claude_any, "start_router_if_needed"))
+                stack.enter_context(mock.patch.object(claude_any, "auto_import_passthrough_channels"))
+                stack.enter_context(mock.patch.object(claude_any, "env_vars", return_value={"CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1"}))
+                stack.enter_context(mock.patch.object(claude_any, "disable_claude_any_slash_commands_for_native"))
+                stack.enter_context(mock.patch.object(claude_any, "find_executable", return_value="claude"))
+                stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
+                stack.enter_context(mock.patch.object(claude_any, "claude_code_channels_auth_available", return_value=(True, "claude.ai")))
+                stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
+                ensure_probe = stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=True))
+                stack.enter_context(mock.patch.object(claude_any, "cached_external_channel_capable_server_names", return_value=["ai-net-http"]))
+                write_channel = stack.enter_context(mock.patch.object(claude_any, "write_channel_mcp_config"))
+                write_proxy = stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config"))
+                write_native = stack.enter_context(
+                    mock.patch.object(claude_any, "write_native_mcp_config_from_discovery", return_value=native_mcp)
+                )
+                call = stack.enter_context(mock.patch.object(claude_any.subprocess, "call", return_value=0))
+                rc = claude_any.launch_claude([])
+
+        self.assertEqual(0, rc)
+        ensure_probe.assert_called_once_with(cfg, [])
+        start_router.assert_not_called()
+        write_channel.assert_not_called()
+        write_proxy.assert_not_called()
+        write_native.assert_called_once()
+        launch_cmd = call.call_args.args[0]
+        self.assertIn("--mcp-config", launch_cmd)
+        self.assertIn(str(native_mcp), launch_cmd)
+        self.assertIn("--dangerously-load-development-channels", launch_cmd)
+        self.assertIn("server:ai-net-http", launch_cmd)
+        self.assertNotIn("server:claude-any-router", launch_cmd)
         launch_env = call.call_args.kwargs["env"]
         self.assertNotIn("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", launch_env)
 
@@ -901,6 +951,21 @@ class ChannelProbeCacheTests(unittest.TestCase):
         self.assertIn("claude-any-router", names)
         self.assertIn("ai-net", names)
         self.assertNotIn("boring", names)
+
+    def test_cached_external_capable_names_excludes_router_self(self):
+        with tempfile.TemporaryDirectory() as td, ExitStack() as stack:
+            self._isolate_cache(stack, td)
+            claude_any._write_channel_probe_cache({
+                "version": 1,
+                "probed_at": 1700000000.0,
+                "servers": [
+                    {"name": "claude-any-router", "capable": True, "transport": "sse"},
+                    {"name": "ai-net-http", "capable": True, "transport": "streamable-http"},
+                    {"name": "boring", "capable": False, "transport": "stdio"},
+                ],
+            })
+            names = claude_any.cached_external_channel_capable_server_names()
+        self.assertEqual(["ai-net-http"], names)
 
     def test_cached_source_paths_for_selected_sse_channel(self):
         with tempfile.TemporaryDirectory() as td, ExitStack() as stack:

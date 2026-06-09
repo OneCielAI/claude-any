@@ -16033,6 +16033,26 @@ def cached_channel_capable_server_names() -> list[str]:
     return _dedupe_strings(names)
 
 
+def cached_external_channel_capable_server_names() -> list[str]:
+    """Channel-capable MCP servers from cache, excluding claude-any's router.
+
+    Claude Native launches can directly subscribe to external channel-capable
+    MCP servers with --dangerously-load-development-channels. The built-in
+    claude-any-router is only valid when claude-any intentionally starts and
+    manages its router bridge, so it must not be auto-injected into plain
+    native launches.
+    """
+    names: list[str] = []
+    for record in cached_channel_probe_servers():
+        if not record.get("capable"):
+            continue
+        name = str(record.get("name") or "").strip()
+        if not name or name.strip().lower() in _NATIVE_ROUTER_CHANNEL_NAMES:
+            continue
+        names.append(name)
+    return _dedupe_strings(names)
+
+
 def cached_channel_source_paths_for_specs(specs: Iterable[str]) -> list[Path]:
     """Return MCP config files that supplied the selected channel servers.
 
@@ -25933,10 +25953,23 @@ def launch_claude(
     native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
     stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg)
     llm_channel_delivery = should_use_channel_llm_delivery(use_router_mode, launch_passthrough, cfg)
+    native_auto_channel_specs: list[str] = []
+    if use_native_anthropic and not native_channel_bridge and not native_channel_passthrough_requested(launch_passthrough):
+        try:
+            ensure_channel_probe_cache_for_launch(cfg, launch_passthrough)
+            native_auto_names = cached_external_channel_capable_server_names()
+            native_auto_channel_specs = [f"server:{name}" for name in native_auto_names]
+            if native_auto_channel_specs:
+                router_log(
+                    "INFO",
+                    "channel_native_auto_specs servers=%s" % ",".join(native_auto_names),
+                )
+        except Exception as exc:
+            router_log("WARN", f"channel_native_auto_probe_failed error={type(exc).__name__}: {exc}")
     manage_router_lifetime = False
     if use_router_mode or native_channel_bridge or llm_channel_delivery:
         manage_router_lifetime = bool(start_router_if_needed())
-    if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge or llm_channel_delivery:
+    if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge or llm_channel_delivery or native_auto_channel_specs:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
     if use_native_anthropic:
@@ -25995,12 +26028,16 @@ def launch_claude(
         raise RuntimeError("claude executable was not found in PATH or the Claude Any user bin directories")
     run_claude_update_check(claude, enabled=update_check)
     claude = find_executable("claude") or claude
-    if native_channel_bridge:
+    if native_channel_bridge or native_auto_channel_specs:
         auth_ok, auth_reason = claude_code_channels_auth_available(claude)
         if not auth_ok:
-            router_log("WARN", f"channel_native_unavailable_fallback reason={auth_reason} delivery=llm")
-            native_channel_bridge = False
-            llm_channel_delivery = True
+            if native_channel_bridge:
+                router_log("WARN", f"channel_native_unavailable_fallback reason={auth_reason} delivery=llm")
+                native_channel_bridge = False
+                llm_channel_delivery = True
+            else:
+                router_log("WARN", f"channel_native_auto_disabled reason={auth_reason}")
+                native_auto_channel_specs = []
     extra_args: list[str] = []
     mcp_config_paths: list[str] = []
     if should_attach_web_search(provider, cfg, web_search_override):
@@ -26069,6 +26106,8 @@ def launch_claude(
             native_channel_bridge=native_channel_bridge,
         )
     )
+    if native_auto_channel_specs:
+        extra_args.extend(["--dangerously-load-development-channels", *native_auto_channel_specs])
     append_claude_code_runtime_settings_args(extra_args, launch_passthrough, provider, pcfg)
     if fork_native_session:
         session_id = str(uuid.uuid4())
