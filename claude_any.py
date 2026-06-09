@@ -14123,7 +14123,8 @@ class RouterHandler(BaseHTTPRequestHandler):
             word_chunking = bool(pcfg.get("stream_word_chunking", False))
             if not stream_enabled:
                 body["stream"] = False
-            data = json.dumps(body).encode("utf-8")
+            upstream_body = body_without_claude_any_internal_metadata(body)
+            data = json.dumps(upstream_body).encode("utf-8")
             base = native_anthropic_base_url(provider, pcfg) if provider_native_compat_enabled(provider, pcfg) else provider_upstream_request_base(provider, pcfg)
             url = join_url(base, "/v1/messages")
             headers = provider_headers(provider, pcfg, self.headers)
@@ -24082,8 +24083,41 @@ def _commit_channel_llm_summary_cursor_if_newer(last_id: int | None) -> None:
             router_log("WARN", f"channel_llm_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
 
 
-def commit_pending_channel_delivery_cursors(body: dict[str, Any], handler: BaseHTTPRequestHandler | None = None) -> None:
-    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+CLAUDE_ANY_INTERNAL_METADATA_PREFIX = "claude_any_"
+
+
+def body_without_claude_any_internal_metadata(body: dict[str, Any]) -> dict[str, Any]:
+    """Return an upstream-safe copy with claude-any private metadata removed."""
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else None
+    if not metadata:
+        return body
+    internal_keys = [
+        key
+        for key in metadata
+        if str(key).startswith(CLAUDE_ANY_INTERNAL_METADATA_PREFIX)
+    ]
+    if not internal_keys:
+        return body
+    public_metadata = {
+        key: value
+        for key, value in metadata.items()
+        if not str(key).startswith(CLAUDE_ANY_INTERNAL_METADATA_PREFIX)
+    }
+    out = dict(body)
+    if public_metadata:
+        out["metadata"] = public_metadata
+    else:
+        out.pop("metadata", None)
+    return out
+
+
+def commit_pending_channel_delivery_cursors(
+    body: dict[str, Any],
+    handler: BaseHTTPRequestHandler | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    if not isinstance(metadata, dict):
+        metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     if not metadata:
         return
     if handler is not None:

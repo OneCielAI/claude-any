@@ -1260,6 +1260,53 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
         self.assertTrue(any("channel_llm_inject_skipped" in item and "initialized" in item for item in log_messages))
 
+    def test_body_without_claude_any_internal_metadata_strips_private_keys(self):
+        body = {
+            "model": "claude-any-test",
+            "metadata": {
+                "claude_any_channel_injected": True,
+                "claude_any_channel_cursor_last_id": "9",
+                "user_id": "user-1",
+            },
+        }
+
+        out = claude_any.body_without_claude_any_internal_metadata(body)
+
+        self.assertIsNot(out, body)
+        self.assertEqual({"user_id": "user-1"}, out["metadata"])
+        self.assertIn("claude_any_channel_injected", body["metadata"])
+
+    def test_body_without_claude_any_internal_metadata_removes_empty_metadata(self):
+        body = {
+            "model": "claude-any-test",
+            "metadata": {
+                "claude_any_channel_summary_injected": True,
+                "claude_any_channel_summary_cursor_last_id": "12",
+            },
+        }
+
+        out = claude_any.body_without_claude_any_internal_metadata(body)
+
+        self.assertIsNot(out, body)
+        self.assertNotIn("metadata", out)
+
+    def test_commit_pending_channel_delivery_cursors_accepts_private_metadata_override(self):
+        sanitized_body = {"model": "claude-any-test"}
+        private_metadata = {"claude_any_channel_cursor_last_id": "9"}
+        handler = type("Handler", (), {"_claude_any_response_status": 200})()
+
+        with (
+            mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as commit_cursor,
+        ):
+            claude_any.commit_pending_channel_delivery_cursors(
+                sanitized_body,
+                handler,  # type: ignore[arg-type]
+                metadata=private_metadata,
+            )
+
+        commit_cursor.assert_called_with(9)
+
     def test_ensure_channel_llm_delivery_cursor_preserves_existing_cursor(self):
         with tempfile.TemporaryDirectory() as td:
             cursor_path = Path(td) / "channel-llm-cursor.json"
