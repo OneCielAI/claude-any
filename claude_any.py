@@ -2209,6 +2209,39 @@ def join_url(base: str, path: str) -> str:
     return base + path
 
 
+def inbound_query_has_beta_flag(request_path: str) -> bool:
+    """True when Claude Code's inbound request carried ?beta=true.
+
+    Claude Code signals beta-feature opt-in (e.g. the context-1m long-context
+    beta) via the ``beta=true`` query parameter on /v1/messages. The router
+    parses only the path and would otherwise drop it, so callers re-attach the
+    flag when forwarding upstream. Only the known ``beta`` flag is inspected;
+    other query parameters are intentionally not forwarded.
+    """
+    query = urllib.parse.urlparse(request_path).query
+    for value in urllib.parse.parse_qs(query).get("beta", []):
+        if value.strip().lower() in ("true", "1"):
+            return True
+    return False
+
+
+def upstream_messages_query(pcfg: dict[str, Any], request_path: str) -> str:
+    """Query string to append to the upstream /v1/messages URL.
+
+    A configured ``force_query_string`` (testing override) wins, letting an
+    operator inject an arbitrary raw query (e.g. "beta=true") from the options
+    screen. Otherwise the inbound ``beta=true`` flag is propagated so beta
+    features like the context-1m long-context request reach the upstream
+    unchanged (do_POST parses only the path and drops the original query).
+    """
+    forced = str(pcfg.get("force_query_string") or "").strip().lstrip("?").strip()
+    if forced:
+        return forced
+    if inbound_query_has_beta_flag(request_path):
+        return "beta=true"
+    return ""
+
+
 def read_env_file(path: Path) -> dict[str, str]:
     env: dict[str, str] = {}
     if not path.exists():
@@ -14588,6 +14621,9 @@ class RouterHandler(BaseHTTPRequestHandler):
             data = json.dumps(upstream_body).encode("utf-8")
             base = native_anthropic_base_url(provider, pcfg) if provider_native_compat_enabled(provider, pcfg) else provider_upstream_request_base(provider, pcfg)
             url = join_url(base, "/v1/messages")
+            upstream_query = upstream_messages_query(pcfg, self.path)
+            if upstream_query:
+                url = f"{url}?{upstream_query}"
             headers = provider_headers(provider, pcfg, self.headers)
             for h in ("anthropic-beta", "anthropic-dangerous-direct-browser-access"):
                 if self.headers.get(h):
@@ -17455,6 +17491,9 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
         parts.append(f"endpoint_overrides={count}")
     if provider == "anthropic":
         parts.append(f"routed={'on' if anthropic_routed_enabled(provider, pcfg) else 'off'}")
+    forced_query = str(pcfg.get("force_query_string") or "").strip()
+    if forced_query:
+        parts.append(f"force_query={forced_query}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go"):
@@ -19351,6 +19390,8 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg["stream_enabled"] = True
         elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
             pcfg["stream_word_chunking"] = False
+        elif key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
+            pcfg.pop("force_query_string", None)
         elif key in ("workflows_enabled", "workflow", "workflows"):
             pcfg["workflows_enabled"] = False
         elif key in ("ultracode_enabled", "ultracode"):
@@ -19430,6 +19471,17 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         return
     if key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
         pcfg["stream_word_chunking"] = parse_bool(value, default=False)
+        return
+    if key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
+        # Testing aid: force a raw query string onto the upstream /v1/messages URL
+        # (e.g. "beta=true" or "beta=true&foo=bar"). Lets the operator probe how the
+        # upstream reacts to arbitrary query params without code changes. A leading
+        # "?" is tolerated and stripped. Empty value clears the override.
+        text = "" if value is None else str(value).strip().lstrip("?").strip()
+        if not text:
+            pcfg.pop("force_query_string", None)
+        else:
+            pcfg["force_query_string"] = text
         return
     if key in ("rate_limit_status", "rpm_status"):
         pcfg["rate_limit_status"] = parse_bool(value, default=False)
