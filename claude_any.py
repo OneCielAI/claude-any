@@ -167,6 +167,15 @@ ANTHROPIC_MODEL_DOCS_URLS = (
     ANTHROPIC_MODEL_DOCS_URL,
     "https://platform.claude.com/docs/en/about-claude/models/overview",
 )
+ANTHROPIC_PUBLIC_MODEL_FALLBACK_IDS: tuple[str, ...] = (
+    "claude-fable-5",
+    "claude-mythos-5",
+    "claude-mythos-preview",
+    "claude-opus-4-8",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+    "claude-haiku-4-5",
+)
 OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen"
 OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go"
 NCP_PYPI_PACKAGE = "nvd-claude-proxy"
@@ -1681,7 +1690,10 @@ PROVIDER_NOTES = {
 
 DEFAULT_ADVISOR_MODELS: tuple[str, ...] = (
     "",
+    "claude-fable-5",
     "claude-opus-4-8",
+    "claude-mythos-5",
+    "claude-mythos-preview",
     "deepseek-v4-pro",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
@@ -4601,7 +4613,7 @@ def model_cache_key(provider: str, pcfg: dict[str, Any]) -> str:
 
 def anthropic_model_family_from_id(model_id: str) -> str:
     model = (model_id or "").strip().lower()
-    for family in ("opus", "sonnet", "haiku"):
+    for family in ("fable", "mythos", "opus", "sonnet", "haiku"):
         if re.search(rf"(?:^|-)claude-(?:\d+(?:-\d+){{0,2}}-)?{family}(?:-|$)", model) or f"-{family}-" in model:
             return family
     return "claude"
@@ -4612,6 +4624,12 @@ def anthropic_model_limit_hints(model_id: str) -> dict[str, Any]:
     family = anthropic_model_family_from_id(model)
     # Keep provider limits as metadata, not launch defaults. The CLI default
     # max_output_tokens below is intentionally lower for interactive safety.
+    if family in ("fable", "mythos"):
+        return {
+            "context_window": 1048576,
+            "max_output_tokens": 128000,
+            "source": "anthropic-models-overview-current-table",
+        }
     if family == "opus" and re.search(r"(?:^|-)opus-4-[678](?:-|$)", model):
         return {
             "context_window": 1048576,
@@ -4638,6 +4656,17 @@ def anthropic_model_limit_hints(model_id: str) -> dict[str, Any]:
 
 def anthropic_model_runtime_hints(model_id: str) -> dict[str, Any]:
     model = (model_id or "").strip().lower()
+    family = anthropic_model_family_from_id(model)
+    if family in ("fable", "mythos"):
+        return {
+            "claude_code_default_effort": "high",
+            "claude_code_max_effort": "xhigh",
+            "thinking_mode": "adaptive",
+            "extended_thinking": False,
+            "adaptive_thinking_always_on": True,
+            "unsupported_sampling_parameters": ["temperature", "top_p", "top_k"],
+            "source": "anthropic-models-overview-current-table",
+        }
     if re.search(r"(?:^|-)opus-4-8(?:-|$)", model):
         return {
             "claude_code_default_effort": "high",
@@ -4690,6 +4719,14 @@ def normalize_claude_code_supported_capabilities(value: Any) -> list[str]:
 
 def infer_claude_code_supported_capabilities_from_model(model_id: str) -> list[str]:
     model = strip_claude_context_suffix(model_id).strip().lower()
+    if re.search(r"(?:^|-)claude-(?:fable|mythos)(?:-|$)", model):
+        return [
+            "effort",
+            "xhigh_effort",
+            "max_effort",
+            "thinking",
+            "adaptive_thinking",
+        ]
     if re.search(r"(?:^|-)opus-4-[78](?:-|$)", model):
         return [
             "effort",
@@ -5001,6 +5038,8 @@ def model_info_from_response(provider: str, data: Any) -> dict[str, dict[str, An
 ANTHROPIC_PUBLIC_MODEL_ID_RE = re.compile(
     r"(?<![A-Za-z0-9_.@:-])"
     r"(?:"
+    r"claude-(?:fable|mythos)-\d+(?:-\d+)?(?:-\d{8})?|"
+    r"claude-mythos-preview|"
     r"claude-(?:opus|sonnet|haiku)-\d+-\d+-\d{8}|"
     r"claude-(?:opus|sonnet|haiku)-\d+-\d{8}|"
     r"claude-(?:opus|sonnet|haiku)-\d+-\d+|"
@@ -5049,7 +5088,7 @@ def fetch_anthropic_public_model_ids(timeout: float = 8.0) -> list[str]:
         return out
     if errors:
         router_log("WARN", "anthropic model docs fetch failed: " + " ; ".join(errors))
-    return []
+    return list(ANTHROPIC_PUBLIC_MODEL_FALLBACK_IDS)
 
 
 def opencode_zen_endpoint_kind(model_id: str) -> str:
@@ -11360,6 +11399,23 @@ def apply_provider_request_options(provider: str, pcfg: dict[str, Any], body: di
     return out
 
 
+def normalize_anthropic_model_request_options(provider: str, pcfg: dict[str, Any], body: dict[str, Any], model_id: str) -> dict[str, Any]:
+    if provider != "anthropic":
+        return body
+    unsupported = anthropic_model_runtime_hints(model_id).get("unsupported_sampling_parameters")
+    if not isinstance(unsupported, list) or not unsupported:
+        return body
+    out = dict(body)
+    removed: list[str] = []
+    for key in unsupported:
+        if isinstance(key, str) and key in out:
+            out.pop(key, None)
+            removed.append(key)
+    if removed:
+        router_log("INFO", f"anthropic_request_options_removed model={model_id} keys={','.join(removed)}")
+    return out
+
+
 def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], stream: bool = True) -> dict[str, Any]:
     messages = anthropic_messages_to_ollama(body)
     tools = anthropic_tools_to_ollama(body.get("tools"))
@@ -14466,6 +14522,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                 upstream_model = ncp_model_id_for_nvidia_hosted(upstream_model)
             body["model"] = upstream_model
             body = resolve_tool_model_references(provider, pcfg, body)
+            body = normalize_anthropic_model_request_options(provider, pcfg, body, upstream_model)
             stream_enabled = bool(pcfg.get("stream_enabled", True))
             word_chunking = bool(pcfg.get("stream_word_chunking", False))
             if not stream_enabled:

@@ -498,6 +498,8 @@ class NativeSessionBoundaryTests(unittest.TestCase):
 class NativeModelListTests(unittest.TestCase):
     def test_public_docs_parser_extracts_current_claude_models_without_footnotes(self):
         html = """
+        Claude Fable 5 (`claude-fable-5`) is Anthropic's most capable widely released model.
+        Claude Mythos 5 (`claude-mythos-5`) joins the invitation-only Claude Mythos Preview (`claude-mythos-preview`).
         Claude API ID
         <span>claude-opus-4-8</span><span>claude-sonnet-4-6</span>
         <span>claude-haiku-4-5-20251001</span>
@@ -511,9 +513,28 @@ class NativeModelListTests(unittest.TestCase):
         ids = claude_any.anthropic_model_ids_from_docs_text(html)
 
         self.assertEqual(
-            ["claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001", "claude-haiku-4-5"],
+            [
+                "claude-fable-5",
+                "claude-mythos-5",
+                "claude-mythos-preview",
+                "claude-opus-4-8",
+                "claude-sonnet-4-6",
+                "claude-haiku-4-5-20251001",
+                "claude-haiku-4-5",
+            ],
             ids,
         )
+
+    def test_public_docs_parser_rejects_embedded_current_model_words(self):
+        html = """
+        Not a model ID: claude-fable-5-and-claude-mythos-5
+        Not a model ID: anthropic.claude-fable-5
+        Real model ID: `claude-fable-5`
+        """
+
+        ids = claude_any.anthropic_model_ids_from_docs_text(html)
+
+        self.assertEqual(["claude-fable-5"], ids)
 
     def test_public_docs_parser_includes_latest_aliases(self):
         html = """
@@ -569,15 +590,31 @@ class NativeModelListTests(unittest.TestCase):
                 mock.patch.object(claude_any, "MODEL_LIST_CACHE_PATH", cache_path),
                 mock.patch.object(claude_any, "MODEL_REGISTRY_PATH", registry_path),
             ):
-                claude_any.write_model_registry("anthropic", pcfg, ["claude-opus-4-8", "claude-haiku-4-5"], "anthropic-docs")
+                claude_any.write_model_registry(
+                    "anthropic",
+                    pcfg,
+                    ["claude-fable-5", "claude-mythos-preview", "claude-opus-4-8", "claude-haiku-4-5"],
+                    "anthropic-docs",
+                )
                 cached = claude_any.read_model_list_cache("anthropic", pcfg)
                 registry = claude_any.read_model_registry("anthropic", pcfg)
 
-        self.assertEqual(["claude-opus-4-8", "claude-haiku-4-5"], cached)
+        self.assertEqual(["claude-fable-5", "claude-mythos-preview", "claude-opus-4-8", "claude-haiku-4-5"], cached)
         self.assertIsNotNone(registry)
         assert registry is not None
         self.assertEqual("anthropic-docs", registry["source"])
         recommendations = registry["recommendations"]
+        self.assertEqual("balanced", recommendations["claude-fable-5"]["recommended_preset"])
+        self.assertEqual(1048576, recommendations["claude-fable-5"]["limits"]["context_window"])
+        self.assertEqual(128000, recommendations["claude-fable-5"]["limits"]["max_output_tokens"])
+        self.assertEqual("high", recommendations["claude-fable-5"]["runtime"]["claude_code_default_effort"])
+        self.assertEqual("xhigh", recommendations["claude-fable-5"]["runtime"]["claude_code_max_effort"])
+        self.assertEqual("adaptive", recommendations["claude-fable-5"]["runtime"]["thinking_mode"])
+        self.assertTrue(recommendations["claude-fable-5"]["runtime"]["adaptive_thinking_always_on"])
+        self.assertIn("temperature", recommendations["claude-fable-5"]["runtime"]["unsupported_sampling_parameters"])
+        self.assertEqual("mythos", recommendations["claude-mythos-preview"]["model_family"])
+        self.assertEqual(1048576, recommendations["claude-mythos-preview"]["limits"]["context_window"])
+        self.assertEqual(128000, recommendations["claude-mythos-preview"]["limits"]["max_output_tokens"])
         self.assertEqual("balanced", recommendations["claude-opus-4-8"]["recommended_preset"])
         self.assertEqual(4096, recommendations["claude-opus-4-8"]["parameters"]["max_output_tokens"])
         self.assertEqual(1048576, recommendations["claude-opus-4-8"]["limits"]["context_window"])
@@ -590,6 +627,37 @@ class NativeModelListTests(unittest.TestCase):
         self.assertEqual("fast", recommendations["claude-haiku-4-5"]["recommended_preset"])
         self.assertEqual(2048, recommendations["claude-haiku-4-5"]["parameters"]["max_output_tokens"])
         self.assertEqual(200000, recommendations["claude-haiku-4-5"]["limits"]["context_window"])
+
+    def test_anthropic_latest_models_strip_unsupported_sampling_request_options(self):
+        body = {
+            "model": "claude-fable-5",
+            "max_tokens": 4096,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_k": 40,
+            "messages": [],
+        }
+
+        out = claude_any.normalize_anthropic_model_request_options("anthropic", {}, body, "claude-fable-5")
+
+        self.assertNotIn("temperature", out)
+        self.assertNotIn("top_p", out)
+        self.assertNotIn("top_k", out)
+        self.assertEqual(4096, out["max_tokens"])
+        self.assertIn("temperature", body)
+
+    def test_non_anthropic_request_options_are_not_stripped_by_anthropic_model_hints(self):
+        body = {
+            "model": "claude-fable-5",
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_k": 40,
+            "messages": [],
+        }
+
+        out = claude_any.normalize_anthropic_model_request_options("vllm", {}, body, "claude-fable-5")
+
+        self.assertEqual(body, out)
 
     def test_anthropic_docs_registry_survives_api_key_state_changes(self):
         pcfg_with_key = {"base_url": "https://api.anthropic.com", "api_key": "sk-ant-real", "current_model": "claude-sonnet-4-6"}
