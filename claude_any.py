@@ -16845,9 +16845,82 @@ def auto_start_sse_channels_from_mcp_configs(
     return started
 
 
+def proxy_owned_channel_server_names() -> set[str]:
+    """Servers the launch process already routes through claude-any's mcp-proxy.
+
+    launch_claude force-proxies channel-capable streamable-HTTP servers so the
+    proxy is the single owner of their notification stream (and idle wake). The
+    router runs in a separate process and would otherwise ALSO open a channel
+    SSE worker for the same server if it appears in config channels, producing a
+    second owner and duplicate notifications. The proxied servers are recorded
+    in the generated mcp-proxy.json (each as a `mcp-proxy --server-name X`
+    command wrapper), so the router reads that file to learn which servers to
+    leave to the proxy.
+
+    A wrapped server whose per-server config disables the proxy notification
+    stream is NOT proxy-owned for notifications (the proxy suppresses its GET
+    stream), so it is excluded here -- the router worker must still own it, or
+    there would be zero notification owners.
+    """
+    owned: set[str] = set()
+    try:
+        if not MCP_PROXY_CONFIG.exists():
+            return owned
+        data = json.loads(MCP_PROXY_CONFIG.read_text(encoding="utf-8"))
+    except Exception:
+        return owned
+    servers = data.get("mcpServers") if isinstance(data, dict) else None
+    if not isinstance(servers, dict):
+        return owned
+    for name, entry in servers.items():
+        if not isinstance(entry, dict):
+            continue
+        args = entry.get("args")
+        if not isinstance(args, list):
+            continue
+        args_s = [str(a) for a in args]
+        if "mcp-proxy" not in args_s or "--server-name" not in args_s:
+            continue
+        try:
+            wrapped_name = args_s[args_s.index("--server-name") + 1].strip()
+        except IndexError:
+            wrapped_name = str(name).strip()
+        # Skip servers whose proxy notification stream is disabled -- the proxy
+        # does not own notifications for them, so the router must keep its worker.
+        if _proxy_server_config_disables_notifications(args_s):
+            continue
+        if wrapped_name:
+            owned.add(wrapped_name)
+    return owned
+
+
+def _proxy_server_config_disables_notifications(args_s: list[str]) -> bool:
+    try:
+        cfg_path = args_s[args_s.index("--server-config") + 1]
+    except (ValueError, IndexError):
+        return False
+    try:
+        server = json.loads(Path(cfg_path).read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    return _mcp_server_disable_proxy_notification_stream(server) if isinstance(server, dict) else False
+
+
 def router_managed_channel_server_names(cfg: dict[str, Any]) -> list[str]:
     names = _server_names_from_channel_specs(channel_specs_for_launch(cfg, []))
-    return [name for name in names if name.strip().lower() not in _NATIVE_ROUTER_CHANNEL_NAMES]
+    names = [name for name in names if name.strip().lower() not in _NATIVE_ROUTER_CHANNEL_NAMES]
+    owned = proxy_owned_channel_server_names()
+    if not owned:
+        return names
+    owned_public = {_channel_sse_public_mcp_name(n) for n in owned}
+    kept = [n for n in names if _channel_sse_public_mcp_name(n) not in owned_public]
+    if len(kept) != len(names):
+        dropped = sorted({n for n in names} - {n for n in kept})
+        router_log(
+            "INFO",
+            "router_channel_sse_skipped_proxy_owned servers=%s" % (",".join(dropped) or "-"),
+        )
+    return kept
 
 
 def start_router_managed_channel_sse(cfg: dict[str, Any]) -> list[dict[str, Any]]:

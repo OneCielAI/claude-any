@@ -407,11 +407,92 @@ class ChannelConfigTests(unittest.TestCase):
 
         with mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", side_effect=fake_auto_start), \
                 mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=None), \
-                mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[]):
+                mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[]), \
+                mock.patch.object(claude_any, "proxy_owned_channel_server_names", return_value=set()):
             claude_any.start_router_managed_channel_sse(cfg)
 
         self.assertIsNotNone(captured.get("allowed"))
         self.assertIn("ai-net-http", list(captured["allowed"]))
+
+    def test_proxy_owned_channel_server_names_reads_wrapped_servers(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            proxy_config = root / "mcp-proxy.json"
+            proxy_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            # proxy-wrapped (force-proxied streamable-http) -> owned
+                            "ai-net-http": {
+                                "command": "python",
+                                "args": ["claude_any.py", "mcp-proxy", "--server-name", "ai-net-http", "--server-config", "x.json"],
+                            },
+                            # passthrough sse server -> NOT owned (router still owns it)
+                            "ai-net-sse": {"type": "sse", "url": "http://example.test/sse"},
+                            # native router passthrough -> not wrapped
+                            "claude-any-router": {"type": "sse", "url": "http://127.0.0.1:8802/ca/mcp/sse"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config):
+                owned = claude_any.proxy_owned_channel_server_names()
+            self.assertEqual({"ai-net-http"}, owned)
+
+    def test_proxy_owned_channel_server_names_missing_file_is_empty(self):
+        with tempfile.TemporaryDirectory() as td:
+            missing = Path(td) / "nope.json"
+            with mock.patch.object(claude_any, "MCP_PROXY_CONFIG", missing):
+                self.assertEqual(set(), claude_any.proxy_owned_channel_server_names())
+
+    def test_proxy_owned_channel_server_names_excludes_notification_disabled(self):
+        # A wrapped server whose per-server config disables the proxy notification
+        # stream is NOT proxy-owned for notifications -- the router must keep it.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            per_server = root / "ai-net-http.json"
+            per_server.write_text(
+                json.dumps({"type": "http", "url": "http://example.test/mcp", "claude_any_disable_notification_stream": True}),
+                encoding="utf-8",
+            )
+            proxy_config = root / "mcp-proxy.json"
+            proxy_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ai-net-http": {
+                                "command": "python",
+                                "args": ["claude_any.py", "mcp-proxy", "--server-name", "ai-net-http", "--server-config", str(per_server)],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config):
+                self.assertEqual(set(), claude_any.proxy_owned_channel_server_names())
+
+    def test_router_managed_channel_sse_skips_proxy_owned_server(self):
+        # Joy case: ai-net-http is BOTH an explicit channel spec AND force-proxied.
+        # The router must NOT open a second channel worker for it (the proxy owns
+        # notifications); only proxy-owned servers are skipped, others are kept.
+        cfg = {"claude_code": {"channel_delivery": "llm", "channels": ["server:ai-net-http", "server:ai-net-sse"]}}
+        captured = {}
+
+        def fake_auto_start(passthrough, extra_config_paths=None, allowed_server_names=None):
+            captured["allowed"] = allowed_server_names
+            return []
+
+        with mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", side_effect=fake_auto_start), \
+                mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=None), \
+                mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[]), \
+                mock.patch.object(claude_any, "proxy_owned_channel_server_names", return_value={"ai-net-http"}):
+            claude_any.start_router_managed_channel_sse(cfg)
+
+        allowed = list(captured.get("allowed") or [])
+        self.assertNotIn("ai-net-http", allowed)   # proxy owns it
+        self.assertIn("ai-net-sse", allowed)       # router still owns the sse server
 
     def test_web_fetch_mcp_config_marks_jsonl_stdio(self):
         with tempfile.TemporaryDirectory() as td:
