@@ -536,6 +536,32 @@ class NativeModelListTests(unittest.TestCase):
 
         self.assertEqual(["claude-fable-5"], ids)
 
+    def test_public_docs_fetch_filters_limited_and_legacy_models_from_default_picker(self):
+        ids = claude_any.filter_anthropic_default_model_ids(
+            [
+                "claude-fable-5",
+                "claude-mythos-5",
+                "claude-mythos-preview",
+                "claude-opus-4-8",
+                "claude-sonnet-4-6",
+                "claude-haiku-4-5-20251001",
+                "claude-haiku-4-5",
+                "claude-opus-4-5-20251101",
+                "claude-sonnet-4-20250514",
+            ]
+        )
+
+        self.assertEqual(
+            [
+                "claude-fable-5",
+                "claude-opus-4-8",
+                "claude-sonnet-4-6",
+                "claude-haiku-4-5-20251001",
+                "claude-haiku-4-5",
+            ],
+            ids,
+        )
+
     def test_public_docs_parser_includes_latest_aliases(self):
         html = """
         <code>claude-3-7-sonnet-latest</code>

@@ -169,12 +169,15 @@ ANTHROPIC_MODEL_DOCS_URLS = (
 )
 ANTHROPIC_PUBLIC_MODEL_FALLBACK_IDS: tuple[str, ...] = (
     "claude-fable-5",
-    "claude-mythos-5",
-    "claude-mythos-preview",
     "claude-opus-4-8",
     "claude-sonnet-4-6",
     "claude-haiku-4-5-20251001",
     "claude-haiku-4-5",
+)
+ANTHROPIC_PUBLIC_MODEL_DEFAULT_IDS: tuple[str, ...] = ANTHROPIC_PUBLIC_MODEL_FALLBACK_IDS
+ANTHROPIC_LIMITED_ACCESS_MODEL_IDS: tuple[str, ...] = (
+    "claude-mythos-5",
+    "claude-mythos-preview",
 )
 OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen"
 OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go"
@@ -1692,8 +1695,6 @@ DEFAULT_ADVISOR_MODELS: tuple[str, ...] = (
     "",
     "claude-fable-5",
     "claude-opus-4-8",
-    "claude-mythos-5",
-    "claude-mythos-preview",
     "deepseek-v4-pro",
     "claude-opus-4-6",
     "claude-sonnet-4-6",
@@ -5075,6 +5076,28 @@ def anthropic_model_ids_from_docs_text(text: str) -> list[str]:
     return ids
 
 
+def filter_anthropic_default_model_ids(ids: list[str]) -> list[str]:
+    """Keep only generally available current Claude models for the default picker.
+
+    Anthropic's model overview page also mentions limited-access research models,
+    cloud-provider IDs, and legacy/upgrade-path IDs. Those are useful reference
+    text but bad defaults for Claude Code Native and routed launches because many
+    users cannot select them. Custom model IDs still remain supported separately.
+    """
+    allowed = set(ANTHROPIC_PUBLIC_MODEL_DEFAULT_IDS)
+    limited = set(ANTHROPIC_LIMITED_ACCESS_MODEL_IDS)
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in ids:
+        mid = normalize_model_id("anthropic", raw)
+        key = mid.casefold()
+        if not mid or key in seen or mid in limited or mid not in allowed:
+            continue
+        out.append(mid)
+        seen.add(key)
+    return out
+
+
 def fetch_anthropic_public_model_ids(timeout: float = 8.0) -> list[str]:
     ids: list[str] = []
     errors: list[str] = []
@@ -5083,7 +5106,7 @@ def fetch_anthropic_public_model_ids(timeout: float = 8.0) -> list[str]:
             ids.extend(anthropic_model_ids_from_docs_text(fetch_text_url(url, timeout=timeout)))
         except Exception as exc:
             errors.append(f"{url}: {type(exc).__name__}: {exc}")
-    out = unique_model_ids("anthropic", ids)
+    out = filter_anthropic_default_model_ids(unique_model_ids("anthropic", ids))
     if out:
         return out
     if errors:
