@@ -1,4 +1,5 @@
 import unittest
+from unittest import mock
 
 import claude_any
 
@@ -84,6 +85,49 @@ class ForceQueryProviderOptionTests(unittest.TestCase):
         pcfg = {"route_through_router": True}
         status = claude_any.provider_options_status("anthropic", pcfg)
         self.assertNotIn("force_query", status)
+
+
+class ForceQueryMenuTests(unittest.TestCase):
+    def test_option_appears_in_anthropic_menu(self):
+        rows, values = claude_any.llm_option_panel_rows(
+            "anthropic", {"route_through_router": True}
+        )
+        self.assertIn("force_query_string", values)
+
+    def test_prompt_default_reflects_current_value(self):
+        self.assertEqual(
+            "",
+            claude_any.llm_option_prompt_default("anthropic", {}, "force_query_string"),
+        )
+        self.assertEqual(
+            "beta=true",
+            claude_any.llm_option_prompt_default(
+                "anthropic", {"force_query_string": "beta=true"}, "force_query_string"
+            ),
+        )
+
+    def _run_menu_set(self, pcfg, value):
+        cfg = {"providers": {"anthropic": pcfg}, "current_provider": "anthropic"}
+        with mock.patch.object(claude_any, "load_config", lambda: cfg), \
+             mock.patch.object(claude_any, "save_config", lambda c: None), \
+             mock.patch.object(claude_any, "clear_model_cache", lambda: None):
+            claude_any.set_llm_option_config("anthropic", "force_query_string", value)
+        return pcfg
+
+    def test_menu_set_stores_value(self):
+        pcfg = {"route_through_router": True}
+        self._run_menu_set(pcfg, "beta=true")
+        self.assertEqual("beta=true", pcfg.get("force_query_string"))
+
+    def test_menu_set_multi_param(self):
+        pcfg = {"route_through_router": True}
+        self._run_menu_set(pcfg, "beta=true&foo=1")
+        self.assertEqual("beta=true&foo=1", pcfg.get("force_query_string"))
+
+    def test_menu_unset_clears_value(self):
+        pcfg = {"route_through_router": True, "force_query_string": "beta=true"}
+        self._run_menu_set(pcfg, "unset")
+        self.assertNotIn("force_query_string", pcfg)
 
 
 if __name__ == "__main__":

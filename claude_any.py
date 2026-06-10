@@ -19190,6 +19190,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         elif provider == "anthropic":
             add("Route through router", "route_through_router", "on" if anthropic_routed_enabled(provider, pcfg) else "off")
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
+            add("Force query string (test)", "force_query_string", pcfg.get("force_query_string", "auto (beta=true)"))
 
     rows.append(ui_text("back", lang))
     values.append("back")
@@ -19217,6 +19218,8 @@ def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> 
         return "true" if claude_code_ultracode_enabled(provider, pcfg) else "false"
     if key == "claude_code_supported_capabilities":
         return claude_code_capability_string(provider, pcfg, current_upstream_model_id(provider, pcfg))
+    if key == "force_query_string":
+        return str(pcfg.get("force_query_string") or "")
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         if key == "num_ctx":
@@ -19331,6 +19334,8 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
         elif key in ("max_output_tokens", "max_tokens", "maxtoken", "max_token"):
             apply_provider_option(provider, pcfg, token)
         elif key in ("timeout", "timeout_ms", "request_timeout", "request_timeout_ms"):
+            apply_provider_option(provider, pcfg, token)
+        elif key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
             apply_provider_option(provider, pcfg, token)
         else:
             raise SystemExit(f"Unknown Anthropic option: {key}")
