@@ -4007,6 +4007,121 @@ class ChannelBridgeTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_mcp_proxy_streamable_http_stream_self_heals_after_session_loss(self):
+        # If the backend drops the notification-stream session (e.g. it restarts),
+        # the proxy must re-initialize a fresh session ON ITS OWN and keep
+        # streaming -- otherwise, while Claude Code is idle, every notification
+        # until the next tool call is silently missed. The fake server rejects
+        # the FIRST GET with 404 (session not found), then accepts the re-init
+        # and delivers a notification on the second session.
+        state = {"inits": 0, "gets": 0}
+        lock = threading.Lock()
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if payload.get("method") == "initialize":
+                    with lock:
+                        state["inits"] += 1
+                        sess = f"sess-{state['inits']}"
+                    response = {
+                        "jsonrpc": "2.0",
+                        "id": payload.get("id"),
+                        "result": {
+                            "protocolVersion": claude_any.MCP_STREAMABLE_HTTP_PROTOCOL_VERSION,
+                            "capabilities": {"tools": {}},
+                            "serverInfo": {"name": "streamable-test", "version": "1"},
+                        },
+                    }
+                    data = json.dumps(response).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Mcp-Session-Id", sess)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                response = {"jsonrpc": "2.0", "id": payload.get("id"), "result": {}}
+                data = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                with lock:
+                    state["gets"] += 1
+                    n = state["gets"]
+                if n == 1:
+                    # First session's notification stream is rejected: session lost.
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                # Re-initialized session: deliver a notification.
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                self.wfile.write(
+                    b'event: message\n'
+                    b'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"content":"after self-heal","room_id":"room_1"}}\n\n'
+                )
+                self.wfile.flush()
+                time.sleep(0.3)
+
+        def frame(payload):
+            body = json.dumps(payload).encode("utf-8")
+            return b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+
+        with tempfile.TemporaryDirectory(prefix="ca-mcp-http-selfheal-") as td:
+            root = Path(td)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                config = root / "server.json"
+                config.write_text(
+                    json.dumps({"type": "http", "url": f"http://127.0.0.1:{server.server_address[1]}/mcp", "retry_seconds": 1}),
+                    encoding="utf-8",
+                )
+                env = os.environ.copy()
+                env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
+                env["CLAUDE_ANY_MCP_STREAM_REINIT_AFTER_FAILURES"] = "1"
+                proc = subprocess.Popen(
+                    [sys.executable, str(Path(claude_any.__file__).resolve()), "mcp-proxy",
+                     "--server-name", "fake-http", "--server-config", str(config)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                )
+                assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+                proc.stdin.write(frame({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+                proc.stdin.write(frame({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}))
+                proc.stdin.flush()
+                # Give the stream worker time to fail the first GET, re-init, and
+                # receive the notification on the second session.
+                time.sleep(2.5)
+                proc.stdin.close()
+                stderr = proc.stderr.read()
+                proc.wait(timeout=10)
+                proc.stdout.close()
+                proc.stderr.close()
+                self.assertEqual(0, proc.returncode, stderr.decode("utf-8", errors="replace"))
+                # The proxy re-initialized (>=2 initialize calls) and the chat
+                # store captured the post-self-heal notification.
+                with lock:
+                    inits = state["inits"]
+                self.assertGreaterEqual(inits, 2, f"expected re-initialize, inits={inits}")
+                chat_log = root / "config" / "chat-messages.jsonl"
+                self.assertTrue(chat_log.exists())
+                self.assertIn("after self-heal", chat_log.read_text(encoding="utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_channel_mcp_config_points_to_router_sse(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "channel-mcp.json"
