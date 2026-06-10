@@ -16855,7 +16855,13 @@ def start_router_managed_channel_sse(cfg: dict[str, Any]) -> list[dict[str, Any]
         return []
     names = router_managed_channel_server_names(cfg)
     source_paths: list[Path] = []
-    allowed_names: list[str] | None = names or None
+    # Pass the (possibly empty) name list straight through. An empty list MUST
+    # remain an empty allow-list ("open nothing"), not collapse to None which
+    # auto_start_sse_channels_from_mcp_configs treats as "open every MCP server"
+    # -- that allow-all flip made the router open a second held notification
+    # stream to backends like ai-net-http even when no channels were configured,
+    # so the same digest arrived twice (router worker + Claude Code's own MCP).
+    allowed_names: list[str] = list(names)
     if names:
         try:
             ensure_channel_probe_cache_for_launch(cfg, [])
@@ -16863,7 +16869,8 @@ def start_router_managed_channel_sse(cfg: dict[str, Any]) -> list[dict[str, Any]
         except Exception as exc:
             router_log("WARN", f"router_channel_probe_cache_failed error={type(exc).__name__}: {exc}")
     else:
-        router_log("INFO", "router_channel_sse_autodetect reason=no_external_channel_specs")
+        router_log("INFO", "router_channel_sse_skipped reason=no_external_channel_specs")
+        return []
     started = auto_start_sse_channels_from_mcp_configs(
         [],
         extra_config_paths=source_paths,
@@ -26981,10 +26988,24 @@ def launch_claude(
             )
         else:
             router_log("INFO", "channel_sse_auto_start_skipped reason=router_managed_llm_delivery")
+        # Channel-capable streamable-HTTP backends (e.g. ai-net-http) are forced
+        # through claude-any's own mcp-proxy so there is exactly ONE backend
+        # connection: the proxy serves Claude Code's tool calls AND owns the
+        # notification stream + idle-death wake handling. Because the proxy now
+        # OWNS the stream, it must NOT also be in the disable set -- forcing a
+        # server while disabling its stream would leave zero notification owners
+        # and the agent would never wake. force and disable are mutually
+        # exclusive per server, so the disable set excludes anything we force.
+        forced_channel_names = (
+            set(detected_channel_capable_names)
+            if (stdin_channel_proxy or llm_channel_delivery)
+            else set()
+        )
         proxy_config = write_mcp_proxy_config(
             launch_passthrough,
             extra_config_paths=[Path(path) for path in mcp_config_paths],
-            disable_proxy_notification_stream_names=set(detected_channel_capable_names) if (stdin_channel_proxy or llm_channel_delivery) else None,
+            force_proxy_server_names=forced_channel_names or None,
+            disable_proxy_notification_stream_names=None,
         )
         if proxy_config:
             mcp_config_paths = [str(proxy_config)]

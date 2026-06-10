@@ -311,6 +311,108 @@ class ChannelConfigTests(unittest.TestCase):
             self.assertEqual("http://example.test/mcp", saved_server["url"])
             self.assertTrue(saved_server["claude_any_mcp_proxy"])
 
+    def test_mcp_proxy_config_wraps_streamable_http_server_via_force_names(self):
+        # The launch path forces channel-capable streamable-HTTP servers through
+        # the proxy by passing force_proxy_server_names (not a per-entry flag).
+        # This guards the wiring that was previously missing, which let the
+        # server stay a direct connection and produce duplicate notifications.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp_config = root / "mcp.json"
+            proxy_config = root / "mcp-proxy.json"
+            mcp_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ai-net-http": {"type": "http", "url": "http://example.test/mcp"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "CONFIG_DIR", root), mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config):
+                written = claude_any.write_mcp_proxy_config(
+                    ["--mcp-config", str(mcp_config)],
+                    cwd=root,
+                    home=root,
+                    force_proxy_server_names={"ai-net-http"},
+                )
+
+            data = json.loads(written.read_text(encoding="utf-8"))
+            wrapped = data["mcpServers"]["ai-net-http"]
+            self.assertEqual(claude_any.sys.executable, wrapped["command"])
+            self.assertIn("mcp-proxy", wrapped["args"])
+            self.assertNotIn("type", wrapped)
+            server_config_path = Path(wrapped["args"][wrapped["args"].index("--server-config") + 1])
+            saved_server = json.loads(server_config_path.read_text(encoding="utf-8"))
+            # Forced (proxy owns the connection) but NOT disabled, so the proxy
+            # still owns the notification stream. force and disable are mutually
+            # exclusive per server -- disabling here would leave zero owners and
+            # the agent would never wake.
+            self.assertNotIn("claude_any_disable_notification_stream", saved_server)
+            self.assertFalse(claude_any._mcp_server_disable_proxy_notification_stream(saved_server))
+
+    def test_mcp_proxy_config_force_and_disable_are_independent_sets(self):
+        # A server that is forced through the proxy must not also be stamped
+        # disable_notification_stream, or the proxy would own no stream.
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            mcp_config = root / "mcp.json"
+            proxy_config = root / "mcp-proxy.json"
+            mcp_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ai-net-http": {"type": "http", "url": "http://example.test/mcp"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "CONFIG_DIR", root), mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config):
+                written = claude_any.write_mcp_proxy_config(
+                    ["--mcp-config", str(mcp_config)],
+                    cwd=root,
+                    home=root,
+                    force_proxy_server_names={"ai-net-http"},
+                    disable_proxy_notification_stream_names=None,
+                )
+            data = json.loads(written.read_text(encoding="utf-8"))
+            wrapped = data["mcpServers"]["ai-net-http"]
+            server_config_path = Path(wrapped["args"][wrapped["args"].index("--server-config") + 1])
+            saved_server = json.loads(server_config_path.read_text(encoding="utf-8"))
+            self.assertNotIn("claude_any_disable_notification_stream", saved_server)
+
+    def test_router_managed_channel_sse_opens_nothing_without_channel_specs(self):
+        # With channels:[] the router must NOT open a channel worker for every
+        # MCP server. The previous "[] -> None -> open all" flip made the router
+        # hold a second notification stream to backends like ai-net-http,
+        # duplicating every digest. start_router_managed_channel_sse must short
+        # out before reaching auto-start when there are no external specs.
+        cfg = {"claude_code": {"channel_delivery": "llm", "channels": []}}
+        with mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs") as auto_start:
+            started = claude_any.start_router_managed_channel_sse(cfg)
+        self.assertEqual([], started)
+        auto_start.assert_not_called()
+
+    def test_router_managed_channel_sse_scopes_to_named_specs(self):
+        # When channels are configured, only those named servers are passed as
+        # the allow-list (never None, which would re-open the allow-all flip).
+        cfg = {"claude_code": {"channel_delivery": "llm", "channels": ["server:ai-net-http"]}}
+        captured = {}
+
+        def fake_auto_start(passthrough, extra_config_paths=None, allowed_server_names=None):
+            captured["allowed"] = allowed_server_names
+            return []
+
+        with mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", side_effect=fake_auto_start), \
+                mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=None), \
+                mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[]):
+            claude_any.start_router_managed_channel_sse(cfg)
+
+        self.assertIsNotNone(captured.get("allowed"))
+        self.assertIn("ai-net-http", list(captured["allowed"]))
+
     def test_web_fetch_mcp_config_marks_jsonl_stdio(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
@@ -590,8 +692,11 @@ class ChannelConfigTests(unittest.TestCase):
         write_channel.assert_called_once()
         auto_start.assert_not_called()
         self.assertEqual([channel_path, source_path], write_proxy.call_args.kwargs["extra_config_paths"])
-        self.assertNotIn("force_proxy_server_names", write_proxy.call_args.kwargs)
-        self.assertEqual({"claude-any-router", "ai-net-sse"}, write_proxy.call_args.kwargs["disable_proxy_notification_stream_names"])
+        # Channel-capable servers are forced through the proxy (single backend
+        # owner) and therefore must NOT be in the disable set -- the proxy owns
+        # the notification stream. force and disable are mutually exclusive.
+        self.assertEqual({"claude-any-router", "ai-net-sse"}, write_proxy.call_args.kwargs["force_proxy_server_names"])
+        self.assertIsNone(write_proxy.call_args.kwargs["disable_proxy_notification_stream_names"])
         launch_cmd = call.call_args.args[0]
         self.assertIn(str(proxy_path), launch_cmd)
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)

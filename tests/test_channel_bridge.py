@@ -719,12 +719,16 @@ class ChannelBridgeTests(unittest.TestCase):
         auto_start.assert_called_once()
         self.assertEqual(["ai-net-sse"], auto_start.call_args.kwargs["allowed_server_names"])
 
-    def test_start_router_managed_channel_sse_autodetects_without_external_channels(self):
+    def test_start_router_managed_channel_sse_opens_nothing_without_external_channels(self):
+        # Only the built-in native router is configured (filtered out), so there
+        # are no external channel specs. The router must NOT auto-open every MCP
+        # server as a channel worker -- that allow-all flip held a second
+        # notification stream to backends like ai-net-http and duplicated every
+        # digest. With no external specs, open nothing.
         cfg = {"claude_code": {"channels": ["server:claude-any-router"]}}
-        with mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", return_value=[{"name": "mcp-ai-net-sse"}]) as auto_start:
-            self.assertEqual([{"name": "mcp-ai-net-sse"}], claude_any.start_router_managed_channel_sse(cfg))
-        auto_start.assert_called_once()
-        self.assertIsNone(auto_start.call_args.kwargs["allowed_server_names"])
+        with mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs") as auto_start:
+            self.assertEqual([], claude_any.start_router_managed_channel_sse(cfg))
+        auto_start.assert_not_called()
 
     def test_launch_process_does_not_start_sse_for_llm_delivery(self):
         self.assertFalse(claude_any.should_launch_process_start_channel_sse(False, False, True))
