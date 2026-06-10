@@ -25718,8 +25718,32 @@ def _mcp_proxy_write_stdout_frame(body: bytes) -> None:
         sys.stdout.buffer.flush()
 
 
+# Framing the Streamable HTTP proxy uses when replying to the MCP client on
+# stdout. Claude Code's stdio MCP client speaks newline-delimited JSON (JSONL);
+# replying with LSP-style Content-Length frames makes Claude Code fail to
+# connect ("Failed to connect"). The stdio proxy paths are unaffected -- they
+# keep using _mcp_proxy_write_stdout_frame directly. Default JSONL (Claude
+# Code's format); switched to "framed" if the client actually sends frames.
+_MCP_PROXY_HTTP_CLIENT_FRAMING = "jsonl"
+
+
+def _mcp_proxy_set_http_client_framing(mode: str) -> None:
+    global _MCP_PROXY_HTTP_CLIENT_FRAMING
+    if mode in ("jsonl", "framed"):
+        _MCP_PROXY_HTTP_CLIENT_FRAMING = mode
+
+
+def _mcp_proxy_write_client_message(body: bytes) -> None:
+    with _CHANNEL_MCP_LOCK:
+        if _MCP_PROXY_HTTP_CLIENT_FRAMING == "framed":
+            sys.stdout.buffer.write(b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body)
+        else:
+            sys.stdout.buffer.write(body.strip() + b"\n")
+        sys.stdout.buffer.flush()
+
+
 def _mcp_proxy_write_json_response(payload: dict[str, Any]) -> None:
-    _mcp_proxy_write_stdout_frame(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+    _mcp_proxy_write_client_message(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
 
 
 def _mcp_proxy_error_response(request_id: Any, message: str, code: int = -32000) -> dict[str, Any]:
@@ -25842,6 +25866,8 @@ def _mcp_proxy_drain_input_messages(buffer: bytearray, *, final: bool = False) -
             data = stripped
         frame = _mcp_proxy_frame_header(data)
         if frame:
+            # Client sent an LSP-style Content-Length frame: reply in kind.
+            _mcp_proxy_set_http_client_framing("framed")
             header_end, delimiter_len, length = frame
             body_start = header_end + delimiter_len
             body_end = body_start + length
@@ -25850,6 +25876,8 @@ def _mcp_proxy_drain_input_messages(buffer: bytearray, *, final: bool = False) -
             body = data[body_start:body_end]
             del buffer[:body_end]
         elif data.startswith(b"{"):
+            # Client sent newline-delimited JSON (Claude Code): reply in kind.
+            _mcp_proxy_set_http_client_framing("jsonl")
             newline_idx = data.find(b"\n")
             if newline_idx < 0:
                 if not final:

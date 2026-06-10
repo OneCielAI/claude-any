@@ -3798,6 +3798,100 @@ class ChannelBridgeTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_mcp_proxy_streamable_http_replies_jsonl_when_client_uses_jsonl(self):
+        # Claude Code's stdio MCP client speaks newline-delimited JSON, not
+        # LSP-style Content-Length frames. When a channel-capable streamable-HTTP
+        # backend is forced through the proxy, the proxy must reply in JSONL or
+        # Claude Code fails to connect to the server ("Failed to connect").
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if payload.get("method") == "initialize":
+                    result = {
+                        "protocolVersion": claude_any.MCP_STREAMABLE_HTTP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "streamable-test", "version": "1"},
+                    }
+                    response = {"jsonrpc": "2.0", "id": payload.get("id"), "result": result}
+                    data = json.dumps(response).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Mcp-Session-Id", "sess-jsonl")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                response = {"jsonrpc": "2.0", "id": payload.get("id"), "result": {}}
+                data = json.dumps(response).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                time.sleep(0.1)
+
+        with tempfile.TemporaryDirectory(prefix="ca-mcp-http-jsonl-test-") as td:
+            root = Path(td)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                config = root / "server.json"
+                config.write_text(
+                    json.dumps({"type": "http", "url": f"http://127.0.0.1:{server.server_address[1]}/mcp"}),
+                    encoding="utf-8",
+                )
+                env = os.environ.copy()
+                env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(claude_any.__file__).resolve()),
+                        "mcp-proxy",
+                        "--server-name",
+                        "fake-http",
+                        "--server-config",
+                        str(config),
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+                assert proc.stdin is not None
+                assert proc.stdout is not None
+                assert proc.stderr is not None
+                # JSONL framing: one compact JSON object per line, no headers.
+                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}).encode("utf-8") + b"\n")
+                proc.stdin.flush()
+                time.sleep(0.2)
+                proc.stdin.close()
+                stdout = proc.stdout.read()
+                stderr = proc.stderr.read()
+                proc.wait(timeout=10)
+                proc.stdout.close()
+                proc.stderr.close()
+                self.assertEqual(0, proc.returncode, stderr.decode("utf-8", errors="replace"))
+                # The reply must be JSONL: no Content-Length header, and the
+                # first non-empty line parses as the initialize result.
+                self.assertNotIn(b"Content-Length:", stdout)
+                first_line = stdout.strip().splitlines()[0]
+                reply = json.loads(first_line.decode("utf-8"))
+                self.assertEqual(1, reply["id"])
+                self.assertIn("protocolVersion", reply["result"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_mcp_proxy_streamable_http_wait_tool_receives_queued_notification(self):
         seen_posts: list[str] = []
 
