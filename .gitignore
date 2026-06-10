@@ -47,3 +47,6 @@ Thumbs.db
 
 # Local scratch checkouts / SDK inspections
 .tmp-*/
+
+# Internal-only docs (SSH inventory, credentials maps) — never commit or publish
+internal-docs/

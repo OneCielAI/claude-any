@@ -5222,6 +5222,26 @@ def provider_model_list_headers(provider: str, pcfg: dict[str, Any]) -> dict[str
     return headers
 
 
+def fetch_anthropic_api_model_ids(
+    pcfg: dict[str, Any],
+    headers: dict[str, str],
+    timeout: float = 6.0,
+) -> tuple[list[str], str]:
+    base = provider_upstream_request_base("anthropic", pcfg)
+    errors: list[str] = []
+    for path in ("/v1/models", "/models"):
+        try:
+            data = http_json(join_url(base, path), headers=headers, timeout=timeout)
+            ids = unique_model_ids("anthropic", model_ids_from_response(data))
+            if ids:
+                return ids, f"api:{path}"
+        except Exception as exc:
+            errors.append(f"{path}: {type(exc).__name__}: {exc}")
+    if errors:
+        router_log("DEBUG", "anthropic model API fetch failed: " + " ; ".join(errors))
+    return [], ""
+
+
 def post_json(url: str, body: Any, headers: dict[str, str] | None = None, timeout: float = 60.0) -> Any:
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=with_upstream_user_agent(headers), method="POST")
@@ -5853,19 +5873,13 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
         write_model_list_cache(provider, pcfg, sorted_ids)
         return sorted_ids
     if provider == "anthropic":
-        ids = fetch_anthropic_public_model_ids()
-        source = "anthropic-docs"
+        ids: list[str] = []
+        source = ""
+        if provider_has_api_key(provider, pcfg):
+            ids, source = fetch_anthropic_api_model_ids(pcfg, provider_model_list_headers(provider, pcfg), timeout=6.0)
         if not ids:
-            base = provider_upstream_request_base(provider, pcfg)
-            for path in ("/v1/models", "/models"):
-                try:
-                    data = http_json(join_url(base, path), headers=provider_model_list_headers(provider, pcfg), timeout=6.0)
-                    ids = model_ids_from_response(data)
-                    source = f"api:{path}"
-                    if ids:
-                        break
-                except Exception:
-                    continue
+            ids = fetch_anthropic_public_model_ids()
+            source = "anthropic-docs"
         if not ids:
             return []
         for mid in pcfg.get("custom_models", []) or []:
@@ -6491,6 +6505,26 @@ def resolve_tool_model_references(provider: str, pcfg: dict[str, Any], body: dic
 
 def list_model_objects(provider: str, pcfg: dict[str, Any]) -> list[dict[str, Any]]:
     return [model_object(provider, mid, pcfg) for mid in upstream_model_ids(provider, pcfg)]
+
+
+def list_model_objects_for_request(provider: str, pcfg: dict[str, Any], inbound_headers: Any | None = None) -> list[dict[str, Any]]:
+    if anthropic_routed_enabled(provider, pcfg):
+        try:
+            headers = provider_headers(provider, pcfg, inbound_headers)
+            ids, source = fetch_anthropic_api_model_ids(pcfg, headers, timeout=6.0)
+            if ids:
+                for mid in pcfg.get("custom_models", []) or []:
+                    mid = normalize_model_id(provider, mid)
+                    if mid and mid not in ids:
+                        ids.append(mid)
+                cur = normalize_model_id(provider, pcfg.get("current_model") or "")
+                if cur and cur not in ids:
+                    ids.append(cur)
+                router_log("DEBUG", f"anthropic routed model discovery source={source} count={len(ids)}")
+                return [model_object(provider, mid, pcfg) for mid in sorted_model_ids(unique_model_ids(provider, ids))]
+        except Exception as exc:
+            router_log("DEBUG", f"anthropic routed model discovery fallback error={type(exc).__name__}: {exc}")
+    return list_model_objects(provider, pcfg)
 
 
 def provider_upstream_request_base(provider: str, pcfg: dict[str, Any]) -> str:
@@ -14422,7 +14456,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             )
             return
         if path == "/v1/models":
-            data = list_model_objects(provider, pcfg)
+            data = list_model_objects_for_request(provider, pcfg, self.headers)
             write_json(self, {"object": "list", "data": data, "has_more": False})
             return
         if path.startswith("/v1/models/"):

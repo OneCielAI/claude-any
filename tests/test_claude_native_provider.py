@@ -592,19 +592,47 @@ class NativeModelListTests(unittest.TestCase):
         docs.assert_called_once()
         write.assert_called_once_with("anthropic", pcfg, ["claude-opus-4-8", "claude-sonnet-4-6"])
 
-    def test_native_refresh_prefers_public_docs_over_api_key_model_list(self):
+    def test_anthropic_refresh_prefers_api_key_model_list(self):
         pcfg = {"base_url": "https://api.anthropic.com", "api_key": "sk-ant-real", "current_model": "claude-sonnet-4-6"}
 
         with (
             mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
-            mock.patch.object(claude_any, "fetch_anthropic_public_model_ids", return_value=["claude-opus-4-8", "claude-sonnet-4-6"]),
-            mock.patch.object(claude_any, "http_json", return_value={"data": [{"id": "claude-old-api"}]}) as http_json,
+            mock.patch.object(claude_any, "fetch_anthropic_public_model_ids", return_value=["claude-opus-4-8", "claude-sonnet-4-6"]) as docs,
+            mock.patch.object(claude_any, "http_json", return_value={"data": [{"id": "claude-account-only"}]}) as http_json,
             mock.patch.object(claude_any, "write_model_list_cache"),
         ):
             refreshed = claude_any.upstream_model_ids("anthropic", pcfg, force_refresh=True)
 
-        self.assertEqual(["claude-opus-4-8", "claude-sonnet-4-6"], refreshed)
-        http_json.assert_not_called()
+        self.assertEqual(["claude-sonnet-4-6", "claude-account-only"], refreshed)
+        http_json.assert_called_once()
+        docs.assert_not_called()
+
+    def test_anthropic_routed_model_discovery_uses_inbound_oauth_headers(self):
+        pcfg = {
+            "base_url": "https://api.anthropic.com",
+            "api_key": "",
+            "current_model": "claude-sonnet-4-6",
+            "route_through_router": True,
+        }
+
+        with (
+            mock.patch.object(claude_any, "http_json", return_value={"data": [{"id": "claude-oauth-only"}]}) as http_json,
+            mock.patch.object(claude_any, "fetch_anthropic_public_model_ids", return_value=["claude-opus-4-8"]) as docs,
+        ):
+            models = claude_any.list_model_objects_for_request(
+                "anthropic",
+                pcfg,
+                {"authorization": "Bearer oauth-token", "anthropic-beta": "tools-2026"},
+            )
+
+        ids = [item["id"] for item in models]
+        self.assertIn("claude-any-anthropic-claude-oauth-only", ids)
+        self.assertIn("claude-any-anthropic-claude-sonnet-4-6", ids)
+        http_json.assert_called_once()
+        _, kwargs = http_json.call_args
+        self.assertEqual("Bearer oauth-token", kwargs["headers"]["authorization"])
+        self.assertEqual("tools-2026", kwargs["headers"]["anthropic-beta"])
+        docs.assert_not_called()
 
     def test_native_model_registry_persists_provider_model_list(self):
         pcfg = {"base_url": "https://api.anthropic.com", "api_key": "", "current_model": "claude-sonnet-4-6"}
