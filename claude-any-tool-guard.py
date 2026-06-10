@@ -524,7 +524,9 @@ def handle_stop(event: dict[str, Any]) -> int:
         return 0
     session_id = str(event.get("session_id") or "")
     transcript_path = str(event.get("transcript_path") or "")
-    if active():
+    # Also run the plan-idle block for bypass-only (anthropic-routed) sessions:
+    # the plan auto-exit guarantee must hold regardless of provider.
+    if active() or bypass_permissions_enabled():
         should_block, reason = should_block_plan_stop(transcript_path)
         if should_block:
             out = {"decision": "block", "reason": reason, "suppressOutput": True}
@@ -638,6 +640,11 @@ def handle_pre_tool(event: dict[str, Any]) -> None:
         return
 
     if tool in {"EnterPlanMode", "ExitPlanMode"}:
+        # Under bypass, always auto-allow ExitPlanMode before any transcript-based
+        # stale check -- the session must escape plan mode without a human, and a
+        # truncated transcript must not be able to deny the exit.
+        if tool == "ExitPlanMode" and handle_plan_exit_pre_tool(event):
+            return
         transcript_path = str(event.get("transcript_path") or "")
         if transcript_path:
             in_plan_mode = transcript_plan_mode_active(transcript_path)
@@ -719,6 +726,32 @@ def handle_post_failure(event: dict[str, Any]) -> None:
         if isinstance(raw, dict):
             hint += f" Previous invalid input was: {json.dumps(raw, ensure_ascii=False)[:1000]}"
         post_failure_context(hint)
+
+
+def handle_plan_exit_pre_tool(event: dict[str, Any]) -> bool:
+    """Auto-allow ExitPlanMode on PreToolUse for a bypass session.
+
+    PermissionRequest hooks do not fire in headless ``-p`` mode, so the
+    PermissionRequest-based auto-allow (handle_permission_request) never runs
+    there and a bypass session would deadlock at plan approval. PreToolUse fires
+    in every mode, so allowing ExitPlanMode here covers headless and interactive
+    sessions alike. We do NOT consult the transcript: a long plan-mode session
+    can push the EnterPlanMode marker out of the 240-line read window, which
+    would make a stale-detection check wrongly deny the very ExitPlanMode the
+    session needs to escape. Under bypass, exiting plan mode is always safe to
+    allow.
+    """
+    if not bypass_permissions_enabled():
+        return False
+    raw = event.get("tool_input")
+    updated = raw if isinstance(raw, dict) else {}
+    log_event("PreToolUse auto-allowed ExitPlanMode under bypass permissions")
+    pre_allow(
+        updated,
+        "ExitPlanMode auto-allowed because claude-any launched with bypass permissions.",
+        "Bypass session must not stall on plan approval; exiting plan mode and continuing.",
+    )
+    return True
 
 
 def handle_permission_request(event: dict[str, Any]) -> bool:
@@ -807,19 +840,34 @@ def main() -> int:
         return 0
     name = str(event.get("hook_event_name") or "")
     provider = os.environ.get("CLAUDE_ANY_PROVIDER", "").strip()
-    is_active = active()
+    # Stay active for any session Claude Any launched with bypass permissions,
+    # even when the provider is "anthropic" (anthropic-routed mode), which is
+    # NOT in NON_NATIVE_PROVIDERS. Such a session runs --permission-mode
+    # bypassPermissions and must never stall on a human plan-approval decision,
+    # so the guard's plan auto-exit has to run for it. CLAUDE_ANY_BYPASS_PERMISSIONS
+    # is set only on Claude-Any-launched sessions (it is popped for direct-native
+    # launches), so this never re-activates the guard for a plain native session.
+    provider_active = active()
+    bypass_active = bypass_permissions_enabled()
+    is_active = provider_active or bypass_active
     if not is_active:
         if provider:
             log_event(f"inactive provider={provider}")
         return 0
 
-    # Claude Any hooks are installed in Claude Code's global settings, so they
-    # must be silent for native Claude sessions. Only alter worktree, stop, and
-    # tool behavior when Claude Any launched the process with an active provider.
+    # Bypass-only activation (anthropic-routed: provider not in NON_NATIVE_PROVIDERS
+    # but launched with bypassPermissions). Here the guard's ONLY job is to keep
+    # the autonomous session from stalling on plan approval. It must NOT normalize
+    # or deny other tool calls -- a native Anthropic model emits correct schemas,
+    # and rewriting its tool input would be a regression. So when only bypass is
+    # active, we handle plan auto-exit (Stop idle-block, ExitPlanMode auto-allow on
+    # both PermissionRequest and PreToolUse) and otherwise stay silent.
+    plan_only = bypass_active and not provider_active
+
     if name == "WorktreeCreate":
-        return handle_worktree_create(event)
+        return 0 if plan_only else handle_worktree_create(event)
     if name == "WorktreeRemove":
-        return handle_worktree_remove(event)
+        return 0 if plan_only else handle_worktree_remove(event)
     if name in {"Stop", "SubagentStop"}:
         return handle_stop(event)
     if name == "PermissionRequest":
@@ -843,6 +891,12 @@ def main() -> int:
         raw = event.get("tool_input")
         keys = list(raw.keys()) if isinstance(raw, dict) else []
         log_event(f"PreToolUse seen provider={provider} tool={tool} keys={keys}")
+        if plan_only:
+            # Native model under bypass: only auto-allow ExitPlanMode, never
+            # touch other tool input.
+            if tool == "ExitPlanMode":
+                handle_plan_exit_pre_tool(event)
+            return 0
         handle_pre_tool(event)
     elif name == "PostToolUseFailure":
         handle_post_failure(event)

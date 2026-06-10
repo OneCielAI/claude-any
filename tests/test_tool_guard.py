@@ -15,7 +15,13 @@ class ToolGuardTests(unittest.TestCase):
     def run_guard(self, event: dict, env_extra: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
         with tempfile.TemporaryDirectory() as tmp:
             env = os.environ.copy()
-            env.pop("CLAUDE_ANY_PROVIDER", None)
+            # Drop Claude-Any vars that may be exported on a dev host (where
+            # claude-any itself runs) so the guard's behavior is decided only by
+            # what each test injects via env_extra -- otherwise a leaked
+            # CLAUDE_ANY_BYPASS_PERMISSIONS=1 would make "without bypass" tests
+            # see bypass and fail non-deterministically by host.
+            for leaked in ("CLAUDE_ANY_PROVIDER", "CLAUDE_ANY_BYPASS_PERMISSIONS", "CLAUDE_ANY_MODEL_ALIAS"):
+                env.pop(leaked, None)
             env["HOME"] = tmp
             env["USERPROFILE"] = tmp
             if env_extra:
@@ -106,6 +112,110 @@ class ToolGuardTests(unittest.TestCase):
             },
         )
 
+        self.assertEqual("", proc.stdout.strip())
+        self.assertEqual("", proc.stderr.strip())
+
+    def test_exit_plan_pretooluse_is_auto_allowed_under_bypass(self):
+        # PermissionRequest does not fire in headless -p mode, so the guard must
+        # also auto-allow ExitPlanMode on PreToolUse (which fires in every mode).
+        proc = self.run_guard(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "ExitPlanMode",
+                "tool_input": {"plan": "Ship it."},
+            },
+            {
+                "CLAUDE_ANY_PROVIDER": "ollama-cloud",
+                "CLAUDE_ANY_BYPASS_PERMISSIONS": "1",
+            },
+        )
+        payload = json.loads(proc.stdout)
+        output = payload["hookSpecificOutput"]
+        self.assertEqual("PreToolUse", output["hookEventName"])
+        self.assertEqual("allow", output["permissionDecision"])
+        self.assertEqual({"plan": "Ship it."}, output["updatedInput"])
+
+    def test_exit_plan_pretooluse_auto_allow_ignores_missing_transcript(self):
+        # A truncated/missing transcript must not be able to deny the exit a
+        # bypass session needs. With no transcript_path the old stale-detection
+        # would skip; the bypass auto-allow must still fire before that check.
+        proc = self.run_guard(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "ExitPlanMode",
+                "tool_input": {"plan": "Continue."},
+            },
+            {
+                "CLAUDE_ANY_PROVIDER": "deepseek",
+                "CLAUDE_ANY_BYPASS_PERMISSIONS": "1",
+            },
+        )
+        payload = json.loads(proc.stdout)
+        self.assertEqual("allow", payload["hookSpecificOutput"]["permissionDecision"])
+
+    def test_anthropic_routed_bypass_auto_allows_exit_plan(self):
+        # GAP 1: anthropic-routed bypass sessions run with provider="anthropic",
+        # which is NOT in NON_NATIVE_PROVIDERS, yet still launch bypassPermissions.
+        # The guard must stay active for them so plan approval is auto-resolved.
+        proc = self.run_guard(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "ExitPlanMode",
+                "tool_input": {"plan": "Proceed."},
+            },
+            {
+                "CLAUDE_ANY_PROVIDER": "anthropic",
+                "CLAUDE_ANY_BYPASS_PERMISSIONS": "1",
+            },
+        )
+        payload = json.loads(proc.stdout)
+        self.assertEqual("allow", payload["hookSpecificOutput"]["permissionDecision"])
+
+    def test_anthropic_routed_bypass_permission_request_auto_allows_exit_plan(self):
+        # Interactive anthropic-routed bypass: the PermissionRequest path must
+        # also work now that the guard activates for provider="anthropic"+bypass.
+        proc = self.run_guard(
+            {
+                "hook_event_name": "PermissionRequest",
+                "tool_name": "ExitPlanMode",
+                "tool_input": {"plan": "Go."},
+            },
+            {
+                "CLAUDE_ANY_PROVIDER": "anthropic",
+                "CLAUDE_ANY_BYPASS_PERMISSIONS": "1",
+            },
+        )
+        payload = json.loads(proc.stdout)
+        self.assertEqual("allow", payload["hookSpecificOutput"]["decision"]["behavior"])
+
+    def test_anthropic_routed_bypass_does_not_touch_other_tools(self):
+        # When active only via bypass (native provider), the guard must NOT
+        # normalize or deny non-plan tools -- a native Anthropic model emits
+        # correct schemas and rewriting its input would be a regression.
+        proc = self.run_guard(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "TaskUpdate",
+                "tool_input": {"task_id": "1", "status": "done"},
+            },
+            {
+                "CLAUDE_ANY_PROVIDER": "anthropic",
+                "CLAUDE_ANY_BYPASS_PERMISSIONS": "1",
+            },
+        )
+        self.assertEqual("", proc.stdout.strip())
+        self.assertEqual("", proc.stderr.strip())
+
+    def test_native_session_without_bypass_stays_silent(self):
+        # No bypass, native provider not in NON_NATIVE_PROVIDERS -> fully silent.
+        proc = self.run_guard(
+            {
+                "hook_event_name": "PreToolUse",
+                "tool_name": "ExitPlanMode",
+                "tool_input": {"plan": "x"},
+            },
+            {"CLAUDE_ANY_PROVIDER": "anthropic"},
+        )
         self.assertEqual("", proc.stdout.strip())
         self.assertEqual("", proc.stderr.strip())
 
