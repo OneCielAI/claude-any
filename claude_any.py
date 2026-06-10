@@ -2034,6 +2034,20 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
             pcfg["context_window"] = 1048576
         migrations[marker] = True
 
+    marker = "anthropic_drop_preset_output_tokens_20260610"
+    if not migrations.get(marker):
+        # Older anthropic presets force-wrote max_output_tokens (2048/4096/6144/8192),
+        # which pinned CLAUDE_CODE_MAX_OUTPUT_TOKENS and overrode Claude Code's native
+        # per-model default in routed mode. Those values are no longer written. Drop a
+        # stale preset-origin value so existing routed configs recover the native cap.
+        # Trade-off (matches the rate_limit precedent): a user who deliberately set one
+        # of these exact round numbers via the CLI is cleared once; re-setting persists.
+        providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        pcfg = providers.get("anthropic")
+        if isinstance(pcfg, dict) and positive_int(pcfg.get("max_output_tokens")) in (2048, 4096, 6144, 8192):
+            pcfg.pop("max_output_tokens", None)
+        migrations[marker] = True
+
 
 _config_cache: dict[str, Any] | None = None
 _config_cache_mtime: float = 0.0
@@ -18477,20 +18491,28 @@ def apply_llm_preset_to_provider(
             context_msgs = sync_ollama_library_context_limit(provider, pcfg, model_id)
         context_msgs.extend(apply_ollama_runtime_output_guard(provider, pcfg))
     elif provider == "anthropic":
+        # Anthropic presets intentionally do NOT set max_output_tokens. Forcing it
+        # would pin CLAUDE_CODE_MAX_OUTPUT_TOKENS and override Claude Code's native
+        # per-model default (e.g. Fable 5 / Opus = 64000, Sonnet = 32000). Claude
+        # Code chooses that per-model cap itself; claude-any must not degrade it.
+        # Only an explicit user value set via the options screen should emit the
+        # env var. Clear any preset-origin value so a stale forced cap cannot linger
+        # (older builds wrote 2048/4096/6144/8192 here).
+        pcfg.pop("max_output_tokens", None)
         tokens_by_preset = {
-            "balanced": ["max_output_tokens=4096", "timeout=300000"],
-            "coding": ["max_output_tokens=4096", "timeout=300000"],
-            "fast": ["max_output_tokens=2048", "timeout=300000"],
-            "long-context-65k": ["max_output_tokens=4096", "timeout=300000"],
-            "long-context-128k": ["max_output_tokens=8192", "timeout=300000"],
-            "million-context-1m": ["max_output_tokens=8192", "timeout=300000"],
-            "large-output": ["max_output_tokens=8192", "timeout=300000"],
-            "reasoning": ["max_output_tokens=4096", "timeout=300000"],
-            "novelist": ["max_output_tokens=8192", "timeout=300000"],
-            "humanities-researcher": ["max_output_tokens=8192", "timeout=300000"],
-            "mathematician": ["max_output_tokens=8192", "timeout=300000"],
-            "product-architect": ["max_output_tokens=8192", "timeout=300000"],
-            "teacher": ["max_output_tokens=6144", "timeout=300000"],
+            "balanced": ["timeout=300000"],
+            "coding": ["timeout=300000"],
+            "fast": ["timeout=300000"],
+            "long-context-65k": ["timeout=300000"],
+            "long-context-128k": ["timeout=300000"],
+            "million-context-1m": ["timeout=300000"],
+            "large-output": ["timeout=300000"],
+            "reasoning": ["timeout=300000"],
+            "novelist": ["timeout=300000"],
+            "humanities-researcher": ["timeout=300000"],
+            "mathematician": ["timeout=300000"],
+            "product-architect": ["timeout=300000"],
+            "teacher": ["timeout=300000"],
         }
         for token in with_preset_timeout_tokens(tokens_by_preset[preset_id], preset_id):
             apply_provider_option(provider, pcfg, token)
