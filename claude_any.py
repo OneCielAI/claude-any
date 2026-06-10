@@ -8360,10 +8360,6 @@ def _channel_sse_absolute_endpoint(stream_url: str, endpoint: str) -> str:
 
 MCP_STREAMABLE_HTTP_PROTOCOL_VERSION = "2025-03-26"
 MCP_LEGACY_SSE_PROTOCOL_VERSION = "2024-11-05"
-# After this many consecutive notification-stream reconnect failures (e.g. the
-# backend reset the connection), force a fresh MCP session instead of retrying
-# the same one forever -- a session the backend already dropped never recovers.
-STREAM_REINIT_AFTER_FAILURES = positive_env_int("CLAUDE_ANY_MCP_STREAM_REINIT_AFTER_FAILURES", 3)
 
 
 def _read_mcp_sse_json_response(response: Any, request_id: Any | None = None) -> Any:
@@ -26149,51 +26145,9 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
         _mcp_proxy_observe_json_message(server_name, payload)
         _mcp_proxy_write_json_response(payload)
 
-    def reinitialize_stream_session(lost_session_id: str) -> str | None:
-        """Re-establish a backend session after the notification stream lost it.
-
-        Returns the new session id (so the stream worker can keep going), or
-        None if we couldn't re-initialize (caller then ends the worker, and a
-        later tool call will re-init). Only re-inits if the lost session is
-        still the current one, to avoid racing a session another path already
-        refreshed.
-        """
-        nonlocal session_id
-        if stream_stop.is_set() or not initialize_payload:
-            return None
-        with session_lock:
-            if session_id not in (None, lost_session_id):
-                # Another path already refreshed the session; adopt it.
-                return session_id
-            session_id = None
-        try:
-            result, returned_session = _mcp_proxy_streamable_http_request(
-                endpoint, headers, initialize_payload, timeout, protocol_version, None,
-            )
-        except Exception as exc:
-            router_log("WARN", f"mcp_http_proxy_stream_reinit_failed server={server_name} error={type(exc).__name__}: {exc}")
-            return None
-        if isinstance(result, dict):
-            _mcp_proxy_observe_json_message(server_name, result)
-        with session_lock:
-            session_id = returned_session or session_id
-            new_session = session_id
-        if not new_session:
-            return None
-        if initialized_payload:
-            try:
-                _mcp_proxy_streamable_http_request(
-                    endpoint, headers, initialized_payload, timeout, protocol_version, new_session,
-                )
-            except Exception:
-                pass
-        router_log("INFO", f"mcp_http_proxy_stream_reinitialized server={server_name} session={new_session}")
-        return new_session
-
     def stream_worker(worker_session_id: str) -> None:
         nonlocal session_id
         last_event_id: str | None = None
-        consecutive_failures = 0
         retry_seconds = max(1.0, min(60.0, float(server.get("retry_seconds") or 5.0)))
         read_timeout = max(5.0, min(3600.0, float(server.get("read_timeout_seconds") or server.get("stream_timeout") or 300.0)))
         while not stream_stop.is_set():
@@ -26214,7 +26168,6 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                     request_headers["Last-Event-ID"] = last_event_id
                 req = urllib.request.Request(endpoint, headers=request_headers, method="GET")
                 with urllib.request.urlopen(req, timeout=read_timeout) as response:
-                    consecutive_failures = 0
                     router_log("INFO", f"mcp_http_proxy_stream_connected server={server_name} session={worker_session_id} last_event_id={last_event_id or '-'}")
                     while not stream_stop.is_set():
                         raw = response.readline()
@@ -26246,36 +26199,14 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
             except urllib.error.HTTPError as exc:
                 body_text = _http_error_body_text(exc)
                 if _streamable_http_session_not_found(exc, body_text):
-                    # The backend dropped our session (e.g. ai-net restarted).
-                    # Do NOT just die: while Claude Code is idle nothing else
-                    # would re-initialize the session, so the notification stream
-                    # would stay dead and every backend notification until the
-                    # next tool call is missed. Re-initialize a fresh session
-                    # ourselves and keep streaming on it.
+                    with session_lock:
+                        if session_id == worker_session_id:
+                            session_id = None
                     router_log("WARN", f"mcp_http_proxy_stream_session_lost server={server_name} error=HTTPError:{exc.code}:{exc.reason}")
-                    new_session = reinitialize_stream_session(worker_session_id)
-                    if new_session:
-                        worker_session_id = new_session
-                        last_event_id = None
-                        consecutive_failures = 0
-                        continue
                     return
-                consecutive_failures += 1
                 router_log("WARN", f"mcp_http_proxy_stream_reconnect server={server_name} event={event_name} error=HTTPError:{exc.code}:{exc.reason}")
             except Exception as exc:
-                consecutive_failures += 1
                 router_log("WARN", f"mcp_http_proxy_stream_reconnect server={server_name} event={event_name} error={type(exc).__name__}: {exc}")
-            # A plain reconnect (ConnectionReset / stream EOF) retries the SAME
-            # session. If the backend actually dropped the session (e.g. it
-            # restarted), retrying the dead session never recovers, so after a
-            # few consecutive failures force a fresh session.
-            if consecutive_failures >= STREAM_REINIT_AFTER_FAILURES:
-                new_session = reinitialize_stream_session(worker_session_id)
-                if new_session:
-                    worker_session_id = new_session
-                    last_event_id = None
-                    consecutive_failures = 0
-                    continue
             stream_stop.wait(retry_seconds)
 
     def start_stream_if_needed() -> None:
