@@ -88,7 +88,7 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertIn("--dangerously-skip-permissions", launch_cmd)
         mode_idx = launch_cmd.index("--permission-mode")
         self.assertEqual("bypassPermissions", launch_cmd[mode_idx + 1])
-        self.assertTrue(proxy.call_args.kwargs["inject_web_chat_only"])
+        self.assertFalse(proxy.call_args.kwargs.get("inject_web_chat_only", False))
         call.assert_not_called()
         launch_env = proxy.call_args.args[1]
         self.assertEqual(claude_any.ROUTER_BASE, launch_env["ANTHROPIC_BASE_URL"])

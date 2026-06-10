@@ -22486,6 +22486,21 @@ def has_passthrough_option(passthrough: list[str], *names: str) -> bool:
     return any(arg in names or any(arg.startswith(name + "=") for name in names) for arg in passthrough)
 
 
+CLAUDE_CODE_GENERATED_GREEDY_OPTIONS = {
+    "--mcp-config",
+    "--dangerously-load-development-channels",
+}
+
+
+def should_insert_passthrough_option_boundary(extra_args: list[str], passthrough: list[str]) -> bool:
+    if not passthrough:
+        return False
+    first = passthrough[0]
+    if first == "--" or first.startswith("-"):
+        return False
+    return any(arg in CLAUDE_CODE_GENERATED_GREEDY_OPTIONS for arg in extra_args)
+
+
 def claude_session_control_requested(passthrough: list[str]) -> bool:
     return has_passthrough_option(
         passthrough,
@@ -24904,15 +24919,24 @@ def _inject_pending_channel_messages(
     pending: list[dict[str, Any]] = []
     for message in read_chat_messages(last_id, None, None, 100):
         try:
-            last_id = max(last_id, int(message.get("id") or 0))
+            message_id = int(message.get("id") or 0)
+            last_id = max(last_id, message_id)
         except Exception:
             continue
-        if _channel_message_is_direct_llm_owned(message):
+        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+        with _CHANNEL_LLM_DIRECT_LOCK:
+            direct_delivered = message_id in _CHANNEL_LLM_DIRECT_DELIVERED
+        if direct_delivered or meta.get("llm_direct_delivered"):
             router_log(
                 "INFO",
-                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
+                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_delivered",
             )
             continue
+        if meta.get("llm_direct_pending"):
+            router_log(
+                "INFO",
+                f"channel_stdin_proxy_inject_fallback message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
+            )
         if web_chat_only and not _channel_message_is_web_chat_request(message):
             router_log(
                 "INFO",
@@ -26885,6 +26909,8 @@ def launch_claude(
     if model:
         cmd.extend(["--model", model])
     cmd.extend(extra_args)
+    if should_insert_passthrough_option_boundary(extra_args, claude_passthrough):
+        cmd.append("--")
     cmd.extend(claude_passthrough)
     _log_claude_command_for_diagnostics(cmd, env)
     record_launch_state_for_cwd(
@@ -26903,7 +26929,7 @@ def launch_claude(
         if stdin_channel_proxy or screen_summary_proxy:
             if screen_summary_proxy and not stdin_channel_proxy:
                 return subprocess_call_with_channel_screen_summary_proxy(cmd, env)
-            return subprocess_call_with_channel_wake_proxy(cmd, env, inject_web_chat_only=llm_channel_delivery)
+            return subprocess_call_with_channel_wake_proxy(cmd, env)
         if capture_stderr:
             return _subprocess_call_capturing_stderr(cmd, env)
         return subprocess.call(cmd, env=env)

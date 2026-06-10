@@ -1154,7 +1154,7 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("reason=not_web_chat" in item and "message_id=2" in item for item in log_messages))
 
-    def test_inject_pending_channel_messages_skips_direct_llm_owned_messages(self):
+    def test_inject_pending_channel_messages_wakes_direct_pending_messages(self):
         messages = [
             {
                 "id": 4,
@@ -1167,13 +1167,41 @@ class ChannelBridgeTests(unittest.TestCase):
         with (
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
+            mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0)
         self.assertEqual(4, last_id)
+        self.assertEqual(2, write_all.call_count)
+        self.assertIn(b"New message from Sarah", write_all.call_args_list[0].args[1])
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("channel_stdin_proxy_inject_fallback" in item and "reason=llm_direct_pending" in item for item in log_messages))
+
+    def test_inject_pending_channel_messages_skips_direct_delivered_messages(self):
+        messages = [
+            {
+                "id": 4,
+                "channel": "room_dm_generic",
+                "sender_id": "ai-net-sse",
+                "message": "New message from Sarah",
+                "meta": {},
+            }
+        ]
+        claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+        claude_any._CHANNEL_LLM_DIRECT_DELIVERED.add(4)
+        try:
+            with (
+                mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+                mock.patch.object(claude_any, "_write_fd_all") as write_all,
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                last_id = claude_any._inject_pending_channel_messages(99, 0)
+        finally:
+            claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+        self.assertEqual(4, last_id)
         write_all.assert_not_called()
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
-        self.assertTrue(any("reason=llm_direct_pending" in item for item in log_messages))
+        self.assertTrue(any("reason=llm_direct_delivered" in item for item in log_messages))
 
     def test_inject_pending_channel_summaries_writes_prompt_to_child_stdin(self):
         original_cursor = claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID

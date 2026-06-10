@@ -373,6 +373,34 @@ class ChannelConfigTests(unittest.TestCase):
         args = claude_any.strip_mcp_config_passthrough(["--mcp-config", "a.json", "b.json", "-p", "hello"])
         self.assertEqual(["-p", "hello"], args)
 
+    def test_passthrough_boundary_needed_after_generated_greedy_option(self):
+        self.assertTrue(
+            claude_any.should_insert_passthrough_option_boundary(
+                ["--mcp-config", "generated.json"],
+                ["ai-net 체크인"],
+            )
+        )
+
+    def test_passthrough_boundary_not_needed_for_options_or_existing_boundary(self):
+        self.assertFalse(
+            claude_any.should_insert_passthrough_option_boundary(
+                ["--mcp-config", "generated.json"],
+                ["-p", "hello"],
+            )
+        )
+        self.assertFalse(
+            claude_any.should_insert_passthrough_option_boundary(
+                ["--mcp-config", "generated.json"],
+                ["--", "hello"],
+            )
+        )
+        self.assertFalse(
+            claude_any.should_insert_passthrough_option_boundary(
+                ["--model", "x"],
+                ["hello"],
+            )
+        )
+
     def test_launch_with_external_channels_defers_to_claude_native(self):
         cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False}}
         with ExitStack() as stack:
@@ -506,7 +534,7 @@ class ChannelConfigTests(unittest.TestCase):
         proxy_config.assert_called_once()
         self.assertEqual([channel_path], proxy_config.call_args.kwargs["extra_config_paths"])
         proxy.assert_called_once()
-        self.assertTrue(proxy.call_args.kwargs["inject_web_chat_only"])
+        self.assertFalse(proxy.call_args.kwargs.get("inject_web_chat_only", False))
         call.assert_not_called()
         launch_cmd = proxy.call_args.args[0]
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
