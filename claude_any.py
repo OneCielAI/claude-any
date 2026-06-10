@@ -26074,8 +26074,17 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
     initialized_payload: dict[str, Any] | None = None
     session_lock = threading.Lock()
     stream_stop = threading.Event()
-    stream_thread: threading.Thread | None = None
-    stream_session_id: str | None = None
+    # Single-owner notification-stream lifecycle. ONE manager thread owns the
+    # backend session and the notification GET stream. It initializes the
+    # session, streams notifications, and on session loss re-initializes IN THE
+    # SAME thread -- so a second stream can never exist (no leak) and the stream
+    # never stays dead while Claude Code is idle (no zombie). The stdin loop
+    # NEVER initializes a session or opens a stream; when a tool call needs a
+    # session it asks the manager via session_cond and waits briefly.
+    session_cond = threading.Condition(session_lock)
+    session_requested = False
+    initialize_result: dict[str, Any] | None = None
+    manager_thread: threading.Thread | None = None
     pending_notifications: list[dict[str, Any]] = []
     pending_wait_count = 0
     notification_condition = threading.Condition()
@@ -26145,31 +26154,120 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
         _mcp_proxy_observe_json_message(server_name, payload)
         _mcp_proxy_write_json_response(payload)
 
-    def stream_worker(worker_session_id: str) -> None:
-        nonlocal session_id
+    def current_session_id() -> str | None:
+        with session_lock:
+            return session_id
+
+    def request_session_and_wait(timeout_s: float) -> str | None:
+        """Ask the manager for a session and wait briefly. Never inits here.
+
+        The stdin loop calls this when a tool call needs a session but none is
+        active. It only signals the manager (which solely owns session creation)
+        and waits; it never POSTs initialize or opens a stream itself, so two
+        owners can never exist.
+        """
+        nonlocal session_requested
+        with session_cond:
+            if session_id is not None:
+                return session_id
+            session_requested = True
+            session_cond.notify_all()
+            deadline = time.time() + timeout_s
+            while session_id is None and not stream_stop.is_set():
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                session_cond.wait(timeout=min(1.0, remaining))
+            return session_id
+
+    def manager_initialize_locked() -> str | None:
+        """Re-establish the backend session. Returns the new session id or None.
+
+        Called ONLY by the manager thread, so session_id has a single writer.
+        Publishes the initialize result (for the stdin initialize reply) and the
+        new session id under session_cond, waking any waiter.
+        """
+        nonlocal session_id, initialize_result
+        init_payload = initialize_payload
+        if not init_payload:
+            return None
+        try:
+            result, returned_session = _mcp_proxy_streamable_http_request(
+                endpoint, headers, init_payload, timeout, protocol_version, None,
+            )
+        except Exception as exc:
+            router_log("WARN", f"mcp_http_proxy_session_init_failed server={server_name} error={type(exc).__name__}: {exc}")
+            return None
+        if isinstance(result, dict):
+            _mcp_proxy_observe_json_message(server_name, result)
+        with session_cond:
+            session_id = returned_session or session_id
+            if isinstance(result, dict):
+                initialize_result = result
+            new_session = session_id
+            session_cond.notify_all()
+        if new_session and initialized_payload:
+            try:
+                _mcp_proxy_streamable_http_request(
+                    endpoint, headers, initialized_payload, timeout, protocol_version, new_session,
+                )
+            except Exception:
+                pass
+        if new_session:
+            router_log("INFO", f"mcp_http_proxy_session_initialized server={server_name} session={new_session}")
+        return new_session
+
+    def stream_manager() -> None:
+        """Single owner of the backend session and notification GET stream.
+
+        One thread for the whole proxy lifetime. It (re)initializes the session
+        when missing or requested, then runs the GET event-stream; on any
+        session loss / reconnect it loops back and re-initializes here, so there
+        is never a second stream worker and the stream never stays dead while
+        Claude Code is idle.
+        """
+        nonlocal session_requested, session_id
         last_event_id: str | None = None
         retry_seconds = max(1.0, min(60.0, float(server.get("retry_seconds") or 5.0)))
         read_timeout = max(5.0, min(3600.0, float(server.get("read_timeout_seconds") or server.get("stream_timeout") or 300.0)))
         while not stream_stop.is_set():
-            with session_lock:
+            with session_cond:
                 current_session = session_id
-            if not current_session or current_session != worker_session_id:
-                return
+                requested = session_requested
+            # (Re)initialize when we have no session, or a tool call requested one.
+            if current_session is None or requested:
+                with session_cond:
+                    session_requested = False
+                current_session = manager_initialize_locked()
+                if current_session is None:
+                    # Init failed; back off and retry. Wake early on shutdown.
+                    with session_cond:
+                        if not stream_stop.is_set():
+                            session_cond.wait(timeout=retry_seconds)
+                    continue
+                last_event_id = None
+            if not notification_stream_enabled:
+                # No stream to own; just idle until shutdown or a session request.
+                with session_cond:
+                    if not stream_stop.is_set() and not session_requested:
+                        session_cond.wait(timeout=read_timeout)
+                continue
+            worker_session = current_session
             event_name = "message"
             data_lines: list[str] = []
             try:
                 request_headers = _mcp_streamable_headers(
-                    headers,
-                    protocol_version,
-                    worker_session_id,
-                    accept="text/event-stream",
+                    headers, protocol_version, worker_session, accept="text/event-stream",
                 )
                 if last_event_id:
                     request_headers["Last-Event-ID"] = last_event_id
                 req = urllib.request.Request(endpoint, headers=request_headers, method="GET")
                 with urllib.request.urlopen(req, timeout=read_timeout) as response:
-                    router_log("INFO", f"mcp_http_proxy_stream_connected server={server_name} session={worker_session_id} last_event_id={last_event_id or '-'}")
+                    router_log("INFO", f"mcp_http_proxy_stream_connected server={server_name} session={worker_session} last_event_id={last_event_id or '-'}")
                     while not stream_stop.is_set():
+                        with session_cond:
+                            if session_requested or session_id != worker_session:
+                                break
                         raw = response.readline()
                         if raw == b"":
                             raise ConnectionError("Streamable HTTP MCP notification stream ended")
@@ -26195,75 +26293,34 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                                 retry_seconds = max(1.0, min(60.0, int(value) / 1000.0))
                             except Exception:
                                 pass
-                    return
+                continue
             except urllib.error.HTTPError as exc:
                 body_text = _http_error_body_text(exc)
                 if _streamable_http_session_not_found(exc, body_text):
-                    with session_lock:
-                        if session_id == worker_session_id:
+                    with session_cond:
+                        if session_id == worker_session:
                             session_id = None
+                    last_event_id = None
                     router_log("WARN", f"mcp_http_proxy_stream_session_lost server={server_name} error=HTTPError:{exc.code}:{exc.reason}")
-                    return
+                    continue  # re-init at loop top
                 router_log("WARN", f"mcp_http_proxy_stream_reconnect server={server_name} event={event_name} error=HTTPError:{exc.code}:{exc.reason}")
             except Exception as exc:
                 router_log("WARN", f"mcp_http_proxy_stream_reconnect server={server_name} event={event_name} error={type(exc).__name__}: {exc}")
-            stream_stop.wait(retry_seconds)
+            # Reconnect backoff. A plain reset retries the same session; a stream
+            # that ended because the backend dropped the session will fail the
+            # GET with 404 next round and re-init above.
+            with session_cond:
+                if not stream_stop.is_set():
+                    session_cond.wait(timeout=retry_seconds)
 
-    def start_stream_if_needed() -> None:
-        nonlocal stream_thread, stream_session_id
-        if not notification_stream_enabled:
+    def ensure_manager_started() -> None:
+        nonlocal manager_thread
+        if manager_thread is not None:
             return
-        with session_lock:
-            current_session = session_id
-        if not current_session:
-            return
-        if stream_thread and stream_thread.is_alive() and stream_session_id == current_session:
-            return
-        stream_session_id = current_session
-        stream_thread = threading.Thread(
-            target=stream_worker,
-            args=(current_session,),
-            daemon=True,
-            name=f"ca-mcp-http-stream-{server_name}",
+        manager_thread = threading.Thread(
+            target=stream_manager, daemon=True, name=f"ca-mcp-http-stream-{server_name}",
         )
-        stream_thread.start()
-        router_log("INFO", f"mcp_http_proxy_stream_started server={server_name} session={current_session}")
-
-    def current_session_id() -> str | None:
-        with session_lock:
-            return session_id
-
-    def set_session_id(value: str | None) -> None:
-        nonlocal session_id
-        with session_lock:
-            session_id = value
-
-    def ensure_session_for_retry() -> None:
-        nonlocal session_id
-        if not initialize_payload:
-            return
-        result, returned_session = _mcp_proxy_streamable_http_request(
-            endpoint,
-            headers,
-            initialize_payload,
-            timeout,
-            protocol_version,
-            None,
-        )
-        if isinstance(result, dict):
-            _mcp_proxy_observe_json_message(server_name, result)
-        with session_lock:
-            session_id = returned_session or session_id
-        start_stream_if_needed()
-        if initialized_payload:
-            _mcp_proxy_streamable_http_request(
-                endpoint,
-                headers,
-                initialized_payload,
-                timeout,
-                protocol_version,
-                session_id,
-            )
+        manager_thread.start()
 
     buffer = bytearray()
     try:
@@ -26276,32 +26333,58 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
             for payload in _mcp_proxy_drain_input_messages(buffer):
                 request_id = payload.get("id")
                 method = str(payload.get("method") or "")
+                if method == "notifications/initialized":
+                    # Cache it (the manager re-sends it after each re-init) and,
+                    # if a session is already up, forward it now so the initial
+                    # handshake completes in order.
+                    with session_cond:
+                        initialized_payload = payload
+                        active = session_id
+                    if active:
+                        try:
+                            _mcp_proxy_streamable_http_request(endpoint, headers, payload, timeout, protocol_version, active)
+                        except Exception:
+                            pass
+                    continue
                 if method == "initialize":
-                    initialize_payload = payload
-                elif method == "notifications/initialized":
-                    initialized_payload = payload
+                    # Hand the initialize off to the single session owner: cache
+                    # the payload, wake the manager to (re)initialize, and reply
+                    # with the result it produces. stdin never POSTs initialize
+                    # itself, so session_id has exactly one writer (the manager).
+                    with session_cond:
+                        initialize_payload = payload
+                        initialize_result = None
+                        session_requested = True
+                        session_cond.notify_all()
+                    ensure_manager_started()
+                    with session_cond:
+                        deadline = time.time() + timeout
+                        while initialize_result is None and not stream_stop.is_set():
+                            remaining = deadline - time.time()
+                            if remaining <= 0:
+                                break
+                            session_cond.wait(timeout=min(1.0, remaining))
+                        resp = initialize_result
+                    if payload.get("id") is not None:
+                        if isinstance(resp, dict):
+                            reply = dict(resp)
+                            reply["id"] = request_id
+                            _mcp_proxy_write_json_response(reply)
+                        else:
+                            _mcp_proxy_write_json_response(_mcp_proxy_error_response(request_id, "initialize timeout"))
+                    continue
                 try:
                     if _mcp_proxy_tool_is_notification_wait(_mcp_proxy_tool_call_name(payload)):
                         _mcp_proxy_write_json_response(wait_for_proxy_notifications(payload))
                         continue
                     active_session = current_session_id()
-                    if requires_session and method not in {"initialize"} and not active_session:
-                        if initialize_payload:
-                            ensure_session_for_retry()
-                        active_session = current_session_id()
-                        if requires_session and method not in {"initialize"} and not active_session:
+                    if requires_session and not active_session:
+                        active_session = request_session_and_wait(timeout)
+                        if not active_session:
                             raise RuntimeError("Streamable HTTP MCP session is not initialized")
-                    result, returned_session = _mcp_proxy_streamable_http_request(
-                        endpoint,
-                        headers,
-                        payload,
-                        timeout,
-                        protocol_version,
-                        active_session if method != "initialize" else None,
+                    result, _returned = _mcp_proxy_streamable_http_request(
+                        endpoint, headers, payload, timeout, protocol_version, active_session,
                     )
-                    if returned_session:
-                        set_session_id(returned_session)
-                        start_stream_if_needed()
                     if isinstance(result, dict):
                         _mcp_proxy_observe_json_message(server_name, result)
                     if payload.get("id") is not None:
@@ -26309,37 +26392,37 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                             _mcp_proxy_write_json_response(result)
                         else:
                             _mcp_proxy_write_json_response(
-                                {
-                                    "jsonrpc": "2.0",
-                                    "id": request_id,
-                                    "result": result if result is not None else {},
-                                }
+                                {"jsonrpc": "2.0", "id": request_id, "result": result if result is not None else {}}
                             )
                 except urllib.error.HTTPError as exc:
                     body_text = _http_error_body_text(exc)
                     if _streamable_http_session_not_found(exc, body_text) and initialize_payload:
+                        # Backend dropped the session mid tool-call. Ask the
+                        # manager to re-init (single owner) and retry once on the
+                        # session it provides. The stream resumes on that same
+                        # re-init -- no second owner.
                         router_log("WARN", f"mcp_http_proxy_session_lost server={server_name} method={method} error=HTTPError:{exc.code}:{exc.reason}")
-                        set_session_id(None)
-                        try:
-                            ensure_session_for_retry()
-                            active_session = current_session_id()
-                            result, returned_session = _mcp_proxy_streamable_http_request(
-                                endpoint,
-                                headers,
-                                payload,
-                                timeout,
-                                protocol_version,
-                                active_session if method != "initialize" else None,
-                            )
-                            if returned_session:
-                                set_session_id(returned_session)
-                                start_stream_if_needed()
-                            if payload.get("id") is not None:
-                                _mcp_proxy_write_json_response(result if isinstance(result, dict) else {"jsonrpc": "2.0", "id": request_id, "result": result if result is not None else {}})
-                            continue
-                        except Exception as retry_exc:
-                            _mcp_proxy_write_json_response(_mcp_proxy_error_response(request_id, f"{type(retry_exc).__name__}: {retry_exc}"))
-                            continue
+                        with session_cond:
+                            if session_id is not None:
+                                session_id = None
+                            session_requested = True
+                            session_cond.notify_all()
+                        active_session = request_session_and_wait(timeout)
+                        if active_session:
+                            try:
+                                result, _r = _mcp_proxy_streamable_http_request(
+                                    endpoint, headers, payload, timeout, protocol_version, active_session,
+                                )
+                                if isinstance(result, dict):
+                                    _mcp_proxy_observe_json_message(server_name, result)
+                                if payload.get("id") is not None:
+                                    _mcp_proxy_write_json_response(result if isinstance(result, dict) else {"jsonrpc": "2.0", "id": request_id, "result": result if result is not None else {}})
+                                continue
+                            except Exception as retry_exc:
+                                _mcp_proxy_write_json_response(_mcp_proxy_error_response(request_id, f"{type(retry_exc).__name__}: {retry_exc}"))
+                                continue
+                        _mcp_proxy_write_json_response(_mcp_proxy_error_response(request_id, "Streamable HTTP MCP session is not initialized"))
+                        continue
                     _mcp_proxy_write_json_response(_mcp_proxy_error_response(request_id, f"HTTPError:{exc.code}: {exc.reason}; {body_text}".strip()))
                 except Exception as exc:
                     _mcp_proxy_write_json_response(_mcp_proxy_error_response(request_id, f"{type(exc).__name__}: {exc}"))
@@ -26349,10 +26432,7 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                 if _mcp_proxy_tool_is_notification_wait(_mcp_proxy_tool_call_name(payload)):
                     _mcp_proxy_write_json_response(wait_for_proxy_notifications(payload))
                     continue
-                result, returned_session = _mcp_proxy_streamable_http_request(endpoint, headers, payload, timeout, protocol_version, current_session_id())
-                if returned_session:
-                    set_session_id(returned_session)
-                    start_stream_if_needed()
+                result, _r = _mcp_proxy_streamable_http_request(endpoint, headers, payload, timeout, protocol_version, current_session_id())
                 if payload.get("id") is not None:
                     _mcp_proxy_write_json_response(result if isinstance(result, dict) else {"jsonrpc": "2.0", "id": request_id, "result": result if result is not None else {}})
             except Exception as exc:
@@ -26365,6 +26445,10 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
         return 1
     finally:
         stream_stop.set()
+        with session_cond:
+            session_cond.notify_all()
+        if manager_thread is not None:
+            manager_thread.join(timeout=2.0)
 
 
 def run_mcp_stdio_proxy(server_name: str, server_config_path: Path) -> int:

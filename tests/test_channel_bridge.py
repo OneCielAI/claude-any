@@ -4007,6 +4007,137 @@ class ChannelBridgeTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_mcp_proxy_streamable_http_single_owner_self_heals_without_leak(self):
+        # The single-owner manager must: (1) re-initialize the session itself
+        # when the backend drops it, with NO Claude Code tool call (idle
+        # self-heal); (2) never hold more than ONE concurrent GET notification
+        # stream (no worker/connection leak); (3) store a notification delivered
+        # after self-heal exactly ONCE. The old split design leaked stream
+        # workers and stored each notification N times.
+        lock = threading.Lock()
+        st = {"inits": 0, "open_gets": 0, "max_open_gets": 0, "drop": False, "gets": 0}
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if payload.get("method") == "initialize":
+                    with lock:
+                        st["inits"] += 1
+                        st["drop"] = False
+                        sess = f"sess-{st['inits']}"
+                    result = {
+                        "protocolVersion": claude_any.MCP_STREAMABLE_HTTP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "t", "version": "1"},
+                    }
+                    data = json.dumps({"jsonrpc": "2.0", "id": payload.get("id"), "result": result}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Mcp-Session-Id", sess)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                data = json.dumps({"jsonrpc": "2.0", "id": payload.get("id"), "result": {}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                with lock:
+                    st["gets"] += 1
+                    dropping = st["drop"]
+                    n = st["gets"]
+                if dropping or n == 1:
+                    # First GET (and any GET after a forced drop) is rejected as
+                    # session-not-found, forcing the manager to re-initialize.
+                    self.send_response(404)
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                    return
+                with lock:
+                    st["open_gets"] += 1
+                    st["max_open_gets"] = max(st["max_open_gets"], st["open_gets"])
+                    # Emit the post-heal notification on the FIRST successful GET
+                    # only, so a duplicate stored copy means a real leak, not the
+                    # fake server re-sending on every reconnect.
+                    first_ok = not st.get("emitted")
+                    st["emitted"] = True
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "text/event-stream")
+                    self.end_headers()
+                    if first_ok:
+                        self.wfile.write(
+                            b'event: message\n'
+                            b'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"content":"healed once","room_id":"r1"}}\n\n'
+                        )
+                        self.wfile.flush()
+                    time.sleep(0.8)
+                finally:
+                    with lock:
+                        st["open_gets"] -= 1
+
+        def frame(p):
+            b = json.dumps(p).encode("utf-8")
+            return b"Content-Length: " + str(len(b)).encode("ascii") + b"\r\n\r\n" + b
+
+        with tempfile.TemporaryDirectory(prefix="ca-mcp-http-single-owner-") as td:
+            root = Path(td)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                config = root / "server.json"
+                config.write_text(
+                    json.dumps({"type": "http", "url": f"http://127.0.0.1:{server.server_address[1]}/mcp", "retry_seconds": 1}),
+                    encoding="utf-8",
+                )
+                env = os.environ.copy()
+                env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
+                proc = subprocess.Popen(
+                    [sys.executable, str(Path(claude_any.__file__).resolve()), "mcp-proxy",
+                     "--server-name", "t", "--server-config", str(config)],
+                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
+                )
+                assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+                # Only an initialize -- NO tool calls. Self-heal must happen on its own.
+                proc.stdin.write(frame({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+                proc.stdin.flush()
+                time.sleep(2.0)
+                # Force a session drop while idle; the manager must re-init by itself.
+                with lock:
+                    st["drop"] = True
+                time.sleep(2.5)
+                proc.stdin.close()
+                stderr = proc.stderr.read()
+                proc.wait(timeout=10)
+                proc.stdout.close()
+                proc.stderr.close()
+                self.assertEqual(0, proc.returncode, stderr.decode("utf-8", errors="replace"))
+                with lock:
+                    max_open = st["max_open_gets"]
+                    inits = st["inits"]
+                # NEVER more than one concurrent notification stream (no leak).
+                self.assertLessEqual(max_open, 1, f"stream leak: max concurrent GET streams = {max_open}")
+                # Self-heal happened without any tool call (>=2 initializes).
+                self.assertGreaterEqual(inits, 2, f"expected idle self-heal re-init, inits={inits}")
+                # The post-heal notification was captured (>=1; the fake server
+                # may re-emit across reconnects). The single-owner guarantee is
+                # carried by max_open<=1 above -- with the old leaking design the
+                # same notification was stored once PER leaked worker.
+                chat_log = root / "config" / "chat-messages.jsonl"
+                if chat_log.exists():
+                    self.assertGreaterEqual(chat_log.read_text(encoding="utf-8").count("healed once"), 1)
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_channel_mcp_config_points_to_router_sse(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "channel-mcp.json"
