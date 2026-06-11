@@ -283,6 +283,142 @@ def with_upstream_user_agent(headers: dict[str, str] | None = None) -> dict[str,
     return out
 
 
+IP_FAMILY_ALIASES = {
+    "": "auto",
+    "auto": "auto",
+    "default": "auto",
+    "system": "auto",
+    "any": "auto",
+    "4": "ipv4",
+    "v4": "ipv4",
+    "ipv4": "ipv4",
+    "inet": "ipv4",
+    "6": "ipv6",
+    "v6": "ipv6",
+    "ipv6": "ipv6",
+    "inet6": "ipv6",
+    "prefer4": "ipv4-preferred",
+    "prefer-v4": "ipv4-preferred",
+    "preferred4": "ipv4-preferred",
+    "ipv4-preferred": "ipv4-preferred",
+    "ipv4_preferred": "ipv4-preferred",
+    "prefer-ipv4": "ipv4-preferred",
+    "prefer6": "ipv6-preferred",
+    "prefer-v6": "ipv6-preferred",
+    "preferred6": "ipv6-preferred",
+    "ipv6-preferred": "ipv6-preferred",
+    "ipv6_preferred": "ipv6-preferred",
+    "prefer-ipv6": "ipv6-preferred",
+}
+IP_FAMILY_CHOICES = ("auto", "ipv4", "ipv6", "ipv4-preferred", "ipv6-preferred")
+
+
+def normalize_ip_family(value: Any, default: str = "auto") -> str:
+    text = str(value if value is not None else default).strip().lower().replace("_", "-")
+    family = IP_FAMILY_ALIASES.get(text)
+    if family:
+        return family
+    raise SystemExit(f"ip_family must be one of: {', '.join(IP_FAMILY_CHOICES)}")
+
+
+def default_provider_ip_family(provider: str) -> str:
+    return "ipv6-preferred" if provider in OPENCODE_PROVIDER_NAMES else "auto"
+
+
+def provider_ip_family(provider: str | None, pcfg: dict[str, Any] | None) -> str:
+    if not provider or not isinstance(pcfg, dict):
+        return "auto"
+    return normalize_ip_family(pcfg.get("ip_family"), default_provider_ip_family(provider))
+
+
+def _ip_family_sort_key(family: int, preferred: int) -> tuple[int, int]:
+    return (0 if family == preferred else 1, family)
+
+
+@contextlib.contextmanager
+def socket_getaddrinfo_ip_family_policy(ip_family: str) -> Iterable[None]:
+    policy = normalize_ip_family(ip_family)
+    if policy == "auto":
+        yield
+        return
+    strict = policy in ("ipv4", "ipv6")
+    desired = socket.AF_INET6 if policy in ("ipv6", "ipv6-preferred") else socket.AF_INET
+    with _IP_FAMILY_LOCK:
+        original_getaddrinfo = socket.getaddrinfo
+
+        def filtered_getaddrinfo(host: Any, port: Any, family: int = 0, type: int = 0, proto: int = 0, flags: int = 0) -> Any:
+            infos = original_getaddrinfo(host, port, family, type, proto, flags)
+            matches = [info for info in infos if info and info[0] == desired]
+            if strict:
+                if not matches:
+                    raise socket.gaierror(socket.EAI_NONAME, f"no {policy} address for {host}")
+                return matches
+            others = [info for info in infos if not info or info[0] != desired]
+            return sorted(matches, key=lambda info: _ip_family_sort_key(info[0], desired)) + others
+
+        socket.getaddrinfo = filtered_getaddrinfo
+        try:
+            yield
+        finally:
+            socket.getaddrinfo = original_getaddrinfo
+
+
+def provider_urlopen(
+    req: urllib.request.Request,
+    timeout: float,
+    provider: str | None = None,
+    pcfg: dict[str, Any] | None = None,
+) -> Any:
+    policy = provider_ip_family(provider, pcfg)
+    if policy != "auto":
+        router_log("DEBUG", f"upstream_ip_family provider={provider or ''} policy={policy}")
+    with socket_getaddrinfo_ip_family_policy(policy):
+        return urllib.request.urlopen(req, timeout=timeout)
+
+
+def ip_family_connectivity(host: str, port: int, family: int, timeout: float = 1.5) -> tuple[bool, str]:
+    try:
+        infos = socket.getaddrinfo(host, port, family, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+    except Exception as exc:
+        return False, f"dns:{type(exc).__name__}"
+    if not infos:
+        return False, "dns:no-address"
+    last_error = ""
+    for info in infos:
+        af, socktype, proto, _canonname, sockaddr = info
+        sock = socket.socket(af, socktype, proto)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(sockaddr)
+            return True, "connect:ok"
+        except Exception as exc:
+            last_error = f"connect:{type(exc).__name__}"
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return False, last_error or "connect:failed"
+
+
+def provider_ip_family_probe_lines(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    if provider not in OPENCODE_PROVIDER_NAMES:
+        return []
+    base = str(pcfg.get("base_url") or default_base_url(provider) or "").strip()
+    parsed = urllib.parse.urlparse(base)
+    host = parsed.hostname
+    if not host:
+        return [f"IP family: {provider_ip_family(provider, pcfg)}; probe unavailable (base URL host missing)"]
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    ipv4_ok, ipv4_reason = ip_family_connectivity(host, port, socket.AF_INET)
+    ipv6_ok, ipv6_reason = ip_family_connectivity(host, port, socket.AF_INET6)
+    return [
+        f"IP family: {provider_ip_family(provider, pcfg)}",
+        f"IPv4 connectivity: {'OK' if ipv4_ok else 'FAIL'} ({ipv4_reason})",
+        f"IPv6 connectivity: {'OK' if ipv6_ok else 'FAIL'} ({ipv6_reason})",
+    ]
+
+
 def claude_any_source_fingerprint() -> str:
     try:
         return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
@@ -313,6 +449,7 @@ _LOG_LEVEL_CACHE: dict[str, Any] = {"value": None, "checked_at": 0.0, "file_mtim
 _RATE_LIMIT_LOCK = threading.Lock()
 _API_KEY_ROTATION_LOCK = threading.Lock()
 _API_KEY_ROTATION_CURSOR: dict[str, int] = {}
+_IP_FAMILY_LOCK = threading.RLock()
 _CHAT_CONDITION = threading.Condition()
 _CHAT_NEXT_ID: int | None = None
 _CHANNEL_SSE_LOCK = threading.Lock()
@@ -1817,6 +1954,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT_MS,
             "stream_enabled": True,
             "stream_word_chunking": False,
+            "ip_family": "ipv6-preferred",
             "haiku_model": "claude-haiku-4-5",
             "subagent_model": "claude-sonnet-4-6",
             "model_endpoints": {},
@@ -1834,6 +1972,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "request_timeout_ms": DEFAULT_REQUEST_TIMEOUT_MS,
             "stream_enabled": True,
             "stream_word_chunking": False,
+            "ip_family": "ipv6-preferred",
             "haiku_model": "qwen3.5-plus",
             "subagent_model": "qwen3.6-plus",
             "model_endpoints": {},
@@ -2069,6 +2208,15 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
         pcfg = providers.get("anthropic")
         if isinstance(pcfg, dict) and positive_int(pcfg.get("max_output_tokens")) in (2048, 4096, 6144, 8192):
             pcfg.pop("max_output_tokens", None)
+        migrations[marker] = True
+
+    marker = "opencode_default_ipv6_preferred_20260611"
+    if not migrations.get(marker):
+        providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        for provider_name in OPENCODE_PROVIDER_NAMES:
+            pcfg = providers.get(provider_name)
+            if isinstance(pcfg, dict) and not pcfg.get("ip_family"):
+                pcfg["ip_family"] = "ipv6-preferred"
         migrations[marker] = True
 
 
@@ -3139,9 +3287,15 @@ def disable_claude_any_slash_commands_for_native() -> None:
         print(f"Claude Any warning: could not remove claude-any slash commands for native mode ({type(exc).__name__}: {exc}).", flush=True)
 
 
-def http_json(url: str, headers: dict[str, str] | None = None, timeout: float = 8.0) -> Any:
+def http_json(
+    url: str,
+    headers: dict[str, str] | None = None,
+    timeout: float = 8.0,
+    provider: str | None = None,
+    pcfg: dict[str, Any] | None = None,
+) -> Any:
     req = urllib.request.Request(url, headers=with_upstream_user_agent(headers))
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with provider_urlopen(req, timeout=timeout, provider=provider, pcfg=pcfg) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -5362,10 +5516,17 @@ def fetch_anthropic_api_model_ids(
     return [], ""
 
 
-def post_json(url: str, body: Any, headers: dict[str, str] | None = None, timeout: float = 60.0) -> Any:
+def post_json(
+    url: str,
+    body: Any,
+    headers: dict[str, str] | None = None,
+    timeout: float = 60.0,
+    provider: str | None = None,
+    pcfg: dict[str, Any] | None = None,
+) -> Any:
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=with_upstream_user_agent(headers), method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with provider_urlopen(req, timeout=timeout, provider=provider, pcfg=pcfg) as r:
         return json.loads(r.read().decode("utf-8"))
 
 
@@ -6135,17 +6296,17 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
     try:
         if provider in ("ollama", "ollama-cloud"):
             try:
-                data = http_json(join_url(base, "/api/tags"), headers=provider_model_list_headers(provider, pcfg), timeout=4.0)
+                data = http_json(join_url(base, "/api/tags"), headers=provider_model_list_headers(provider, pcfg), timeout=4.0, provider=provider, pcfg=pcfg)
                 ids = [normalize_model_id(provider, mid) for mid in model_ids_from_response(data)]
                 model_info.update(model_info_from_response(provider, data))
                 fetched = True
             except Exception:
-                data = http_json(join_url(base, "/v1/models"), headers=provider_model_list_headers(provider, pcfg), timeout=4.0)
+                data = http_json(join_url(base, "/v1/models"), headers=provider_model_list_headers(provider, pcfg), timeout=4.0, provider=provider, pcfg=pcfg)
                 ids = [normalize_model_id(provider, mid) for mid in model_ids_from_response(data)]
                 model_info.update(model_info_from_response(provider, data))
                 fetched = True
         elif provider == "nvidia-hosted":
-            data = http_json(join_url(base, "/v1/models"), headers=nvidia_hosted_list_headers(), timeout=8.0)
+            data = http_json(join_url(base, "/v1/models"), headers=nvidia_hosted_list_headers(), timeout=8.0, provider=provider, pcfg=pcfg)
             ids = model_ids_from_response(data)
             model_info.update(model_info_from_response(provider, data))
             fetched = True
@@ -6153,7 +6314,7 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
             headers = provider_model_list_headers(provider, pcfg)
             for path in ("/api/v0/models", "/api/v1/models", "/v1/models", "/models"):
                 try:
-                    data = http_json(join_url(lm_studio_api_base(pcfg) if path.startswith("/api/") else base, path), headers=headers, timeout=2.0)
+                    data = http_json(join_url(lm_studio_api_base(pcfg) if path.startswith("/api/") else base, path), headers=headers, timeout=2.0, provider=provider, pcfg=pcfg)
                     ids = [normalize_model_id(provider, mid) for mid in model_ids_from_response(data)]
                     model_info.update(model_info_from_response(provider, data))
                     fetched = True
@@ -6165,7 +6326,7 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
             headers = provider_model_list_headers(provider, pcfg)
             for path in ("/v1/models", "/models"):
                 try:
-                    data = http_json(join_url(base, path), headers=headers, timeout=6.0)
+                    data = http_json(join_url(base, path), headers=headers, timeout=6.0, provider=provider, pcfg=pcfg)
                     ids = model_ids_from_response(data)
                     model_info.update(model_info_from_response(provider, data))
                     fetched = True
@@ -14424,7 +14585,7 @@ def post_json_with_rate_retry(
             router_log("INFO", f"upstream_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={token_estimate} bytes={byte_estimate} timeout={timeout}")
             data_bytes = json.dumps(req_body).encode("utf-8")
             req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with provider_urlopen(req, timeout=timeout, provider=provider, pcfg=pcfg) as resp:
                 learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
                 data = json.loads(resp.read().decode("utf-8"))
                 write_router_activity("success", provider, model, attempt=attempt + 1, tokens=token_estimate, bytes=byte_estimate)
@@ -14509,7 +14670,7 @@ def open_openai_stream_with_rate_retry(
             )
             router_log("INFO", f"upstream_stream_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={token_estimate} bytes={byte_estimate} timeout={timeout}")
             req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
-            resp = urllib.request.urlopen(req, timeout=timeout)
+            resp = provider_urlopen(req, timeout=timeout, provider=provider, pcfg=pcfg)
             set_upstream_stream_read_timeout(resp, provider_stream_idle_timeout_seconds(pcfg))
             learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
             return resp
@@ -14877,7 +15038,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             try:
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to Anthropic-compatible provider", request_id=request_id, provider=provider, model=upstream_model, data={"url": url, "stream": bool(body.get("stream", stream_enabled))})
-                resp = urllib.request.urlopen(req, timeout=provider_request_timeout_seconds(pcfg))
+                resp = provider_urlopen(req, timeout=provider_request_timeout_seconds(pcfg), provider=provider, pcfg=pcfg)
                 if bool(body.get("stream", stream_enabled)):
                     set_upstream_stream_read_timeout(resp, provider_stream_idle_timeout_seconds(pcfg))
                 status = getattr(resp, "status", 200)
@@ -17743,6 +17904,7 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     if provider in OPENCODE_PROVIDER_NAMES:
         overrides = pcfg.get("model_endpoints")
         count = len(overrides) if isinstance(overrides, dict) else 0
+        parts.append(f"ip_family={provider_ip_family(provider, pcfg)}")
         parts.append(f"endpoint_overrides={count}")
     if provider == "anthropic":
         parts.append(f"routed={'on' if anthropic_routed_enabled(provider, pcfg) else 'off'}")
@@ -19658,6 +19820,8 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg["stream_enabled"] = True
         elif key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
             pcfg["stream_word_chunking"] = False
+        elif key in ("ip_family", "network_family", "address_family", "addr_family"):
+            pcfg.pop("ip_family", None)
         elif key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
             pcfg.pop("force_query_string", None)
         elif key in ("workflows_enabled", "workflow", "workflows"):
@@ -19740,6 +19904,9 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
     if key in ("stream_word_chunking", "word_chunking", "stream_chunk", "stream_words"):
         pcfg["stream_word_chunking"] = parse_bool(value, default=False)
         return
+    if key in ("ip_family", "network_family", "address_family", "addr_family"):
+        pcfg["ip_family"] = normalize_ip_family(value)
+        return
     if key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
         # Testing aid: force a raw query string onto the upstream /v1/messages URL
         # (e.g. "beta=true" or "beta=true&foo=bar"). Lets the operator probe how the
@@ -19815,9 +19982,11 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
     print("  temperature/top_p/top_k are injected by claude-any router mode when the provider supports them.")
     if provider in OPENCODE_PROVIDER_NAMES:
         print("  OpenCode endpoint override: endpoint:<model-id>=messages|chat|responses|gemini")
+        print("  OpenCode ip_family options: auto, ipv4, ipv6, ipv4-preferred, ipv6-preferred")
     print("Examples:")
     print("  claude-anyctl provider-options deepseek max_output_tokens=8192 context_window=1048576")
     print("  claude-anyctl provider-options opencode-go endpoint:custom-model=chat")
+    print("  claude-anyctl provider-options opencode ip_family=ipv6-preferred")
     print("  claude-anyctl provider-options nvidia-hosted max_output_tokens=4096 temperature=0.7 top_p=0.8 timeout=300000 rate_limit_rpm=40")
     print("  claude-anyctl provider-options vllm max_output_tokens=4096 context_window=65536 timeout=300000")
     print("  claude-anyctl provider-options self-hosted-nim native=true max_output_tokens=4096")
@@ -20115,7 +20284,7 @@ def run_compatibility_api_key_probes(
         keyed_pcfg = provider_config_for_single_api_key(pcfg, key)
         try:
             url, probe_body, probe_headers = compatibility_api_key_probe_request(provider, keyed_pcfg, model, request_body)
-            post_json(url, probe_body, headers=probe_headers, timeout=timeout)
+            post_json(url, probe_body, headers=probe_headers, timeout=timeout, provider=provider, pcfg=keyed_pcfg)
         except CompatibilityApiKeyProbeError:
             raise
         except urllib.error.HTTPError as exc:
@@ -20289,9 +20458,14 @@ def _cmd_test(args: argparse.Namespace) -> None:
     print(f"Claude API URL: {url}")
     if not native:
         print(f"Upstream base URL: {pcfg.get('base_url')}")
+        for line in provider_ip_family_probe_lines(provider, pcfg):
+            print(line)
         if provider in ("ollama", "ollama-cloud"):
             req_preview = ollama_chat_request(resolve_requested_model(provider, pcfg, model), tool_body, pcfg, stream=False)
             print(f"Ollama num_ctx: {req_preview.get('options', {}).get('num_ctx', 'default')}")
+    elif provider in OPENCODE_PROVIDER_NAMES:
+        for line in provider_ip_family_probe_lines(provider, pcfg):
+            print(line)
     print(f"Model: {model}")
     for line in lm_studio_preflight_lines:
         print(line)
@@ -20332,7 +20506,14 @@ def _cmd_test(args: argparse.Namespace) -> None:
     def run_phase(label: str, request_body: dict[str, Any]) -> Any:
         print(f"{label}: running")
         try:
-            return post_json(url, request_body, headers=headers, timeout=args.timeout)
+            return post_json(
+                url,
+                request_body,
+                headers=headers,
+                timeout=args.timeout,
+                provider=provider if native else None,
+                pcfg=pcfg if native else None,
+            )
         except urllib.error.HTTPError as exc:
             msg = compatibility_http_error_message(exc)
             diagnosis = compatibility_failure_diagnosis(provider, exc.code, msg)
@@ -21346,7 +21527,7 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
     headers = with_upstream_user_agent(headers)
     try:
         req = urllib.request.Request(join_url(base, path), headers=headers)
-        with urllib.request.urlopen(req, timeout=2.5) as resp:
+        with provider_urlopen(req, timeout=2.5, provider=provider, pcfg=pcfg) as resp:
             body = resp.read(131072).decode("utf-8", errors="ignore")
         count = ""
         try:

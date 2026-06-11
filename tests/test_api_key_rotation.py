@@ -120,8 +120,8 @@ class ApiKeyRotationTests(unittest.TestCase):
         pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-one", "sk-two"])
         calls = []
 
-        def fake_post_json(url, body, headers=None, timeout=60.0):
-            calls.append((url, body, headers or {}, timeout))
+        def fake_post_json(url, body, headers=None, timeout=60.0, **kwargs):
+            calls.append((url, body, headers or {}, timeout, kwargs))
             return {"content": [{"type": "text", "text": "OK"}]}
 
         with mock.patch.object(claude_any, "post_json", side_effect=fake_post_json):
@@ -137,6 +137,8 @@ class ApiKeyRotationTests(unittest.TestCase):
         self.assertEqual("Bearer sk-one", calls[0][2]["authorization"])
         self.assertEqual("Bearer sk-two", calls[1][2]["authorization"])
         self.assertTrue(calls[0][0].endswith("/v1/messages"))
+        self.assertEqual("deepseek", calls[0][4]["provider"])
+        self.assertEqual("deepseek", calls[1][4]["provider"])
         self.assertIn("API key 1/2", "\n".join(lines))
         self.assertIn("API key 2/2", "\n".join(lines))
 
@@ -283,8 +285,8 @@ class ApiKeyRotationTests(unittest.TestCase):
                 pcfg = self.provider_pcfg(provider, api_key="", api_keys=["sk-one", "sk-two"], current_model=model)
                 calls = []
 
-                def fake_post_json(url, body, headers=None, timeout=60.0):
-                    calls.append((url, body, headers or {}, timeout))
+                def fake_post_json(url, body, headers=None, timeout=60.0, **kwargs):
+                    calls.append((url, body, headers or {}, timeout, kwargs))
                     return {"content": [{"type": "text", "text": "OK"}]}
 
                 with mock.patch.object(claude_any, "post_json", side_effect=fake_post_json):
@@ -301,6 +303,8 @@ class ApiKeyRotationTests(unittest.TestCase):
                 self.assertTrue(calls[1][0].endswith(expected_suffix), calls[1][0])
                 self.assertEqual("Bearer sk-one", calls[0][2]["authorization"])
                 self.assertEqual("Bearer sk-two", calls[1][2]["authorization"])
+                self.assertEqual(provider, calls[0][4]["provider"])
+                self.assertEqual(provider, calls[1][4]["provider"])
 
 
 if __name__ == "__main__":
