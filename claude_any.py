@@ -10298,12 +10298,29 @@ def advisor_provider_supported(provider: str) -> bool:
 
 
 def anthropic_system_with_advisor(system: Any, extra_system_texts: list[str] | None = None) -> list[dict[str, Any]]:
-    blocks: list[dict[str, Any]] = [{"type": "text", "text": ADVISOR_REVIEW_PROMPT}]
+    """Build the advisor request system blocks, keeping the session identity first.
+
+    Anthropic rejects OAuth-authenticated requests whose first system block is
+    not the original Claude Code identity block (HTTP 429 ``rate_limit_error``
+    with message "Error"), so the inbound session's first system block stays
+    first and verbatim; the advisor instruction rides behind it.
+    """
+    blocks: list[dict[str, Any]] = []
     original_text = ""
     if isinstance(system, str):
-        original_text = system.strip()
+        clean = system.strip()
+        if clean:
+            blocks.append({"type": "text", "text": clean})
+    elif isinstance(system, list) and system:
+        first = system[0]
+        if isinstance(first, dict) and str(first.get("type") or "") == "text" and str(first.get("text") or "").strip():
+            blocks.append(dict(first))
+            original_text = anthropic_content_to_text(system[1:]).strip()
+        else:
+            original_text = anthropic_content_to_text(system).strip()
     elif system:
         original_text = anthropic_content_to_text(system).strip()
+    blocks.append({"type": "text", "text": ADVISOR_REVIEW_PROMPT})
     if original_text:
         blocks.append({"type": "text", "text": "Original session system context:\n" + original_text})
     for text in extra_system_texts or []:
@@ -11876,7 +11893,11 @@ def advisor_response_text(provider: str, data: Any) -> str:
 def advisor_endpoint(provider: str, pcfg: dict[str, Any]) -> str:
     base = pcfg.get("base_url", "").rstrip("/")
     if advisor_provider_kind(provider) == "anthropic":
-        return join_url(base, "/v1/messages")
+        url = join_url(base, "/v1/messages")
+        # Honor force_query_string like the main forwarding path; the advisor
+        # call has no inbound request path, so only the explicit override applies.
+        query = upstream_messages_query(pcfg, "")
+        return f"{url}?{query}" if query else url
     if advisor_provider_kind(provider) == "openai-compatible":
         return join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions")
     return join_url(base, "/api/chat")

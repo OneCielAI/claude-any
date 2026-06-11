@@ -270,8 +270,11 @@ class NativeEnvContractTests(unittest.TestCase):
         self.assertNotIn("tool_choice", req)
         self.assertEqual(["user", "assistant", "user"], [message["role"] for message in req["messages"]])
         self.assertIn("Advisor focus", claude_any.anthropic_content_to_text(req["messages"][-1]["content"]))
-        self.assertIn("claude-any Advisor", claude_any.anthropic_content_to_text(req["system"]))
-        self.assertIn("Original session system context", claude_any.anthropic_content_to_text(req["system"]))
+        # The session's own system text must stay first and verbatim — Anthropic
+        # rejects OAuth requests whose first system block is not the Claude Code
+        # identity (429 rate_limit_error).
+        self.assertEqual("You are in Claude Code.", req["system"][0]["text"])
+        self.assertEqual(claude_any.ADVISOR_REVIEW_PROMPT, req["system"][1]["text"])
         self.assertIn("Runtime state from Claude Code.", claude_any.anthropic_content_to_text(req["system"]))
 
     def test_routed_anthropic_advisor_call_forwards_oauth_headers(self):
