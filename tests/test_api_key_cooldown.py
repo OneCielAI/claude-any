@@ -1,5 +1,6 @@
 import copy
 import email.message
+import json
 import os
 import tempfile
 import time
@@ -135,6 +136,65 @@ class ApiKeyCooldownTests(unittest.TestCase):
     def test_key_from_request_headers(self):
         self.assertEqual("sk-x", claude_any.key_from_request_headers({"x-api-key": "sk-x"}))
         self.assertEqual("sk-y", claude_any.key_from_request_headers({"authorization": "Bearer sk-y"}))
+
+    def test_multi_key_rate_limit_headers_do_not_set_global_penalty(self):
+        pcfg = self.pcfg(api_key="", api_keys=["sk-k1", "sk-k2"])
+
+        claude_any.learn_router_rate_limit_headers(
+            "openrouter",
+            pcfg,
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            _headers(**{"X-RateLimit-Limit": "50", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "3600"}),
+        )
+
+        state = json.loads(Path(self._tmp.name).read_text(encoding="utf-8"))
+        entry = state["openrouter:__global__"]
+        self.assertEqual(50, entry["server_rpm"])
+        self.assertNotIn("penalty_until", entry)
+
+    def test_multi_key_rate_limit_headers_clear_existing_global_penalty(self):
+        pcfg = self.pcfg(api_key="", api_keys=["sk-k1", "sk-k2"])
+        Path(self._tmp.name).write_text(
+            json.dumps({"openrouter:__global__": {"timestamps": [], "rpm": 50, "penalty_until": time.time() + 3600}}),
+            encoding="utf-8",
+        )
+
+        claude_any.learn_router_rate_limit_headers(
+            "openrouter",
+            pcfg,
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            _headers(**{"X-RateLimit-Limit": "50", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "3600"}),
+        )
+
+        state = json.loads(Path(self._tmp.name).read_text(encoding="utf-8"))
+        self.assertNotIn("penalty_until", state["openrouter:__global__"])
+
+    def test_single_key_rate_limit_headers_keep_global_penalty(self):
+        pcfg = self.pcfg(api_key="sk-k1", api_keys=[])
+
+        claude_any.learn_router_rate_limit_headers(
+            "openrouter",
+            pcfg,
+            "nvidia/nemotron-3-ultra-550b-a55b:free",
+            _headers(**{"X-RateLimit-Limit": "50", "X-RateLimit-Remaining": "0", "X-RateLimit-Reset": "3600"}),
+        )
+
+        state = json.loads(Path(self._tmp.name).read_text(encoding="utf-8"))
+        self.assertGreater(state["openrouter:__global__"]["penalty_until"], time.time())
+
+    def test_multi_key_apply_rate_limit_ignores_existing_global_penalty(self):
+        pcfg = self.pcfg(api_key="", api_keys=["sk-k1", "sk-k2"], rate_limit_rpm=50)
+        Path(self._tmp.name).write_text(
+            json.dumps({"openrouter:__global__": {"timestamps": [], "rpm": 50, "penalty_until": time.time() + 3600}}),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(claude_any.time, "sleep") as sleep:
+            waited, used, rpm = claude_any.apply_router_rate_limit("openrouter", pcfg, "model")
+
+        self.assertEqual(0.0, waited)
+        self.assertEqual(50, rpm)
+        sleep.assert_not_called()
 
 
 if __name__ == "__main__":

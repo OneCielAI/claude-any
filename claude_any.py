@@ -5589,6 +5589,7 @@ def learn_router_rate_limit_headers(provider: str, pcfg: dict[str, Any], model: 
     rpm = limit if limit and limit > 0 else configured
     if rpm is None:
         rpm = 0
+    multi_key = provider_api_key_count(provider, pcfg) > 1
     key = router_rate_limit_key(provider, pcfg, model)
     with _RATE_LIMIT_LOCK:
         try:
@@ -5604,8 +5605,8 @@ def learn_router_rate_limit_headers(provider: str, pcfg: dict[str, Any], model: 
             entry = state.get(legacy_key)
         timestamps = entry.get("timestamps") if isinstance(entry, dict) else []
         recent = router_rate_limit_recent(timestamps, now, 60.0, include_future=True)
-        penalty_until = float(entry.get("penalty_until") or 0.0) if isinstance(entry, dict) else 0.0
-        if remaining == 0 and reset and reset > 0:
+        penalty_until = 0.0 if multi_key else (float(entry.get("penalty_until") or 0.0) if isinstance(entry, dict) else 0.0)
+        if remaining == 0 and reset and reset > 0 and not multi_key:
             penalty_until = max(penalty_until, now + reset)
         new_entry: dict[str, Any] = {
             "timestamps": recent[-max(int(rpm or 0), 240):],
@@ -5626,7 +5627,8 @@ def learn_router_rate_limit_headers(provider: str, pcfg: dict[str, Any], model: 
         state[key] = new_entry
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
-    router_log("INFO", f"rate_limit_headers provider={provider} model={model or ''} limit={limit} remaining={remaining} reset={reset}")
+    extra = " multi_key_no_global_penalty=1" if multi_key and remaining == 0 and reset and reset > 0 else ""
+    router_log("INFO", f"rate_limit_headers provider={provider} model={model or ''} limit={limit} remaining={remaining} reset={reset}{extra}")
 
 
 def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], model: str | None, retry_after: str | None = None) -> float:
@@ -5637,6 +5639,7 @@ def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], mode
         wait = max(10.0, min(60.0, fallback * 4.0))
     wait = max(1.0, min(300.0, wait))
     key = router_rate_limit_key(provider, pcfg, model)
+    multi_key = provider_api_key_count(provider, pcfg) > 1
     with _RATE_LIMIT_LOCK:
         try:
             state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
@@ -5666,15 +5669,17 @@ def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], mode
         capacity = router_rate_limit_capacity(int(rpm or 0)) if rpm and rpm > 0 else int(rpm or 0)
         if capacity and capacity > 0 and len(actual_recent) >= capacity and actual_recent:
             wait = max(wait, max(0.0, actual_recent[0] + 60.0 - now))
-        penalty_until = max(float(entry.get("penalty_until") or 0.0) if isinstance(entry, dict) else 0.0, now + wait)
+        existing_penalty_until = 0.0 if multi_key else (float(entry.get("penalty_until") or 0.0) if isinstance(entry, dict) else 0.0)
+        penalty_until = max(existing_penalty_until, now + wait) if not multi_key else 0.0
         state[key] = {
             "timestamps": recent[-max(int(rpm or 0), 240):],
             "rpm": int(rpm or 0),
             "updated_at": now,
             "last_wait": wait,
-            "penalty_until": penalty_until,
             "last_429_at": now,
         }
+        if penalty_until > now:
+            state[key]["penalty_until"] = penalty_until
         if isinstance(entry, dict):
             for preserve_key in ("server_rpm", "server_rpm_updated_at", "server_remaining", "server_reset_seconds"):
                 if preserve_key in entry:
@@ -5685,7 +5690,8 @@ def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], mode
             state[key]["server_rpm_reason"] = "inferred_from_429"
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
-    router_log("WARN", f"rate_limit_429_backoff provider={provider} model={model or ''} wait={wait:.2f}s")
+    extra = " multi_key_no_global_penalty=1" if multi_key else ""
+    router_log("WARN", f"rate_limit_429_backoff provider={provider} model={model or ''} wait={wait:.2f}s{extra}")
     return wait
 
 
@@ -5787,6 +5793,7 @@ def apply_router_rate_limit(provider: str, pcfg: dict[str, Any], model: str | No
     base_interval = window / float(rpm)
     capacity = router_rate_limit_capacity(rpm)
     key = router_rate_limit_key(provider, pcfg, model)
+    multi_key = provider_api_key_count(provider, pcfg) > 1
     waited = 0.0
     while True:
         with _RATE_LIMIT_LOCK:
@@ -5804,7 +5811,7 @@ def apply_router_rate_limit(provider: str, pcfg: dict[str, Any], model: str | No
             if isinstance(entry, dict):
                 timestamps = entry.get("timestamps")
                 try:
-                    penalty_until = float(entry.get("penalty_until") or 0.0)
+                    penalty_until = 0.0 if multi_key else float(entry.get("penalty_until") or 0.0)
                 except Exception:
                     penalty_until = 0.0
             elif isinstance(entry, (int, float)):
