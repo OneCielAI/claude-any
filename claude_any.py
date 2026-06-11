@@ -2304,9 +2304,32 @@ def parse_api_key_list(value: Any) -> list[str]:
         return []
     raw_items: list[Any]
     if isinstance(value, (list, tuple, set)):
-        raw_items = list(value)
+        raw_items = []
+        for item in value:
+            raw_items.extend(parse_api_key_list(item))
     else:
-        raw_items = re.split(r"[\r\n,;]+", str(value))
+        text = str(value)
+        if re.search(r"[,;]", text):
+            # Comma/semicolon-separated input often arrives through terminals or
+            # web consoles with visual soft-wrap line breaks inside a long key.
+            # Treat indented continuation lines inside a comma field as part of
+            # the same key, while preserving non-indented newlines as separators.
+            raw_items = []
+            for field in re.split(r"[,;]+", text):
+                current = ""
+                for line in str(field).splitlines() or [str(field)]:
+                    if not line.strip():
+                        continue
+                    if current and line[:1].isspace():
+                        current += line.strip()
+                    else:
+                        if current:
+                            raw_items.append(current)
+                        current = line.strip()
+                if current:
+                    raw_items.append(current)
+        else:
+            raw_items = re.split(r"[\r\n]+", text)
     keys: list[str] = []
     seen: set[str] = set()
     for item in raw_items:
@@ -5981,7 +6004,7 @@ def key_from_request_headers(headers: Any) -> str:
         key = headers.get("x-api-key")
         if key:
             return str(key)
-        auth = str(headers.get("authorization") or "")
+        auth = str(headers.get("authorization") or headers.get("Authorization") or "")
     except Exception:
         return ""
     if auth.lower().startswith("bearer "):
@@ -6010,7 +6033,12 @@ def provider_headers(provider: str, pcfg: dict[str, Any], inbound_headers: Any |
                 raise RuntimeError("Anthropic routed mode did not receive Claude Code OAuth/API auth headers.")
         else:
             raise RuntimeError("Anthropic routed mode needs a configured API key or inbound Claude Code auth headers.")
-    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter"):
+    elif provider == "openrouter":
+        if not meaningful_key(key):
+            raise RuntimeError("OpenRouter requires a configured API key.")
+        headers["x-api-key"] = key
+        headers["Authorization"] = f"Bearer {key}"
+    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go"):
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
     elif provider == "lm-studio":

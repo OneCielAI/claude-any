@@ -49,23 +49,28 @@ class OpenRouterProviderTests(unittest.TestCase):
 
     def test_provider_headers_emit_bearer(self):
         headers = claude_any.provider_headers("openrouter", self.openrouter_pcfg(api_key="sk-or-test"))
-        self.assertEqual("Bearer sk-or-test", headers["authorization"])
+        self.assertEqual("Bearer sk-or-test", headers["Authorization"])
         self.assertEqual("sk-or-test", headers["x-api-key"])
+        self.assertNotIn("authorization", headers)
 
     def test_multi_key_round_robin(self):
         pcfg = self.openrouter_pcfg(api_key="", api_keys=["sk-or-one", "sk-or-two"])
         first = claude_any.provider_headers("openrouter", pcfg)
         second = claude_any.provider_headers("openrouter", pcfg)
         third = claude_any.provider_headers("openrouter", pcfg)
-        self.assertEqual("Bearer sk-or-one", first["authorization"])
-        self.assertEqual("Bearer sk-or-two", second["authorization"])
-        self.assertEqual("Bearer sk-or-one", third["authorization"])
+        self.assertEqual("Bearer sk-or-one", first["Authorization"])
+        self.assertEqual("Bearer sk-or-two", second["Authorization"])
+        self.assertEqual("Bearer sk-or-one", third["Authorization"])
 
     def test_select_provider_api_key_rotates(self):
         pcfg = self.openrouter_pcfg(api_key="", api_keys=["sk-or-one", "sk-or-two"])
         self.assertEqual("sk-or-one", claude_any.select_provider_api_key("openrouter", pcfg))
         self.assertEqual("sk-or-two", claude_any.select_provider_api_key("openrouter", pcfg))
         self.assertEqual("sk-or-one", claude_any.select_provider_api_key("openrouter", pcfg))
+
+    def test_provider_headers_require_openrouter_api_key(self):
+        with self.assertRaisesRegex(RuntimeError, "OpenRouter requires"):
+            claude_any.provider_headers("openrouter", self.openrouter_pcfg(api_key="", api_keys=[]))
 
     def test_provider_selectable_in_menu(self):
         rows, values = claude_any.provider_panel_rows(self.openrouter_cfg())
@@ -120,6 +125,40 @@ class OpenRouterProviderTests(unittest.TestCase):
             handler.do_POST()
         forward.assert_called_once()
         self.assertEqual("openrouter", forward.call_args.args[1])
+
+    def test_openrouter_stream_request_sends_authorization_header(self):
+        pcfg = self.openrouter_pcfg(api_key="", api_keys=["sk-or-one", "sk-or-two"])
+        captured = {}
+
+        class FakeResponse:
+            headers = {}
+
+            def read(self):
+                return b""
+
+        def fake_urlopen(req, timeout):
+            captured["timeout"] = timeout
+            captured["headers"] = dict(req.header_items())
+            return FakeResponse()
+
+        body = {"model": "test", "messages": [{"role": "user", "content": "hello"}], "stream": True}
+        with (
+            mock.patch.object(claude_any.urllib.request, "urlopen", side_effect=fake_urlopen),
+            mock.patch.object(claude_any, "set_upstream_stream_read_timeout"),
+        ):
+            claude_any.open_openai_stream_with_rate_retry(
+                "https://openrouter.ai/api/v1/chat/completions",
+                body,
+                claude_any.provider_headers("openrouter", pcfg),
+                7.0,
+                "openrouter",
+                pcfg,
+                "test",
+            )
+
+        self.assertEqual(7.0, captured["timeout"])
+        self.assertEqual("Bearer sk-or-one", captured["headers"].get("Authorization"))
+        self.assertEqual("sk-or-one", captured["headers"].get("X-api-key"))
 
 
 if __name__ == "__main__":

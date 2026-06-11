@@ -27,6 +27,18 @@ class ApiKeyRotationTests(unittest.TestCase):
 
         self.assertEqual(["sk-a", "sk-b"], keys)
 
+    def test_parse_api_key_list_repairs_soft_wrapped_comma_fields(self):
+        keys = claude_any.parse_api_key_list(
+            "sk-one,sk-two,sk-or\n  -v1-wrapped,sk-four"
+        )
+
+        self.assertEqual(["sk-one", "sk-two", "sk-or-v1-wrapped", "sk-four"], keys)
+
+    def test_parse_api_key_list_keeps_newline_separator_without_commas(self):
+        keys = claude_any.parse_api_key_list("sk-one\nsk-two\nsk-three")
+
+        self.assertEqual(["sk-one", "sk-two", "sk-three"], keys)
+
     def test_provider_headers_round_robin_multiple_keys(self):
         pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-one", "sk-two"])
 
