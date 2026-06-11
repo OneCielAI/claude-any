@@ -1,5 +1,8 @@
 import copy
 import io
+import json
+from pathlib import Path
+import tempfile
 import unittest
 from unittest import mock
 import urllib.error
@@ -92,6 +95,39 @@ class ApiKeyRotationTests(unittest.TestCase):
         self.assertIn("2 keys", status)
         self.assertIn(f"primary {claude_any.mask_secret('sk-secret-one')}", status)
         self.assertIn(claude_any.secret_fingerprint("sk-secret-one"), status)
+
+    def test_router_start_resets_only_per_key_cooldowns(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "rate-limit-state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "opencode:https://opencode.ai/zen:__key__:abc123": {
+                            "cooldown_until": 9999999999,
+                            "last_429_at": 123.0,
+                        },
+                        "opencode:__global__": {
+                            "timestamps": [1.0, 2.0],
+                            "server_rpm": 20,
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(claude_any, "RATE_LIMIT_STATE_PATH", state_path),
+                mock.patch.object(claude_any, "CONFIG_DIR", Path(tmp)),
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                removed = claude_any.reset_api_key_cooldowns_for_router_start()
+
+            self.assertEqual(1, removed)
+            saved = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("opencode:https://opencode.ai/zen:__key__:abc123", saved)
+            self.assertIn("opencode:__global__", saved)
+            self.assertEqual(20, saved["opencode:__global__"]["server_rpm"])
 
     def test_store_api_key_input_detects_multiple_keys(self):
         cfg = {

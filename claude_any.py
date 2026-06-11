@@ -5949,6 +5949,30 @@ def api_key_cooldown_until(provider: str, pcfg: dict[str, Any], key: str) -> flo
     return until if until > time.time() else 0.0
 
 
+def reset_api_key_cooldowns_for_router_start() -> int:
+    """Clear per-API-key cooldowns when a fresh router process starts.
+
+    Key cooldowns are runtime retry state. Keeping them across a new Claude Any
+    router process can make a restarted session use only the one key that did
+    not hit a prior 429. Provider/global RPM state is intentionally preserved.
+    """
+    with _RATE_LIMIT_LOCK:
+        try:
+            state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
+            if not isinstance(state, dict):
+                return 0
+        except Exception:
+            return 0
+        kept = {key: value for key, value in state.items() if ":__key__:" not in str(key)}
+        removed = len(state) - len(kept)
+        if removed <= 0:
+            return 0
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        RATE_LIMIT_STATE_PATH.write_text(json.dumps(kept, ensure_ascii=False) + "\n", encoding="utf-8")
+    router_log("INFO", f"api_key_cooldown_reset_on_router_start removed={removed}")
+    return removed
+
+
 def retry_after_exceeds_request_timeout(headers: Any, timeout: float) -> tuple[bool, float | None]:
     retry_after = first_header(headers, ["Retry-After", "retry-after"])
     seconds = parse_retry_after_seconds(retry_after)
@@ -15096,6 +15120,7 @@ class RouterHandler(BaseHTTPRequestHandler):
 def serve(_: argparse.Namespace) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     cfg = load_config()
+    reset_api_key_cooldowns_for_router_start()
     bind_host = router_bind_host(cfg)
     PID_PATH.write_text(str(os.getpid()))
     os.chmod(PID_PATH, 0o600)
