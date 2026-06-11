@@ -40,7 +40,11 @@
    Claude Code's native per-model output cap (e.g. Fable 5 keeps its 64k default
    instead of a forced 4096), `/model` switching reaches the chosen model instead
    of collapsing to the menu model, and the `?beta=true` flag is forwarded so
-   long-context (1M) requests are billed correctly.
+   long-context (1M) requests are billed correctly. Claude native and Anthropic
+   routed sessions now follow Claude Code's built-in `/advisor` flow (model
+   picker + advisor server tool) end to end: Claude Any no longer installs its
+   own `/advisor` command, intercepts advisor traffic, or strips the advisor
+   server tool for the Anthropic provider.
 
 ### 2026-06-05
 
@@ -609,8 +613,11 @@ steps under that larger model's supervision.
   `--ca-max-output-tokens`.
 - Claude Code Plan Mode support on router-backed non-Anthropic providers,
   including local handling for `EnterPlanMode` and plan artifacts.
-- Optional `/advisor` slash command that routes the current task state to a
-  selected Advisor Model, useful for long-context review and next-step checks.
+- Optional `/advisor` slash command on non-Anthropic providers that routes the
+  current task state to a selected Advisor Model, useful for long-context
+  review and next-step checks. Claude native and Anthropic routed sessions use
+  Claude Code's built-in `/advisor` (run `/advisor` in the session to pick its
+  model); Claude Any passes that flow through untouched.
 - Optional Claude Code `statusLine` integration for router RPM usage and wait
   time in the bottom status area instead of polluting the chat transcript.
 - Router-side RPM control for NVIDIA hosted, self-hosted NIM, Ollama, and

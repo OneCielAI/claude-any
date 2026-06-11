@@ -94,11 +94,27 @@ class AdvisorFeedbackTests(unittest.TestCase):
             ],
         }
 
-        out = claude_any.strip_autonomous_advisor_server_tools(body)
+        out = claude_any.strip_autonomous_advisor_server_tools("ollama", body)
 
         self.assertIsNot(out, body)
         self.assertEqual([tool["name"] for tool in out["tools"]], ["Bash"])
         self.assertEqual(2, len(body["tools"]))
+
+    def test_anthropic_provider_keeps_native_advisor_server_tool(self):
+        # Claude native / Anthropic routed sessions follow Claude Code's
+        # built-in advisor flow; the server tool must pass through untouched.
+        body = {
+            "messages": [{"role": "user", "content": "continue"}],
+            "tools": [
+                {"name": "Bash", "description": "run", "input_schema": {"type": "object"}},
+                {"type": "advisor_20260301", "name": "advisor", "model": "claude-sonnet-4-6"},
+            ],
+        }
+
+        out = claude_any.strip_autonomous_advisor_server_tools("anthropic", body)
+
+        self.assertIs(out, body)
+        self.assertEqual(["Bash", "advisor"], [tool["name"] for tool in out["tools"]])
 
     def test_plain_claude_any_advisor_tool_schema_is_not_stripped(self):
         body = {
@@ -109,7 +125,7 @@ class AdvisorFeedbackTests(unittest.TestCase):
             ],
         }
 
-        out = claude_any.strip_autonomous_advisor_server_tools(body)
+        out = claude_any.strip_autonomous_advisor_server_tools("ollama", body)
 
         self.assertIs(out, body)
         self.assertEqual(["advisor", "Read"], [tool["name"] for tool in out["tools"]])
@@ -123,7 +139,7 @@ class AdvisorFeedbackTests(unittest.TestCase):
             ],
         }
 
-        out = claude_any.strip_autonomous_advisor_server_tools(body)
+        out = claude_any.strip_autonomous_advisor_server_tools("ollama", body)
 
         self.assertIs(out, body)
         self.assertEqual(["advisor", "Bash"], [tool["name"] for tool in out["tools"]])

@@ -3071,13 +3071,27 @@ def command_file_is_claude_any_owned(path: Path, markers: tuple[str, ...]) -> bo
     return any(marker in text for marker in markers)
 
 
-def install_claude_any_slash_commands() -> None:
+def remove_claude_any_advisor_command() -> None:
+    """Remove the claude-any-owned /advisor command so Claude Code's built-in
+    /advisor (the standard flow for the anthropic provider) surfaces."""
+    try:
+        path = CLAUDE_COMMANDS_DIR / "advisor.md"
+        if path.exists() and command_file_is_claude_any_owned(path, CLAUDE_ANY_ADVISOR_COMMAND_MARKERS):
+            path.unlink()
+    except Exception as exc:
+        print(f"Claude Any warning: could not remove claude-any /advisor command ({type(exc).__name__}: {exc}).", flush=True)
+
+
+def install_claude_any_slash_commands(include_advisor: bool = True) -> None:
     try:
         CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
         commands = {
-            "advisor.md": ADVISOR_SLASH_COMMAND,
             "router-debug.md": ROUTER_DEBUG_SLASH_COMMAND,
         }
+        if include_advisor:
+            commands["advisor.md"] = ADVISOR_SLASH_COMMAND
+        else:
+            remove_claude_any_advisor_command()
         stale_channel = CLAUDE_COMMANDS_DIR / "channel.md"
         if stale_channel.exists():
             try:
@@ -10450,15 +10464,18 @@ def is_claude_code_advisor_server_tool(tool: Any) -> bool:
     return name == "advisor" and tool_type.startswith("advisor_")
 
 
-def strip_autonomous_advisor_server_tools(body: dict[str, Any]) -> dict[str, Any]:
-    """Remove Claude Code's routed server-side advisor tool from normal turns.
+def strip_autonomous_advisor_server_tools(provider: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Remove Claude Code's advisor server tool for non-Anthropic backends.
 
-    Explicit ``/advisor`` calls are handled locally before upstream forwarding.
-    For ordinary routed turns, leaving the ``advisor_...`` server tool exposed
-    lets the model autonomously call Claude Code's built-in advisor path, which
-    can return ``advisor_tool_result`` / ``too_many_requests`` errors that do
-    not occur in native Claude Code sessions.
+    The ``advisor_...`` server tool is executed by the Anthropic API; other
+    backends cannot run it, so leaving it exposed on routed turns produces
+    ``advisor_tool_result`` / ``too_many_requests`` errors. The anthropic
+    provider passes through untouched: Claude Code's built-in /advisor flow
+    (model picker + server tool) is the standard process in Claude native and
+    Anthropic routed modes and must keep working.
     """
+    if provider == "anthropic":
+        return body
     if is_advisor_request(body) or body_has_advisor_feedback(body):
         return body
     tools = body.get("tools")
@@ -12255,6 +12272,12 @@ def prepend_anthropic_text(message: dict[str, Any], text: str) -> dict[str, Any]
 
 
 def maybe_handle_advisor_request(handler: BaseHTTPRequestHandler, provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> bool:
+    if provider == "anthropic":
+        # Claude native and Anthropic routed sessions follow Claude Code's
+        # built-in /advisor flow (model picker + advisor server tool);
+        # claude-any neither installs its own /advisor command nor intercepts
+        # advisor traffic for this provider.
+        return False
     if not is_advisor_request(body):
         return False
     advisor_model = str(pcfg.get("advisor_model") or "").strip()
@@ -14774,7 +14797,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         if maybe_handle_advisor_request(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
-        body = strip_autonomous_advisor_server_tools(body)
+        body = strip_autonomous_advisor_server_tools(provider, body)
         body = body_with_pending_channel_messages(body)
         body = body_with_pending_channel_summaries(body)
         body = body_with_channel_tool_result_context(body)
@@ -15126,6 +15149,11 @@ def set_model_config(value: str) -> list[str]:
 def set_advisor_model_config(value: str) -> list[str]:
     cfg = load_config()
     provider, pcfg = get_current_provider(cfg)
+    if provider == "anthropic":
+        return [
+            "Anthropic modes use Claude Code's built-in /advisor; "
+            "run /advisor in the session to pick its model."
+        ]
     model_id = normalize_model_id(provider, value.strip()) if value.strip() else ""
     pcfg["advisor_model"] = model_id
     if model_id:
@@ -15373,6 +15401,9 @@ def cmd_advisor_model(args: argparse.Namespace) -> None:
     if not args.value:
         cfg = load_config()
         provider, pcfg = get_current_provider(cfg)
+        if provider == "anthropic":
+            print("Anthropic modes use Claude Code's built-in /advisor; run /advisor in the session to pick its model.")
+            return
         current = pcfg.get("advisor_model") or "off"
         print(f"Advisor Model for {provider}: {current}")
         print("Set with: claude-anyctl advisor-model deepseek-v4-pro")
@@ -21728,7 +21759,7 @@ def main_menu_rows(cfg: dict[str, Any], provider: str, pcfg: dict[str, Any], lan
         f"2. {ui_text('api_key', lang)}  [{stored_api_key_mask(provider, pcfg)}]",
         f"3. {ui_text('base_url', lang)}  [{compact_text(pcfg.get('base_url', 'unset'), 62)}]",
         f"4. {ui_text('model', lang)}  [{compact_text(pcfg.get('current_model', 'unset'), 62)}]",
-        f"5. {ui_text('advisor_model', lang)}  [{compact_text(pcfg.get('advisor_model') or 'off', 62)}]",
+        f"5. {ui_text('advisor_model', lang)}  [{'Claude Code native /advisor' if provider == 'anthropic' else compact_text(pcfg.get('advisor_model') or 'off', 62)}]",
         f"6. {ui_text('options', lang)}  [{compact_text(llm_options_status(provider, pcfg), 62)}]",
         f"7. {ui_text('log_level', lang)}  [{log_level_status()}]",
         f"8. {ui_text('test', lang)}",
@@ -21842,6 +21873,15 @@ def advisor_model_panel_rows(
     fetch: bool = True,
     force_refresh: bool = False,
 ) -> tuple[list[str], list[str]]:
+    if provider == "anthropic":
+        return (
+            [
+                "Claude native and Anthropic routed sessions use Claude Code's",
+                "built-in /advisor (run /advisor in the session to pick its model).",
+                "Back",
+            ],
+            ["back", "back", "back"],
+        )
     current = normalize_model_id(provider, pcfg.get("advisor_model", ""))
     values = unique_model_ids(
         provider,
@@ -27397,7 +27437,7 @@ def launch_claude(
         for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
             if key not in launch_env and not preserve_anthropic_auth:
                 env.pop(key, None)
-        install_claude_any_slash_commands()
+        install_claude_any_slash_commands(include_advisor=provider != "anthropic")
         install_tool_guard_hooks()
         install_claude_any_statusline()
     claude = find_executable("claude")

@@ -856,7 +856,7 @@ def main_items() -> list[tuple[str, str]]:
     provider, pcfg = current_provider_cfg()
     lang = current_language()
     model = pcfg.get("current_model", "unset")
-    advisor_model = pcfg.get("advisor_model") or "off"
+    advisor_model = "Claude Code native /advisor" if provider == "anthropic" else (pcfg.get("advisor_model") or "off")
     base = pcfg.get("base_url", "unset")
     rows: list[tuple[str, str]] = []
 
@@ -1009,6 +1009,14 @@ def build_model_submenu() -> tuple[dict | None, list[str]]:
 
 def build_advisor_model_submenu() -> dict:
     provider, pcfg = current_provider_cfg()
+    if provider == "anthropic":
+        items = [{
+            "value": "",
+            "label": "Claude Code native /advisor",
+            "current": True,
+            "description": "Anthropic modes use Claude Code's built-in /advisor; run /advisor in the session to pick its model.",
+        }]
+        return {"kind": "advisor-model", "parent": "advisor-model", "items": items, "idx": 0, "offset": 0}
     current = pcfg.get("advisor_model") or ""
     values: list[str] = []
     for mid in DEFAULT_ADVISOR_MODELS + [upstream for upstream, _ in get_models_for_current_provider()[0]]:
