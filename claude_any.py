@@ -2358,11 +2358,24 @@ def select_provider_api_key(provider: str, pcfg: dict[str, Any], *, rotate: bool
     if not rotate or len(keys) == 1:
         return keys[0]
     name = provider_api_key_rotation_name(provider, pcfg)
+    # Skip keys that are resting after a 429; round-robin over the live ones so a
+    # rate-limited key rests while the rest keep serving. If every key is cooling,
+    # use the one that frees up soonest.
+    now = time.time()
+    live = [k for k in keys if api_key_cooldown_until(provider, pcfg, k) <= now]
+    if not live:
+        soonest = min(keys, key=lambda k: api_key_cooldown_until(provider, pcfg, k))
+        router_log("DEBUG", f"api_key_round_robin provider={provider} all_cooling={len(keys)} using_soonest")
+        return soonest
     with _API_KEY_ROTATION_LOCK:
-        idx = _API_KEY_ROTATION_CURSOR.get(name, 0) % len(keys)
-        _API_KEY_ROTATION_CURSOR[name] = idx + 1
-    router_log("DEBUG", f"api_key_round_robin provider={provider} key_index={idx + 1}/{len(keys)}")
-    return keys[idx]
+        counter = _API_KEY_ROTATION_CURSOR.get(name, 0)
+        _API_KEY_ROTATION_CURSOR[name] = counter + 1
+    idx = counter % len(live)
+    if len(live) < len(keys):
+        router_log("DEBUG", f"api_key_round_robin provider={provider} key_index={idx + 1}/{len(live)} cooling={len(keys) - len(live)}")
+    else:
+        router_log("DEBUG", f"api_key_round_robin provider={provider} key_index={idx + 1}/{len(keys)}")
+    return live[idx]
 
 
 def env_bool(value: str | None, default: bool | None = None) -> bool | None:
@@ -5508,6 +5521,13 @@ def rate_limit_reset_seconds(value: str | None) -> float | None:
     text = value.strip()
     try:
         numeric = float(text)
+        # Some providers (e.g. OpenRouter X-RateLimit-Reset) report the reset as a
+        # millisecond Unix timestamp. A ms epoch is always an absolute timestamp, so
+        # convert it and return the delta directly -- without this a value like
+        # 1.78e12 is read as a seconds epoch and yields a ~55,000-year wait, and a
+        # near-term reset (< 60s away) would otherwise be misread as a relative value.
+        if numeric > 1e12:
+            return max(0.0, numeric / 1000.0 - time.time())
         if numeric > time.time() + 60.0:
             return max(0.0, numeric - time.time())
         return max(0.0, numeric)
@@ -5644,6 +5664,85 @@ def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], mode
         RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
     router_log("WARN", f"rate_limit_429_backoff provider={provider} model={model or ''} wait={wait:.2f}s")
     return wait
+
+
+_RATE_LIMIT_RESET_HEADER_NAMES = (
+    "x-ratelimit-reset-requests",
+    "x-rate-limit-reset-requests",
+    "ratelimit-reset",
+    "rate-limit-reset",
+    "x-ratelimit-reset",
+    "x-rate-limit-reset",
+)
+
+# Ceiling covers a full daily-quota reset (e.g. OpenRouter :free RPD resets at
+# 00:00 UTC, up to ~24h away) plus slack, so a key that hit its per-day limit
+# rests until the quota actually refreshes instead of retrying hourly and burning
+# more of the (failure-counted) daily allowance.
+API_KEY_COOLDOWN_MAX_SECONDS = 90000.0
+API_KEY_COOLDOWN_DEFAULT_SECONDS = 60.0
+
+
+def _api_key_cooldown_state_key(provider: str, pcfg: dict[str, Any], key: str) -> str:
+    # Namespaced by provider+base_url (so the same key rotates independently per
+    # endpoint) and hashed -- the state file is plaintext, never store raw secrets.
+    digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()[:12]
+    return f"{provider_api_key_rotation_name(provider, pcfg)}:__key__:{digest}"
+
+
+def api_key_cooldown_reset_seconds(headers: Any) -> float:
+    """Seconds to rest a key after a 429, from the response headers.
+
+    Priority: X-RateLimit-Reset (exact reset, possibly ms epoch) -> Retry-After
+    (seconds) -> a conservative default. Clamped to a sane ceiling.
+    """
+    reset = rate_limit_reset_seconds(first_header(headers, list(_RATE_LIMIT_RESET_HEADER_NAMES)))
+    if reset is None or reset <= 0:
+        reset = parse_retry_after_seconds(first_header(headers, ["Retry-After", "retry-after"]))
+    if reset is None or reset <= 0:
+        reset = API_KEY_COOLDOWN_DEFAULT_SECONDS
+    return max(1.0, min(float(reset), API_KEY_COOLDOWN_MAX_SECONDS))
+
+
+def register_api_key_cooldown(provider: str, pcfg: dict[str, Any], key: str, headers: Any) -> float:
+    """Rest a specific API key until its rate-limit reset. Returns the cooldown seconds."""
+    if not meaningful_key(key):
+        return 0.0
+    reset = api_key_cooldown_reset_seconds(headers)
+    state_key = _api_key_cooldown_state_key(provider, pcfg, key)
+    with _RATE_LIMIT_LOCK:
+        try:
+            state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
+            if not isinstance(state, dict):
+                state = {}
+        except Exception:
+            state = {}
+        now = time.time()
+        state[state_key] = {"cooldown_until": now + reset, "last_429_at": now}
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
+    router_log("WARN", f"api_key_cooldown provider={provider} key_hash={state_key.rsplit(':', 1)[-1]} rest={reset:.0f}s")
+    return reset
+
+
+def api_key_cooldown_until(provider: str, pcfg: dict[str, Any], key: str) -> float:
+    """Epoch until which this key is resting (0.0 if not cooling / expired)."""
+    if not meaningful_key(key):
+        return 0.0
+    state_key = _api_key_cooldown_state_key(provider, pcfg, key)
+    with _RATE_LIMIT_LOCK:
+        try:
+            state = json.loads(RATE_LIMIT_STATE_PATH.read_text(encoding="utf-8")) if RATE_LIMIT_STATE_PATH.exists() else {}
+        except Exception:
+            return 0.0
+        entry = state.get(state_key) if isinstance(state, dict) else None
+    if not isinstance(entry, dict):
+        return 0.0
+    try:
+        until = float(entry.get("cooldown_until") or 0.0)
+    except Exception:
+        return 0.0
+    return until if until > time.time() else 0.0
 
 
 def retry_after_exceeds_request_timeout(headers: Any, timeout: float) -> tuple[bool, float | None]:
@@ -5874,6 +5973,20 @@ def ncp_model_id_for_nvidia_hosted(model_id: str) -> str:
         if nvidia_id and nvidia_id == model_id and ncp_id:
             return ncp_id
     return model_id
+
+
+def key_from_request_headers(headers: Any) -> str:
+    """Recover the API key baked into an outgoing request's headers (for cooldown)."""
+    try:
+        key = headers.get("x-api-key")
+        if key:
+            return str(key)
+        auth = str(headers.get("authorization") or "")
+    except Exception:
+        return ""
+    if auth.lower().startswith("bearer "):
+        return auth[7:].strip()
+    return auth.strip()
 
 
 def provider_headers(provider: str, pcfg: dict[str, Any], inbound_headers: Any | None = None) -> dict[str, str]:
@@ -14240,6 +14353,8 @@ def post_json_with_rate_retry(
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="ignore")
             learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
+            if exc.code == 429:
+                register_api_key_cooldown(provider, pcfg, key_from_request_headers(headers), exc.headers)
             if exc.code == 429 and retry_rate_limits and attempt + 1 < max_attempts:
                 skip_retry, retry_after_seconds = retry_after_exceeds_request_timeout(exc.headers, timeout)
                 if skip_retry:
@@ -14256,6 +14371,8 @@ def post_json_with_rate_retry(
                 if retry_notice:
                     retry_notice(upstream_rate_limit_retry_message(retry_no, gateway_retries))
                 time.sleep(wait)
+                # The just-failed key is now resting; re-pick so the retry uses a live key.
+                headers = provider_headers(provider, pcfg)
                 continue
             if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
                 retry_no = attempt + 1
@@ -14320,6 +14437,8 @@ def open_openai_stream_with_rate_retry(
         except urllib.error.HTTPError as exc:
             raw = exc.read().decode("utf-8", errors="ignore")
             learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
+            if exc.code == 429:
+                register_api_key_cooldown(provider, pcfg, key_from_request_headers(headers), exc.headers)
             if exc.code == 429 and retry_rate_limits and attempt + 1 < max_attempts:
                 skip_retry, retry_after_seconds = retry_after_exceeds_request_timeout(exc.headers, timeout)
                 if skip_retry:
@@ -14336,6 +14455,8 @@ def open_openai_stream_with_rate_retry(
                 if retry_notice:
                     retry_notice(upstream_rate_limit_retry_message(retry_no, gateway_retries))
                 time.sleep(wait)
+                # The just-failed key is now resting; re-pick so the retry uses a live key.
+                headers = provider_headers(provider, pcfg)
                 continue
             if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
                 retry_no = attempt + 1
@@ -14720,6 +14841,8 @@ class RouterHandler(BaseHTTPRequestHandler):
                 commit_pending_channel_delivery_cursors(body, self)
             except urllib.error.HTTPError as e:
                 err = e.read()
+                if e.code == 429:
+                    register_api_key_cooldown(provider, pcfg, key_from_request_headers(headers), e.headers)
                 EVENT_BUS.publish(level="error", category="upstream.error", message=f"upstream HTTP {e.code}", request_id=request_id, provider=provider, model=upstream_model, data={"status": e.code})
                 self.send_response(e.code)
                 self.send_header("content-type", e.headers.get("content-type", "application/json"))
