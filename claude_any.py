@@ -6511,6 +6511,14 @@ def resolve_requested_model(provider: str, pcfg: dict[str, Any], requested: str 
         resolved = unslug_provider_alias(provider, requested, mmap)
         if resolved:
             return resolved
+        # For the anthropic provider, a bare native Claude model id (e.g.
+        # claude-sonnet-4-6) is a REAL upstream model. Claude Code sends exactly
+        # this string when the user switches via /model, so it must resolve to
+        # itself, not collapse to current_model -- otherwise /model switching has
+        # no effect. Only pass through ids the router actually exposes (model_map
+        # values), so unknown/stale ids still fall back.
+        if provider == "anthropic" and requested in set(mmap.values()):
+            return requested
         # Built-in Claude aliases and stale aliases from another provider route to current provider's model.
         if requested.startswith("claude-") or requested.startswith("claude-any-"):
             return fallback
