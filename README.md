@@ -26,6 +26,22 @@
 
 ## Today's Top 3 Benefits
 
+### 2026-06-11
+
+1. **OpenRouter provider** — [OpenRouter](https://openrouter.ai/) is a first-class
+   OpenAI-compatible provider with full feature parity (model discovery,
+   provider-options, status, help), defaulting to the free
+   `nvidia/nemotron-3-ultra-550b-a55b:free` model.
+2. **Per-key cooldown for multi-key rotation** — when one key in a multi-key pool
+   hits a 429, Claude Any rests it until its rate limit resets (from
+   `X-RateLimit-Reset`/`Retry-After`) and keeps serving from the remaining keys,
+   then rejoins it automatically. Ideal for OpenRouter `:free` per-key limits.
+3. **Faithful Anthropic native behavior** — routed Anthropic no longer overrides
+   Claude Code's native per-model output cap (e.g. Fable 5 keeps its 64k default
+   instead of a forced 4096), `/model` switching reaches the chosen model instead
+   of collapsing to the menu model, and the `?beta=true` flag is forwarded so
+   long-context (1M) requests are billed correctly.
+
 ### 2026-06-05
 
 1. **Windows-aware install paths** — Claude Any now uses `%APPDATA%\claude-any`
@@ -105,7 +121,7 @@ Ollama Cloud (glm-5.1) streamed through the claude-any router with SSE word-boun
 
 Claude Any is a provider selector and compatibility launcher for Claude Code.
 It lets you choose Anthropic, Ollama, Ollama Cloud, DeepSeek.com, OpenCode Zen,
-OpenCode Go, LM Studio,
+OpenCode Go, OpenRouter, LM Studio,
 vLLM, NVIDIA hosted models, or self-hosted NIM before Claude Code starts, then
 passes normal Claude Code arguments through unchanged.
 
@@ -223,6 +239,19 @@ For OpenCode Go:
 ```sh
 claude-any --ca-provider opencode-go --ca-base-url https://opencode.ai/zen/go --ca-model qwen3.6-plus --ca-api-key-env OPENCODE_GO_API_KEY --ca-provider-option endpoint:custom-model=chat --ca-no-launch
 ```
+
+For [OpenRouter](https://openrouter.ai/) (OpenAI-compatible; access to hundreds of
+models through one key). The default model is the free
+`nvidia/nemotron-3-ultra-550b-a55b:free`; pick any slug from OpenRouter's catalog:
+
+```sh
+claude-any --ca-provider openrouter --ca-model nvidia/nemotron-3-ultra-550b-a55b:free --ca-api-key-env OPENROUTER_API_KEY --ca-no-launch
+```
+
+OpenRouter free (`:free`) models are rate-limited per key (e.g. 20 requests/min),
+so this is a natural fit for multi-key round-robin (below): store several keys and
+Claude Any spreads requests across them and rests any key that hits a 429 until
+its rate limit resets.
 
 `--ca-provider-option KEY=VALUE` applies a provider option to the current
 provider; use `--ca-set-provider-option PROVIDER KEY=VALUE` when a script needs
@@ -368,13 +397,22 @@ passthrough arguments are all configurable without opening the menu. API keys
 can be passed directly with `--ca-api-key`, but `--ca-api-key-env` is safer for
 scripts because the secret does not appear in shell history.
 
-For high-token routed sessions such as ultracode, store multiple keys for the
-same provider and Claude Any will rotate them per upstream request:
+For high-token routed sessions such as ultracode, or for rate-limited free models
+like OpenRouter `:free`, store multiple keys for the same provider and Claude Any
+will rotate them per upstream request:
 
 ```sh
-export OPENCODE_API_KEYS="KEY1,KEY2,KEY3"
-claude-any --ca-provider opencode --ca-api-keys-env OPENCODE_API_KEYS --ca-no-launch
+export OPENROUTER_API_KEYS="KEY1,KEY2,KEY3,KEY4"
+claude-any --ca-provider openrouter --ca-api-keys-env OPENROUTER_API_KEYS --ca-no-launch
+# or directly: claude-any set-api-keys openrouter KEY1,KEY2,KEY3,KEY4
 ```
+
+Rotation is round-robin **with per-key cooldown**: if one key returns a 429, that
+key rests until its rate limit resets — Claude Any reads the reset time from the
+response (`X-RateLimit-Reset`, falling back to `Retry-After`), skips the resting
+key, and keeps serving from the remaining keys; the key automatically rejoins the
+rotation once its cooldown expires. A key that exhausts a daily quota rests until
+the quota refreshes rather than retrying every hour.
 
 This distributes provider quota/rate usage across keys; it does not reduce the
 task's actual token consumption. The menu also accepts comma/newline-separated
