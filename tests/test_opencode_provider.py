@@ -44,6 +44,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("claude-sonnet-4-6", pcfg["current_model"])
         self.assertEqual("claude-haiku-4-5", pcfg["haiku_model"])
         self.assertEqual("claude-sonnet-4-6", pcfg["subagent_model"])
+        self.assertEqual("ipv6-preferred", pcfg["ip_family"])
         self.assertTrue(pcfg["native_compat"])
 
     def test_go_default_config_matches_go_docs(self):
@@ -53,7 +54,34 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("qwen3.5-plus", pcfg["haiku_model"])
         self.assertEqual("qwen3.6-plus", pcfg["subagent_model"])
         self.assertEqual(1048576, pcfg["context_window"])
+        self.assertEqual("ipv6-preferred", pcfg["ip_family"])
         self.assertTrue(pcfg["native_compat"])
+
+    def test_llm_options_expose_ip_family(self):
+        pcfg = self.opencode_cfg()["providers"]["opencode"]
+
+        rows, values = claude_any.llm_option_panel_rows("opencode", pcfg, "en")
+
+        self.assertIn("ip_family", values)
+        row = rows[values.index("ip_family")]
+        self.assertIn("IP family", row)
+        self.assertIn("ipv6-preferred", row)
+        self.assertEqual("ipv6-preferred", claude_any.llm_option_prompt_default("opencode", pcfg, "ip_family"))
+
+    def test_llm_options_can_set_ip_family(self):
+        cfg = self.opencode_cfg(ip_family="ipv6-preferred")
+        pcfg = cfg["providers"]["opencode"]
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config") as save_config,
+            mock.patch.object(claude_any, "clear_model_cache"),
+        ):
+            messages = claude_any.set_llm_option_config("opencode", "ip_family", "ipv4")
+
+        self.assertEqual("ipv4", pcfg["ip_family"])
+        self.assertIn("ip_family: ipv4", messages)
+        save_config.assert_called_once_with(cfg)
 
     def test_qwen36_plus_models_are_million_context(self):
         models = ["qwen3.6-plus", "qwen3.6-plus-free", "Qwen3.6 Plus", "Qwen3.6 Plus Free"]

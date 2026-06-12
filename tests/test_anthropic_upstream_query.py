@@ -94,6 +94,18 @@ class ForceQueryMenuTests(unittest.TestCase):
         )
         self.assertIn("force_query_string", values)
 
+    def test_ip_family_appears_only_for_routed_anthropic_menu(self):
+        _rows, native_values = claude_any.llm_option_panel_rows(
+            "anthropic", {"route_through_router": False}
+        )
+        routed_rows, routed_values = claude_any.llm_option_panel_rows(
+            "anthropic", {"route_through_router": True}
+        )
+
+        self.assertNotIn("ip_family", native_values)
+        self.assertIn("ip_family", routed_values)
+        self.assertIn("auto", routed_rows[routed_values.index("ip_family")])
+
     def test_prompt_default_reflects_current_value(self):
         self.assertEqual(
             "",

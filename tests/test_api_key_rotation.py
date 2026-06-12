@@ -271,6 +271,182 @@ class ApiKeyRotationTests(unittest.TestCase):
         self.assertIn("Retry-After", str(caught.exception))
         sleep.assert_not_called()
 
+    def test_upstream_429_rotates_to_live_key_without_waiting(self):
+        pcfg = self.provider_pcfg(
+            "opencode",
+            api_key="",
+            api_keys=["sk-one", "sk-two"],
+            current_model="deepseek-v4-flash-free",
+        )
+        error = urllib.error.HTTPError(
+            "https://opencode.ai/zen/v1/chat/completions",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "3600"},
+            io.BytesIO(
+                b'{"type":"error","error":{"type":"RateLimitError",'
+                b'"message":"Rate limit exceeded."},"metadata":{}}'
+            ),
+        )
+        calls = []
+
+        class FakeResponse:
+            headers = {}
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return b'{"choices":[{"message":{"role":"assistant","content":"OK"}}]}'
+
+        def fake_urlopen(req, timeout):
+            calls.append(dict(req.header_items()))
+            if len(calls) == 1:
+                raise error
+            return FakeResponse()
+
+        notices = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.object(claude_any, "RATE_LIMIT_STATE_PATH", Path(tmpdir) / "rate-limit-state.json"),
+                mock.patch.object(claude_any, "CONFIG_DIR", Path(tmpdir)),
+                mock.patch.object(claude_any.urllib.request, "urlopen", side_effect=fake_urlopen),
+                mock.patch.object(claude_any, "write_router_activity"),
+                mock.patch.object(claude_any, "learn_router_rate_limit_headers"),
+                mock.patch.object(claude_any.time, "sleep") as sleep,
+                mock.patch.object(claude_any, "register_router_rate_limit_backoff") as backoff,
+            ):
+                data = claude_any.post_json_with_rate_retry(
+                    "https://opencode.ai/zen/v1/chat/completions",
+                    {"model": "deepseek-v4-flash-free", "messages": []},
+                    claude_any.provider_headers("opencode", pcfg),
+                    30.0,
+                    "opencode",
+                    pcfg,
+                    "deepseek-v4-flash-free",
+                    notices.append,
+                )
+
+        self.assertEqual("OK", data["choices"][0]["message"]["content"])
+        self.assertEqual("Bearer sk-one", calls[0].get("Authorization"))
+        self.assertEqual("Bearer sk-two", calls[1].get("Authorization"))
+        self.assertEqual([], notices)
+        sleep.assert_not_called()
+        backoff.assert_not_called()
+
+    def test_stream_429_rotates_to_live_key_without_waiting(self):
+        pcfg = self.provider_pcfg(
+            "opencode",
+            api_key="",
+            api_keys=["sk-one", "sk-two"],
+            current_model="deepseek-v4-flash-free",
+        )
+        error = urllib.error.HTTPError(
+            "https://opencode.ai/zen/v1/chat/completions",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "3600"},
+            io.BytesIO(
+                b'{"type":"error","error":{"type":"RateLimitError",'
+                b'"message":"Rate limit exceeded."},"metadata":{}}'
+            ),
+        )
+        calls = []
+
+        class FakeResponse:
+            headers = {}
+
+        def fake_urlopen(req, timeout):
+            calls.append(dict(req.header_items()))
+            if len(calls) == 1:
+                raise error
+            return FakeResponse()
+
+        notices = []
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.object(claude_any, "RATE_LIMIT_STATE_PATH", Path(tmpdir) / "rate-limit-state.json"),
+                mock.patch.object(claude_any, "CONFIG_DIR", Path(tmpdir)),
+                mock.patch.object(claude_any.urllib.request, "urlopen", side_effect=fake_urlopen),
+                mock.patch.object(claude_any, "set_upstream_stream_read_timeout"),
+                mock.patch.object(claude_any, "write_router_activity"),
+                mock.patch.object(claude_any, "learn_router_rate_limit_headers"),
+                mock.patch.object(claude_any.time, "sleep") as sleep,
+                mock.patch.object(claude_any, "register_router_rate_limit_backoff") as backoff,
+            ):
+                resp = claude_any.open_openai_stream_with_rate_retry(
+                    "https://opencode.ai/zen/v1/chat/completions",
+                    {"model": "deepseek-v4-flash-free", "messages": [], "stream": True},
+                    claude_any.provider_headers("opencode", pcfg),
+                    120.0,
+                    "opencode",
+                    pcfg,
+                    "deepseek-v4-flash-free",
+                    notices.append,
+                )
+
+        self.assertIsInstance(resp, FakeResponse)
+        self.assertEqual("Bearer sk-one", calls[0].get("Authorization"))
+        self.assertEqual("Bearer sk-two", calls[1].get("Authorization"))
+        self.assertEqual([], notices)
+        sleep.assert_not_called()
+        backoff.assert_not_called()
+
+    def test_direct_anthropic_compatible_429_rotates_to_live_key(self):
+        pcfg = self.provider_pcfg(
+            "deepseek",
+            api_key="",
+            api_keys=["sk-one", "sk-two"],
+            current_model="deepseek-v4-pro",
+        )
+        error = urllib.error.HTTPError(
+            "https://api.deepseek.com/anthropic/v1/messages",
+            429,
+            "Too Many Requests",
+            {"Retry-After": "3600"},
+            io.BytesIO(b'{"error":{"message":"rate limit"}}'),
+        )
+        calls = []
+
+        class FakeResponse:
+            headers = {}
+
+            def read(self):
+                return b'{"content":[{"type":"text","text":"OK"}]}'
+
+        def fake_urlopen(req, timeout):
+            calls.append(dict(req.header_items()))
+            if len(calls) == 1:
+                raise error
+            return FakeResponse()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with (
+                mock.patch.object(claude_any, "RATE_LIMIT_STATE_PATH", Path(tmpdir) / "rate-limit-state.json"),
+                mock.patch.object(claude_any, "CONFIG_DIR", Path(tmpdir)),
+                mock.patch.object(claude_any.urllib.request, "urlopen", side_effect=fake_urlopen),
+                mock.patch.object(claude_any, "write_router_activity"),
+                mock.patch.object(claude_any, "learn_router_rate_limit_headers"),
+                mock.patch.object(claude_any.time, "sleep") as sleep,
+            ):
+                resp = claude_any.open_provider_request_with_key_retry(
+                    "https://api.deepseek.com/anthropic/v1/messages",
+                    {"model": "deepseek-v4-pro", "messages": []},
+                    claude_any.provider_headers("deepseek", pcfg),
+                    30.0,
+                    "deepseek",
+                    pcfg,
+                    "deepseek-v4-pro",
+                )
+
+        self.assertEqual(b'{"content":[{"type":"text","text":"OK"}]}', resp.read())
+        self.assertEqual("Bearer sk-one", calls[0].get("Authorization"))
+        self.assertEqual("Bearer sk-two", calls[1].get("Authorization"))
+        sleep.assert_not_called()
+
     def test_stream_429_can_disable_rate_limit_retry_for_compatibility_tests(self):
         pcfg = self.provider_pcfg("opencode", api_key="sk-one", current_model="deepseek-v4-flash-free")
         error = urllib.error.HTTPError(

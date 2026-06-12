@@ -5949,6 +5949,18 @@ def api_key_cooldown_until(provider: str, pcfg: dict[str, Any], key: str) -> flo
     return until if until > time.time() else 0.0
 
 
+def provider_live_api_key_count(provider: str, pcfg: dict[str, Any]) -> int:
+    keys = provider_config_api_keys(provider, pcfg)
+    if len(keys) <= 1:
+        return len(keys)
+    now = time.time()
+    return sum(1 for key in keys if api_key_cooldown_until(provider, pcfg, key) <= now)
+
+
+def provider_has_live_api_key(provider: str, pcfg: dict[str, Any]) -> bool:
+    return provider_live_api_key_count(provider, pcfg) > 0
+
+
 def reset_api_key_cooldowns_for_router_start() -> int:
     """Clear per-API-key cooldowns when a fresh router process starts.
 
@@ -14592,9 +14604,10 @@ def post_json_with_rate_retry(
 ) -> Any:
     gateway_retries = configured_gateway_retries(pcfg)
     max_attempts = max(1, gateway_retries + 1)
+    rate_limit_max_attempts = max(max_attempts, provider_api_key_count(provider, pcfg))
     token_estimate = estimate_tokens(req_body)
     byte_estimate = len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))
-    for attempt in range(max_attempts):
+    for attempt in range(rate_limit_max_attempts):
         try:
             write_router_activity(
                 "request",
@@ -14619,6 +14632,19 @@ def post_json_with_rate_retry(
             learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
             if exc.code == 429:
                 register_api_key_cooldown(provider, pcfg, key_from_request_headers(headers), exc.headers)
+            if (
+                exc.code == 429
+                and retry_rate_limits
+                and provider_api_key_count(provider, pcfg) > 1
+                and provider_has_live_api_key(provider, pcfg)
+                and attempt + 1 < rate_limit_max_attempts
+            ):
+                retry_no = attempt + 1
+                headers = provider_headers(provider, pcfg)
+                next_hash = hashlib.sha256(key_from_request_headers(headers).encode("utf-8")).hexdigest()[:12]
+                write_router_activity("retry", provider, model, attempt=retry_no, total=rate_limit_max_attempts - 1, code=exc.code, wait=0, tokens=token_estimate, bytes=byte_estimate)
+                router_log("WARN", f"upstream_rate_limit_key_retry provider={provider} model={model} attempt={retry_no}/{rate_limit_max_attempts - 1} next_key_hash={next_hash} tokens={token_estimate} bytes={byte_estimate}")
+                continue
             if exc.code == 429 and retry_rate_limits and attempt + 1 < max_attempts:
                 skip_retry, retry_after_seconds = retry_after_exceeds_request_timeout(exc.headers, timeout)
                 if skip_retry:
@@ -14662,6 +14688,77 @@ def post_json_with_rate_retry(
     raise RuntimeError("upstream request failed")
 
 
+def open_provider_request_with_key_retry(
+    url: str,
+    req_body: Any,
+    headers: dict[str, str],
+    timeout: float,
+    provider: str,
+    pcfg: dict[str, Any],
+    model: str,
+    *,
+    stream: bool = False,
+    retry_rate_limits: bool = True,
+) -> Any:
+    gateway_retries = configured_gateway_retries(pcfg)
+    max_attempts = max(1, gateway_retries + 1)
+    rate_limit_max_attempts = max(max_attempts, provider_api_key_count(provider, pcfg))
+    token_estimate = estimate_tokens(req_body)
+    byte_estimate = len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))
+    data_bytes = json.dumps(req_body).encode("utf-8")
+    for attempt in range(rate_limit_max_attempts):
+        try:
+            write_router_activity(
+                "request",
+                provider,
+                model,
+                attempt=attempt + 1,
+                total=max_attempts,
+                tokens=token_estimate,
+                bytes=byte_estimate,
+                timeout=timeout,
+                stream=stream,
+            )
+            router_log("INFO", f"upstream_direct_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={token_estimate} bytes={byte_estimate} timeout={timeout}")
+            req = urllib.request.Request(url, data=data_bytes, headers=headers, method="POST")
+            resp = provider_urlopen(req, timeout=timeout, provider=provider, pcfg=pcfg)
+            learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
+            return resp
+        except urllib.error.HTTPError as exc:
+            learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
+            if exc.code == 429:
+                register_api_key_cooldown(provider, pcfg, key_from_request_headers(headers), exc.headers)
+            if (
+                exc.code == 429
+                and retry_rate_limits
+                and provider_api_key_count(provider, pcfg) > 1
+                and provider_has_live_api_key(provider, pcfg)
+                and attempt + 1 < rate_limit_max_attempts
+            ):
+                retry_no = attempt + 1
+                headers = provider_headers(provider, pcfg)
+                next_hash = hashlib.sha256(key_from_request_headers(headers).encode("utf-8")).hexdigest()[:12]
+                write_router_activity("retry", provider, model, attempt=retry_no, total=rate_limit_max_attempts - 1, code=exc.code, wait=0, tokens=token_estimate, bytes=byte_estimate, stream=stream)
+                router_log("WARN", f"upstream_direct_rate_limit_key_retry provider={provider} model={model} attempt={retry_no}/{rate_limit_max_attempts - 1} next_key_hash={next_hash} tokens={token_estimate} bytes={byte_estimate}")
+                continue
+            if exc.code in UPSTREAM_RETRY_HTTP_CODES and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, code=exc.code, tokens=token_estimate, bytes=byte_estimate, stream=stream)
+                router_log("WARN", f"upstream_direct_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} code={exc.code} tokens={token_estimate} bytes={byte_estimate}")
+                time.sleep(upstream_retry_wait_seconds(retry_no))
+                continue
+            raise
+        except (TimeoutError, urllib.error.URLError) as exc:
+            if retryable_upstream_exception(exc) and attempt + 1 < max_attempts:
+                retry_no = attempt + 1
+                write_router_activity("retry", provider, model, attempt=retry_no, total=gateway_retries, error=type(exc).__name__, tokens=token_estimate, bytes=byte_estimate, stream=stream)
+                router_log("WARN", f"upstream_direct_retry provider={provider} model={model} attempt={retry_no}/{gateway_retries} error={type(exc).__name__} tokens={token_estimate} bytes={byte_estimate}")
+                time.sleep(upstream_retry_wait_seconds(retry_no))
+                continue
+            raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    raise RuntimeError("upstream direct request failed")
+
+
 def open_openai_stream_with_rate_retry(
     url: str,
     req_body: Any,
@@ -14676,10 +14773,11 @@ def open_openai_stream_with_rate_retry(
 ) -> Any:
     gateway_retries = configured_gateway_retries(pcfg)
     max_attempts = max(1, gateway_retries + 1)
+    rate_limit_max_attempts = max(max_attempts, provider_api_key_count(provider, pcfg))
     token_estimate = estimate_tokens(req_body)
     byte_estimate = len(json.dumps(req_body, ensure_ascii=False).encode("utf-8"))
     data_bytes = json.dumps(req_body).encode("utf-8")
-    for attempt in range(max_attempts):
+    for attempt in range(rate_limit_max_attempts):
         try:
             write_router_activity(
                 "request",
@@ -14703,6 +14801,19 @@ def open_openai_stream_with_rate_retry(
             learn_router_rate_limit_headers(provider, pcfg, model, exc.headers)
             if exc.code == 429:
                 register_api_key_cooldown(provider, pcfg, key_from_request_headers(headers), exc.headers)
+            if (
+                exc.code == 429
+                and retry_rate_limits
+                and provider_api_key_count(provider, pcfg) > 1
+                and provider_has_live_api_key(provider, pcfg)
+                and attempt + 1 < rate_limit_max_attempts
+            ):
+                retry_no = attempt + 1
+                headers = provider_headers(provider, pcfg)
+                next_hash = hashlib.sha256(key_from_request_headers(headers).encode("utf-8")).hexdigest()[:12]
+                write_router_activity("retry", provider, model, attempt=retry_no, total=rate_limit_max_attempts - 1, code=exc.code, wait=0, tokens=token_estimate, bytes=byte_estimate, stream=True)
+                router_log("WARN", f"upstream_stream_rate_limit_key_retry provider={provider} model={model} attempt={retry_no}/{rate_limit_max_attempts - 1} next_key_hash={next_hash} tokens={token_estimate} bytes={byte_estimate}")
+                continue
             if exc.code == 429 and retry_rate_limits and attempt + 1 < max_attempts:
                 skip_retry, retry_after_seconds = retry_after_exceeds_request_timeout(exc.headers, timeout)
                 if skip_retry:
@@ -15048,7 +15159,6 @@ class RouterHandler(BaseHTTPRequestHandler):
             if not stream_enabled:
                 body["stream"] = False
             upstream_body = body_without_claude_any_internal_metadata(body)
-            data = json.dumps(upstream_body).encode("utf-8")
             base = native_anthropic_base_url(provider, pcfg) if provider_native_compat_enabled(provider, pcfg) else provider_upstream_request_base(provider, pcfg)
             url = join_url(base, "/v1/messages")
             upstream_query = upstream_messages_query(pcfg, self.path)
@@ -15059,10 +15169,18 @@ class RouterHandler(BaseHTTPRequestHandler):
                 if self.headers.get(h):
                     headers[h] = self.headers[h]
             waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, upstream_model)
-            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
             try:
                 EVENT_BUS.publish(level="info", category="upstream.request", message="forwarding to Anthropic-compatible provider", request_id=request_id, provider=provider, model=upstream_model, data={"url": url, "stream": bool(body.get("stream", stream_enabled))})
-                resp = provider_urlopen(req, timeout=provider_request_timeout_seconds(pcfg), provider=provider, pcfg=pcfg)
+                resp = open_provider_request_with_key_retry(
+                    url,
+                    upstream_body,
+                    headers,
+                    provider_request_timeout_seconds(pcfg),
+                    provider,
+                    pcfg,
+                    upstream_model,
+                    stream=bool(body.get("stream", stream_enabled)),
+                )
                 if bool(body.get("stream", stream_enabled)):
                     set_upstream_stream_read_timeout(resp, provider_stream_idle_timeout_seconds(pcfg))
                 status = getattr(resp, "status", 200)
@@ -19618,6 +19736,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("RPM limiter", "rate_limit_enabled", rate_limit_status_label(provider, pcfg))
         add("Rate limit RPM", "rate_limit_rpm", rate_limit_rpm_label(provider, pcfg))
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", False)) else "off")
+        add("IP family", "ip_family", provider_ip_family(provider, pcfg))
     else:
         if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
@@ -19637,10 +19756,13 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
             if bool(pcfg.get("stream_enabled", True)):
                 add("Stream idle timeout ms", "stream_idle_timeout_ms", pcfg.get("stream_idle_timeout_ms", "auto"))
                 add("Stream word chunking", "stream_word_chunking", "on" if bool(pcfg.get("stream_word_chunking", False)) else "off")
+            add("IP family", "ip_family", provider_ip_family(provider, pcfg))
         elif provider == "anthropic":
             add("Route through router", "route_through_router", "on" if anthropic_routed_enabled(provider, pcfg) else "off")
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
             add("Force query string (test)", "force_query_string", pcfg.get("force_query_string", "auto (beta=true)"))
+            if anthropic_routed_enabled(provider, pcfg):
+                add("IP family", "ip_family", provider_ip_family(provider, pcfg))
 
     rows.append(ui_text("back", lang))
     values.append("back")
@@ -19670,6 +19792,8 @@ def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> 
         return claude_code_capability_string(provider, pcfg, current_upstream_model_id(provider, pcfg))
     if key == "force_query_string":
         return str(pcfg.get("force_query_string") or "")
+    if key == "ip_family":
+        return provider_ip_family(provider, pcfg)
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         if key == "num_ctx":

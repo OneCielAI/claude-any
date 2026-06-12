@@ -65,6 +65,20 @@ class RateLimitDefaultTests(unittest.TestCase):
         self.assertIn("off", limiter_row)
         self.assertIn("0 (off)", rpm_row)
 
+    def test_llm_options_expose_default_ip_family_for_ollama_cloud(self):
+        pcfg = {"rate_limit_rpm": 0, "rate_limit_status": False}
+        with (
+            mock.patch.object(claude_any, "router_debug_external_access_enabled", return_value=False),
+            mock.patch.object(claude_any, "router_debug_message_preview_chars", return_value=0),
+        ):
+            rows, values = claude_any.llm_option_panel_rows("ollama-cloud", pcfg, "en")
+
+        self.assertIn("ip_family", values)
+        row = rows[values.index("ip_family")]
+        self.assertIn("IP family", row)
+        self.assertIn("auto", row)
+        self.assertEqual("auto", claude_any.llm_option_prompt_default("ollama-cloud", pcfg, "ip_family"))
+
     def test_llm_options_disable_rpm_limiter_sets_rpm_zero_and_status_off(self):
         cfg = {
             "providers": {
