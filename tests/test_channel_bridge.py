@@ -1229,6 +1229,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            cursor_path.write_text(json.dumps({"last_id": 0}) + "\n", encoding="utf-8")
             try:
                 claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = None
                 with (
@@ -1255,6 +1256,43 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(b"\r\n", write_all.call_args_list[1].args[1])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_stdin_summary_injected" in item and "message_ids=12" in item for item in log_messages))
+
+    def test_missing_channel_summary_cursor_starts_at_queue_tail(self):
+        original_cursor = claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+        with tempfile.TemporaryDirectory() as td:
+            queue_path = Path(td) / "channel-llm-summary-queue.jsonl"
+            cursor_path = Path(td) / "channel-llm-summary-cursor.json"
+            queue_path.write_text(
+                json.dumps(
+                    {
+                        "message_id": 12,
+                        "channel": "room_dm_generic",
+                        "source": "mcp-generic",
+                        "sender_id": "agent",
+                        "stop_reason": "end_turn",
+                        "incoming": "stale restart summary",
+                        "summary": "Already surfaced before restart.",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            try:
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = None
+                with (
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_QUEUE_PATH", queue_path),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_CURSOR_PATH", cursor_path),
+                    mock.patch.object(claude_any, "_write_fd_all") as write_all,
+                ):
+                    last_id = claude_any._inject_pending_channel_summaries(99, b"\r\n")
+                    cursor_payload = json.loads(cursor_path.read_text(encoding="utf-8"))
+            finally:
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = original_cursor
+
+        self.assertEqual(12, last_id)
+        self.assertEqual({"last_id": 12}, cursor_payload)
+        write_all.assert_not_called()
 
     def test_body_with_pending_channel_messages_injects_llm_context(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
@@ -1581,6 +1619,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            cursor_path.write_text(json.dumps({"last_id": 0}) + "\n", encoding="utf-8")
             try:
                 claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = None
                 with (
@@ -1593,7 +1632,6 @@ class ChannelBridgeTests(unittest.TestCase):
                     out = claude_any.body_with_pending_channel_summaries(
                         {"messages": [{"role": "user", "content": "continue"}]}
                     )
-                    self.assertFalse(cursor_path.exists())
                     handler = type("Handler", (), {"_claude_any_response_status": 200})()
                     claude_any.commit_pending_channel_delivery_cursors(out, handler)  # type: ignore[arg-type]
                     cursor_payload = json.loads(cursor_path.read_text(encoding="utf-8"))
