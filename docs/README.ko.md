@@ -222,7 +222,9 @@ RPM status 표시, streaming, web search, web fetch, Claude skills, update check
 language, Ollama context/options, provider-specific option, 일반 Claude Code
 passthrough 인자를 모두 메뉴 없이 설정할 수 있습니다. API key는
 `--ca-api-key`로 직접 전달할 수 있지만, 스크립트에서는 shell history에
-비밀값이 남지 않는 `--ca-api-key-env`를 권장합니다.
+비밀값이 남지 않는 `--ca-api-key-env`를 권장합니다. 저장된 키를 지우려면
+런치 메뉴의 `Clear stored API key(s)` 항목을 쓰거나
+`claude-any set-api-key PROVIDER clear`를 실행합니다.
 
 ultracode처럼 고토큰 작업을 routed provider로 실행할 때는 같은 provider 안에
 여러 키를 저장해 upstream 요청마다 라운드로빈할 수 있습니다. 이는 quota/rate

@@ -424,7 +424,9 @@ RPM limit, RPM status display, streaming, web search, web fetch, Claude skills,
 update check, language, Ollama context/options, and normal Claude Code
 passthrough arguments are all configurable without opening the menu. API keys
 can be passed directly with `--ca-api-key`, but `--ca-api-key-env` is safer for
-scripts because the secret does not appear in shell history.
+scripts because the secret does not appear in shell history. To remove stored
+credentials, use the launch-menu `Clear stored API key(s)` action or run
+`claude-any set-api-key PROVIDER clear`.
 
 For high-token routed sessions such as ultracode, or for rate-limited free models
 like OpenRouter `:free`, store multiple keys for the same provider and Claude Any

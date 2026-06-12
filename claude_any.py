@@ -2473,6 +2473,13 @@ def meaningful_key_value(value: Any) -> bool:
     return bool(text and text not in ("dummy", "not-used", "ollama"))
 
 
+API_KEY_CLEAR_TOKENS = {"clear", "unset", "none", "null", "off", "delete", "remove"}
+
+
+def api_key_clear_requested(value: Any) -> bool:
+    return str(value or "").strip().lower() in API_KEY_CLEAR_TOKENS
+
+
 def parse_api_key_list(value: Any) -> list[str]:
     if value is None:
         return []
@@ -15519,6 +15526,16 @@ def store_nvidia_api_key(key: str) -> None:
     os.chmod(NCP_ENV, 0o600)
 
 
+def clear_nvidia_api_key() -> None:
+    env = read_env_file(NCP_ENV)
+    if "NVIDIA_API_KEY" not in env:
+        return
+    env.pop("NVIDIA_API_KEY", None)
+    NCP_ENV.parent.mkdir(parents=True, exist_ok=True)
+    NCP_ENV.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
+    os.chmod(NCP_ENV, 0o600)
+
+
 def set_provider_config(provider: str) -> list[str]:
     cfg = load_config()
     cfg["current_provider"] = provider
@@ -15649,6 +15666,8 @@ def set_advisor_model_config(value: str) -> list[str]:
 
 
 def store_api_key_config(provider: str, key: str) -> list[str]:
+    if api_key_clear_requested(key):
+        return clear_api_key_config(provider)
     if provider == "nvidia-hosted":
         store_nvidia_api_key(key)
         cfg = load_config()
@@ -15669,8 +15688,29 @@ def store_api_key_config(provider: str, key: str) -> list[str]:
     ]
 
 
+def clear_api_key_config(provider: str) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    had_config_key = bool(parse_api_key_list(pcfg.get("api_key")) or parse_api_key_list(pcfg.get("api_keys")))
+    pcfg.pop("api_key", None)
+    pcfg.pop("api_keys", None)
+    if provider == "nvidia-hosted":
+        had_config_key = had_config_key or bool(parse_api_key_list(read_env_file(NCP_ENV).get("NVIDIA_API_KEY")))
+        clear_nvidia_api_key()
+        ensure_nvidia_hosted_base_url(pcfg)
+    save_config(cfg)
+    clear_model_cache()
+    with _API_KEY_ROTATION_LOCK:
+        _API_KEY_ROTATION_CURSOR.pop(provider_api_key_rotation_name(provider, pcfg), None)
+    if had_config_key:
+        return [f"Cleared stored API key(s) for {provider}."]
+    return [f"No stored API key(s) for {provider}; unchanged."]
+
+
 def store_api_keys_config(provider: str, keys: list[str]) -> list[str]:
     parsed = parse_api_key_list(keys)
+    if len(parsed) == 1 and api_key_clear_requested(parsed[0]):
+        return clear_api_key_config(provider)
     if not parsed:
         raise SystemExit("No API keys provided; unchanged.")
     cfg = load_config()
@@ -15754,6 +15794,8 @@ def stored_api_key_mask(provider: str, pcfg: dict[str, Any]) -> str:
 
 
 def store_api_key_input_config(provider: str, raw_value: str) -> list[str]:
+    if api_key_clear_requested(raw_value):
+        return clear_api_key_config(provider)
     keys = parse_api_key_list(raw_value)
     if len(keys) > 1:
         return store_api_keys_config(provider, keys)
@@ -15834,6 +15876,11 @@ def cmd_api_key(args: argparse.Namespace) -> None:
         print("For NVIDIA hosted, use: claude-anyctl api-key nvidia-hosted")
         return
     provider = normalize_provider(args.provider)
+    action = str(getattr(args, "action", "") or "").strip()
+    if api_key_clear_requested(action):
+        for line in clear_api_key_config(provider):
+            print(line)
+        return
     if not sys.stdin.isatty():
         print("For security, do not paste API keys into Claude Code chat.")
         print(f"Run this in the SSH terminal instead: claude-anyctl api-key {provider}")
@@ -22726,7 +22773,7 @@ def channel_delivery_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[st
     return rows, ["llm", "native", "stdin", "back"]
 
 
-def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
+def api_key_panel_rows(provider: str, pcfg: dict[str, Any] | None = None) -> tuple[list[str], list[str]]:
     rows = [
         "Type or paste API key as hidden input",
         "Type or paste multiple API keys (comma/newline separated)",
@@ -22740,6 +22787,9 @@ def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
     if os.name != "nt":
         rows[4] = "Read API key from desktop clipboard if available"
         rows[5] = "Read API keys from desktop clipboard if available"
+    if pcfg is not None and provider_api_key_count(provider, pcfg):
+        rows.insert(-1, "Clear stored API key(s)")
+        values.insert(-1, "clear")
     return rows, values
 
 
@@ -23058,7 +23108,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
             current_choice = current_provider_panel_choice(provider, pcfg)
             panel_idx = panel_values.index(current_choice) if current_choice in panel_values else 0
         elif name == "api-key":
-            panel_rows, panel_values = api_key_panel_rows(provider)
+            panel_rows, panel_values = api_key_panel_rows(provider, pcfg)
         elif name == "base-url":
             panel_rows, panel_values = base_url_panel_rows(provider, pcfg)
         elif name == "model":
@@ -23327,6 +23377,10 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                                 messages = store_api_keys_config(provider, keys)
                             else:
                                 messages = ["Clipboard API keys were not stored."]
+                        refresh_checks()
+                        close_panel(3)
+                    elif value == "clear":
+                        messages = clear_api_key_config(provider)
                         refresh_checks()
                         close_panel(3)
                 elif panel == "base-url":
@@ -28433,6 +28487,7 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
   claude-any advisor-model MODEL_ID  Set current provider advisor model (off disables)
   claude-any models [PROVIDER]       List models
   claude-any api-key PROVIDER        Store API key securely
+  claude-any api-key PROVIDER clear  Clear stored API key(s)
   claude-any set-api-key PROVIDER KEY
   claude-any set-api-keys PROVIDER KEY1,KEY2
   claude-any web-search [on|off]     Auto-attach DuckDuckGo MCP for non-native providers
@@ -28461,6 +28516,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-auto-llm-options [MODEL_ID]
                                       Apply recommended LLM options for MODEL_ID or the saved model
   claude-any --ca-api-key KEY        Set current provider API key, then launch
+  claude-any --ca-api-key clear      Clear current provider API key(s), then launch
   claude-any --ca-api-key-env ENVVAR Set current provider API key from env, then launch
   claude-any --ca-api-keys KEY1,KEY2 Set current provider API keys with round-robin
   claude-any --ca-api-keys-env ENVVAR
@@ -28679,7 +28735,7 @@ def run_cli(argv: list[str]) -> int:
         if head in ("api-key", "apikey"):
             if not rest:
                 raise SystemExit("Missing provider")
-            cmd_api_key(argparse.Namespace(provider=rest[0]))
+            cmd_api_key(argparse.Namespace(provider=rest[0], action=rest[1] if len(rest) > 1 else None))
             return 0
         if head in ("set-api-key", "set-apikey"):
             if len(rest) < 2:
@@ -29271,6 +29327,7 @@ def build_parser() -> argparse.ArgumentParser:
     pp.set_defaults(func=cmd_provider)
     ak = sub.add_parser("api-key")
     ak.add_argument("provider", nargs="?")
+    ak.add_argument("action", nargs="?")
     ak.set_defaults(func=cmd_api_key)
     sak = sub.add_parser("set-api-key")
     sak.add_argument("provider")

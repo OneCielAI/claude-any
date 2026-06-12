@@ -152,6 +152,52 @@ class ApiKeyRotationTests(unittest.TestCase):
         self.assertEqual(["sk-one", "sk-two"], pcfg["api_keys"])
         self.assertIn("Round-robin: enabled", "\n".join(messages))
 
+    def test_store_api_key_input_clear_removes_single_and_multi_keys(self):
+        cfg = {
+            "providers": {
+                "deepseek": self.deepseek_pcfg(api_key="sk-old", api_keys=["sk-old", "sk-two"]),
+            }
+        }
+        saved = {}
+
+        def fake_save_config(value):
+            saved.update(copy.deepcopy(value))
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config", side_effect=fake_save_config),
+            mock.patch.object(claude_any, "clear_model_cache"),
+        ):
+            messages = claude_any.store_api_key_input_config("deepseek", "clear")
+
+        pcfg = saved["providers"]["deepseek"]
+        self.assertNotIn("api_key", pcfg)
+        self.assertNotIn("api_keys", pcfg)
+        self.assertIn("Cleared stored API key(s) for deepseek.", "\n".join(messages))
+
+    def test_store_api_keys_unset_clears_keys(self):
+        cfg = {
+            "providers": {
+                "deepseek": self.deepseek_pcfg(api_key="sk-old", api_keys=["sk-old", "sk-two"]),
+            }
+        }
+        saved = {}
+
+        def fake_save_config(value):
+            saved.update(copy.deepcopy(value))
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config", side_effect=fake_save_config),
+            mock.patch.object(claude_any, "clear_model_cache"),
+        ):
+            messages = claude_any.store_api_keys_config("deepseek", ["unset"])
+
+        pcfg = saved["providers"]["deepseek"]
+        self.assertNotIn("api_key", pcfg)
+        self.assertNotIn("api_keys", pcfg)
+        self.assertIn("Cleared stored API key(s) for deepseek.", "\n".join(messages))
+
     def test_compatibility_api_key_probe_tests_each_configured_key(self):
         pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-one", "sk-two"])
         calls = []

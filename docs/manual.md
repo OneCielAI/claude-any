@@ -728,11 +728,11 @@ Common Claude Any setup flags:
 | `--ca-model MODEL` | Set the current provider model. |
 | `--ca-advisor-model MODEL` | Set the Advisor model; use `off` to disable it. |
 | `--ca-base-url URL` | Set the current provider base URL. |
-| `--ca-api-key KEY` | Store the current provider API key directly. Prefer env vars for scripts. |
+| `--ca-api-key KEY` | Store the current provider API key directly. Prefer env vars for scripts. Use `clear`, `unset`, `none`, or `off` to remove stored key(s). |
 | `--ca-api-key-env ENVVAR` | Store the current provider API key from an environment variable. |
 | `--ca-api-keys KEY1,KEY2` | Store multiple current-provider API keys and rotate them per routed upstream request. |
 | `--ca-api-keys-env ENVVAR` | Store multiple current-provider API keys from a comma-, semicolon-, or newline-separated environment variable. |
-| `--ca-set-api-key PROVIDER KEY` | Store a key for a specific provider. |
+| `--ca-set-api-key PROVIDER KEY` | Store a key for a specific provider. Use `clear`, `unset`, `none`, or `off` to remove stored key(s). |
 | `--ca-set-api-key-env PROVIDER ENVVAR` | Store a provider key from an environment variable. |
 | `--ca-set-api-keys PROVIDER KEY1,KEY2` | Store multiple API keys for a specific provider. |
 | `--ca-set-api-keys-env PROVIDER ENVVAR` | Store multiple provider keys from an environment variable. |
@@ -763,6 +763,8 @@ Notes for automation:
   environment variable to `KEY1,KEY2,KEY3` or one key per line.
 - `--ca-api-key` and `--ca-set-api-key` are available for direct key passing,
   but prefer the environment-variable forms in shared scripts and terminals.
+- To remove stored credentials, use the launch-menu API key panel's
+  `Clear stored API key(s)` action or run `claude-any set-api-key PROVIDER clear`.
 - `claude-any stop` is safe to run before scripted tests to remove stale
   router/proxy processes.
 - npm-installed interactive launches check the npm registry for a newer
