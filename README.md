@@ -16,7 +16,7 @@
 > ## 🚀 Use the full Claude Code experience with free or low-cost LLMs
 >
 > - **Free** — [NVIDIA hosted NIM](https://build.nvidia.com/) (qwen3-coder-480b, gpt-oss, and friends) through the API Catalog.
-> - **Low-cost** — [Ollama Cloud](https://ollama.com/cloud) for GLM, Qwen, DeepSeek, and other open-weight models at a fraction of frontier-model pricing.
+> - **Low-cost** — [Ollama Cloud](https://ollama.com/cloud) and [Fireworks.ai](https://fireworks.ai/) for GLM, Qwen, DeepSeek, Kimi, and other open-weight models at a fraction of frontier-model pricing.
 > - **Free + local** — [Ollama](https://ollama.com/), [LM Studio](https://lmstudio.ai/), or [vLLM](https://github.com/vllm-project/vllm) on your own GPU, fully offline.
 > - **Plan Mode + Advisor ready** — Claude Any preserves Claude Code Plan Mode on non-Anthropic providers and adds an optional long-context Advisor model for review.
 > - **Local browser chat** — the router serves `/ca/web/chat`, a local browser UI that talks to the selected provider through the same `/v1/messages` path Claude Code uses.
@@ -25,6 +25,22 @@
 > Provider, model, base URL, API key, streaming behavior, and LLM options are all selected from a console menu **before** Claude Code starts. Claude Code itself runs untouched with all of its native tooling, slash commands, and workflows.
 
 ## Today's Top 3 Benefits
+
+### 2026-06-12
+
+1. **Fireworks.ai provider** — Fireworks is now a first-class
+   Anthropic-compatible routed provider. Claude Any defaults to
+   `https://api.fireworks.ai/inference` for `/v1/messages`, reads live model
+   metadata from `https://api.fireworks.ai/v1/accounts/{account_id}/models`,
+   and caches `contextLength`, tool/vision support, and
+   `baseModelDetails.parameterCount` for LLM option presets.
+2. **Provider metadata stays account-aware** — Fireworks model discovery supports
+   `account_id` and `model_api_base_url` provider options, so public
+   `accounts/fireworks/...` models and account-scoped custom models can share
+   the same runtime path without hardcoded model-size guesses.
+3. **Fireworks headless setup** — Fireworks can be provisioned through the same
+   `--ca-provider`, `--ca-model`, `--ca-api-key-env`, and
+   `--ca-provider-option` flags as the other routed providers.
 
 ### 2026-06-11
 
@@ -257,10 +273,19 @@ so this is a natural fit for multi-key round-robin (below): store several keys a
 Claude Any spreads requests across them and rests any key that hits a 429 until
 its rate limit resets.
 
+For [Fireworks.ai](https://fireworks.ai/) (Anthropic-compatible `/v1/messages`;
+model metadata comes from the account-scoped Fireworks model API):
+
+```sh
+claude-any --ca-provider fireworks --ca-base-url https://api.fireworks.ai/inference --ca-model accounts/fireworks/models/kimi-k2p5 --ca-api-key-env FIREWORKS_API_KEY --ca-provider-option account_id=fireworks --ca-no-launch
+```
+
 `--ca-provider-option KEY=VALUE` applies a provider option to the current
 provider; use `--ca-set-provider-option PROVIDER KEY=VALUE` when a script needs
 to configure a provider other than the current one. OpenCode endpoint overrides
-use `endpoint:<model-id>=messages|chat|responses|gemini`.
+use `endpoint:<model-id>=messages|chat|responses|gemini`. Fireworks model-list
+overrides use `account_id=<account>` and
+`model_api_base_url=https://api.fireworks.ai`.
 
 Apply the recommended LLM options for the saved provider/model, then exit:
 
@@ -649,6 +674,20 @@ steps under that larger model's supervision.
   and `/ca/plan/artifacts`.
 
 ## Changelog
+
+### 0.1.107
+
+- **Fireworks.ai provider**: added first-class Fireworks support using the
+  Anthropic-compatible inference base `https://api.fireworks.ai/inference` and
+  the documented account-scoped model API
+  `/v1/accounts/{account_id}/models` for model discovery.
+- **Fireworks model metadata**: model refresh now stores Fireworks
+  `contextLength`, `supportsTools`, `supportsImageInput`, and
+  `baseModelDetails.parameterCount`, so context presets and model-size display
+  are based on provider metadata instead of guessed IDs.
+- **Fireworks provisioning flags**: `--ca-provider fireworks`,
+  `FIREWORKS_API_KEY`/`FIREWORKS_API_KEYS`, and provider options
+  `account_id` / `model_api_base_url` are available for scripted setup.
 
 ### 0.1.106
 

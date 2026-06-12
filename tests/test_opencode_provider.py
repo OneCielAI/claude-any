@@ -215,6 +215,40 @@ class OpenCodeProviderTests(unittest.TestCase):
         expected_model = claude_any.claude_code_context_model_alias("opencode", pcfg, claude_any.current_alias(cfg))
         self.assertEqual(expected_model, env["ANTHROPIC_MODEL"])
 
+    def test_default_family_models_use_provider_family_candidates(self):
+        cfg = self.opencode_cfg(
+            api_key="sk-opencode-test",
+            current_model="deepseek-v4-flash-free",
+        )
+        pcfg = cfg["providers"]["opencode"]
+        models = [
+            "deepseek-v4-flash-free",
+            "claude-haiku-4-5",
+            "claude-opus-4-8",
+            "claude-sonnet-4-6",
+        ]
+
+        with mock.patch.object(claude_any, "read_model_list_cache", return_value=models):
+            env = claude_any.env_vars(cfg)
+
+        self.assertEqual(
+            claude_any.claude_code_context_model_alias("opencode", pcfg, claude_any.alias_for("opencode", "deepseek-v4-flash-free")),
+            env["ANTHROPIC_MODEL"],
+        )
+        self.assertEqual(
+            claude_any.claude_code_context_model_alias("opencode", pcfg, claude_any.alias_for("opencode", "claude-haiku-4-5")),
+            env["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+        )
+        self.assertEqual(
+            claude_any.claude_code_context_model_alias("opencode", pcfg, claude_any.alias_for("opencode", "claude-opus-4-8")),
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+        )
+        self.assertEqual(
+            claude_any.claude_code_context_model_alias("opencode", pcfg, claude_any.alias_for("opencode", "claude-sonnet-4-6")),
+            env["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+        )
+        self.assertNotEqual(env["ANTHROPIC_MODEL"], env["ANTHROPIC_DEFAULT_OPUS_MODEL"])
+
     def test_workflow_env_advertises_inferred_claude_capabilities(self):
         cfg = self.opencode_cfg(
             api_key="sk-opencode-test",
@@ -234,6 +268,10 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual(
             env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"],
             env["ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"],
+        )
+        self.assertEqual(
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES"],
+            env["ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTS"],
         )
 
     def test_configured_capabilities_override_inference(self):

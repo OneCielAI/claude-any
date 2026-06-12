@@ -45,6 +45,9 @@ Thumbs.db
 # Local analysis wiki
 .obsidian-claude-code-wiki/
 
+# Local billing/evidence captures
+claude-free/evidence/
+
 # Local scratch checkouts / SDK inspections
 .tmp-*/
 

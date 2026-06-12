@@ -59,6 +59,18 @@ class AnthropicModelSwitchTests(unittest.TestCase):
         )
         self.assertEqual("deepseek-v4-flash", result)
 
+    def test_provider_advertised_bare_claude_id_resolves_for_third_party(self):
+        # Some third-party providers expose Claude-named upstream models. If the
+        # router advertised that bare id in /v1/models, Claude Code may send it
+        # back from /model and it must not collapse to the launch model.
+        result = _resolve(
+            "claude-opus-4-8",
+            current_model="deepseek-v4-flash-free",
+            provider="opencode",
+            models=["deepseek-v4-flash-free", "claude-opus-4-8"],
+        )
+        self.assertEqual("claude-opus-4-8", result)
+
 
 if __name__ == "__main__":
     unittest.main()
