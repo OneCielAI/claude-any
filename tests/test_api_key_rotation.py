@@ -173,7 +173,7 @@ class ApiKeyRotationTests(unittest.TestCase):
         pcfg = saved["providers"]["deepseek"]
         self.assertNotIn("api_key", pcfg)
         self.assertNotIn("api_keys", pcfg)
-        self.assertIn("Cleared stored API key(s) for deepseek.", "\n".join(messages))
+        self.assertIn("Cleared stored API key(s) for deepseek. Other providers unchanged.", "\n".join(messages))
 
     def test_store_api_keys_unset_clears_keys(self):
         cfg = {
@@ -196,7 +196,34 @@ class ApiKeyRotationTests(unittest.TestCase):
         pcfg = saved["providers"]["deepseek"]
         self.assertNotIn("api_key", pcfg)
         self.assertNotIn("api_keys", pcfg)
-        self.assertIn("Cleared stored API key(s) for deepseek.", "\n".join(messages))
+        self.assertIn("Cleared stored API key(s) for deepseek. Other providers unchanged.", "\n".join(messages))
+
+    def test_clear_api_key_preserves_other_provider_keys_after_reload(self):
+        providers = ["anthropic", "deepseek", "opencode", "openrouter", "ollama-cloud", "fireworks"]
+        cfg = copy.deepcopy(claude_any.DEFAULT_CONFIG)
+        cfg["current_provider"] = "anthropic"
+        for provider in providers:
+            cfg["providers"][provider]["api_key"] = f"sk-{provider}-one"
+            cfg["providers"][provider]["api_keys"] = [f"sk-{provider}-one", f"sk-{provider}-two"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "config.json"
+            cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+            with (
+                mock.patch.object(claude_any, "CONFIG_PATH", cfg_path),
+                mock.patch.object(claude_any, "CONFIG_DIR", Path(tmp)),
+                mock.patch.object(claude_any, "clear_model_cache", side_effect=claude_any.invalidate_config_cache),
+            ):
+                claude_any.clear_api_key_config("deepseek")
+                reloaded = claude_any.load_config()
+
+        for provider in providers:
+            keys = claude_any.provider_config_api_keys(provider, reloaded["providers"][provider])
+            if provider == "deepseek":
+                self.assertEqual([], keys)
+            else:
+                self.assertEqual([f"sk-{provider}-one", f"sk-{provider}-two"], keys)
 
     def test_compatibility_api_key_probe_tests_each_configured_key(self):
         pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-one", "sk-two"])

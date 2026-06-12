@@ -15690,6 +15690,15 @@ def store_api_key_config(provider: str, key: str) -> list[str]:
 
 def clear_api_key_config(provider: str) -> list[str]:
     cfg = load_config()
+    providers = cfg["providers"]
+    missing = object()
+    other_key_fields: dict[str, tuple[Any, Any]] = {}
+    for name, other_pcfg in providers.items():
+        if name == provider or not isinstance(other_pcfg, dict):
+            continue
+        api_key_value = other_pcfg.get("api_key", missing)
+        api_keys_value = json.loads(json.dumps(other_pcfg.get("api_keys"))) if "api_keys" in other_pcfg else missing
+        other_key_fields[name] = (api_key_value, api_keys_value)
     pcfg = cfg["providers"][provider]
     had_config_key = bool(parse_api_key_list(pcfg.get("api_key")) or parse_api_key_list(pcfg.get("api_keys")))
     pcfg.pop("api_key", None)
@@ -15698,13 +15707,25 @@ def clear_api_key_config(provider: str) -> list[str]:
         had_config_key = had_config_key or bool(parse_api_key_list(read_env_file(NCP_ENV).get("NVIDIA_API_KEY")))
         clear_nvidia_api_key()
         ensure_nvidia_hosted_base_url(pcfg)
+    for name, (api_key_value, api_keys_value) in other_key_fields.items():
+        other_pcfg = providers.get(name)
+        if not isinstance(other_pcfg, dict):
+            continue
+        if api_key_value is missing:
+            other_pcfg.pop("api_key", None)
+        else:
+            other_pcfg["api_key"] = api_key_value
+        if api_keys_value is missing:
+            other_pcfg.pop("api_keys", None)
+        else:
+            other_pcfg["api_keys"] = api_keys_value
     save_config(cfg)
     clear_model_cache()
     with _API_KEY_ROTATION_LOCK:
         _API_KEY_ROTATION_CURSOR.pop(provider_api_key_rotation_name(provider, pcfg), None)
     if had_config_key:
-        return [f"Cleared stored API key(s) for {provider}."]
-    return [f"No stored API key(s) for {provider}; unchanged."]
+        return [f"Cleared stored API key(s) for {provider}. Other providers unchanged."]
+    return [f"No stored API key(s) for {provider}; other providers unchanged."]
 
 
 def store_api_keys_config(provider: str, keys: list[str]) -> list[str]:
