@@ -25362,6 +25362,30 @@ def _channel_llm_summary_write_cursor_locked(last_id: int) -> None:
     tmp_path.replace(CHANNEL_LLM_SUMMARY_CURSOR_PATH)
 
 
+def _channel_llm_summary_scan_max_id_locked() -> int:
+    if not CHANNEL_LLM_SUMMARY_QUEUE_PATH.exists():
+        return 0
+    max_id = 0
+    try:
+        with CHANNEL_LLM_SUMMARY_QUEUE_PATH.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    message_id = int(item.get("message_id") or 0)
+                except Exception:
+                    message_id = 0
+                if message_id > max_id:
+                    max_id = message_id
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_summary_queue_scan_failed error={type(exc).__name__}: {exc}")
+    return max_id
+
+
 def _channel_llm_summary_read_cursor_locked() -> int:
     global _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
     if _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID is not None:
@@ -25373,8 +25397,12 @@ def _channel_llm_summary_read_cursor_locked() -> int:
             return _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
         except Exception as exc:
             router_log("WARN", f"channel_llm_summary_cursor_read_failed error={type(exc).__name__}: {exc}")
-    _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = 0
-    return 0
+    _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = max(0, _channel_llm_summary_scan_max_id_locked())
+    try:
+        _channel_llm_summary_write_cursor_locked(_CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID)
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
+    return _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
 
 
 def _read_channel_llm_summary_records(after_id: int, limit: int = 20) -> list[dict[str, Any]]:
@@ -25579,6 +25607,7 @@ def body_with_pending_channel_summaries(body: dict[str, Any]) -> dict[str, Any]:
     out_metadata["claude_any_channel_summary_message_ids"] = ",".join(str(item.get("message_id") or "") for item in records)
     out_metadata["claude_any_channel_summary_cursor_last_id"] = str(max_seen)
     out["metadata"] = out_metadata
+    _commit_channel_llm_summary_cursor_if_newer(max_seen)
     router_log("INFO", f"channel_llm_summary_injected count={len(records)} message_ids={out_metadata['claude_any_channel_summary_message_ids']}")
     return out
 
