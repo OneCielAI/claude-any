@@ -216,6 +216,21 @@ class NativeEnvContractTests(unittest.TestCase):
         self.assertEqual("anthropic-routed", claude_any.provider_mode_label("anthropic", pcfg))
         self.assertFalse(claude_any.direct_native_anthropic_enabled("anthropic", pcfg))
 
+    def test_server_side_web_tools_are_only_disallowed_outside_claude_modes(self):
+        native_pcfg = self._cfg()["providers"]["anthropic"]
+        routed_pcfg = self._cfg(route_through_router=True)["providers"]["anthropic"]
+        self.assertFalse(
+            claude_any.should_disallow_claude_server_side_web_tools("anthropic", native_pcfg, True)
+        )
+        self.assertFalse(
+            claude_any.should_disallow_claude_server_side_web_tools("anthropic", routed_pcfg, False)
+        )
+        self.assertTrue(
+            claude_any.should_disallow_claude_server_side_web_tools(
+                "ollama", {"route_through_router": False}, False
+            )
+        )
+
     def test_routed_anthropic_without_api_key_can_launch_for_oauth_header_pass_through(self):
         with mock.patch.object(claude_any, "base_url_status_line", return_value="Base URL: model list reachable"):
             errors = claude_any.launch_readiness_errors(self._cfg(route_through_router=True, api_key=""))

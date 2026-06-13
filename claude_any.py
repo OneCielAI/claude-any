@@ -562,9 +562,12 @@ DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC: tuple[str, ...] = (
     "WaitForMcpServers",
     "WebSearch",
     "web_search",
+    "WebFetch",
+    "web_fetch",
     "RemoteTrigger",
     "PushNotification",
 )
+CLAUDE_SERVER_SIDE_WEB_TOOLS: tuple[str, ...] = ("WebSearch", "WebFetch")
 NON_ANTHROPIC_COMPAT_PROMPT = (
     "You are running inside Claude Code through a non-Anthropic model provider. "
     "Do not stop after announcing what you plan to do. When the user asks you to create, edit, or run code, "
@@ -24280,6 +24283,14 @@ def has_passthrough_option(passthrough: list[str], *names: str) -> bool:
     return any(arg in names or any(arg.startswith(name + "=") for name in names) for arg in passthrough)
 
 
+def should_disallow_claude_server_side_web_tools(
+    provider: str,
+    pcfg: dict[str, Any],
+    use_native_anthropic: bool,
+) -> bool:
+    return not use_native_anthropic and not anthropic_routed_enabled(provider, pcfg)
+
+
 CLAUDE_CODE_GENERATED_GREEDY_OPTIONS = {
     "--mcp-config",
     "--dangerously-load-development-channels",
@@ -28945,6 +28956,11 @@ def launch_claude(
         and claude_supports_permission_mode_arg(claude)
     ):
         cmd.extend(["--permission-mode", "bypassPermissions"])
+    if (
+        should_disallow_claude_server_side_web_tools(provider, pcfg, use_native_anthropic)
+        and not has_passthrough_option([*extra_args, *claude_passthrough], "--disallowedTools", "--disallowed-tools")
+    ):
+        cmd.extend(["--disallowedTools", ",".join(CLAUDE_SERVER_SIDE_WEB_TOOLS)])
     model = env.get("CLAUDE_ANY_MODEL_ALIAS")
     if model:
         cmd.extend(["--model", model])

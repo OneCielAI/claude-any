@@ -63,6 +63,20 @@ class ReviewCommandPassthroughTests(unittest.TestCase):
                     "max_uses": 8,
                 },
                 {
+                    "name": "WebFetch",
+                    "description": "Fetch a URL",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"url": {"type": "string"}},
+                        "required": ["url"],
+                    },
+                },
+                {
+                    "name": "web_fetch",
+                    "type": "web_fetch_20250305",
+                    "max_uses": 8,
+                },
+                {
                     "name": "mcp__duckduckgo__search",
                     "description": "Search with DuckDuckGo",
                     "input_schema": {
@@ -79,6 +93,8 @@ class ReviewCommandPassthroughTests(unittest.TestCase):
 
         self.assertNotIn("WebSearch", names)
         self.assertNotIn("web_search", names)
+        self.assertNotIn("WebFetch", names)
+        self.assertNotIn("web_fetch", names)
         self.assertIn("mcp__duckduckgo__search", names)
 
     def test_filter_keeps_server_side_web_search_for_anthropic_provider(self):
@@ -86,6 +102,8 @@ class ReviewCommandPassthroughTests(unittest.TestCase):
             "tools": [
                 {"name": "WebSearch", "input_schema": {"type": "object", "properties": {}}},
                 {"name": "web_search", "type": "web_search_20250305", "max_uses": 8},
+                {"name": "WebFetch", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "web_fetch", "type": "web_fetch_20250305", "max_uses": 8},
             ]
         }
 
@@ -94,6 +112,8 @@ class ReviewCommandPassthroughTests(unittest.TestCase):
 
         self.assertIn("WebSearch", names)
         self.assertIn("web_search", names)
+        self.assertIn("WebFetch", names)
+        self.assertIn("web_fetch", names)
 
     def test_slash_command_tool_schema_is_forwarded_to_ollama(self):
         tools = [
