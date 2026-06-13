@@ -16,6 +16,9 @@ import claude_any
 
 
 class ChannelBridgeTests(unittest.TestCase):
+    def setUp(self):
+        claude_any._CHANNEL_STDIN_WAKE_DELIVERED.clear()
+
     def test_parse_channel_args_accepts_sse_command(self):
         command, options = claude_any.parse_channel_bridge_args("sse")
         self.assertEqual(command, "sse")
@@ -263,6 +266,44 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(1, first["id"])
         self.assertEqual(1, second["id"])
         self.assertTrue(second["_claude_any_duplicate"])
+        self.assertEqual(1, len(rows))
+
+    def test_append_chat_message_dedupes_identical_mcp_json_notification(self):
+        payload = {
+            "message": 'Board "positions" updated. board_get(room_id, key) to read.',
+            "channel": "room",
+            "sender_id": "mcp-server",
+            "kind": "channel",
+            "meta": {
+                "mcp_server": "mcp-server",
+                "mcp_method": "notifications/claude/channel",
+                "stream_id": "",
+                "mcp_json": {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/claude/channel",
+                    "params": {
+                        "content": 'Board "positions" updated. board_get(room_id, key) to read.',
+                        "meta": {"kind": "board_updated", "room_id": "room", "key": "positions", "stream_id": ""},
+                    },
+                },
+            },
+        }
+        old = dict(payload)
+        old.update({"id": 1, "time": "2000-01-01T00:00:00", "recipients": ["all"], "thread_id": "1", "parent_id": None})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            path.write_text(json.dumps(old, ensure_ascii=False) + "\n", encoding="utf-8")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                saved = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(1, saved["id"])
+        self.assertTrue(saved["_claude_any_duplicate"])
         self.assertEqual(1, len(rows))
 
     def test_append_chat_message_keeps_old_fallback_duplicate_without_launch_guard(self):
@@ -1265,6 +1306,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(write_all.call_args_list[0].args[1].startswith(b"\x15"))
         self.assertEqual(b"\r\n", write_all.call_args_list[1].args[1])
 
+        claude_any._CHANNEL_STDIN_WAKE_DELIVERED.clear()
         with (
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_write_fd_all") as write_all_cr,
@@ -1356,6 +1398,33 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn(b"New message from Sarah", write_all.call_args_list[0].args[1])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_stdin_proxy_inject_fallback" in item and "reason=llm_direct_pending" in item for item in log_messages))
+
+    def test_inject_pending_channel_messages_claims_before_terminal_write(self):
+        messages = [
+            {
+                "id": 7,
+                "channel": "room",
+                "sender_id": "agent",
+                "message": "wake up",
+                "meta": {},
+            }
+        ]
+
+        def assert_claimed_before_write(fd, data):
+            self.assertIn(7, claude_any._CHANNEL_STDIN_WAKE_DELIVERED)
+
+        with (
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_write_fd_all", side_effect=assert_claimed_before_write) as write_all,
+            mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            last_id = claude_any._inject_pending_channel_messages(99, 1)
+
+        self.assertEqual(7, last_id)
+        self.assertEqual(2, write_all.call_count)
+        commit_cursor.assert_called_once_with(7)
 
     def test_inject_pending_channel_messages_skips_direct_delivered_messages(self):
         messages = [
@@ -1603,6 +1672,68 @@ class ChannelBridgeTests(unittest.TestCase):
         write_cursor.assert_not_called()
         write_summary_cursor.assert_not_called()
         self.assertTrue(any("channel_delivery_cursor_deferred" in str(call.args[1]) for call in router_log.call_args_list))
+
+    def test_commit_pending_channel_delivery_cursors_skips_unconfirmed_channel_response(self):
+        body = {
+            "metadata": {
+                "claude_any_channel_cursor_last_id": "9",
+                "claude_any_channel_summary_cursor_last_id": "12",
+            }
+        }
+        handler = type(
+            "Handler",
+            (),
+            {
+                "_claude_any_response_status": 200,
+                "_claude_any_channel_delivery_guard": True,
+                "_claude_any_channel_delivery_ok": False,
+                "_claude_any_channel_delivery_reason": "ollama_stream_error:TimeoutError",
+            },
+        )()
+        with (
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+            mock.patch.object(claude_any, "_channel_llm_summary_write_cursor_locked") as write_summary_cursor,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            claude_any.commit_pending_channel_delivery_cursors(body, handler)  # type: ignore[arg-type]
+
+        write_cursor.assert_not_called()
+        write_summary_cursor.assert_not_called()
+        self.assertTrue(
+            any(
+                "channel_delivery_cursor_deferred" in str(call.args[1])
+                and "ollama_stream_error:TimeoutError" in str(call.args[1])
+                for call in router_log.call_args_list
+            )
+        )
+
+    def test_commit_pending_channel_delivery_cursors_commits_confirmed_channel_response(self):
+        body = {
+            "metadata": {
+                "claude_any_channel_cursor_last_id": "9",
+                "claude_any_channel_summary_cursor_last_id": "12",
+            }
+        }
+        handler = type(
+            "Handler",
+            (),
+            {
+                "_claude_any_response_status": 200,
+                "_claude_any_channel_delivery_guard": True,
+                "_claude_any_channel_delivery_ok": True,
+                "_claude_any_channel_delivery_reason": "ollama_stream_message_stop",
+            },
+        )()
+        with (
+            mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+            mock.patch.object(claude_any, "_channel_llm_summary_read_cursor_locked", return_value=1),
+            mock.patch.object(claude_any, "_channel_llm_summary_write_cursor_locked") as write_summary_cursor,
+        ):
+            claude_any.commit_pending_channel_delivery_cursors(body, handler)  # type: ignore[arg-type]
+
+        write_cursor.assert_called_with(9)
+        write_summary_cursor.assert_called_with(12)
 
     def test_body_with_pending_channel_messages_keeps_ai_net_write_tools(self):
         body = {

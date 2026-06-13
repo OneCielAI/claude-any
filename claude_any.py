@@ -480,6 +480,7 @@ _CHANNEL_LLM_DIRECT_DELIVERED: set[int] = set()
 _CHANNEL_LLM_DIRECT_QUEUE: queue.Queue[dict[str, Any]] = queue.Queue()
 _CHANNEL_LLM_DIRECT_WORKERS_STARTED = 0
 _CHANNEL_STDIN_WAKE_LOCK = threading.Lock()
+_CHANNEL_STDIN_INJECT_LOCK = threading.Lock()
 _CHANNEL_STDIN_WAKE_DELIVERED: set[int] = set()
 _NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
 BUILTIN_CHANNEL_SPEC = "server:claude-any-router"
@@ -7403,6 +7404,64 @@ def _handler_response_status(handler: BaseHTTPRequestHandler) -> int | None:
         return None
 
 
+def _channel_delivery_metadata(metadata: dict[str, Any] | None) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    return bool(
+        metadata.get("claude_any_channel_cursor_last_id")
+        or metadata.get("claude_any_channel_summary_cursor_last_id")
+    )
+
+
+def begin_pending_channel_delivery(
+    handler: BaseHTTPRequestHandler | None,
+    body: dict[str, Any],
+) -> None:
+    if handler is None:
+        return
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    if not _channel_delivery_metadata(metadata):
+        return
+    try:
+        setattr(handler, "_claude_any_channel_delivery_guard", True)
+        setattr(handler, "_claude_any_channel_delivery_ok", False)
+        setattr(handler, "_claude_any_channel_delivery_reason", "pending")
+    except Exception:
+        pass
+
+
+def mark_pending_channel_delivery_success(
+    handler: BaseHTTPRequestHandler | None,
+    reason: str = "response_complete",
+) -> None:
+    if handler is None or not getattr(handler, "_claude_any_channel_delivery_guard", False):
+        return
+    try:
+        setattr(handler, "_claude_any_channel_delivery_ok", True)
+        setattr(handler, "_claude_any_channel_delivery_reason", reason)
+    except Exception:
+        pass
+
+
+def mark_pending_channel_delivery_failed(
+    handler: BaseHTTPRequestHandler | None,
+    reason: str = "response_failed",
+) -> None:
+    if handler is None or not getattr(handler, "_claude_any_channel_delivery_guard", False):
+        return
+    try:
+        setattr(handler, "_claude_any_channel_delivery_ok", False)
+        setattr(handler, "_claude_any_channel_delivery_reason", reason)
+    except Exception:
+        pass
+
+
+def pending_channel_delivery_confirmed(handler: BaseHTTPRequestHandler | None) -> bool:
+    if handler is None or not getattr(handler, "_claude_any_channel_delivery_guard", False):
+        return True
+    return bool(getattr(handler, "_claude_any_channel_delivery_ok", False))
+
+
 def write_empty_response(handler: BaseHTTPRequestHandler, status: int = 202) -> None:
     handler.send_response(status)
     handler.send_header("content-length", "0")
@@ -8901,6 +8960,15 @@ def _chat_message_stable_dedupe_key(message: dict[str, Any]) -> tuple[str, ...] 
         stable_value = str(value).strip()
         if stable_value:
             return ("stable", source, method, channel, kind, key, stable_value, body_hash)
+    mcp_json = meta.get("mcp_json")
+    if method.startswith("notifications/") and isinstance(mcp_json, dict):
+        try:
+            normalized = json.dumps(mcp_json, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+            if normalized:
+                digest = hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
+                return ("stable", source, method, channel, kind, "mcp_json", digest, body_hash)
+        except Exception:
+            pass
     return None
 
 
@@ -13325,6 +13393,7 @@ def _rebatch_anthropic_sse_text(
     pending_message_delta: tuple[str | None, str] | None = None
     pending_message_stop: tuple[str | None, str] | None = None
     last_suppressed_keepalive_at = 0.0
+    stream_success = False
 
     class ClientStreamDisconnected(Exception):
         pass
@@ -13836,7 +13905,9 @@ def _rebatch_anthropic_sse_text(
         flush_suppressed_thinking_passback()
         if pending_message_delta is not None or pending_message_stop is not None:
             emit_pending_message_end()
+        stream_success = bool(saw_message_stop)
     except ClientStreamDisconnected as exc:
+        mark_pending_channel_delivery_failed(handler, "anthropic_stream_client_disconnected")
         router_log(
             "WARN",
             f"anthropic_sse_client_disconnected model={model} "
@@ -13893,6 +13964,11 @@ def _rebatch_anthropic_sse_text(
         except Exception:
             pass
     finally:
+        if stream_success:
+            mark_pending_channel_delivery_success(handler, "anthropic_stream_message_stop")
+        else:
+            reason = str(getattr(handler, "_claude_any_channel_delivery_reason", "anthropic_stream_incomplete") or "anthropic_stream_incomplete")
+            mark_pending_channel_delivery_failed(handler, reason)
         try:
             resp.close()
         except Exception:
@@ -14298,9 +14374,11 @@ def _ollama_stream_to_anthropic_sse(
                 chunks=chunks_seen,
                 stream=True,
             )
+        mark_pending_channel_delivery_success(handler, "ollama_stream_message_stop")
     except UpstreamClientDisconnected as exc:
         sse_trace_outcome = "client_disconnected"
         sse_trace_error = f"{type(exc).__name__}: {exc}"
+        mark_pending_channel_delivery_failed(handler, "ollama_stream_client_disconnected")
         router_log(
             "WARN",
             f"ollama_stream_client_disconnected provider={provider} model={model} "
@@ -14319,6 +14397,7 @@ def _ollama_stream_to_anthropic_sse(
     except Exception as exc:
         sse_trace_outcome = "error"
         sse_trace_error = f"{type(exc).__name__}: {exc}"
+        mark_pending_channel_delivery_failed(handler, f"ollama_stream_error:{type(exc).__name__}")
         router_log("ERROR", f"ollama_stream_error provider={provider} model={model} error={type(exc).__name__}: {exc}")
         write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
         try:
@@ -14521,6 +14600,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
             remember_channel_injected_tool_uses(original_body, message)
             message = prepend_anthropic_text(message, rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
             write_json(handler, message)
+            mark_pending_channel_delivery_success(handler, "ollama_collected_json")
         return
     # Non-streaming fallback
     data_bytes = json.dumps(req_body).encode("utf-8")
@@ -14614,6 +14694,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     remember_channel_injected_tool_uses(original_body, message)
     message = prepend_anthropic_text(message, rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
     write_json(handler, message)
+    mark_pending_channel_delivery_success(handler, "ollama_json")
 
 
 def openai_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -15443,14 +15524,19 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
                 input_bytes=req_bytes,
             )
             if stream_ok:
+                mark_pending_channel_delivery_success(handler, "openai_stream_message_stop")
                 write_router_activity("success", provider, model, tokens=req_tokens, bytes=req_bytes, stream=True)
+            else:
+                mark_pending_channel_delivery_failed(handler, "openai_stream_error")
         except RuntimeError as exc:
             msg = str(exc)
+            mark_pending_channel_delivery_failed(handler, f"openai_stream_runtime_error:{type(exc).__name__}")
             write_anthropic_stream_blocks(handler, [{"type": "text", "text": f"Upstream error: {msg}"}], index)
             write_anthropic_open_stream_stop(handler)
             return
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
+            mark_pending_channel_delivery_failed(handler, f"openai_stream_error:{type(exc).__name__}")
             write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
             write_anthropic_stream_blocks(handler, [{"type": "text", "text": f"Upstream error: {msg}"}], index)
             write_anthropic_open_stream_stop(handler)
@@ -15477,6 +15563,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
     remember_channel_injected_tool_uses(original_body, message)
     message = prepend_anthropic_text(message, notice)
     write_anthropic_message_response(handler, message, stream)
+    mark_pending_channel_delivery_success(handler, "openai_json")
 
 
 class RouterHandler(BaseHTTPRequestHandler):
@@ -15626,6 +15713,7 @@ class RouterHandler(BaseHTTPRequestHandler):
         body = body_with_pending_channel_messages(body)
         body = body_with_pending_channel_summaries(body)
         body = body_with_channel_tool_result_context(body)
+        begin_pending_channel_delivery(self, body)
         body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
         body = normalize_tool_choice_for_provider(provider, pcfg, body)
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
@@ -15749,6 +15837,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                             pass
                     self.wfile.write(raw_resp)
                     self.wfile.flush()
+                    mark_pending_channel_delivery_success(self, "anthropic_json")
                 commit_pending_channel_delivery_cursors(body, self)
             except urllib.error.HTTPError as e:
                 err = e.read()
@@ -26134,6 +26223,10 @@ def commit_pending_channel_delivery_cursors(
                 f"channel_delivery_cursor_deferred status={status if status is not None else '-'}",
             )
             return
+        if _channel_delivery_metadata(metadata) and not pending_channel_delivery_confirmed(handler):
+            reason = str(getattr(handler, "_claude_any_channel_delivery_reason", "unconfirmed") or "unconfirmed")
+            router_log("INFO", f"channel_delivery_cursor_deferred reason={reason}")
+            return
     message_cursor = _metadata_int(metadata, "claude_any_channel_cursor_last_id")
     summary_cursor = _metadata_int(metadata, "claude_any_channel_summary_cursor_last_id")
     _commit_channel_llm_cursor_if_newer(message_cursor)
@@ -26590,68 +26683,80 @@ def _inject_pending_channel_messages(
     *,
     web_chat_only: bool = False,
 ) -> int:
-    pending: list[dict[str, Any]] = []
-    for message in read_chat_messages(last_id, None, None, 100):
-        try:
-            message_id = int(message.get("id") or 0)
-            last_id = max(last_id, message_id)
-        except Exception:
-            continue
-        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
-        with _CHANNEL_LLM_DIRECT_LOCK:
-            direct_delivered = message_id in _CHANNEL_LLM_DIRECT_DELIVERED
-        if direct_delivered or meta.get("llm_direct_delivered"):
-            router_log(
-                "INFO",
-                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_delivered",
-            )
-            continue
-        if meta.get("llm_direct_pending"):
-            router_log(
-                "INFO",
-                f"channel_stdin_proxy_inject_fallback message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
-            )
-        if web_chat_only and not _channel_message_is_web_chat_request(message):
-            router_log(
-                "INFO",
-                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=not_web_chat",
-            )
-            continue
-        noise_reason = _channel_wake_message_noise_reason(message)
-        if noise_reason:
-            router_log(
-                "INFO",
-                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
-            )
-            continue
-        pending.append(message)
-        last_id = message_id
-        break
-    if pending:
-        if web_chat_only and all(_channel_message_is_web_chat_request(message) for message in pending):
-            prompt = format_channel_web_chat_wake_batch_prompt(pending)
-        else:
-            prompt = format_channel_wake_batch_prompt(pending)
-        submit_bytes = _channel_wake_enter_bytes(enter_bytes)
-        _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
-        with _CHANNEL_STDIN_WAKE_LOCK:
-            for message in pending:
-                try:
-                    _CHANNEL_STDIN_WAKE_DELIVERED.add(int(message.get("id") or 0))
-                except Exception:
+    with _CHANNEL_STDIN_INJECT_LOCK:
+        pending: list[dict[str, Any]] = []
+        for message in read_chat_messages(last_id, None, None, 100):
+            try:
+                message_id = int(message.get("id") or 0)
+                last_id = max(last_id, message_id)
+            except Exception:
+                continue
+            meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+            with _CHANNEL_LLM_DIRECT_LOCK:
+                direct_delivered = message_id in _CHANNEL_LLM_DIRECT_DELIVERED
+            if direct_delivered or meta.get("llm_direct_delivered"):
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_delivered",
+                )
+                continue
+            if meta.get("llm_direct_pending"):
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_inject_fallback message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
+                )
+            if web_chat_only and not _channel_message_is_web_chat_request(message):
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=not_web_chat",
+                )
+                continue
+            noise_reason = _channel_wake_message_noise_reason(message)
+            if noise_reason:
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
+                )
+                continue
+            with _CHANNEL_STDIN_WAKE_LOCK:
+                if message_id in _CHANNEL_STDIN_WAKE_DELIVERED:
+                    router_log(
+                        "INFO",
+                        f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=stdin_wake_delivered",
+                    )
                     continue
-            if len(_CHANNEL_STDIN_WAKE_DELIVERED) > 1000:
-                for old_id in sorted(_CHANNEL_STDIN_WAKE_DELIVERED)[:500]:
-                    _CHANNEL_STDIN_WAKE_DELIVERED.discard(old_id)
-        if not web_chat_only:
-            _commit_channel_llm_cursor_if_newer(last_id)
-        ids = ",".join(str(message.get("id") or "") for message in pending)
-        channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
-        router_log(
-            "INFO",
-            f"channel_stdin_proxy_injected count={len(pending)} message_ids={ids} channels={channels} enter={_channel_enter_label(submit_bytes)}",
-        )
-    return last_id
+                _CHANNEL_STDIN_WAKE_DELIVERED.add(message_id)
+                if len(_CHANNEL_STDIN_WAKE_DELIVERED) > 1000:
+                    for old_id in sorted(_CHANNEL_STDIN_WAKE_DELIVERED)[:500]:
+                        _CHANNEL_STDIN_WAKE_DELIVERED.discard(old_id)
+            pending.append(message)
+            last_id = message_id
+            break
+        if pending:
+            if web_chat_only and all(_channel_message_is_web_chat_request(message) for message in pending):
+                prompt = format_channel_web_chat_wake_batch_prompt(pending)
+            else:
+                prompt = format_channel_wake_batch_prompt(pending)
+            submit_bytes = _channel_wake_enter_bytes(enter_bytes)
+            try:
+                _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
+            except Exception:
+                with _CHANNEL_STDIN_WAKE_LOCK:
+                    for message in pending:
+                        try:
+                            _CHANNEL_STDIN_WAKE_DELIVERED.discard(int(message.get("id") or 0))
+                        except Exception:
+                            continue
+                raise
+            if not web_chat_only:
+                _commit_channel_llm_cursor_if_newer(last_id)
+            ids = ",".join(str(message.get("id") or "") for message in pending)
+            channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
+            router_log(
+                "INFO",
+                f"channel_stdin_proxy_injected count={len(pending)} message_ids={ids} channels={channels} enter={_channel_enter_label(submit_bytes)}",
+            )
+        return last_id
 
 
 def _inject_pending_channel_summaries(master_fd: int, enter_bytes: bytes | None = None) -> int:
