@@ -12520,25 +12520,6 @@ def router_client_connection_closed(handler: BaseHTTPRequestHandler) -> bool:
         return True
 
 
-def upstream_stream_poll_timeout_seconds(idle_timeout: float) -> float:
-    try:
-        idle = float(idle_timeout)
-    except Exception:
-        idle = 30.0
-    return max(0.2, min(1.0, idle))
-
-
-def upstream_read_timed_out(exc: BaseException) -> bool:
-    if isinstance(exc, TimeoutError):
-        return True
-    return "timed out" in f"{type(exc).__name__}: {exc}".lower()
-
-
-def upstream_read_timeout_poisoned(exc: BaseException) -> bool:
-    """Python's buffered HTTP reader can become unrecoverable after a socket timeout."""
-    return "cannot read from timed out object" in f"{type(exc).__name__}: {exc}".lower()
-
-
 def iter_upstream_lines_until_client_disconnect(
     handler: BaseHTTPRequestHandler,
     resp: Any,
@@ -12548,8 +12529,7 @@ def iter_upstream_lines_until_client_disconnect(
         idle = max(1.0, float(idle_timeout))
     except Exception:
         idle = 30.0
-    poll_timeout = upstream_stream_poll_timeout_seconds(idle)
-    set_upstream_stream_read_timeout(resp, poll_timeout)
+    set_upstream_stream_read_timeout(resp, idle)
     idle_deadline = time.monotonic() + idle
     while True:
         if router_client_connection_closed(handler):
@@ -12559,11 +12539,6 @@ def iter_upstream_lines_until_client_disconnect(
         except (TimeoutError, OSError) as exc:
             if router_client_connection_closed(handler):
                 raise UpstreamClientDisconnected("downstream client disconnected during upstream read") from exc
-            if upstream_read_timeout_poisoned(exc):
-                raise
-            if upstream_read_timed_out(exc) and time.monotonic() < idle_deadline:
-                time.sleep(poll_timeout)
-                continue
             raise
         if raw in (b"", ""):
             return
@@ -14605,7 +14580,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                 )
                 router_log("INFO", f"ollama_stream_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={req_tokens} bytes={req_bytes}")
                 resp = urllib.request.urlopen(req, timeout=ollama_request_timeout_seconds(pcfg))
-                set_upstream_stream_read_timeout(resp, upstream_stream_poll_timeout_seconds(stream_idle_timeout))
+                set_upstream_stream_read_timeout(resp, stream_idle_timeout)
                 learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
                 break
             except urllib.error.HTTPError as exc:

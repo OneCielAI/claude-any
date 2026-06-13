@@ -71,16 +71,17 @@ class UpstreamCancelTests(unittest.TestCase):
             with self.assertRaises(claude_any.UpstreamClientDisconnected):
                 list(claude_any.iter_upstream_lines_until_client_disconnect(handler, resp, 30.0))
 
-    def test_stream_iterator_sleeps_between_recoverable_timeouts(self):
+    def test_stream_iterator_treats_upstream_timeout_as_terminal(self):
         resp = FakeResponse([TimeoutError("timed out"), b'{"message":{"content":"ok"},"done":false}\n'])
         handler = FakeHandler(wfile=object())
 
         with mock.patch.object(claude_any, "router_client_connection_closed", return_value=False):
             with mock.patch.object(claude_any.time, "sleep") as sleep_mock:
-                lines = list(claude_any.iter_upstream_lines_until_client_disconnect(handler, resp, 30.0))
+                with self.assertRaises(TimeoutError):
+                    list(claude_any.iter_upstream_lines_until_client_disconnect(handler, resp, 30.0))
 
-        self.assertEqual(lines, [b'{"message":{"content":"ok"},"done":false}\n'])
-        sleep_mock.assert_called()
+        sleep_mock.assert_not_called()
+        self.assertEqual(resp.items, [b'{"message":{"content":"ok"},"done":false}\n'])
 
     def test_stream_iterator_does_not_spin_on_poisoned_timeout(self):
         resp = FakeResponse([OSError("cannot read from timed out object"), b"should-not-read\n"])
