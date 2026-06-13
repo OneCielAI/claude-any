@@ -1114,12 +1114,41 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("from=robert", prompt)
         self.assertIn("id=9", prompt)
         self.assertIn("please review the latest update", prompt)
-        self.assertNotIn("metadata=", prompt)
+        self.assertIn('metadata={"room_id":"room_phase1sim"}', prompt)
         self.assertIn("room_phase1sim", prompt)
         self.assertNotIn("send_message", prompt)
         self.assertNotIn("recipients='web'", prompt)
         self.assertNotIn("send_file", prompt)
         self.assertNotIn("\n", prompt)
+
+    def test_channel_wake_prompt_includes_small_event_metadata_only(self):
+        prompt = claude_any.format_channel_wake_prompt(
+            {
+                "id": 9,
+                "channel": "room",
+                "sender_id": "mcp-server",
+                "message": "New message from Kevin",
+                "meta": {
+                    "kind": "activity",
+                    "room_id": "room",
+                    "room_name": "Project Room",
+                    "message_id": "msg_123",
+                    "stream_id": "1781389494764-0",
+                    "mcp_json": {"params": {"content": "large raw payload"}},
+                    "reply_instruction": "web routing text",
+                    "api_key": "secret",
+                    "large": "x" * 500,
+                },
+            }
+        )
+        self.assertIn('"kind":"activity"', prompt)
+        self.assertIn('"message_id":"msg_123"', prompt)
+        self.assertIn('"stream_id":"1781389494764-0"', prompt)
+        self.assertIn('"room_name":"Project Room"', prompt)
+        self.assertNotIn("mcp_json", prompt)
+        self.assertNotIn("reply_instruction", prompt)
+        self.assertNotIn("secret", prompt)
+        self.assertNotIn("x" * 100, prompt)
 
     def test_channel_wake_prompt_adds_browser_reply_instructions_only_for_web_chat(self):
         prompt = claude_any.format_channel_wake_prompt(

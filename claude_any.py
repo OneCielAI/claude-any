@@ -24709,6 +24709,101 @@ def should_use_channel_screen_summary_proxy(
     )
 
 
+_CHANNEL_PROMPT_META_KEYS = (
+    "kind",
+    "type",
+    "event_type",
+    "eventType",
+    "status",
+    "mcp_server",
+    "mcp_method",
+    "room_name",
+    "room_label",
+    "room_id",
+    "room",
+    "channel",
+    "thread_id",
+    "parent_id",
+    "message_id",
+    "source_message_id",
+    "event_id",
+    "stream_id",
+    "sse_id",
+    "cursor",
+    "sequence",
+    "seq",
+    "assignment_id",
+    "poll_id",
+    "task_id",
+    "round_id",
+    "conversation_id",
+    "session_id",
+    "agent_id",
+    "agent_name",
+    "sender_id",
+    "sender",
+    "sender_name",
+    "author_id",
+    "author_name",
+    "recipient_id",
+    "recipient",
+    "recipient_name",
+    "mentioned_by",
+    "key",
+    "path",
+)
+
+
+def _channel_prompt_scalar(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or len(text) > 240:
+            return None
+        return text
+    if isinstance(value, list):
+        out: list[Any] = []
+        for item in value[:10]:
+            scalar = _channel_prompt_scalar(item)
+            if scalar is not None:
+                out.append(scalar)
+        if not out:
+            return None
+        try:
+            if len(json.dumps(out, ensure_ascii=False, separators=(",", ":"), default=str)) > 300:
+                return None
+        except Exception:
+            return None
+        return out
+    return None
+
+
+def _channel_prompt_metadata(message: dict[str, Any]) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    if not meta:
+        return ""
+    prompt_meta: dict[str, Any] = {}
+    for key in _CHANNEL_PROMPT_META_KEYS:
+        if key not in meta or _metadata_key_is_sensitive(key):
+            continue
+        value = _channel_prompt_scalar(meta.get(key))
+        if value is None:
+            continue
+        prompt_meta[key] = value
+    if not prompt_meta:
+        return ""
+    kept: dict[str, Any] = {}
+    for key, value in prompt_meta.items():
+        candidate = dict(kept)
+        candidate[key] = value
+        text = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(text) > 900:
+            continue
+        kept = candidate
+    return json.dumps(kept, ensure_ascii=False, separators=(",", ":"), default=str) if kept else ""
+
+
 def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     channel = str(message.get("channel") or "default")
     sender = str(message.get("sender_id") or "channel")
@@ -24722,6 +24817,9 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
         fields.append(f"id={mid}")
     if thread:
         fields.append(f"thread={thread}")
+    prompt_meta = _channel_prompt_metadata(message)
+    if prompt_meta:
+        fields.append(f"metadata={prompt_meta}")
     suffix = "If relevant to current work, respond or act now; otherwise keep working."
     if _channel_message_is_web_chat_request(message):
         suffix = (
@@ -24816,6 +24914,9 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
         fields = [f"id={mid}", f"room={room}", f"from={sender}"]
         if thread:
             fields.append(f"thread={thread}")
+        prompt_meta = _channel_prompt_metadata(message)
+        if prompt_meta:
+            fields.append(f"metadata={prompt_meta}")
         parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False))
     suffix = "If relevant to current work, respond or act now; otherwise keep working."
     if any(_channel_message_is_web_chat_request(message) for message in messages):
@@ -24848,6 +24949,9 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
             fields.append(f"to={_compact_json_for_prompt(recipients, max_chars=400)}")
         if thread:
             fields.append(f"thread={thread}")
+        prompt_meta = _channel_prompt_metadata(message)
+        if prompt_meta:
+            fields.append(f"metadata={prompt_meta}")
         parts.append(
             f"<< {channel} >> incoming channel message for the current agent.\n"
             f"<< 메시지 >>\n"
