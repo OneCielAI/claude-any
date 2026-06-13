@@ -4094,6 +4094,9 @@ def backfill_exit_plan_mode_allowed_prompts(body: dict[str, Any], tool_input: di
 
 def plan_mode_tool_name_for_emit(body: dict[str, Any], name: str, tool_input: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     active = plan_mode_active(body)
+    if name == "EnterPlanMode" and body_is_channel_prompt(body):
+        router_log("WARN", "dropped EnterPlanMode for external channel prompt")
+        return None, tool_input
     if name == "EnterPlanMode" and active:
         router_log("WARN", "dropped repeated EnterPlanMode while plan mode is active")
         return None, tool_input
@@ -4232,8 +4235,20 @@ def non_actionable_short_response(text: str) -> bool:
     return False
 
 
+def body_is_channel_prompt(body: dict[str, Any]) -> bool:
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    latest_text = latest_user_text(body)
+    return bool(
+        metadata.get("claude_any_channel_injected")
+        or latest_text.startswith("[claude-any channel inbox]")
+        or latest_text.startswith("[claude-any external channel message")
+    )
+
+
 def should_auto_enter_plan_mode(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
     if tool_calls:
+        return False
+    if body_is_channel_prompt(body):
         return False
     if ultracode_workflow_preferred(body):
         return False

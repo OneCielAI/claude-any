@@ -219,6 +219,76 @@ class ToolGuardTests(unittest.TestCase):
         self.assertEqual("", proc.stdout.strip())
         self.assertEqual("", proc.stderr.strip())
 
+    def test_enter_plan_pretooluse_denies_external_channel_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "session.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "[claude-any external channel message] "
+                                        "channel=ai-net-http room=room1 from=agent id=42 text=\"hello\"."
+                                    ),
+                                }
+                            ],
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            proc = self.run_guard(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "EnterPlanMode",
+                    "tool_input": {},
+                    "transcript_path": str(transcript),
+                },
+                {"CLAUDE_ANY_PROVIDER": "ollama-cloud"},
+            )
+
+        payload = json.loads(proc.stdout)
+        output = payload["hookSpecificOutput"]
+        self.assertEqual("deny", output["permissionDecision"])
+        self.assertIn("External channel messages", output["permissionDecisionReason"])
+
+    def test_enter_plan_pretooluse_denies_channel_inbox_prompt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            transcript = Path(tmp) / "session.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": "[claude-any channel inbox]\n<< ai-net-http >> incoming channel message.",
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            proc = self.run_guard(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "EnterPlanMode",
+                    "tool_input": {},
+                    "transcript_path": str(transcript),
+                },
+                {"CLAUDE_ANY_PROVIDER": "deepseek"},
+            )
+
+        payload = json.loads(proc.stdout)
+        output = payload["hookSpecificOutput"]
+        self.assertEqual("deny", output["permissionDecision"])
+        self.assertIn("External channel messages", output["permissionDecisionReason"])
+
 
 if __name__ == "__main__":
     unittest.main()

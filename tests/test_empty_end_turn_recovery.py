@@ -176,6 +176,38 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertIsNone(name)
         self.assertEqual({}, fixed)
 
+    def test_channel_inbox_runtime_drops_enter_plan_mode_emit(self):
+        body = body_with_tools(
+            "[claude-any channel inbox]\n<< ai-net-http >> incoming channel message for the current agent.",
+            ["EnterPlanMode", "TaskList"],
+        )
+        body["metadata"] = {"claude_any_channel_injected": True}
+
+        name, fixed = claude_any.plan_mode_tool_name_for_emit(body, "EnterPlanMode", {})
+
+        self.assertIsNone(name)
+        self.assertEqual({}, fixed)
+
+    def test_external_channel_runtime_drops_enter_plan_mode_emit(self):
+        body = body_with_tools(
+            "[claude-any external channel message] channel=ai-net-http room=room1 from=agent id=42 text=\"hello\".",
+            ["EnterPlanMode", "TaskList"],
+        )
+
+        name, fixed = claude_any.plan_mode_tool_name_for_emit(body, "EnterPlanMode", {})
+
+        self.assertIsNone(name)
+        self.assertEqual({}, fixed)
+
+    def test_channel_prompt_does_not_auto_synthesize_enter_plan_mode(self):
+        body = body_with_tools(
+            "[claude-any channel inbox]\n<< ai-net-http >> incoming channel message for the current agent.",
+            ["EnterPlanMode", "TaskList"],
+        )
+        body["metadata"] = {"claude_any_channel_injected": True}
+
+        self.assertFalse(claude_any.should_auto_enter_plan_mode(body, "", []))
+
     def test_empty_turn_without_tasklist_returns_visible_notice(self):
         body = body_with_tools("continue implementation", ["Read", "Edit"])
         data = {
