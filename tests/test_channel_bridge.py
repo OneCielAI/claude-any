@@ -208,6 +208,82 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(42, saved["id"])
         self.assertEqual([41, 42], [row["id"] for row in rows])
 
+    def test_append_chat_message_dedupes_mcp_notification_with_stable_cursor(self):
+        payload = {
+            "message": "same notification",
+            "channel": "room",
+            "sender_id": "mcp-server",
+            "kind": "channel",
+            "meta": {
+                "mcp_server": "mcp-server",
+                "mcp_method": "notifications/claude/channel",
+                "cursor": "1781319043580-0",
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                first = claude_any.append_chat_message(payload)
+                second = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(1, first["id"])
+        self.assertEqual(1, second["id"])
+        self.assertTrue(second["_claude_any_duplicate"])
+        self.assertEqual(1, len(rows))
+
+    def test_append_chat_message_dedupes_recent_mcp_notification_without_stable_id(self):
+        payload = {
+            "message": "board updated",
+            "channel": "room",
+            "sender_id": "mcp-server",
+            "kind": "channel",
+            "meta": {
+                "mcp_server": "mcp-server",
+                "mcp_method": "notifications/claude/channel",
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                first = claude_any.append_chat_message(payload)
+                second = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(1, first["id"])
+        self.assertEqual(1, second["id"])
+        self.assertTrue(second["_claude_any_duplicate"])
+        self.assertEqual(1, len(rows))
+
+    def test_append_chat_message_does_not_dedupe_plain_user_messages(self):
+        payload = {"message": "repeat is valid", "channel": "web-chat", "sender_id": "web-user"}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                first = claude_any.append_chat_message(payload)
+                second = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(1, first["id"])
+        self.assertEqual(2, second["id"])
+        self.assertNotIn("_claude_any_duplicate", second)
+        self.assertEqual(2, len(rows))
+
     def test_mcp_endpoint_event_initializes_sse_session(self):
         name = "unit-mcp"
         original = dict(claude_any._CHANNEL_SSE_CONNECTIONS)
@@ -1909,6 +1985,11 @@ class ChannelBridgeTests(unittest.TestCase):
                 {"message": "x", "sender_id": "mcp-claude-any-router", "meta": {"sse_source": "mcp-claude-any-router"}}
             ),
         )
+
+    def test_channel_skip_reason_rejects_system_event_metadata(self):
+        message = {"message": "Connected", "meta": {"eventType": "system"}}
+        self.assertEqual("system", claude_any._channel_llm_message_skip_reason(message))
+        self.assertEqual("system", claude_any._channel_mcp_message_skip_reason(message))
 
     def test_channel_direct_llm_worker_uses_router_without_hidden_print_mode(self):
         message = {

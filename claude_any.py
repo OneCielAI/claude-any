@@ -452,6 +452,8 @@ SSE_TRACE_MAX_BYTES = 2 * 1024 * 1024
 SSE_TRACE_EVENT_LIMIT = 240
 SSE_TRACE_PAYLOAD_LIMIT = 4_000
 CHAT_MESSAGES_MAX_BYTES = 20_000_000
+CHAT_MESSAGE_DEDUPE_SCAN_LIMIT = 500
+CHAT_MESSAGE_FALLBACK_DEDUPE_TTL_SECONDS = 30.0
 DEFAULT_REQUEST_TIMEOUT_MS = 300000
 _LOG_LEVEL_CACHE: dict[str, Any] = {"value": None, "checked_at": 0.0, "file_mtime": 0.0}
 _RATE_LIMIT_LOCK = threading.Lock()
@@ -3010,6 +3012,10 @@ def _status_channel_message_skip_reason(message):
         normalized_delivery = {item.strip().lower() for item in delivery}
         if not ({"all", "*", "llm"} & normalized_delivery):
             return "delivery_not_llm"
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or meta.get("event") or meta.get("status") or "").strip().lower()
+    if meta_kind in {"connection", "connected", "disconnect", "disconnected", "endpoint", "heartbeat", "initialized", "init", "keepalive", "ping", "pong", "ready", "status", "system"}:
+        return meta_kind
     body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip().lower()
     kind = str(message.get("kind") or "").strip().lower()
     if not body:
@@ -3018,7 +3024,6 @@ def _status_channel_message_skip_reason(message):
         return kind
     if re.fullmatch(r"[a-z0-9_.:-]{1,80}\.(ws|sse)\.connected", body):
         return "transport_connected"
-    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
     if meta.get("llm_direct_delivered"):
         return "llm_direct_delivered"
     return ""
@@ -8749,6 +8754,90 @@ def read_chat_messages_before(before_id: int = 0, channel: str | None = None, re
     return messages
 
 
+def _chat_message_payload_hash(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _chat_message_time_seconds(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return time.mktime(time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 0.0
+
+
+def _chat_message_recent_rows_locked(limit: int = CHAT_MESSAGE_DEDUPE_SCAN_LIMIT) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if limit <= 0 or not CHAT_MESSAGES_PATH.exists():
+        return rows
+    try:
+        with CHAT_MESSAGES_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(item, dict):
+                    rows.append(item)
+                    if len(rows) > limit:
+                        rows = rows[-limit:]
+    except Exception as exc:
+        router_log("WARN", f"chat duplicate scan failed: {exc}")
+    return rows
+
+
+def _chat_message_stable_dedupe_key(message: dict[str, Any]) -> tuple[str, ...] | None:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    source = str(meta.get("mcp_server") or meta.get("sse_source") or meta.get("source") or message.get("sender_id") or "").strip()
+    method = str(meta.get("mcp_method") or "").strip()
+    channel = str(message.get("channel") or meta.get("room_id") or meta.get("room") or meta.get("channel") or "").strip()
+    kind = str(message.get("kind") or meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or "").strip()
+    body_hash = _chat_message_payload_hash(message.get("message"))
+    for key in ("cursor", "stream_id", "sse_id", "event_id", "message_id", "source_message_id", "sequence", "seq", "rpc_id"):
+        value = meta.get(key)
+        if value is None:
+            continue
+        stable_value = str(value).strip()
+        if stable_value:
+            return ("stable", source, method, channel, kind, key, stable_value, body_hash)
+    return None
+
+
+def _chat_message_fallback_dedupe_key(message: dict[str, Any]) -> tuple[str, ...] | None:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    method = str(meta.get("mcp_method") or "").strip()
+    if not method.startswith("notifications/"):
+        return None
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
+    if not body:
+        return None
+    source = str(meta.get("mcp_server") or meta.get("sse_source") or meta.get("source") or message.get("sender_id") or "").strip()
+    channel = str(message.get("channel") or meta.get("room_id") or meta.get("room") or meta.get("channel") or "").strip()
+    sender = str(message.get("sender_id") or meta.get("sender_id") or meta.get("agent_id") or "").strip()
+    kind = str(message.get("kind") or meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or "").strip()
+    return ("fallback", source, method, channel, sender, kind, _chat_message_payload_hash(body))
+
+
+def _chat_message_duplicate_locked(message: dict[str, Any]) -> dict[str, Any] | None:
+    stable_key = _chat_message_stable_dedupe_key(message)
+    fallback_key = _chat_message_fallback_dedupe_key(message)
+    if not stable_key and not fallback_key:
+        return None
+    now = time.time()
+    for row in reversed(_chat_message_recent_rows_locked()):
+        if stable_key and _chat_message_stable_dedupe_key(row) == stable_key:
+            return row
+        if not fallback_key or _chat_message_fallback_dedupe_key(row) != fallback_key:
+            continue
+        row_time = _chat_message_time_seconds(row.get("time"))
+        if row_time > 0 and now - row_time <= CHAT_MESSAGE_FALLBACK_DEDUPE_TTL_SECONDS:
+            return row
+    return None
+
+
 def append_chat_message(payload: dict[str, Any]) -> dict[str, Any]:
     global _CHAT_NEXT_ID
     with _CHAT_CONDITION:
@@ -8775,6 +8864,16 @@ def append_chat_message(payload: dict[str, Any]) -> dict[str, Any]:
                 message["visibility"] = str(payload.get("visibility") or "user")
             if payload.get("delivery") is not None:
                 message["delivery"] = _as_string_list(payload.get("delivery"))
+            duplicate = _chat_message_duplicate_locked(message)
+            if duplicate:
+                existing_id = duplicate.get("id")
+                returned = dict(duplicate)
+                returned["_claude_any_duplicate"] = True
+                router_log(
+                    "INFO",
+                    f"chat_message_skipped_duplicate existing_id={existing_id} channel={message.get('channel')} kind={message.get('kind')}",
+                )
+                return returned
             with CHAT_MESSAGES_PATH.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
         _CHAT_CONDITION.notify_all()
@@ -8888,6 +8987,7 @@ def _event_meta_from_sources(*sources: Any) -> dict[str, Any]:
             "target",
             "type",
             "event_type",
+            "eventType",
             "kind",
             "timestamp",
             "created_at",
@@ -8957,6 +9057,7 @@ _CHANNEL_CONTROL_KINDS = {
     "pong",
     "ready",
     "status",
+    "system",
 }
 
 
@@ -8964,7 +9065,7 @@ def _channel_event_is_user_visible(kind: str, method: str, event_name: str, cont
     normalized_kind = str(kind or "").strip().lower().replace("_", ".").replace("/", ".")
     normalized_method = str(method or "").strip().lower()
     normalized_event = str(event_name or "").strip().lower()
-    meta_type = str(meta.get("type") or meta.get("event_type") or meta.get("kind") or meta.get("status") or "").strip().lower()
+    meta_type = str(meta.get("type") or meta.get("event_type") or meta.get("eventType") or meta.get("kind") or meta.get("status") or "").strip().lower()
     if normalized_kind in _CHANNEL_CONTROL_KINDS or normalized_event in _CHANNEL_CONTROL_KINDS or meta_type in _CHANNEL_CONTROL_KINDS:
         return False
     if meta.get("jsonrpc") is not None:
@@ -9462,6 +9563,12 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], eve
         return
     payload = _mark_channel_payload_direct_llm_pending(payload)
     saved = append_chat_message(payload)
+    if saved.get("_claude_any_duplicate"):
+        router_log(
+            "INFO",
+            f"channel_sse_message_skipped_duplicate name={name} event={event_name or 'message'} existing_id={saved.get('id')} channel={saved.get('channel')}",
+        )
+        return
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _CHANNEL_SSE_LOCK:
         state = _CHANNEL_SSE_CONNECTIONS.get(name)
@@ -10221,6 +10328,9 @@ def _channel_mcp_message_skip_reason(message: dict[str, Any]) -> str | None:
     if visibility in {"hidden", "internal", "transport", "control", "system"}:
         return f"visibility_{visibility}"
     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or meta.get("event") or meta.get("status") or "").strip().lower()
+    if meta_kind in _CHANNEL_CONTROL_KINDS:
+        return meta_kind
     if meta.get("llm_direct_pending"):
         return "llm_direct_pending"
     recipients = {item.strip().lower() for item in _as_string_list(message.get("recipients"))}
@@ -24310,7 +24420,7 @@ def _channel_llm_message_skip_reason(message: dict[str, Any]) -> str | None:
     sender = str(message.get("sender_id") or meta.get("sender_id") or "").strip().lower()
     if sse_source in _NATIVE_ROUTER_CHANNEL_NAMES or sender in _NATIVE_ROUTER_CHANNEL_NAMES:
         return "native_router_self_echo"
-    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event") or meta.get("status") or "").strip().lower()
+    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or meta.get("event") or meta.get("status") or "").strip().lower()
     if meta_kind in _CHANNEL_CONTROL_KINDS:
         return meta_kind
     return None
@@ -26748,6 +26858,12 @@ def _mcp_proxy_observe_json_message(server_name: str, payload: Any, *, schedule_
         if schedule_direct:
             chat_payload = _mark_channel_payload_direct_llm_pending(chat_payload)
         saved = append_chat_message(chat_payload)
+        if saved.get("_claude_any_duplicate"):
+            router_log(
+                "INFO",
+                f"mcp_proxy_notification_skipped_duplicate_persisted server={server_name} method={payload.get('method')} existing_id={saved.get('id')}",
+            )
+            return saved
         router_log(
             "INFO",
             f"mcp_proxy_notification server={server_name} method={payload.get('method')} message_id={saved.get('id')}",
