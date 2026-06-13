@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import errno
 import getpass
 import hashlib
 import html as html_lib
@@ -7459,6 +7460,32 @@ def write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> 
     handler.wfile.write(body)
 
 
+CLIENT_DISCONNECT_ERRNOS = {
+    errno.EPIPE,
+    errno.ECONNRESET,
+    getattr(errno, "ECONNABORTED", errno.ECONNRESET),
+}
+
+
+def is_client_disconnect_error(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    if isinstance(exc, OSError):
+        return getattr(exc, "errno", None) in CLIENT_DISCONNECT_ERRNOS
+    return False
+
+
+def try_write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> bool:
+    try:
+        write_json(handler, obj, status)
+        return True
+    except Exception as exc:
+        if is_client_disconnect_error(exc):
+            router_log("WARN", f"write_json_client_disconnected status={status} error={type(exc).__name__}: {exc}")
+            return False
+        raise
+
+
 def _handler_response_status(handler: BaseHTTPRequestHandler) -> int | None:
     status = getattr(handler, "_claude_any_response_status", None)
     try:
@@ -12507,6 +12534,11 @@ def upstream_read_timed_out(exc: BaseException) -> bool:
     return "timed out" in f"{type(exc).__name__}: {exc}".lower()
 
 
+def upstream_read_timeout_poisoned(exc: BaseException) -> bool:
+    """Python's buffered HTTP reader can become unrecoverable after a socket timeout."""
+    return "cannot read from timed out object" in f"{type(exc).__name__}: {exc}".lower()
+
+
 def iter_upstream_lines_until_client_disconnect(
     handler: BaseHTTPRequestHandler,
     resp: Any,
@@ -12527,7 +12559,10 @@ def iter_upstream_lines_until_client_disconnect(
         except (TimeoutError, OSError) as exc:
             if router_client_connection_closed(handler):
                 raise UpstreamClientDisconnected("downstream client disconnected during upstream read") from exc
+            if upstream_read_timeout_poisoned(exc):
+                raise
             if upstream_read_timed_out(exc) and time.monotonic() < idle_deadline:
+                time.sleep(poll_timeout)
                 continue
             raise
         if raw in (b"", ""):
@@ -14470,22 +14505,16 @@ def _ollama_stream_to_anthropic_sse(
         router_log("ERROR", f"ollama_stream_error provider={provider} model={model} error={type(exc).__name__}: {exc}")
         write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
         try:
-            ensure_message_started()
-            if word_chunking and text_started and text_buffer:
-                to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
-                if to_flush and text_index is not None:
-                    emit("content_block_delta", {"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": to_flush}})
-            if text_started and text_index is not None and not text_stopped:
-                emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
-            for tool_index in tool_indices:
-                if tool_index not in stopped_tool_indices:
-                    emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
-            if not text_started and not tool_indices:
-                error_index = next_content_index
-                next_content_index += 1
-                emit_text_block(error_index, "")
-            emit("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": max(1, output_tokens or len(text_so_far) // 4)}})
-            emit("message_stop", {"type": "message_stop"})
+            emit(
+                "error",
+                {
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": f"Upstream stream error: {type(exc).__name__}: {exc}",
+                    },
+                },
+            )
         except Exception:
             pass
     finally:
@@ -15920,8 +15949,30 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(err)
         except Exception as exc:
+            if is_client_disconnect_error(exc):
+                mark_pending_channel_delivery_failed(self, f"client_disconnected:{type(exc).__name__}")
+                write_router_activity(
+                    "cancel",
+                    provider,
+                    str(body.get("model") or ""),
+                    error=type(exc).__name__,
+                    stream=bool(body.get("stream", True)),
+                )
+                router_log(
+                    "WARN",
+                    f"router_client_disconnected provider={provider} model={body.get('model')} error={type(exc).__name__}: {exc}",
+                )
+                EVENT_BUS.publish(
+                    level="warning",
+                    category="router.client_disconnected",
+                    message=f"client disconnected: {type(exc).__name__}",
+                    request_id=request_id,
+                    provider=provider,
+                    model=str(body.get("model") or ""),
+                )
+                return
             EVENT_BUS.publish(level="error", category="router.error", message=str(exc), request_id=request_id, provider=provider, model=str(body.get("model") or ""), data={"error_type": type(exc).__name__})
-            write_json(self, {"type": "error", "error": {"type": "api_error", "message": str(exc)}}, 500)
+            try_write_json(self, {"type": "error", "error": {"type": "api_error", "message": str(exc)}}, 500)
 
 
 def serve(_: argparse.Namespace) -> None:
