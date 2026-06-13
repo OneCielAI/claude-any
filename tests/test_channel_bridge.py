@@ -1513,6 +1513,34 @@ class ChannelBridgeTests(unittest.TestCase):
             with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
                 self.assertTrue(claude_any._channel_stdin_wake_completed(9))
 
+    def test_channel_stdin_rechecks_pending_after_inflight_completion_without_marker_change(self):
+        marker = (123.0, 456)
+
+        self.assertTrue(
+            claude_any._channel_stdin_should_check_pending(
+                marker,
+                marker,
+                force_recheck=True,
+                channel_inflight_id=None,
+            )
+        )
+        self.assertFalse(
+            claude_any._channel_stdin_should_check_pending(
+                marker,
+                marker,
+                force_recheck=False,
+                channel_inflight_id=None,
+            )
+        )
+        self.assertFalse(
+            claude_any._channel_stdin_should_check_pending(
+                marker,
+                marker,
+                force_recheck=True,
+                channel_inflight_id=3807,
+            )
+        )
+
     def test_inject_pending_channel_messages_skips_direct_delivered_messages(self):
         messages = [
             {

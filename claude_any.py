@@ -26899,6 +26899,17 @@ def _channel_stdin_wake_completed(message_id: int) -> bool:
     )
 
 
+def _channel_stdin_should_check_pending(
+    marker: tuple[float, int],
+    last_marker: tuple[float, int],
+    force_recheck: bool,
+    channel_inflight_id: int | None,
+) -> bool:
+    if channel_inflight_id is not None:
+        return False
+    return force_recheck or marker != last_marker
+
+
 def _inject_pending_channel_messages(
     master_fd: int,
     last_id: int,
@@ -27132,6 +27143,7 @@ def subprocess_call_with_channel_wake_proxy(
     channel_inflight_id: int | None = None
     channel_inflight_cursor: int | None = None
     channel_inflight_logged_at = 0.0
+    channel_pending_recheck = False
     channel_enter_bytes = _channel_wake_enter_bytes()
     router_log(
         "INFO",
@@ -27190,6 +27202,7 @@ def subprocess_call_with_channel_wake_proxy(
                     )
                     channel_inflight_id = None
                     channel_inflight_cursor = None
+                    channel_pending_recheck = True
                 elif now - channel_inflight_logged_at >= 30.0:
                     channel_inflight_logged_at = now
                     router_log(
@@ -27199,8 +27212,15 @@ def subprocess_call_with_channel_wake_proxy(
             if now - last_channel_poll >= 0.5:
                 last_channel_poll = now
                 marker = _chat_messages_file_marker()
-                if inject_channel_messages and marker != last_channel_marker and channel_inflight_id is None:
-                    last_channel_marker = marker
+                if inject_channel_messages and _channel_stdin_should_check_pending(
+                    marker,
+                    last_channel_marker,
+                    channel_pending_recheck,
+                    channel_inflight_id,
+                ):
+                    if marker != last_channel_marker:
+                        last_channel_marker = marker
+                    channel_pending_recheck = False
                     last_id = max(last_id, ensure_channel_llm_delivery_cursor_initialized())
                     injected_ids: list[int] = []
                     last_id = _inject_pending_channel_messages(
