@@ -26522,6 +26522,8 @@ def _inject_pending_channel_messages(
             if len(_CHANNEL_STDIN_WAKE_DELIVERED) > 1000:
                 for old_id in sorted(_CHANNEL_STDIN_WAKE_DELIVERED)[:500]:
                     _CHANNEL_STDIN_WAKE_DELIVERED.discard(old_id)
+        if not web_chat_only:
+            _commit_channel_llm_cursor_if_newer(last_id)
         ids = ",".join(str(message.get("id") or "") for message in pending)
         channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
         router_log(

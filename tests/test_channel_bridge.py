@@ -1254,10 +1254,12 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
             mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
             mock.patch.object(claude_any, "router_log"),
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 1)
         self.assertEqual(2, last_id)
+        commit_cursor.assert_called_once_with(2)
         self.assertEqual(2, write_all.call_count)
         self.assertIn(b"wake up", write_all.call_args_list[0].args[1])
         self.assertTrue(write_all.call_args_list[0].args[1].startswith(b"\x15"))
@@ -1267,6 +1269,7 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_write_fd_all") as write_all_cr,
             mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer"),
             mock.patch.object(claude_any, "router_log"),
         ):
             claude_any._inject_pending_channel_messages(99, 1, b"\r")
@@ -1283,10 +1286,12 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
             mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0)
         self.assertEqual(2, last_id)
+        commit_cursor.assert_called_once_with(2)
         payload = write_all.call_args_list[0].args[1]
         self.assertIn(b"external channel message", payload)
         self.assertIn(b"hello Sarah", payload)
@@ -1313,10 +1318,12 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
             mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0, web_chat_only=True)
         self.assertEqual(3, last_id)
+        commit_cursor.assert_not_called()
         payload = write_all.call_args_list[0].args[1]
         self.assertIn("마지막 작업 요약".encode("utf-8"), payload)
         self.assertIn(b"claude-any web chat", payload)
@@ -1339,10 +1346,12 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
             mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0)
         self.assertEqual(4, last_id)
+        commit_cursor.assert_called_once_with(4)
         self.assertEqual(2, write_all.call_count)
         self.assertIn(b"New message from Sarah", write_all.call_args_list[0].args[1])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
@@ -1364,12 +1373,14 @@ class ChannelBridgeTests(unittest.TestCase):
             with (
                 mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
                 mock.patch.object(claude_any, "_write_fd_all") as write_all,
+                mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
                 mock.patch.object(claude_any, "router_log") as router_log,
             ):
                 last_id = claude_any._inject_pending_channel_messages(99, 0)
         finally:
             claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
         self.assertEqual(4, last_id)
+        commit_cursor.assert_not_called()
         write_all.assert_not_called()
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("reason=llm_direct_delivered" in item for item in log_messages))
