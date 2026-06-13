@@ -1089,6 +1089,9 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("DM label", prompt)
         self.assertIn("현재 에이전트가 수신자가 아니라고 결론내리지 마세요", prompt)
         self.assertIn("자동 회신 루프", prompt)
+        self.assertNotIn("claude-any-router send_message", prompt)
+        self.assertNotIn("recipients='web'", prompt)
+        self.assertNotIn("웹 채팅 요청", prompt)
 
     def test_reply_action_prompt_warns_against_dm_label_recipient_misread(self):
         prompt = claude_any._channel_direct_reply_action_prompt("I am not the recipient.")
@@ -1113,7 +1116,37 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("please review the latest update", prompt)
         self.assertNotIn("metadata=", prompt)
         self.assertIn("room_phase1sim", prompt)
+        self.assertNotIn("send_message", prompt)
+        self.assertNotIn("recipients='web'", prompt)
+        self.assertNotIn("send_file", prompt)
         self.assertNotIn("\n", prompt)
+
+    def test_channel_wake_prompt_adds_browser_reply_instructions_only_for_web_chat(self):
+        prompt = claude_any.format_channel_wake_prompt(
+            {
+                "id": 10,
+                "channel": "web-chat-session",
+                "sender_id": "web-user",
+                "thread_id": "thread-1",
+                "message": "현재상태는",
+                "kind": "web_chat",
+                "meta": {"source": "claude-any-web-chat", "reply_channel": "web-chat-session"},
+            }
+        )
+        self.assertIn("send_message", prompt)
+        self.assertIn("recipients='web'", prompt)
+        self.assertIn("send_file", prompt)
+
+    def test_channel_wake_batch_omits_browser_reply_instructions_without_web_chat(self):
+        prompt = claude_any.format_channel_wake_batch_prompt(
+            [
+                {"id": 1, "channel": "room", "sender_id": "agent-a", "message": "one", "meta": {}},
+                {"id": 2, "channel": "room", "sender_id": "agent-b", "message": "two", "meta": {}},
+            ]
+        )
+        self.assertNotIn("send_message", prompt)
+        self.assertNotIn("recipients='web'", prompt)
+        self.assertNotIn("send_file", prompt)
 
     def test_web_chat_wake_prompt_is_compact_and_omits_raw_metadata(self):
         prompt = claude_any.format_channel_web_chat_wake_batch_prompt(
@@ -1425,6 +1458,60 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual(7, last_id)
         self.assertEqual(2, write_all.call_count)
         commit_cursor.assert_called_once_with(7)
+
+    def test_inject_pending_channel_messages_can_defer_cursor_commit(self):
+        messages = [
+            {
+                "id": 8,
+                "channel": "room",
+                "sender_id": "agent",
+                "message": "wake up later",
+                "meta": {},
+            }
+        ]
+        injected: list[int] = []
+        with (
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_write_fd_all"),
+            mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            last_id = claude_any._inject_pending_channel_messages(
+                99,
+                7,
+                commit_cursor=False,
+                injected_message_ids=injected,
+            )
+
+        self.assertEqual(8, last_id)
+        self.assertEqual([8], injected)
+        commit_cursor.assert_not_called()
+
+    def test_channel_stdin_wake_completed_requires_assistant_after_prompt(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "user", "message": {"content": "id=9 text=\"hello\""}}),
+                        json.dumps({"type": "queue-operation", "operation": "enqueue"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertFalse(claude_any._channel_stdin_wake_completed(9))
+
+            transcript.write_text(
+                transcript.read_text(encoding="utf-8")
+                + json.dumps({"type": "assistant", "message": {"content": []}})
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertTrue(claude_any._channel_stdin_wake_completed(9))
 
     def test_inject_pending_channel_messages_skips_direct_delivered_messages(self):
         messages = [
@@ -1800,6 +1887,32 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn('to=["agent_n3wy9gfjmcil"]', prompt)
         self.assertIn("message_id/source_message_id", prompt)
         self.assertIn("after_id/cursor", prompt)
+        self.assertNotIn("claude-any-router send_message", prompt)
+        self.assertNotIn("recipients='web'", prompt)
+        self.assertNotIn("웹 채팅 요청", prompt)
+
+    def test_channel_llm_prompt_adds_browser_reply_instructions_only_for_web_chat(self):
+        prompt = claude_any.format_channel_llm_batch_prompt(
+            [
+                {
+                    "id": 220,
+                    "channel": "web-chat-session",
+                    "sender_id": "web-user",
+                    "recipients": ["agent"],
+                    "message": "현재 작업 상태를 알려줘",
+                    "kind": "web_chat",
+                    "meta": {
+                        "source": "claude-any-web-chat",
+                        "reply_channel": "web-chat-session",
+                        "reply_recipient": "web",
+                    },
+                }
+            ]
+        )
+        self.assertIn("claude-any-router send_message", prompt)
+        self.assertIn("recipients='web'", prompt)
+        self.assertIn("웹 채팅 요청", prompt)
+        self.assertIn("현재 작업 상태를 알려줘", prompt)
 
     def test_channel_tool_result_context_is_injected_for_remembered_tool_use(self):
         claude_any._CHANNEL_LLM_TOOL_CONTEXT.clear()
@@ -2078,7 +2191,7 @@ class ChannelBridgeTests(unittest.TestCase):
         finally:
             claude_any._CHANNEL_STDIN_WAKE_DELIVERED.clear()
         self.assertIs(out, body)
-        write_cursor.assert_called_with(3)
+        write_cursor.assert_not_called()
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("stdin_wake_delivered" in item for item in log_messages))
 
@@ -2099,7 +2212,7 @@ class ChannelBridgeTests(unittest.TestCase):
         finally:
             claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.clear()
         self.assertIs(out, body)
-        write_cursor.assert_called_with(3)
+        write_cursor.assert_not_called()
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("llm_direct_inflight" in item for item in log_messages))
 

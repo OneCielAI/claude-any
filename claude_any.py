@@ -14505,16 +14505,26 @@ def _ollama_stream_to_anthropic_sse(
         router_log("ERROR", f"ollama_stream_error provider={provider} model={model} error={type(exc).__name__}: {exc}")
         write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
         try:
+            ensure_message_started()
+            if text_started and not text_stopped:
+                emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
+            if not text_started and not tool_indices:
+                error_index = next_content_index
+                next_content_index += 1
+                emit_text_block(error_index, f"Upstream stream error: {type(exc).__name__}: {exc}")
+            for tool_index in tool_indices:
+                if tool_index not in stopped_tool_indices:
+                    emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
+                    stopped_tool_indices.add(tool_index)
             emit(
-                "error",
+                "message_delta",
                 {
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": f"Upstream stream error: {type(exc).__name__}: {exc}",
-                    },
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": output_tokens or 1},
                 },
             )
+            emit("message_stop", {"type": "message_stop"})
         except Exception:
             pass
     finally:
@@ -24739,13 +24749,19 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
         fields.append(f"id={mid}")
     if thread:
         fields.append(f"thread={thread}")
+    suffix = "If relevant to current work, respond or act now; otherwise keep working."
+    if _channel_message_is_web_chat_request(message):
+        suffix = (
+            "Answer back through the claude-any-router send_message tool on the same channel/thread "
+            "with recipients='web' and delivery=['web']; use send_file when returning a file attachment. "
+            + suffix
+        )
     return (
         "[claude-any external channel message] "
         + " ".join(fields)
         + f" text={json.dumps(body, ensure_ascii=False)}"
         + ". "
-        + "If this is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']; use send_file when returning a file attachment. "
-        + "If relevant to current work, respond or act now; otherwise keep working."
+        + suffix
     )
 
 
@@ -24828,11 +24844,18 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
         if thread:
             fields.append(f"thread={thread}")
         parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False))
+    suffix = "If relevant to current work, respond or act now; otherwise keep working."
+    if any(_channel_message_is_web_chat_request(message) for message in messages):
+        suffix = (
+            "For claude-any-web-chat item(s), answer back through the claude-any-router send_message tool "
+            "on the same channel/thread with recipients='web' and delivery=['web']; use send_file when returning a file attachment. "
+            + suffix
+        )
     return (
         f"[claude-any external channel messages] {len(messages)} new messages: "
         + " ; ".join(parts)
-        + ". If any item is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']. "
-        + "If relevant to current work, respond or act now; otherwise keep working."
+        + ". "
+        + suffix
     )
 
 
@@ -24857,6 +24880,12 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
             f"<< 메시지 >>\n"
             + " ".join(fields)
             + f"\ntext={json.dumps(body, ensure_ascii=False)}"
+        )
+    web_chat_instructions = ""
+    if any(_channel_message_is_web_chat_request(message) for message in messages):
+        web_chat_instructions = (
+            "메시지 metadata source가 claude-any-web-chat 이거나 reply_channel/reply_recipient가 있으면, 답변 내용은 반드시 사용 가능한 claude-any-router send_message 계열 도구로 같은 channel/thread_id에 recipients='web', delivery=['web']로 보내세요. "
+            "웹 채팅 요청도 현재 Claude Code 세션의 기존 Read/Bash/Edit/MCP 도구를 사용할 수 있는 실제 작업 요청입니다. "
         )
     return (
         "[claude-any channel inbox]\n"
@@ -24883,8 +24912,8 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         "'진행하겠습니다', '착수합니다', '보고하겠습니다', '결과를 공유하겠습니다', "
         "'Let me send...', 'I will reply...', 'I'll respond...'처럼 미래 행동을 약속하는 말만 남기고 턴을 끝내지 마세요. "
         "그런 말을 할 상황이면 같은 턴에서 필요한 조사/도구 호출/채널 보고까지 수행하고, 수행할 수 없으면 구체적 차단 사유를 보고하세요. "
-        "메시지 metadata source가 claude-any-web-chat 이거나 reply_channel/reply_recipient가 있으면, 답변 내용은 반드시 사용 가능한 claude-any-router send_message 계열 도구로 같은 channel/thread_id에 recipients='web', delivery=['web']로 보내세요. "
-        "웹 채팅 요청도 현재 Claude Code 세션의 기존 Read/Bash/Edit/MCP 도구를 사용할 수 있는 실제 작업 요청입니다. "
+        + web_chat_instructions
+        +
         "다음 응답에는 사용자가 화면에서 볼 수 있도록 수신 메시지 요약과 수행한 처리 또는 필요한 다음 조치를 간단히 보여주세요. "
         "도구를 호출했다면 tool_result 후속 턴에서 그 결과를 LLM이 다시 검토한 뒤 사용자에게 요약하고, 필요한 경우 후속 답장/작업까지 완료하세요.\n\n"
         + "\n\n".join(parts)
@@ -26637,20 +26666,17 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
         max_seen = last_id
         for message in read_chat_messages(last_id, None, None, 100):
             try:
-                max_seen = max(max_seen, int(message.get("id") or 0))
+                message_id = int(message.get("id") or 0)
             except Exception:
                 continue
             skip_reason = _channel_llm_message_skip_reason(message)
             if skip_reason:
+                max_seen = max(max_seen, message_id)
                 router_log(
                     "INFO",
                     f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
                 )
                 continue
-            try:
-                message_id = int(message.get("id") or 0)
-            except Exception:
-                message_id = 0
             with _CHANNEL_LLM_DIRECT_LOCK:
                 direct_inflight = message_id in _CHANNEL_LLM_DIRECT_INFLIGHT
                 direct_delivered = message_id in _CHANNEL_LLM_DIRECT_DELIVERED
@@ -26666,6 +26692,8 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                     "INFO",
                     f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={reason}",
                 )
+                if direct_delivered or persisted_direct_delivered:
+                    max_seen = max(max_seen, message_id)
                 continue
             if meta.get("llm_direct_pending"):
                 router_log(
@@ -26806,12 +26834,79 @@ def _write_channel_wake_prompt(master_fd: int, prompt: str, enter_bytes: bytes |
     _write_fd_all(master_fd, _channel_wake_enter_bytes(enter_bytes))
 
 
+_CHANNEL_TRANSCRIPT_CACHE: dict[str, Any] = {"checked_at": 0.0, "path": None}
+
+
+def _latest_claude_transcript_path(ttl_seconds: float = 2.0) -> Path | None:
+    now = time.time()
+    cached_at = float(_CHANNEL_TRANSCRIPT_CACHE.get("checked_at") or 0.0)
+    cached_path = _CHANNEL_TRANSCRIPT_CACHE.get("path")
+    if now - cached_at < ttl_seconds:
+        return cached_path if isinstance(cached_path, Path) else None
+    root = Path.home() / ".claude" / "projects"
+    latest: Path | None = None
+    latest_mtime = -1.0
+    try:
+        for path in root.glob("*/*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > latest_mtime:
+                latest = path
+                latest_mtime = mtime
+    except Exception:
+        latest = None
+    _CHANNEL_TRANSCRIPT_CACHE["checked_at"] = now
+    _CHANNEL_TRANSCRIPT_CACHE["path"] = latest
+    return latest
+
+
+def _read_file_tail_text(path: Path, max_bytes: int = 512 * 1024) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > max_bytes:
+                f.seek(max(0, size - max_bytes))
+            return f.read(max_bytes).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _channel_stdin_wake_completed(message_id: int) -> bool:
+    if message_id <= 0:
+        return True
+    path = _latest_claude_transcript_path()
+    if path is None:
+        return False
+    text = _read_file_tail_text(path)
+    if not text:
+        return False
+    prompt_markers = (
+        f"id={message_id} ",
+        f"id={message_id}\n",
+        f"id={message_id}\\n",
+        f"id={message_id}\"",
+        f"id={message_id}'",
+    )
+    pos = max(text.rfind(marker) for marker in prompt_markers)
+    if pos < 0:
+        return False
+    suffix = text[pos:]
+    return bool(
+        re.search(r'"type"\s*:\s*"assistant"', suffix)
+        or re.search(r'"subtype"\s*:\s*"turn_duration"', suffix)
+    )
+
+
 def _inject_pending_channel_messages(
     master_fd: int,
     last_id: int,
     enter_bytes: bytes | None = None,
     *,
     web_chat_only: bool = False,
+    commit_cursor: bool = True,
+    injected_message_ids: list[int] | None = None,
 ) -> int:
     with _CHANNEL_STDIN_INJECT_LOCK:
         pending: list[dict[str, Any]] = []
@@ -26879,12 +26974,19 @@ def _inject_pending_channel_messages(
                             continue
                 raise
             if not web_chat_only:
-                _commit_channel_llm_cursor_if_newer(last_id)
+                if commit_cursor:
+                    _commit_channel_llm_cursor_if_newer(last_id)
+                if injected_message_ids is not None:
+                    injected_message_ids.extend(
+                        int(message.get("id") or 0)
+                        for message in pending
+                        if int(message.get("id") or 0) > 0
+                    )
             ids = ",".join(str(message.get("id") or "") for message in pending)
             channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
             router_log(
                 "INFO",
-                f"channel_stdin_proxy_injected count={len(pending)} message_ids={ids} channels={channels} enter={_channel_enter_label(submit_bytes)}",
+                f"channel_stdin_proxy_injected count={len(pending)} message_ids={ids} channels={channels} enter={_channel_enter_label(submit_bytes)} commit_cursor={commit_cursor}",
             )
         return last_id
 
@@ -27012,8 +27114,8 @@ def subprocess_call_with_channel_wake_proxy(
     import termios
     import tty
 
-    last_id = _chat_scan_max_id()
-    last_channel_marker = _chat_messages_file_marker()
+    last_id = ensure_channel_llm_delivery_cursor_initialized()
+    last_channel_marker: tuple[float, int] = (0.0, -1)
     last_summary_marker = _channel_llm_summary_file_marker()
     master_fd, slave_fd = pty.openpty()
     stdout_fd = sys.stdout.fileno()
@@ -27027,6 +27129,9 @@ def subprocess_call_with_channel_wake_proxy(
     old_sigwinch = None
     sigwinch_installed = False
     last_channel_poll = 0.0
+    channel_inflight_id: int | None = None
+    channel_inflight_cursor: int | None = None
+    channel_inflight_logged_at = 0.0
     channel_enter_bytes = _channel_wake_enter_bytes()
     router_log(
         "INFO",
@@ -27075,17 +27180,41 @@ def subprocess_call_with_channel_wake_proxy(
                 if data:
                     _write_fd_all(stdout_fd, data)
             now = time.time()
+            if channel_inflight_id is not None:
+                if _channel_stdin_wake_completed(channel_inflight_id):
+                    if channel_inflight_cursor is not None:
+                        _commit_channel_llm_cursor_if_newer(channel_inflight_cursor)
+                    router_log(
+                        "INFO",
+                        f"channel_stdin_proxy_confirmed message_id={channel_inflight_id} cursor={channel_inflight_cursor or '-'}",
+                    )
+                    channel_inflight_id = None
+                    channel_inflight_cursor = None
+                elif now - channel_inflight_logged_at >= 30.0:
+                    channel_inflight_logged_at = now
+                    router_log(
+                        "INFO",
+                        f"channel_stdin_proxy_waiting_for_turn_completion message_id={channel_inflight_id}",
+                    )
             if now - last_channel_poll >= 0.5:
                 last_channel_poll = now
                 marker = _chat_messages_file_marker()
-                if inject_channel_messages and marker != last_channel_marker:
+                if inject_channel_messages and marker != last_channel_marker and channel_inflight_id is None:
                     last_channel_marker = marker
+                    last_id = max(last_id, ensure_channel_llm_delivery_cursor_initialized())
+                    injected_ids: list[int] = []
                     last_id = _inject_pending_channel_messages(
                         master_fd,
                         last_id,
                         channel_enter_bytes,
                         web_chat_only=inject_web_chat_only,
+                        commit_cursor=False,
+                        injected_message_ids=injected_ids,
                     )
+                    if injected_ids:
+                        channel_inflight_id = injected_ids[-1]
+                        channel_inflight_cursor = last_id
+                        channel_inflight_logged_at = now
                 summary_marker = _channel_llm_summary_file_marker()
                 if inject_channel_summaries and summary_marker != last_summary_marker:
                     last_summary_marker = summary_marker

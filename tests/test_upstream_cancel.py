@@ -116,9 +116,11 @@ class UpstreamCancelTests(unittest.TestCase):
             claude_any._ollama_stream_to_anthropic_sse(handler, resp, "gemma4:12b", idle_timeout=30.0)
 
         text = wfile.data.decode("utf-8")
-        self.assertIn("event: error", text)
         self.assertIn("Upstream stream error", text)
-        self.assertNotIn("event: message_stop", text)
+        self.assertIn("event: message_start", text)
+        self.assertIn("event: content_block_start", text)
+        self.assertIn("event: message_delta", text)
+        self.assertIn("event: message_stop", text)
         self.assertTrue(resp.closed)
 
     def test_try_write_json_returns_false_when_client_is_gone(self):
