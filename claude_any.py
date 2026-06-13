@@ -146,6 +146,7 @@ CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
 NATIVE_MCP_CONFIG = CONFIG_DIR / "native-mcp.json"
 CHANNEL_MCP_CURSOR_PATH = CONFIG_DIR / "channel-mcp-cursor.json"
 CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
+CHANNEL_LLM_LAUNCH_GUARD_PATH = CONFIG_DIR / "channel-llm-launch-guard.json"
 CHANNEL_LLM_SUMMARY_QUEUE_PATH = CONFIG_DIR / "channel-llm-summary-queue.jsonl"
 CHANNEL_LLM_SUMMARY_CURSOR_PATH = CONFIG_DIR / "channel-llm-summary-cursor.json"
 CHANNEL_PROBE_CACHE_PATH = CONFIG_DIR / "channel-probe-cache.json"
@@ -8821,12 +8822,47 @@ def _chat_message_fallback_dedupe_key(message: dict[str, Any]) -> tuple[str, ...
     return ("fallback", source, method, channel, sender, kind, _chat_message_payload_hash(body))
 
 
+def _channel_llm_launch_guard() -> dict[str, Any] | None:
+    try:
+        if not CHANNEL_LLM_LAUNCH_GUARD_PATH.exists():
+            return None
+        data = json.loads(CHANNEL_LLM_LAUNCH_GUARD_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        expires_at = float(data.get("expires_at") or 0)
+        if expires_at <= time.time():
+            return None
+        max_existing_id = int(data.get("max_existing_id") or 0)
+        if max_existing_id <= 0:
+            return None
+        return {"max_existing_id": max_existing_id, "expires_at": expires_at}
+    except Exception:
+        return None
+
+
+def _write_channel_llm_launch_guard(max_existing_id: int, ttl_seconds: float = 180.0) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "created_at": time.time(),
+            "expires_at": time.time() + max(1.0, float(ttl_seconds)),
+            "max_existing_id": max(0, int(max_existing_id)),
+        }
+        tmp_path = CHANNEL_LLM_LAUNCH_GUARD_PATH.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+        tmp_path.replace(CHANNEL_LLM_LAUNCH_GUARD_PATH)
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_launch_guard_write_failed error={type(exc).__name__}: {exc}")
+
+
 def _chat_message_duplicate_locked(message: dict[str, Any]) -> dict[str, Any] | None:
     stable_key = _chat_message_stable_dedupe_key(message)
     fallback_key = _chat_message_fallback_dedupe_key(message)
     if not stable_key and not fallback_key:
         return None
     now = time.time()
+    launch_guard = _channel_llm_launch_guard() if fallback_key else None
+    guard_max_existing_id = int(launch_guard.get("max_existing_id") or 0) if launch_guard else 0
     for row in reversed(_chat_message_recent_rows_locked()):
         if stable_key and _chat_message_stable_dedupe_key(row) == stable_key:
             return row
@@ -8834,6 +8870,12 @@ def _chat_message_duplicate_locked(message: dict[str, Any]) -> dict[str, Any] | 
             continue
         row_time = _chat_message_time_seconds(row.get("time"))
         if row_time > 0 and now - row_time <= CHAT_MESSAGE_FALLBACK_DEDUPE_TTL_SECONDS:
+            return row
+        try:
+            row_id = int(row.get("id") or 0)
+        except Exception:
+            row_id = 0
+        if guard_max_existing_id > 0 and 0 < row_id <= guard_max_existing_id:
             return row
     return None
 
@@ -25881,6 +25923,7 @@ def prepare_channel_llm_delivery_for_launch() -> int:
     # surfaces stale "one more" channel messages at startup. New channel events
     # are appended after this point and remain deliverable.
     last_id = reset_channel_llm_delivery_cursor()
+    _write_channel_llm_launch_guard(last_id)
     router_log("INFO", f"channel_llm_cursor_fast_forward_on_launch last_id={last_id}")
     return last_id
 

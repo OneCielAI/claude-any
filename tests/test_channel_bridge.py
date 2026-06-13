@@ -265,6 +265,72 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(second["_claude_any_duplicate"])
         self.assertEqual(1, len(rows))
 
+    def test_append_chat_message_keeps_old_fallback_duplicate_without_launch_guard(self):
+        payload = {
+            "message": "board updated",
+            "channel": "room",
+            "sender_id": "mcp-server",
+            "kind": "channel",
+            "meta": {
+                "mcp_server": "mcp-server",
+                "mcp_method": "notifications/claude/channel",
+            },
+        }
+        old = dict(payload)
+        old.update({"id": 1, "time": "2000-01-01T00:00:00", "recipients": ["all"], "thread_id": "1", "parent_id": None})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            guard_path = root / "channel-llm-launch-guard.json"
+            path.write_text(json.dumps(old, ensure_ascii=False) + "\n", encoding="utf-8")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "CHANNEL_LLM_LAUNCH_GUARD_PATH", guard_path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                saved = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(2, saved["id"])
+        self.assertNotIn("_claude_any_duplicate", saved)
+        self.assertEqual(2, len(rows))
+
+    def test_append_chat_message_dedupes_startup_replay_without_stable_id(self):
+        payload = {
+            "message": "board updated",
+            "channel": "room",
+            "sender_id": "mcp-server",
+            "kind": "channel",
+            "meta": {
+                "mcp_server": "mcp-server",
+                "mcp_method": "notifications/claude/channel",
+            },
+        }
+        old = dict(payload)
+        old.update({"id": 7, "time": "2000-01-01T00:00:00", "recipients": ["all"], "thread_id": "7", "parent_id": None})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            guard_path = root / "channel-llm-launch-guard.json"
+            path.write_text(json.dumps(old, ensure_ascii=False) + "\n", encoding="utf-8")
+            guard_path.write_text(
+                json.dumps({"max_existing_id": 7, "expires_at": time.time() + 60}, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "CHANNEL_LLM_LAUNCH_GUARD_PATH", guard_path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                saved = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(7, saved["id"])
+        self.assertTrue(saved["_claude_any_duplicate"])
+        self.assertEqual(1, len(rows))
+
     def test_append_chat_message_does_not_dedupe_plain_user_messages(self):
         payload = {"message": "repeat is valid", "channel": "web-chat", "sender_id": "web-user"}
         with tempfile.TemporaryDirectory() as td:
@@ -298,13 +364,16 @@ class ChannelBridgeTests(unittest.TestCase):
                 mock.patch.object(claude_any, "CONFIG_DIR", root),
                 mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
                 mock.patch.object(claude_any, "CHANNEL_LLM_CURSOR_PATH", cursor_path),
+                mock.patch.object(claude_any, "CHANNEL_LLM_LAUNCH_GUARD_PATH", root / "channel-llm-launch-guard.json"),
                 mock.patch.object(claude_any, "_CHANNEL_LLM_CURSOR_LAST_ID", None),
             ):
                 last_id = claude_any.prepare_channel_llm_delivery_for_launch()
                 saved = json.loads(cursor_path.read_text(encoding="utf-8"))
+                guard = json.loads((root / "channel-llm-launch-guard.json").read_text(encoding="utf-8"))
 
         self.assertEqual(3, last_id)
         self.assertEqual(3, saved["last_id"])
+        self.assertEqual(3, guard["max_existing_id"])
 
     def test_mcp_endpoint_event_initializes_sse_session(self):
         name = "unit-mcp"
