@@ -1064,13 +1064,22 @@ def ollama_context_model_matches(current_model: str, cached_model: str | None) -
 def sync_ollama_library_context_limit(provider: str, pcfg: dict[str, Any], model_id: str) -> list[str]:
     if provider not in ("ollama", "ollama-cloud"):
         return []
-    catalog = load_ollama_model_catalog()
-    if ollama_catalog_is_stale(catalog):
-        try:
-            catalog = refresh_ollama_model_catalog(include_contexts=False)
-        except Exception as exc:
-            router_log("WARN", f"ollama catalog: api refresh failed: {exc}")
-    limit, matched_model, url = ollama_catalog_context_for_model(model_id)
+    api_specs: dict[str, Any] = {}
+    try:
+        api_specs = fetch_ollama_api_model_specs(provider, pcfg, model_id)
+    except Exception as exc:
+        router_log("DEBUG", f"{provider} /api/show model specs unavailable for {model_id}: {type(exc).__name__}: {exc}")
+    limit = positive_int(api_specs.get("max_model_len"))
+    matched_model = normalize_model_id(provider, model_id) if limit else ""
+    url = "/api/show" if limit else ""
+    if not limit:
+        catalog = load_ollama_model_catalog()
+        if ollama_catalog_is_stale(catalog):
+            try:
+                catalog = refresh_ollama_model_catalog(include_contexts=False)
+            except Exception as exc:
+                router_log("WARN", f"ollama catalog: api refresh failed: {exc}")
+        limit, matched_model, url = ollama_catalog_context_for_model(model_id)
     if not limit:
         limit, matched_model, url = fetch_ollama_library_context_limit(model_id)
         if limit:
@@ -6690,6 +6699,14 @@ def model_context_field(item: dict[str, Any]) -> int | None:
         value = positive_int(item.get(key))
         if value:
             return value
+    for key, value in item.items():
+        if not isinstance(key, str):
+            continue
+        leaf = key.rsplit(".", 1)[-1]
+        if leaf in ("max_model_len", "max_context_length", "context_length", "max_context_tokens", "max_position_embeddings"):
+            fixed = positive_int(value)
+            if fixed:
+                return fixed
     details = item.get("details")
     if isinstance(details, dict):
         for key in ("max_model_len", "max_context_length", "context_length", "contextLength", "max_context_tokens", "max_position_embeddings"):
@@ -6704,6 +6721,71 @@ def ollama_api_base(pcfg: dict[str, Any]) -> str:
     if base.endswith("/api"):
         return base[:-4].rstrip("/")
     return base.rstrip("/")
+
+
+def ollama_provider_api_base(provider: str, pcfg: dict[str, Any]) -> str:
+    base = provider_upstream_request_base(provider, pcfg)
+    if base.endswith("/api"):
+        return base[:-4].rstrip("/")
+    return base.rstrip("/")
+
+
+def ollama_show_parameters(data: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    raw = data.get("parameters")
+    if isinstance(raw, dict):
+        out.update(raw)
+    elif isinstance(raw, str):
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                out[parts[0].strip()] = parts[1].strip().strip('"')
+    modelfile = data.get("modelfile")
+    if isinstance(modelfile, str):
+        for line in modelfile.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].lower() == "parameter":
+                out.setdefault(parts[1].strip(), parts[2].strip().strip('"'))
+    return out
+
+
+def fetch_ollama_api_model_specs(provider: str, pcfg: dict[str, Any], model_id: str, timeout: float = 3.0) -> dict[str, Any]:
+    if provider not in ("ollama", "ollama-cloud") or not model_id:
+        return {}
+    base = ollama_provider_api_base(provider, pcfg)
+    if not base:
+        return {}
+    data = post_json(
+        join_url(base, "/api/show"),
+        {"model": model_id},
+        headers=provider_model_list_headers(provider, pcfg),
+        timeout=timeout,
+        provider=provider,
+        pcfg=pcfg,
+    )
+    if not isinstance(data, dict):
+        return {}
+    model_info = data.get("model_info") if isinstance(data.get("model_info"), dict) else {}
+    params = ollama_show_parameters(data)
+    max_context = (
+        model_context_field(data)
+        or model_context_field(model_info)
+        or positive_int(params.get("num_ctx"))
+        or positive_int(params.get("context_length"))
+    )
+    num_predict = positive_int(params.get("num_predict"))
+    out: dict[str, Any] = {}
+    if max_context:
+        out["max_model_len"] = max_context
+    if num_predict:
+        out["num_predict"] = num_predict
+    return out
 
 
 def ollama_model_id_matches(left: str, right: str) -> bool:
@@ -12047,12 +12129,26 @@ def ctx_bucket(target: int, minimum: int, maximum: int) -> int:
     return maximum
 
 
+def ollama_provider_context_limit(pcfg: dict[str, Any]) -> int | None:
+    current_model = str(pcfg.get("current_model") or "")
+    cached_model = str(pcfg.get("model_context_model") or "")
+    cached_limit = positive_int(pcfg.get("model_context_max"))
+    if not cached_limit:
+        return None
+    if cached_model and (not current_model or not ollama_context_model_matches(current_model, cached_model)):
+        return None
+    return cached_limit
+
+
 def ollama_num_ctx_for_payload(pcfg: dict[str, Any], payload: Any, _token_cache: dict[int, int] | None = None) -> int | None:
     override = os.environ.get("CLAUDE_ANY_OLLAMA_NUM_CTX")
     if override:
         return positive_int(override)
     raw = pcfg.get("num_ctx", "auto")
     if isinstance(raw, str) and raw.strip().lower() in ("", "auto", "dynamic"):
+        provider_limit = ollama_provider_context_limit(pcfg)
+        if provider_limit:
+            return provider_limit
         minimum = positive_int(pcfg.get("num_ctx_min")) or 8192
         maximum = positive_int(pcfg.get("num_ctx_max")) or 65536
         if maximum < minimum:
@@ -12067,6 +12163,9 @@ def ollama_num_ctx_for_payload(pcfg: dict[str, Any], payload: Any, _token_cache:
 def ollama_num_ctx_status(pcfg: dict[str, Any]) -> str:
     raw = pcfg.get("num_ctx", "auto")
     if isinstance(raw, str) and raw.strip().lower() in ("", "auto", "dynamic"):
+        provider_limit = ollama_provider_context_limit(pcfg)
+        if provider_limit:
+            return f"auto (provider {provider_limit:,})"
         minimum = positive_int(pcfg.get("num_ctx_min")) or 8192
         maximum = positive_int(pcfg.get("num_ctx_max")) or 65536
         return f"auto ({minimum}-{maximum})"
@@ -12134,8 +12233,8 @@ def cap_output_tokens_for_context(
 
 def ollama_context_limit_for_budget(pcfg: dict[str, Any]) -> int:
     raw = pcfg.get("num_ctx", "auto")
-    if isinstance(raw, str) and raw.strip().lower() == "auto":
-        return positive_int(pcfg.get("num_ctx_max")) or 65536
+    if isinstance(raw, str) and raw.strip().lower() in ("", "auto", "dynamic"):
+        return ollama_provider_context_limit(pcfg) or positive_int(pcfg.get("num_ctx_max")) or 65536
     return positive_int(raw) or positive_int(pcfg.get("num_ctx_max")) or 65536
 
 
@@ -18888,15 +18987,17 @@ def provider_model_context_capacity(provider: str, pcfg: dict[str, Any]) -> int 
             or model_context_hint_from_model_id(model)
             or positive_int(pcfg.get("context_window"))
         )
+    if provider in ("ollama", "ollama-cloud"):
+        cached = ollama_provider_context_limit(pcfg)
+        if cached:
+            return cached
+        hint = model_context_hint_from_model_id(model)
+        if hint:
+            return hint
+        return positive_int(pcfg.get("num_ctx_max")) or positive_int(pcfg.get("num_ctx"))
     hint = model_context_hint_from_model_id(model)
     if hint:
         return hint
-    if provider in ("ollama", "ollama-cloud"):
-        if ollama_context_model_matches(model, str(pcfg.get("model_context_model") or "")):
-            cached = positive_int(pcfg.get("model_context_max"))
-            if cached:
-                return cached
-        return positive_int(pcfg.get("num_ctx_max")) or positive_int(pcfg.get("num_ctx"))
     return positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
 
 
@@ -18956,6 +19057,8 @@ def apply_current_model_specs_to_provider(provider: str, pcfg: dict[str, Any]) -
             pcfg["model_context_max"] = max_context
             pcfg["model_context_model"] = model
             messages.append(f"Model context size from provider specs: {format_context_tokens(max_context)} ({max_context:,} tokens).")
+        if positive_int(pcfg.get("num_ctx_max")) != max_context:
+            pcfg["num_ctx_max"] = max_context
         return messages
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
         if positive_int(pcfg.get("max_model_len")) != max_context:
@@ -19092,10 +19195,13 @@ def context_setting_status(provider: str, pcfg: dict[str, Any]) -> str:
 
 def configured_context_window_for_timeout(provider: str, pcfg: dict[str, Any]) -> int | None:
     if provider in ("ollama", "ollama-cloud"):
+        raw_ctx = pcfg.get("num_ctx")
+        fixed_ctx = positive_int(raw_ctx)
+        if fixed_ctx:
+            return fixed_ctx
         return (
-            positive_int(pcfg.get("num_ctx_max"))
-            or positive_int(pcfg.get("num_ctx"))
-            or provider_model_context_capacity(provider, pcfg)
+            provider_model_context_capacity(provider, pcfg)
+            or positive_int(pcfg.get("num_ctx_max"))
         )
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
         return positive_int(pcfg.get("context_window")) or provider_model_context_capacity(provider, pcfg)
