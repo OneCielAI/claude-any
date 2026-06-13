@@ -27879,6 +27879,12 @@ def npm_global_install_command(npm: str, package_spec: str, prefix: Path | None 
     return cmd
 
 
+def npm_global_bin_dir_from_prefix(prefix: Path) -> Path:
+    if os.name == "nt":
+        return prefix
+    return prefix / "bin"
+
+
 def claude_code_current_version(claude: str) -> str:
     try:
         p = subprocess.run(
@@ -28162,8 +28168,8 @@ def quiet_upgrade_claude_any() -> int:
 def quiet_upgrade_claude_code() -> int:
     claude = find_executable("claude")
     if not claude:
-        print("Claude Code update skipped: claude executable was not found.", flush=True)
-        return 1
+        claude = install_claude_code_if_missing()
+        return 0 if claude else 1
     current = claude_code_current_version(claude)
     npm = find_executable("npm")
     latest = ""
@@ -28182,6 +28188,51 @@ def quiet_upgrade_claude_code() -> int:
     if rc != 0:
         print(f"Claude Code update failed ({rc}).", flush=True)
     return rc
+
+
+def install_claude_code_if_missing() -> str | None:
+    claude = find_executable("claude")
+    if claude:
+        return claude
+    if os.environ.get("CLAUDE_ANY_SKIP_CLAUDE_INSTALL") == "1":
+        return None
+    npm = find_executable("npm")
+    if not npm:
+        print(
+            "Claude Code executable was not found, and npm is not available to install @anthropic-ai/claude-code.",
+            flush=True,
+        )
+        return None
+    package_spec = os.environ.get("CLAUDE_ANY_CLAUDE_CODE_PACKAGE", "@anthropic-ai/claude-code@latest")
+    install_prefix = current_npm_install_prefix()
+    cmd = npm_global_install_command(npm, package_spec, install_prefix)
+    cmd.insert(3, "--prefer-online")
+    print(f"Claude Code executable was not found; installing {package_spec}...", flush=True)
+    if install_prefix is not None:
+        print(f"Installing Claude Code into active npm prefix: {install_prefix}", flush=True)
+    rc, out = run_command_for_upgrade(cmd, timeout=300)
+    if out:
+        print(out, flush=True)
+    if rc != 0:
+        print(f"Claude Code install failed ({rc}).", flush=True)
+        if install_prefix is not None:
+            print(
+                f"Install targeted the active install prefix ({install_prefix}). "
+                "If this prefix is not writable, install Claude Code with the permissions used for that prefix.",
+                flush=True,
+            )
+        return None
+    if install_prefix is not None:
+        bin_dir = str(npm_global_bin_dir_from_prefix(install_prefix))
+        path = os.environ.get("PATH", "")
+        if bin_dir and bin_dir not in path.split(os.pathsep):
+            os.environ["PATH"] = bin_dir + (os.pathsep + path if path else "")
+    claude = find_executable("claude")
+    if claude:
+        print(f"Claude Code installed: {claude}", flush=True)
+    else:
+        print("Claude Code install completed, but the claude executable is still not visible in PATH.", flush=True)
+    return claude
 
 
 def run_quiet_upgrade_and_exit() -> int:
@@ -28307,9 +28358,12 @@ def launch_claude(
         install_claude_any_slash_commands(include_advisor=provider != "anthropic")
         install_tool_guard_hooks()
         install_claude_any_statusline()
-    claude = find_executable("claude")
+    claude = install_claude_code_if_missing()
     if not claude:
-        raise RuntimeError("claude executable was not found in PATH or the Claude Any user bin directories")
+        raise RuntimeError(
+            "claude executable was not found in PATH or the Claude Any user bin directories, "
+            "and automatic install of @anthropic-ai/claude-code did not make it available"
+        )
     run_claude_update_check(claude, enabled=update_check)
     claude = find_executable("claude") or claude
     if native_channel_bridge or native_auto_channel_specs:
