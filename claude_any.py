@@ -12530,7 +12530,6 @@ def iter_upstream_lines_until_client_disconnect(
     except Exception:
         idle = 30.0
     set_upstream_stream_read_timeout(resp, idle)
-    idle_deadline = time.monotonic() + idle
     while True:
         if router_client_connection_closed(handler):
             raise UpstreamClientDisconnected("downstream client disconnected")
@@ -12542,7 +12541,6 @@ def iter_upstream_lines_until_client_disconnect(
             raise
         if raw in (b"", ""):
             return
-        idle_deadline = time.monotonic() + idle
         yield raw
 
 
