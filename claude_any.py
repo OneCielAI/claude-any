@@ -2844,6 +2844,7 @@ def install_tool_guard_hooks() -> None:
 STATUSLINE_SCRIPT = r'''#!/usr/bin/env python3
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -2868,6 +2869,8 @@ CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
 ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
 CONTEXT_PATH = CONFIG_DIR / "context-usage.json"
+CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
+CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
 PALETTE = (203, 209, 215, 221, 229, 187, 151, 116, 111, 147, 183, 219)
 
 
@@ -2973,6 +2976,80 @@ def session_context_status_text(session):
     return f"ctx {tokens:,} tok"
 
 
+def _status_as_string_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return _status_as_string_list(parsed)
+        except Exception:
+            pass
+        return [text]
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        for item in value:
+            out.extend(_status_as_string_list(item))
+        return out
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _status_channel_message_skip_reason(message):
+    visibility = str(message.get("visibility") or "user").strip().lower()
+    if visibility in {"hidden", "internal", "transport", "control", "system"}:
+        return f"visibility_{visibility}"
+    recipients = {item.strip().lower() for item in _status_as_string_list(message.get("recipients"))}
+    if "internal" in recipients:
+        return "recipient_internal"
+    delivery = _status_as_string_list(message.get("delivery"))
+    if delivery:
+        normalized_delivery = {item.strip().lower() for item in delivery}
+        if not ({"all", "*", "llm"} & normalized_delivery):
+            return "delivery_not_llm"
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip().lower()
+    kind = str(message.get("kind") or "").strip().lower()
+    if not body:
+        return "empty"
+    if kind in {"connection", "connected", "heartbeat", "keepalive"}:
+        return kind
+    if re.fullmatch(r"[a-z0-9_.:-]{1,80}\.(ws|sse)\.connected", body):
+        return "transport_connected"
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    if meta.get("llm_direct_delivered"):
+        return "llm_direct_delivered"
+    return ""
+
+
+def channel_pending_status_count():
+    cursor = load_json(CHANNEL_LLM_CURSOR_PATH, {})
+    last_id = _as_int(cursor.get("last_id") if isinstance(cursor, dict) else 0)
+    count = 0
+    try:
+        if not CHAT_MESSAGES_PATH.exists():
+            return 0
+        with CHAT_MESSAGES_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                    item_id = int(item.get("id") or 0)
+                except Exception:
+                    continue
+                if item_id <= last_id:
+                    continue
+                if _status_channel_message_skip_reason(item):
+                    continue
+                count += 1
+                if count >= 999:
+                    return count
+    except Exception:
+        return 0
+    return count
+
+
 def is_claude_any_session(session):
     if os.environ.get("CLAUDE_ANY_PROVIDER") or os.environ.get("CLAUDE_ANY_MODEL_ALIAS"):
         return True
@@ -3067,6 +3144,9 @@ def main():
     ctx_text = session_context_status_text(session) or context_status_text(context, provider, model)
     if ctx_text:
         status_parts.append(gray(ctx_text))
+    channel_pending = channel_pending_status_count()
+    if channel_pending > 0:
+        status_parts.append(color(f"channel queue {channel_pending}"))
     if router_debug_external:
         status_parts.append(color("debug external"))
     if rpm_status:
@@ -24167,12 +24247,10 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
         fields.append(f"id={mid}")
     if thread:
         fields.append(f"thread={thread}")
-    meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
     return (
         "[claude-any external channel message] "
         + " ".join(fields)
         + f" text={json.dumps(body, ensure_ascii=False)}"
-        + meta_text
         + ". "
         + "If this is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']; use send_file when returning a file attachment. "
         + "If relevant to current work, respond or act now; otherwise keep working."
@@ -24257,8 +24335,7 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
         fields = [f"id={mid}", f"room={room}", f"from={sender}"]
         if thread:
             fields.append(f"thread={thread}")
-        meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
-        parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False) + meta_text)
+        parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False))
     return (
         f"[claude-any external channel messages] {len(messages)} new messages: "
         + " ; ".join(parts)
@@ -24283,13 +24360,11 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
             fields.append(f"to={_compact_json_for_prompt(recipients, max_chars=400)}")
         if thread:
             fields.append(f"thread={thread}")
-        meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
         parts.append(
             f"<< {channel} >> incoming channel message for the current agent.\n"
             f"<< 메시지 >>\n"
             + " ".join(fields)
             + f"\ntext={json.dumps(body, ensure_ascii=False)}"
-            + meta_text
         )
     return (
         "[claude-any channel inbox]\n"
@@ -26099,6 +26174,8 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                 )
                 continue
             pending.append(message)
+            max_seen = message_id
+            break
         if not pending:
             if max_seen != last_id:
                 _CHANNEL_LLM_CURSOR_LAST_ID = max_seen
@@ -26264,6 +26341,8 @@ def _inject_pending_channel_messages(
             )
             continue
         pending.append(message)
+        last_id = message_id
+        break
     if pending:
         if web_chat_only and all(_channel_message_is_web_chat_request(message) for message in pending):
             prompt = format_channel_web_chat_wake_batch_prompt(pending)

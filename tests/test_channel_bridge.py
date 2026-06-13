@@ -903,7 +903,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("from=robert", prompt)
         self.assertIn("id=9", prompt)
         self.assertIn("please review the latest update", prompt)
-        self.assertIn("metadata=", prompt)
+        self.assertNotIn("metadata=", prompt)
         self.assertIn("room_phase1sim", prompt)
         self.assertNotIn("\n", prompt)
 
@@ -1119,15 +1119,15 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0)
-        self.assertEqual(3, last_id)
+        self.assertEqual(2, last_id)
         payload = write_all.call_args_list[0].args[1]
-        self.assertIn(b"external channel messages", payload)
+        self.assertIn(b"external channel message", payload)
         self.assertIn(b"hello Sarah", payload)
-        self.assertIn(b"status please", payload)
+        self.assertNotIn(b"status please", payload)
         self.assertNotIn(b"ai-net.ws.connected", payload)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_stdin_proxy_skipped_noise" in item for item in log_messages))
-        self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2,3" in item and "enter=crlf" in item for item in log_messages))
+        self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2" in item and "enter=crlf" in item for item in log_messages))
 
     def test_inject_pending_channel_messages_can_limit_to_web_chat_requests(self):
         messages = [
@@ -1333,17 +1333,17 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn("ai-net.sse.connected", injected)
         self.assertNotIn("SSE MCP initialized", injected)
         write_cursor.assert_not_called()
-        self.assertEqual("4", out["metadata"]["claude_any_channel_cursor_last_id"])
+        self.assertEqual("3", out["metadata"]["claude_any_channel_cursor_last_id"])
         handler = type("Handler", (), {"_claude_any_response_status": 200})()
         with (
             mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
             mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as commit_cursor,
         ):
             claude_any.commit_pending_channel_delivery_cursors(out, handler)  # type: ignore[arg-type]
-        commit_cursor.assert_called_with(4)
+        commit_cursor.assert_called_with(3)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
-        self.assertTrue(any("channel_llm_inject_skipped" in item and "initialized" in item for item in log_messages))
+        self.assertTrue(any("channel_llm_inject_skipped" in item and "transport_connected" in item for item in log_messages))
 
     def test_body_without_claude_any_internal_metadata_strips_private_keys(self):
         body = {
