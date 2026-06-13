@@ -1502,6 +1502,50 @@ def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> 
     return fixed
 
 
+def _missing_required_tool_fields(tool_name: str, input_dict: dict[str, Any], source_body: dict[str, Any] | None = None) -> list[str]:
+    schema = tool_schema_in_body(source_body, tool_name) if isinstance(source_body, dict) else None
+    if schema is None:
+        schema = _lookup_tool_schema(tool_name)
+    if not isinstance(schema, dict):
+        return []
+    required = schema.get("required") or []
+    if not isinstance(required, list):
+        return []
+    missing: list[str] = []
+    for field in required:
+        if not isinstance(field, str):
+            continue
+        if field not in input_dict or _is_empty_value(input_dict.get(field)):
+            missing.append(field)
+    return missing
+
+
+def should_drop_emitted_tool_call(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    raw_name: str = "",
+    source_body: dict[str, Any] | None = None,
+) -> bool:
+    missing = _missing_required_tool_fields(tool_name, tool_input, source_body)
+    if not missing:
+        return False
+    router_log(
+        "WARN",
+        f"dropped emitted tool call with missing required fields raw_name={raw_name or tool_name!r} "
+        f"matched_name={tool_name!r} fields={','.join(missing)}",
+    )
+    append_tool_call_log(
+        "dropped_tool_call_missing_required",
+        {
+            "raw_name": raw_name or tool_name,
+            "matched_name": tool_name,
+            "missing_required": missing,
+            "emitted_input": tool_input,
+        },
+    )
+    return True
+
+
 MCP_NOTIFICATION_WAIT_TOOL_NAMES = {
     "wait_for_notification",
     "wait_for_notifications",
@@ -3615,6 +3659,20 @@ def _match_available_tool_name(name: str, available: set[str]) -> str | None:
     for candidate in sorted(available):
         if candidate.lower() == low:
             return candidate
+    # Non-native models often change only casing/separators for built-in tool
+    # names, e.g. ``WebSearch`` -> ``web_search``. Normalize punctuation for
+    # non-MCP names only; MCP server/tool segments have stricter semantics.
+    if not name.startswith("mcp__"):
+        normalized = re.sub(r"[^a-z0-9]+", "", low)
+        if normalized:
+            matches = [
+                candidate
+                for candidate in sorted(available)
+                if not candidate.startswith("mcp__")
+                and re.sub(r"[^a-z0-9]+", "", candidate.lower()) == normalized
+            ]
+            if len(matches) == 1:
+                return matches[0]
     mcp_key = _mcp_tool_name_server_normalized_key(name)
     if mcp_key is not None:
         matches = [
@@ -13252,6 +13310,8 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
             if matched_name is None:
                 continue
         fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
+        if should_drop_emitted_tool_call(matched_name, fixed_input, name, source_body):
+            continue
         append_tool_call_log(
             "ollama_nonstream_tool_call",
             {
@@ -13662,6 +13722,8 @@ def _rebatch_anthropic_sse_text(
                 return
             matched_name, fixed_input = mapped_name, mapped_input
         fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
+        if should_drop_emitted_tool_call(matched_name, fixed_input, raw_name, source_body):
+            return
         tool_id = str(tool_state.get("id") or f"toolu_anthropic_{int(time.time() * 1000)}_{index}")
         _remember_channel_injected_tool_use(source_body, tool_id, matched_name, fixed_input)
         append_tool_call_log(
@@ -14162,6 +14224,8 @@ def _ollama_stream_to_anthropic_sse(
                     if matched_name is None:
                         continue
                 fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
+                if should_drop_emitted_tool_call(matched_name, fixed_input, raw_name, source_body):
+                    continue
                 tool_calls.append({"function": {"name": matched_name, "arguments": fixed_input}})
                 tool_id = f"toolu_ollama_{int(time.time() * 1000)}_{len(tool_calls) - 1}"
                 tool_index = next_content_index
@@ -14963,6 +15027,8 @@ def stream_openai_chat_to_anthropic_sse(
                 if matched_name is None:
                     continue
             fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
+            if should_drop_emitted_tool_call(matched_name, fixed_input, raw_name, source_body):
+                continue
             tool_calls.append({"function": {"name": matched_name, "arguments": fixed_input}})
             tool_index = next_content_index
             next_content_index += 1
