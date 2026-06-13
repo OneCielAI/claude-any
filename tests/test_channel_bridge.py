@@ -284,6 +284,28 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn("_claude_any_duplicate", second)
         self.assertEqual(2, len(rows))
 
+    def test_prepare_channel_llm_delivery_for_launch_fast_forwards_stale_queue(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            cursor_path = root / "channel-llm-cursor.json"
+            path.write_text(
+                "\n".join(json.dumps({"id": item_id, "message": f"old-{item_id}"}) for item_id in (1, 2, 3)) + "\n",
+                encoding="utf-8",
+            )
+            cursor_path.write_text(json.dumps({"last_id": 1}), encoding="utf-8")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "CHANNEL_LLM_CURSOR_PATH", cursor_path),
+                mock.patch.object(claude_any, "_CHANNEL_LLM_CURSOR_LAST_ID", None),
+            ):
+                last_id = claude_any.prepare_channel_llm_delivery_for_launch()
+                saved = json.loads(cursor_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(3, last_id)
+        self.assertEqual(3, saved["last_id"])
+
     def test_mcp_endpoint_event_initializes_sse_session(self):
         name = "unit-mcp"
         original = dict(claude_any._CHANNEL_SSE_CONNECTIONS)

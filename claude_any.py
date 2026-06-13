@@ -25875,6 +25875,16 @@ def ensure_channel_llm_delivery_cursor_initialized() -> int:
         return _channel_llm_read_cursor_locked()
 
 
+def prepare_channel_llm_delivery_for_launch() -> int:
+    # chat-messages.jsonl is a transient bridge queue, not the durable MCP inbox.
+    # On a new Claude Code process, replaying rows left by a previous process
+    # surfaces stale "one more" channel messages at startup. New channel events
+    # are appended after this point and remain deliverable.
+    last_id = reset_channel_llm_delivery_cursor()
+    router_log("INFO", f"channel_llm_cursor_fast_forward_on_launch last_id={last_id}")
+    return last_id
+
+
 def _metadata_int(metadata: dict[str, Any], key: str) -> int | None:
     try:
         value = metadata.get(key)
@@ -28536,7 +28546,7 @@ def launch_claude(
             claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
     elif stdin_channel_proxy or llm_channel_delivery or native_auto_channel_specs:
         if llm_channel_delivery:
-            ensure_channel_llm_delivery_cursor_initialized()
+            prepare_channel_llm_delivery_for_launch()
         if should_launch_process_start_channel_sse(stdin_channel_proxy, native_channel_bridge, llm_channel_delivery):
             auto_start_sse_channels_from_mcp_configs(
                 launch_passthrough,
