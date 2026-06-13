@@ -560,6 +560,8 @@ DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC: tuple[str, ...] = (
     "SendMessageTool",
     "ScheduleWakeup",
     "WaitForMcpServers",
+    "WebSearch",
+    "web_search",
     "RemoteTrigger",
     "PushNotification",
 )

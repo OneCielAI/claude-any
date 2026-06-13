@@ -45,6 +45,56 @@ class ReviewCommandPassthroughTests(unittest.TestCase):
         self.assertIn("Read", names)
         self.assertNotIn("EnterWorktree", names)
 
+    def test_filter_hides_server_side_web_search_for_non_anthropic_provider(self):
+        body = {
+            "tools": [
+                {
+                    "name": "WebSearch",
+                    "description": "Search the web",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+                {
+                    "name": "web_search",
+                    "type": "web_search_20250305",
+                    "max_uses": 8,
+                },
+                {
+                    "name": "mcp__duckduckgo__search",
+                    "description": "Search with DuckDuckGo",
+                    "input_schema": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            ]
+        }
+
+        filtered = claude_any.filter_blocked_tools("ollama", {}, body)
+        names = [tool["name"] for tool in filtered["tools"]]
+
+        self.assertNotIn("WebSearch", names)
+        self.assertNotIn("web_search", names)
+        self.assertIn("mcp__duckduckgo__search", names)
+
+    def test_filter_keeps_server_side_web_search_for_anthropic_provider(self):
+        body = {
+            "tools": [
+                {"name": "WebSearch", "input_schema": {"type": "object", "properties": {}}},
+                {"name": "web_search", "type": "web_search_20250305", "max_uses": 8},
+            ]
+        }
+
+        filtered = claude_any.filter_blocked_tools("anthropic", {}, body)
+        names = [tool["name"] for tool in filtered["tools"]]
+
+        self.assertIn("WebSearch", names)
+        self.assertIn("web_search", names)
+
     def test_slash_command_tool_schema_is_forwarded_to_ollama(self):
         tools = [
             {
