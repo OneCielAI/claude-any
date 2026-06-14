@@ -2017,7 +2017,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "api_key": "",
             "current_model": "claude-sonnet-4-6",
             "advisor_model": "",
-            "custom_models": ["claude-sonnet-4-6"],
+            "custom_models": ["claude-sonnet-4-6", "qwen3.6-plus-free"],
             "native_compat": True,
             "context_window": 200000,
             "max_output_tokens": 8192,
@@ -2283,6 +2283,37 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
             and positive_int(pcfg.get("context_window")) == 262144
         ):
             pcfg["context_window"] = 1048576
+        migrations[marker] = True
+
+    marker = "opencode_zen_qwen36_plus_free_model_20260614"
+    if not migrations.get(marker):
+        providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        pcfg = providers.get("opencode")
+        if isinstance(pcfg, dict):
+            custom = pcfg.get("custom_models")
+            if not isinstance(custom, list):
+                custom = []
+                pcfg["custom_models"] = custom
+            normalized_custom = {normalize_model_id("opencode", str(mid)) for mid in custom if str(mid).strip()}
+            if "qwen3.6-plus-free" not in normalized_custom:
+                custom.append("qwen3.6-plus-free")
+        migrations[marker] = True
+
+    marker = "opencode_qwen36_plus_parameters_20260614"
+    if not migrations.get(marker):
+        providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        for provider_name in OPENCODE_PROVIDER_NAMES:
+            pcfg = providers.get(provider_name)
+            if not isinstance(pcfg, dict):
+                continue
+            if not is_qwen36_plus_model_id(str(pcfg.get("current_model") or "")):
+                continue
+            if (positive_int(pcfg.get("context_window")) or 0) < 1048576:
+                pcfg["context_window"] = 1048576
+            if (positive_int(pcfg.get("context_reserve_tokens")) or 0) < 16384:
+                pcfg["context_reserve_tokens"] = 16384
+            if (positive_int(pcfg.get("max_output_tokens")) or 0) < 8192:
+                pcfg["max_output_tokens"] = 8192
         migrations[marker] = True
 
     marker = "anthropic_drop_preset_output_tokens_20260610"

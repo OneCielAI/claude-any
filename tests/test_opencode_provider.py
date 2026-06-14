@@ -44,6 +44,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("claude-sonnet-4-6", pcfg["current_model"])
         self.assertEqual("claude-haiku-4-5", pcfg["haiku_model"])
         self.assertEqual("claude-sonnet-4-6", pcfg["subagent_model"])
+        self.assertIn("qwen3.6-plus-free", pcfg["custom_models"])
         self.assertEqual("ipv6-preferred", pcfg["ip_family"])
         self.assertTrue(pcfg["native_compat"])
 
@@ -111,6 +112,20 @@ class OpenCodeProviderTests(unittest.TestCase):
 
         self.assertEqual("million-context-1m", pcfg["llm_preset"])
         self.assertEqual(1048576, pcfg["context_window"])
+        self.assertEqual(16384, pcfg["context_reserve_tokens"])
+        self.assertEqual(8192, pcfg["max_output_tokens"])
+        self.assertTrue(any("Ultra context 1M" in message for message in messages))
+
+    def test_zen_qwen36_plus_free_auto_preset_applies_one_million_context(self):
+        pcfg = self.opencode_cfg(current_model="qwen3.6-plus-free", context_window=200000)["providers"]["opencode"]
+
+        with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=None):
+            messages = claude_any.auto_apply_recommended_llm_preset_for_model("opencode", pcfg, "en")
+
+        self.assertEqual("million-context-1m", pcfg["llm_preset"])
+        self.assertEqual(1048576, pcfg["context_window"])
+        self.assertEqual(16384, pcfg["context_reserve_tokens"])
+        self.assertEqual(8192, pcfg["max_output_tokens"])
         self.assertTrue(any("Ultra context 1M" in message for message in messages))
 
     def test_provider_capacity_prefers_refreshed_model_specs_over_stale_context_window(self):
@@ -187,6 +202,48 @@ class OpenCodeProviderTests(unittest.TestCase):
 
         self.assertEqual(1048576, cfg["providers"]["opencode-go"]["context_window"])
         self.assertTrue(cfg["migrations"]["opencode_go_qwen36_plus_context_1m_20260530"])
+        self.assertTrue(cfg["migrations"]["opencode_qwen36_plus_parameters_20260614"])
+
+    def test_migration_adds_zen_qwen36_plus_free_fallback_model(self):
+        cfg = {
+            "migrations": {},
+            "providers": {
+                "opencode": {
+                    "current_model": "claude-sonnet-4-6",
+                    "custom_models": ["claude-sonnet-4-6"],
+                    "context_window": 200000,
+                }
+            },
+        }
+
+        claude_any.apply_config_migrations(cfg)
+
+        self.assertIn("qwen3.6-plus-free", cfg["providers"]["opencode"]["custom_models"])
+        self.assertEqual(200000, cfg["providers"]["opencode"]["context_window"])
+        self.assertTrue(cfg["migrations"]["opencode_zen_qwen36_plus_free_model_20260614"])
+
+    def test_migration_updates_zen_qwen36_plus_free_parameters(self):
+        cfg = {
+            "migrations": {},
+            "providers": {
+                "opencode": {
+                    "current_model": "qwen3.6-plus-free",
+                    "custom_models": [],
+                    "context_window": 200000,
+                    "context_reserve_tokens": 8192,
+                    "max_output_tokens": 4096,
+                }
+            },
+        }
+
+        claude_any.apply_config_migrations(cfg)
+
+        pcfg = cfg["providers"]["opencode"]
+        self.assertEqual(1048576, pcfg["context_window"])
+        self.assertEqual(16384, pcfg["context_reserve_tokens"])
+        self.assertEqual(8192, pcfg["max_output_tokens"])
+        self.assertIn("qwen3.6-plus-free", pcfg["custom_models"])
+        self.assertTrue(cfg["migrations"]["opencode_qwen36_plus_parameters_20260614"])
 
     def test_migration_keeps_non_plus_qwen36_context(self):
         cfg = {
@@ -336,6 +393,7 @@ class OpenCodeProviderTests(unittest.TestCase):
             "object": "list",
             "data": [
                 {"id": "claude-sonnet-4-6"},
+                {"id": "qwen3.6-plus-free"},
                 {"id": "glm-5.1"},
                 {"id": "gpt-5.1"},
             ],
@@ -353,6 +411,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("Bearer sk-opencode-test", headers["authorization"])
         self.assertEqual("claude-cli", headers["user-agent"])
         self.assertIn("claude-sonnet-4-6", models)
+        self.assertIn("qwen3.6-plus-free", models)
         self.assertIn("glm-5.1", models)
         self.assertIn("gpt-5.1", models)
         write_cache.assert_called_once()
@@ -462,6 +521,7 @@ class OpenCodeProviderTests(unittest.TestCase):
     def test_zen_endpoint_family_mapping(self):
         self.assertEqual("anthropic-messages", claude_any.opencode_zen_endpoint_kind("claude-sonnet-4-6"))
         self.assertEqual("anthropic-messages", claude_any.opencode_zen_endpoint_kind("qwen3.6-plus"))
+        self.assertEqual("anthropic-messages", claude_any.opencode_zen_endpoint_kind("qwen3.6-plus-free"))
         self.assertEqual("openai-chat", claude_any.opencode_zen_endpoint_kind("glm-5.1"))
         self.assertEqual("openai-responses", claude_any.opencode_zen_endpoint_kind("gpt-5.1"))
         self.assertEqual("google-generative", claude_any.opencode_zen_endpoint_kind("gemini-3.1-pro"))
