@@ -23655,6 +23655,175 @@ def prompt_menu_value(prompt: str, default: str = "", secret: bool = False, rest
     return value or default
 
 
+def _prompt_menu_multiline_value_raw(label: str, secret: bool = False) -> str | None:
+    """Read a pasted or typed multi-line value from a TTY.
+
+    A blank line, Ctrl-D, or Esc finishes input. Pasted multi-line text without a
+    final blank line also finishes once the paste burst drains so the last line is
+    not left behind in the terminal input queue.
+    """
+    if not sys.stdin.isatty():
+        return None
+    chars: list[str] = []
+    saw_newline = False
+    if os.name == "nt":
+        try:
+            import msvcrt
+        except Exception:
+            return None
+        sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
+        sys.stdout.flush()
+        while True:
+            ch = msvcrt.getwch()
+            batch = [ch]
+            time.sleep(0.01)
+            while msvcrt.kbhit():
+                batch.append(msvcrt.getwch())
+            for ch in batch:
+                if ch == "\x03":
+                    raise KeyboardInterrupt
+                if ch in ("\x04", "\x1b"):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return "".join(chars).strip()
+                if ch in ("\r", "\n"):
+                    saw_newline = True
+                    chars.append("\n")
+                    sys.stdout.write("\n")
+                    continue
+                if ch in ("\x08", "\x7f"):
+                    if chars:
+                        chars.pop()
+                    continue
+                if ch == "\x15":
+                    chars.clear()
+                    continue
+                if ch < " ":
+                    continue
+                chars.append(ch)
+                if not secret:
+                    sys.stdout.write(ch)
+            sys.stdout.flush()
+            text = "".join(chars)
+            if text.endswith("\n\n"):
+                return text.strip()
+            if saw_newline and len(batch) > 1:
+                time.sleep(0.05)
+                if not msvcrt.kbhit():
+                    return text.strip()
+    try:
+        import codecs
+        import select
+        import termios
+    except Exception:
+        return None
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+        new_settings = termios.tcgetattr(fd)
+        new_settings[3] = new_settings[3] & ~(termios.ECHO | termios.ICANON)
+        new_settings[6][termios.VMIN] = 1
+        new_settings[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, new_settings)
+    except Exception:
+        return None
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    try:
+        sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
+        sys.stdout.flush()
+        while True:
+            first = os.read(fd, 1)
+            if not first:
+                continue
+            data = bytearray(first)
+            try:
+                while select.select([fd], [], [], 0)[0]:
+                    more = os.read(fd, 4096)
+                    if not more:
+                        break
+                    data.extend(more)
+            except Exception:
+                pass
+            display: list[str] = []
+            for byte in data:
+                b = bytes((byte,))
+                if b == b"\x03":
+                    raise KeyboardInterrupt
+                if b in (b"\x04", b"\x1b"):
+                    display.append("\n")
+                    sys.stdout.write("".join(display))
+                    sys.stdout.flush()
+                    return "".join(chars).strip()
+                if b in (b"\x7f", b"\x08"):
+                    if chars:
+                        chars.pop()
+                    continue
+                if b == b"\x15":
+                    chars.clear()
+                    continue
+                text = decoder.decode(b)
+                if not text:
+                    continue
+                for ch in text:
+                    if ch == "\ufffd":
+                        continue
+                    if ch in ("\r", "\n"):
+                        saw_newline = True
+                        chars.append("\n")
+                        display.append("\n")
+                    elif ch >= " ":
+                        chars.append(ch)
+                        if not secret:
+                            display.append(ch)
+            if display:
+                sys.stdout.write("".join(display))
+                sys.stdout.flush()
+            text = "".join(chars)
+            if text.endswith("\n\n"):
+                return text.strip()
+            if saw_newline and len(data) > 1:
+                try:
+                    if not select.select([fd], [], [], 0.05)[0]:
+                        return text.strip()
+                except Exception:
+                    return text.strip()
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+        except Exception:
+            pass
+
+
+def prompt_menu_multiline_value(prompt: str, restore_tty: Callable[[], None] | None = None, raw_tty: Callable[[], None] | None = None, secret: bool = True) -> str:
+    label = f"{prompt} (finish with a blank line): "
+    if restore_tty:
+        restore_tty()
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+    try:
+        raw_value = _prompt_menu_multiline_value_raw(label, secret=secret)
+        if raw_value is not None:
+            value = raw_value
+        else:
+            sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
+            sys.stdout.flush()
+            lines: list[str] = []
+            while True:
+                line = input()
+                if not line.strip():
+                    break
+                lines.append(line)
+            value = "\n".join(lines)
+    finally:
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+        if raw_tty:
+            raw_tty()
+    return value.strip()
+
+
 def portable_provider_menu() -> int:
     cfg = load_config()
     rows, values = provider_panel_rows(cfg)
@@ -23900,9 +24069,8 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                             refresh_checks()
                         close_panel(3)
                     elif value == "multi-input":
-                        key_value = prompt_menu_value(
+                        key_value = prompt_menu_multiline_value(
                             f"API keys for {provider} (comma/newline separated)",
-                            secret=True,
                             restore_tty=restore_line_mode,
                             raw_tty=restore_raw_mode,
                         )

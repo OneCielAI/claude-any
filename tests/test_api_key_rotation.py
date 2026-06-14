@@ -42,6 +42,11 @@ class ApiKeyRotationTests(unittest.TestCase):
 
         self.assertEqual(["sk-one", "sk-two", "sk-three"], keys)
 
+    def test_parse_api_key_list_keeps_final_pasted_line_without_trailing_newline(self):
+        keys = claude_any.parse_api_key_list("sk-one\nsk-two\nsk-three\nsk-four")
+
+        self.assertEqual(["sk-one", "sk-two", "sk-three", "sk-four"], keys)
+
     def test_provider_headers_round_robin_multiple_keys(self):
         pcfg = self.deepseek_pcfg(api_key="", api_keys=["sk-one", "sk-two"])
 
