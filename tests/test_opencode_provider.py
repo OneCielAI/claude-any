@@ -416,6 +416,38 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertIn("gpt-5.1", models)
         write_cache.assert_called_once()
 
+    def test_model_list_retries_public_opencode_catalog_when_key_request_fails(self):
+        pcfg = self.opencode_cfg(api_key="sk-opencode-test")["providers"]["opencode"]
+        public_response = {
+            "object": "list",
+            "data": [
+                {"id": "deepseek-v4-flash"},
+                {"id": "qwen3.5-plus"},
+            ],
+        }
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "write_model_list_cache") as write_cache,
+            mock.patch.object(
+                claude_any,
+                "http_json",
+                side_effect=[
+                    PermissionError("bad key"),
+                    TimeoutError("fallback path missing"),
+                    public_response,
+                ],
+            ) as http_json,
+        ):
+            models = claude_any.upstream_model_ids("opencode", pcfg)
+
+        self.assertIn("deepseek-v4-flash", models)
+        self.assertIn("qwen3.5-plus", models)
+        self.assertEqual(3, http_json.call_count)
+        public_headers = http_json.call_args_list[2].kwargs["headers"]
+        self.assertNotIn("authorization", public_headers)
+        self.assertEqual("claude-cli", public_headers["user-agent"])
+        write_cache.assert_called_once()
+
     def test_go_model_list_reads_go_v1_models(self):
         pcfg = self.opencode_go_cfg(api_key="sk-opencode-test")["providers"]["opencode-go"]
         response = {
@@ -525,6 +557,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         self.assertEqual("openai-chat", claude_any.opencode_zen_endpoint_kind("glm-5.1"))
         self.assertEqual("openai-responses", claude_any.opencode_zen_endpoint_kind("gpt-5.1"))
         self.assertEqual("google-generative", claude_any.opencode_zen_endpoint_kind("gemini-3.1-pro"))
+        self.assertEqual("openai-chat", claude_any.opencode_zen_endpoint_kind("north-mini-code-free"))
         self.assertEqual("anthropic-messages", claude_any.opencode_zen_endpoint_kind("new-custom-model"))
 
     def test_go_endpoint_family_mapping(self):

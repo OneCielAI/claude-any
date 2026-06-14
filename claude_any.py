@@ -5730,7 +5730,7 @@ def opencode_zen_endpoint_kind(model_id: str) -> str:
         return "openai-responses"
     if model.startswith("gemini-"):
         return "google-generative"
-    if model.startswith(("minimax-", "glm-", "kimi-", "grok-", "big-pickle", "deepseek-", "mimo-", "nemotron-")):
+    if model.startswith(("minimax-", "glm-", "kimi-", "grok-", "big-pickle", "deepseek-", "mimo-", "nemotron-", "north-")):
         return "openai-chat"
     return "anthropic-messages"
 
@@ -6747,6 +6747,17 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
                         break
                 except Exception:
                     continue
+            if not fetched and provider in OPENCODE_PROVIDER_NAMES:
+                # OpenCode publishes the model catalog at /v1/models. Keep the
+                # picker independent from key-specific auth/rate-limit failures.
+                try:
+                    public_headers = with_upstream_user_agent({"content-type": "application/json"})
+                    data = http_json(join_url(base, "/v1/models"), headers=public_headers, timeout=6.0, provider=provider, pcfg=pcfg)
+                    ids = model_ids_from_response(data)
+                    model_info.update(model_info_from_response(provider, data))
+                    fetched = True
+                except Exception as exc:
+                    router_log("DEBUG", f"{provider} public model catalog fetch failed: {type(exc).__name__}: {exc}")
     except Exception:
         ids = []
     if provider == "ollama-cloud" and not ids:
