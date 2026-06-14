@@ -23658,14 +23658,13 @@ def prompt_menu_value(prompt: str, default: str = "", secret: bool = False, rest
 def _prompt_menu_multiline_value_raw(label: str, secret: bool = False) -> str | None:
     """Read a pasted or typed multi-line value from a TTY.
 
-    A blank line, Ctrl-D, or Esc finishes input. Pasted multi-line text without a
-    final blank line also finishes once the paste burst drains so the last line is
-    not left behind in the terminal input queue.
+    A blank line, Ctrl-D, or Esc finishes input. Do not auto-finish on a newline:
+    web terminals and SSH relays can deliver a paste one line at a time, so a
+    debounce-based finish can incorrectly store only the first line.
     """
     if not sys.stdin.isatty():
         return None
     chars: list[str] = []
-    saw_newline = False
     if os.name == "nt":
         try:
             import msvcrt
@@ -23687,7 +23686,6 @@ def _prompt_menu_multiline_value_raw(label: str, secret: bool = False) -> str | 
                     sys.stdout.flush()
                     return "".join(chars).strip()
                 if ch in ("\r", "\n"):
-                    saw_newline = True
                     chars.append("\n")
                     sys.stdout.write("\n")
                     continue
@@ -23707,10 +23705,6 @@ def _prompt_menu_multiline_value_raw(label: str, secret: bool = False) -> str | 
             text = "".join(chars)
             if text.endswith("\n\n"):
                 return text.strip()
-            if saw_newline and len(batch) > 1:
-                time.sleep(0.05)
-                if not msvcrt.kbhit():
-                    return text.strip()
     try:
         import codecs
         import select
@@ -23768,7 +23762,6 @@ def _prompt_menu_multiline_value_raw(label: str, secret: bool = False) -> str | 
                     if ch == "\ufffd":
                         continue
                     if ch in ("\r", "\n"):
-                        saw_newline = True
                         chars.append("\n")
                         display.append("\n")
                     elif ch >= " ":
@@ -23781,12 +23774,6 @@ def _prompt_menu_multiline_value_raw(label: str, secret: bool = False) -> str | 
             text = "".join(chars)
             if text.endswith("\n\n"):
                 return text.strip()
-            if saw_newline and len(data) > 1:
-                try:
-                    if not select.select([fd], [], [], 0.05)[0]:
-                        return text.strip()
-                except Exception:
-                    return text.strip()
     finally:
         try:
             termios.tcsetattr(fd, termios.TCSANOW, old_settings)
