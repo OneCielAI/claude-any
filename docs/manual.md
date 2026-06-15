@@ -418,6 +418,44 @@ Links:
 - OpenCode Go docs: https://opencode.ai/docs/ko/go/
 - OpenCode Go model catalog: https://opencode.ai/zen/go/v1/models
 
+### Kimi.com Code
+
+Kimi.com Code is available as a routed provider through Kimi's
+Anthropic-compatible coding endpoint:
+
+```text
+https://api.kimi.com/coding
+```
+
+Choose `Kimi.com` in the provider menu, or configure it headlessly:
+
+```sh
+claude-any --ca-provider kimi --ca-model kimi-for-coding
+```
+
+Full one-shot setup:
+
+```sh
+claude-any --ca-provider kimi --ca-base-url https://api.kimi.com/coding --ca-model kimi-for-coding --ca-api-key-env KIMI_API_KEY --ca-no-launch
+```
+
+Kimi requires a Kimi Code API key. Claude Any uses
+`https://api.kimi.com/coding/v1/models` for the live model picker and keeps
+`kimi-for-coding` as the canonical model ID for K2.7 Code. The provider is
+treated as Anthropic-compatible: thinking blocks are preserved, tool use is
+sent through `/v1/messages`, and the documented defaults are applied
+automatically: 262144 context tokens, 32768 max output tokens, and medium
+reasoning effort.
+
+Claude Any does not read or reuse Kimi Code CLI's own login/OAuth state. Kimi's
+third-party Claude Code integration documents the API-key path, so configure a
+Kimi Code API key directly or via `KIMI_API_KEY` / `KIMI_API_KEYS`.
+
+Links:
+
+- Kimi Code Claude Code integration: https://www.kimi.com/code/docs/third-party-tools/other-coding-agents.html
+- Kimi Code CLI configuration: https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/config-files.html
+
 ### vLLM
 
 Use a vLLM server that exposes the Anthropic Messages API used by Claude Code.

@@ -763,6 +763,7 @@ Windows/Linux 管理、クリーンアップスクリプト、定期的なセキ
 | DeepSeek.com | Router | `https://api.deepseek.com/anthropic` を呼び出します。DeepSeek API key は `ANTHROPIC_AUTH_TOKEN` として渡し、Claude Code auth conflict を避けるため `ANTHROPIC_API_KEY` は未設定にします。 |
 | OpenCode Zen | Router | `https://opencode.ai/zen` を呼び出し、OpenCode Zen API key が必要です。モデル一覧は `/v1/models` から取得し、Claude/Qwen 系は `/v1/messages`、chat 互換モデルは `/v1/chat/completions` にルーティングします。Responses/Gemini 専用 endpoint 系は metadata として表示し、まだ自動ルーティングしません。 |
 | OpenCode Go | Router | `https://opencode.ai/zen/go` を呼び出し、OpenCode Go API key が必要です。モデル一覧は `/v1/models` から取得し、Qwen/MiniMax Go モデルは `/v1/messages`、GLM/Kimi/DeepSeek/MiMo Go モデルは `/v1/chat/completions` にルーティングします。 |
+| Kimi.com | Router | `https://api.kimi.com/coding` を呼び出し、Kimi Code API key が必要です。モデル一覧は `/v1/models` から取得し、`kimi-for-coding` は thinking を保持する Anthropic-compatible 256K context / 32K output coding model として扱います。 |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 互換 `/v1/messages` endpoint を使い、モデル系列に合う `--tool-call-parser` を指定。 |
 | NVIDIA hosted | Router | NVIDIA hosted API Catalog を Claude Any local router 経由で使用。 |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM の Anthropic 互換 endpoint を使用。 |

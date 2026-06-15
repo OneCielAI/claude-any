@@ -842,6 +842,7 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 | DeepSeek.com | Router | `https://api.deepseek.com/anthropic` 호출. DeepSeek API 키를 `ANTHROPIC_AUTH_TOKEN`으로 전달하고 `ANTHROPIC_API_KEY`는 비워 Claude Code 인증 충돌을 피합니다. |
 | OpenCode Zen | Router | `https://opencode.ai/zen` 호출. OpenCode Zen API 키 필요. 모델 목록은 `/v1/models`에서 가져오며, Claude/Qwen 계열은 `/v1/messages`, chat 호환 모델은 `/v1/chat/completions`로 라우팅합니다. Responses/Gemini 전용 endpoint 계열은 메타데이터로 표시하고 아직 자동 라우팅하지 않습니다. |
 | OpenCode Go | Router | `https://opencode.ai/zen/go` 호출. OpenCode Go API 키 필요. 모델 목록은 `/v1/models`에서 가져오며, Qwen/MiniMax Go 모델은 `/v1/messages`, GLM/Kimi/DeepSeek/MiMo Go 모델은 `/v1/chat/completions`로 라우팅합니다. |
+| Kimi.com | Router | `https://api.kimi.com/coding` 호출. Kimi Code API 키 필요. 모델 목록은 `/v1/models`에서 가져오며, `kimi-for-coding`은 thinking을 보존하는 Anthropic 호환 256K context / 32K output coding 모델로 설정합니다. |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 호환 `/v1/messages`를 제공하는 vLLM endpoint 사용. 모델 계열에 맞는 `--tool-call-parser` 필요. |
 | NVIDIA hosted | Router | NVIDIA hosted API Catalog를 Claude Any local router로 사용. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM Anthropic 호환 endpoint 사용. |

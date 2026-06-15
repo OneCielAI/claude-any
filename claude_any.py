@@ -183,6 +183,8 @@ ANTHROPIC_LIMITED_ACCESS_MODEL_IDS: tuple[str, ...] = (
 )
 OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen"
 OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go"
+KIMI_CODING_BASE_URL = "https://api.kimi.com/coding"
+KIMI_DEFAULT_MODEL = "kimi-for-coding"
 FIREWORKS_INFERENCE_BASE_URL = "https://api.fireworks.ai/inference"
 FIREWORKS_API_BASE_URL = "https://api.fireworks.ai"
 FIREWORKS_DEFAULT_ACCOUNT_ID = "fireworks"
@@ -211,6 +213,12 @@ PROVIDER_ALIASES = {
     "opencode.go": "opencode-go",
     "opencode_go": "opencode-go",
     "opencodego": "opencode-go",
+    "kimi": "kimi",
+    "kimi.com": "kimi",
+    "kimi-code": "kimi",
+    "kimi-coding": "kimi",
+    "moonshot": "kimi",
+    "moonshot-kimi": "kimi",
     "vllm": "vllm",
     "vllm-local": "vllm",
     "lm-studio": "lm-studio",
@@ -239,6 +247,7 @@ PROVIDER_LABELS = {
     "deepseek": "DeepSeek.com",
     "opencode": "OpenCode Zen",
     "opencode-go": "OpenCode Go",
+    "kimi": "Kimi.com",
     "vllm": "vLLM",
     "lm-studio": "LM Studio",
     "nvidia-hosted": "Nvidia Hosted",
@@ -2048,6 +2057,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "subagent_model": "qwen3.6-plus",
             "model_endpoints": {},
         },
+        "kimi": {
+            "base_url": KIMI_CODING_BASE_URL,
+            "api_key": "",
+            "current_model": KIMI_DEFAULT_MODEL,
+            "advisor_model": "",
+            "custom_models": [KIMI_DEFAULT_MODEL],
+            "native_compat": True,
+            "preserve_anthropic_thinking": True,
+            "claude_code_supported_capabilities": ["effort", "thinking"],
+            "context_window": 262144,
+            "max_output_tokens": 32768,
+            "context_reserve_tokens": 32768,
+            "request_timeout_ms": 600000,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
+            "effort_level": "medium",
+            "haiku_model": KIMI_DEFAULT_MODEL,
+            "subagent_model": KIMI_DEFAULT_MODEL,
+        },
         "vllm": {
             "base_url": "http://127.0.0.1:8000",
             "api_key": "dummy",
@@ -2448,6 +2476,18 @@ def unique_model_ids(provider: str, ids: list[str]) -> list[str]:
 
 def normalize_model_id(provider: str, model_id: str) -> str:
     model_id = str(model_id or "").strip() if provider == "deepseek" else strip_claude_context_suffix(model_id).strip()
+    if provider == "kimi":
+        lowered = model_id.lower().replace("_", "-").strip()
+        if lowered in (
+            "kimi-code/kimi-for-coding",
+            "kimi/kimi-for-coding",
+            "moonshot/kimi-for-coding",
+            "kimi-k2.7-code",
+            "kimi-k2.7-coding",
+            "k2.7-code",
+            "k2.7-coding",
+        ):
+            return KIMI_DEFAULT_MODEL
     if provider == "ollama-cloud" and model_id.endswith(":cloud"):
         return model_id[:-6]
     return model_id
@@ -6756,7 +6796,7 @@ def provider_headers(provider: str, pcfg: dict[str, Any], inbound_headers: Any |
             raise RuntimeError("OpenRouter requires a configured API key.")
         headers["x-api-key"] = key
         headers["Authorization"] = f"Bearer {key}"
-    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "fireworks"):
+    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "fireworks"):
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
     elif provider == "lm-studio":
@@ -6932,7 +6972,7 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
     if provider == "ollama-cloud" and not ids:
         ids = ollama_catalog_model_ids(provider)
         fetched = bool(ids)
-    if not fetched and provider in OPENCODE_PROVIDER_NAMES:
+    if not fetched and provider in (*OPENCODE_PROVIDER_NAMES, "kimi"):
         ids = unique_model_ids(provider, [
             *(pcfg.get("custom_models", []) or []),
             pcfg.get("current_model") or "",
@@ -7485,6 +7525,10 @@ def opencode_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     )
 
 
+def kimi_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return provider == "kimi" and bool(pcfg.get("native_compat", True))
+
+
 def fireworks_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return provider == "fireworks" and bool(pcfg.get("native_compat", True))
 
@@ -7497,6 +7541,7 @@ def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
         or nvidia_hosted_native_compat_enabled(provider, pcfg)
         or deepseek_native_compat_enabled(provider, pcfg)
         or opencode_native_compat_enabled(provider, pcfg)
+        or kimi_native_compat_enabled(provider, pcfg)
         or fireworks_native_compat_enabled(provider, pcfg)
     )
 
@@ -7612,7 +7657,7 @@ def provider_upstream_request_base(provider: str, pcfg: dict[str, Any]) -> str:
 
 def native_anthropic_base_url(provider: str, pcfg: dict[str, Any]) -> str:
     base = pcfg.get("base_url", "http://127.0.0.1:8000").rstrip("/")
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "openrouter", "fireworks") and base.endswith("/v1"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "openrouter", "kimi", "fireworks") and base.endswith("/v1"):
         return base[:-3].rstrip("/")
     return base
 
@@ -16637,7 +16682,7 @@ def cmd_api_key(args: argparse.Namespace) -> None:
     if not args.provider:
         print("API key status:")
         for p, pcfg in cfg["providers"].items():
-            needs = p in ("anthropic", "ollama-cloud", "deepseek", "opencode", "opencode-go", "nvidia-hosted", "openrouter", "fireworks")
+            needs = p in ("anthropic", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "nvidia-hosted", "openrouter", "fireworks")
             count = provider_api_key_count(p, pcfg)
             label = f"{count} keys (round-robin)" if count > 1 else ("set" if count == 1 else ("missing" if needs else "not required"))
             primary = provider_primary_api_key(p, pcfg)
@@ -16766,11 +16811,11 @@ def status_lines() -> list[str]:
         *([f"think: {bool(pcfg.get('think', False))}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("ollama", "ollama-cloud") else []),
-        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks") else []),
-        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks") else []),
-        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks") else []),
-        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks") else []),
-        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks") else []),
+        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
+        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
+        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
+        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
+        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
         f"log_level: {log_level_status()}",
         f"channels: {channel_status_text(cfg)}",
@@ -18972,7 +19017,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print("  claude-any --ca-ollama-option temperature=0.7 --ca-ollama-num-ctx 65536")
 
 
-PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks")
+PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks")
 PROVIDER_SAMPLING_OPTION_PROVIDERS = ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "openrouter")
 PROVIDER_SAMPLING_OPTIONS = ("temperature", "top_p", "top_k")
 
@@ -19033,10 +19078,10 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     if provider in ("ollama", "ollama-cloud"):
         parts.insert(0, f"num_ctx={ollama_num_ctx_status(pcfg)}")
         parts.append(f"ollama_options={ollama_options_status(pcfg)}")
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
-    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         native_default = True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
     if provider in OPENCODE_PROVIDER_NAMES:
@@ -19051,7 +19096,7 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
         parts.append(f"force_query={forced_query}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         parts.append(f"stream={'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
         if bool(pcfg.get("stream_word_chunking", False)):
             parts.append("word_chunk=on")
@@ -19094,7 +19139,7 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
         return "million-context"
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
-    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         ctx = provider_model_context_capacity(provider, pcfg) or positive_int(pcfg.get("context_window")) or 0
         if ctx >= 524288:
             return "million-context"
@@ -19361,7 +19406,7 @@ def model_context_hint_from_model_id(model_id: str) -> int | None:
         return catalog_limit
     if any(marker in model for marker in ("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4", "v4-pro", "v4-flash", "1m", "million")):
         return 1048576
-    if any(marker in model for marker in ("kimi-k2.6", "kimi_k2.6", "kimi2.6", "kimi-k2")):
+    if any(marker in model for marker in ("kimi-for-coding", "kimi-code", "kimi-k2.7", "kimi_k2.7", "kimi2.7", "k2.7", "kimi-k2.6", "kimi_k2.6", "kimi2.6", "kimi-k2")):
         return 262144
     if "qwen3.6" in model:
         return 262144
@@ -19386,7 +19431,7 @@ def provider_model_context_capacity(provider: str, pcfg: dict[str, Any]) -> int 
             or model_context_hint_from_model_id(model)
             or positive_int(pcfg.get("context_window"))
         )
-    if provider in ("deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         return (
             positive_int(pcfg.get("max_model_len"))
             or model_context_hint_from_model_id(model)
@@ -19423,7 +19468,7 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
         if fixed_ctx and fixed_ctx > capacity:
             pcfg["num_ctx"] = capacity
         return messages
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         context_window = positive_int(pcfg.get("context_window"))
         if context_window and context_window > capacity:
             pcfg["context_window"] = capacity
@@ -19465,7 +19510,7 @@ def apply_current_model_specs_to_provider(provider: str, pcfg: dict[str, Any]) -
         if positive_int(pcfg.get("num_ctx_max")) != max_context:
             pcfg["num_ctx_max"] = max_context
         return messages
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         if positive_int(pcfg.get("max_model_len")) != max_context:
             pcfg["max_model_len"] = max_context
             messages.append(f"Model context size from provider specs: {format_context_tokens(max_context)} ({max_context:,} tokens).")
@@ -19588,7 +19633,7 @@ def context_setting_status(provider: str, pcfg: dict[str, Any]) -> str:
     cap_text = format_context_tokens(capacity)
     if provider in ("ollama", "ollama-cloud"):
         return f"model max {cap_text}; {ollama_num_ctx_status(pcfg)}"
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         window = positive_int(pcfg.get("context_window"))
         reserve = positive_int(pcfg.get("context_reserve_tokens"))
         reserve_text = f"; reserve {format_context_tokens(reserve)}" if reserve else ""
@@ -19608,7 +19653,7 @@ def configured_context_window_for_timeout(provider: str, pcfg: dict[str, Any]) -
             provider_model_context_capacity(provider, pcfg)
             or positive_int(pcfg.get("num_ctx_max"))
         )
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         return positive_int(pcfg.get("context_window")) or provider_model_context_capacity(provider, pcfg)
     if provider == "anthropic":
         return provider_model_context_capacity(provider, pcfg)
@@ -19624,6 +19669,7 @@ HOSTED_TIMEOUT_PROVIDERS = {
     "deepseek",
     "opencode",
     "opencode-go",
+    "kimi",
     "openrouter",
     "nvidia-hosted",
     "fireworks",
@@ -19808,7 +19854,7 @@ def apply_context_setup_to_provider(provider: str, pcfg: dict[str, Any], mode: s
         pcfg["num_ctx_max"] = window
         pcfg["num_ctx_min"] = min(window, 32768 if window <= 65536 else 65536)
         pcfg.setdefault("ollama_options", {})["num_predict"] = output
-    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         pcfg["context_window"] = window
         pcfg["context_reserve_tokens"] = reserve
         pcfg["max_output_tokens"] = output
@@ -19893,7 +19939,7 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
         if num_ctx and num_ctx <= 32768 and num_predict and num_predict <= 2048:
             return "fast"
         return None
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks", "anthropic"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "anthropic"):
         max_output = positive_int(pcfg.get("max_output_tokens")) or 0
         context_window = positive_int(pcfg.get("context_window")) or 0
         if bool(pcfg.get("think", False)):
@@ -20409,6 +20455,17 @@ def apply_llm_preset_to_provider(
                 f"native={native_default}",
             ],
             }
+            if provider == "kimi":
+                tokens_by_preset["long-context-128k"] = [
+                    "context_window=262144",
+                    "reserve=32768",
+                    "max_output_tokens=32768",
+                    "timeout=600000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                    "native=true",
+                ]
         for token in with_preset_timeout_tokens(tokens_by_preset[preset_id], preset_id):
             if provider == "nvidia-hosted" and token.startswith("native="):
                 continue
@@ -20825,11 +20882,11 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", False)) else "off")
         add("IP family", "ip_family", provider_ip_family(provider, pcfg))
     else:
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
             add("Context reserve", "context_reserve_tokens", pcfg.get("context_reserve_tokens", "default"))
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
             add("RPM limiter", "rate_limit_enabled", rate_limit_status_label(provider, pcfg))
             add("Rate limit RPM", "rate_limit_rpm", rate_limit_rpm_label(provider, pcfg))
@@ -20837,7 +20894,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
             add("Temperature", "temperature", pcfg.get("temperature", "default"))
             add("Top P", "top_p", pcfg.get("top_p", "default"))
             add("Top K", "top_k", pcfg.get("top_k", "default"))
-            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
                 add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", True)))
             add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
             if bool(pcfg.get("stream_enabled", True)):
@@ -21209,7 +21266,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
         except SystemExit:
             pass
     if provider not in PROVIDER_OPTION_PROVIDERS:
-        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, fireworks, vllm, lm-studio, nvidia-hosted, self-hosted-nim, and openrouter.")
+        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, kimi, fireworks, vllm, lm-studio, nvidia-hosted, self-hosted-nim, and openrouter.")
     pcfg = cfg["providers"][provider]
     if values:
         context_changed = any(
@@ -22740,6 +22797,7 @@ def default_base_url(provider: str) -> str:
         "deepseek": "https://api.deepseek.com/anthropic",
         "opencode": OPENCODE_ZEN_BASE_URL,
         "opencode-go": OPENCODE_GO_BASE_URL,
+        "kimi": KIMI_CODING_BASE_URL,
         "vllm": "http://your-vllm:8000",
         "lm-studio": "http://127.0.0.1:1234/v1",
         "nvidia-hosted": nvidia_upstream_base_url(),
@@ -22783,6 +22841,10 @@ def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         if key_count > 1:
             return f"API keys: {round_robin} ({label}{primary_detail})"
         return f"API key: set ({label}{primary_detail})" if key_count else f"API key: missing ({label} required)"
+    if provider == "kimi":
+        if key_count > 1:
+            return f"API keys: {round_robin} (Kimi.com{primary_detail})"
+        return f"API key: set (Kimi.com{primary_detail})" if key_count else "API key: missing (Kimi.com required)"
     if provider == "fireworks":
         if key_count > 1:
             return f"API keys: {round_robin} (Fireworks.ai{primary_detail})"
@@ -22815,6 +22877,20 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         headers = provider_model_list_headers(provider, pcfg)
         try:
             data = http_json(join_url(base, path), headers=headers, timeout=2.5)
+            count = len(model_ids_from_response(data))
+            return f"Base URL: {label} model list reachable ({path}, {count} models)"
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return f"Base URL: {label} reachable, auth rejected ({exc.code})"
+            return f"Base URL: {label} HTTP {exc.code}"
+        except Exception as exc:
+            return f"Base URL: {label} unreachable ({type(exc).__name__})"
+    if provider == "kimi":
+        label = PROVIDER_LABELS.get(provider, provider)
+        path = "/v1/models"
+        headers = provider_model_list_headers(provider, pcfg)
+        try:
+            data = http_json(join_url(base, path), headers=headers, timeout=2.5, provider=provider, pcfg=pcfg)
             count = len(model_ids_from_response(data))
             return f"Base URL: {label} model list reachable ({path}, {count} models)"
         except urllib.error.HTTPError as exc:
@@ -22913,6 +22989,8 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
         errors.append("Launch blocked: OpenRouter requires an OpenRouter API key.")
     if provider == "fireworks" and not provider_has_api_key(provider, pcfg):
         errors.append("Launch blocked: Fireworks.ai requires a Fireworks API key.")
+    if provider == "kimi" and not provider_has_api_key(provider, pcfg):
+        errors.append("Launch blocked: Kimi.com requires a Kimi API key.")
     if provider in OPENCODE_PROVIDER_NAMES and not provider_has_api_key(provider, pcfg):
         label = PROVIDER_LABELS.get(provider, provider)
         errors.append(f"Launch blocked: {label} requires a {label} API key.")
@@ -24251,6 +24329,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                             "deepseek": "DEEPSEEK_API_KEY",
                             "opencode": "OPENCODE_API_KEY",
                             "opencode-go": "OPENCODE_API_KEY",
+                            "kimi": "KIMI_API_KEY",
                             "nvidia-hosted": "NVIDIA_API_KEY",
                             "ollama-cloud": "OLLAMA_API_KEY",
                             "openrouter": "OPENROUTER_API_KEY",
@@ -24270,6 +24349,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                             "deepseek": "DEEPSEEK_API_KEYS",
                             "opencode": "OPENCODE_API_KEYS",
                             "opencode-go": "OPENCODE_API_KEYS",
+                            "kimi": "KIMI_API_KEYS",
                             "nvidia-hosted": "NVIDIA_API_KEYS",
                             "ollama-cloud": "OLLAMA_API_KEYS",
                             "openrouter": "OPENROUTER_API_KEYS",
@@ -29872,7 +29952,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-stop               Stop router/proxy
   claude-any --                      Pass all following args directly to Claude Code
 
-Provider names: anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, vllm, lm-studio, nvidia-hosted, self-hosted-nim, openrouter, fireworks
+Provider names: anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, kimi, vllm, lm-studio, nvidia-hosted, self-hosted-nim, openrouter, fireworks
 Any other arguments are passed through to claude. Use -- before Claude flags that
 collide with claude-any setup flags."""
 
