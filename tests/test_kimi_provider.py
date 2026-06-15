@@ -109,7 +109,6 @@ class KimiProviderTests(unittest.TestCase):
 
     def test_env_vars_route_kimi_through_claude_any_router(self):
         cfg = self.kimi_cfg(api_key="sk-kimi-test")
-        pcfg = cfg["providers"]["kimi"]
         with mock.patch.object(claude_any, "upstream_model_ids", return_value=["kimi-for-coding"]):
             env = claude_any.env_vars(cfg)
 
