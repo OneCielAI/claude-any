@@ -1542,6 +1542,32 @@ class ChannelBridgeTests(unittest.TestCase):
             with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
                 self.assertTrue(claude_any._channel_stdin_wake_completed(9))
 
+    def test_channel_stdin_wake_state_distinguishes_missing_pending_completed(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "user", "message": {"content": "id=10 text=\"hello\""}}) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertEqual("pending", claude_any._channel_stdin_wake_state(10))
+                self.assertEqual("missing", claude_any._channel_stdin_wake_state(11))
+
+            transcript.write_text(
+                transcript.read_text(encoding="utf-8")
+                + json.dumps({"type": "assistant", "message": {"content": []}})
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertEqual("completed", claude_any._channel_stdin_wake_state(10))
+
+    def test_channel_stdin_unseen_retry_seconds_is_bounded(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_WAKE_UNSEEN_RETRY_SECONDS": "0"}):
+            self.assertEqual(2.0, claude_any._channel_stdin_unseen_retry_seconds())
+        with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_WAKE_UNSEEN_RETRY_SECONDS": "999"}):
+            self.assertEqual(300.0, claude_any._channel_stdin_unseen_retry_seconds())
+
     def test_channel_stdin_rechecks_pending_after_inflight_completion_without_marker_change(self):
         marker = (123.0, 456)
 

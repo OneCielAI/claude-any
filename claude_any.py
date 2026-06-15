@@ -27316,15 +27316,15 @@ def _read_file_tail_text(path: Path, max_bytes: int = 512 * 1024) -> str:
         return ""
 
 
-def _channel_stdin_wake_completed(message_id: int) -> bool:
+def _channel_stdin_wake_state(message_id: int) -> str:
     if message_id <= 0:
-        return True
+        return "completed"
     path = _latest_claude_transcript_path()
     if path is None:
-        return False
+        return "unknown"
     text = _read_file_tail_text(path)
     if not text:
-        return False
+        return "unknown"
     prompt_markers = (
         f"id={message_id} ",
         f"id={message_id}\n",
@@ -27334,12 +27334,28 @@ def _channel_stdin_wake_completed(message_id: int) -> bool:
     )
     pos = max(text.rfind(marker) for marker in prompt_markers)
     if pos < 0:
-        return False
+        return "missing"
     suffix = text[pos:]
-    return bool(
+    if (
         re.search(r'"type"\s*:\s*"assistant"', suffix)
         or re.search(r'"subtype"\s*:\s*"turn_duration"', suffix)
-    )
+    ):
+        return "completed"
+    return "pending"
+
+
+def _channel_stdin_wake_completed(message_id: int) -> bool:
+    return _channel_stdin_wake_state(message_id) == "completed"
+
+
+def _channel_stdin_unseen_retry_seconds() -> float:
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_UNSEEN_RETRY_SECONDS")
+    if raw is None:
+        return 20.0
+    try:
+        return max(2.0, min(300.0, float(raw)))
+    except Exception:
+        return 20.0
 
 
 def _channel_stdin_should_check_pending(
@@ -27586,6 +27602,7 @@ def subprocess_call_with_channel_wake_proxy(
     channel_inflight_id: int | None = None
     channel_inflight_cursor: int | None = None
     channel_inflight_logged_at = 0.0
+    channel_inflight_started_at = 0.0
     channel_pending_recheck = False
     channel_enter_bytes = _channel_wake_enter_bytes()
     router_log(
@@ -27636,7 +27653,8 @@ def subprocess_call_with_channel_wake_proxy(
                     _write_fd_all(stdout_fd, data)
             now = time.time()
             if channel_inflight_id is not None:
-                if _channel_stdin_wake_completed(channel_inflight_id):
+                channel_inflight_state = _channel_stdin_wake_state(channel_inflight_id)
+                if channel_inflight_state == "completed":
                     if channel_inflight_cursor is not None:
                         _commit_channel_llm_cursor_if_newer(channel_inflight_cursor)
                     router_log(
@@ -27645,12 +27663,30 @@ def subprocess_call_with_channel_wake_proxy(
                     )
                     channel_inflight_id = None
                     channel_inflight_cursor = None
+                    channel_inflight_started_at = 0.0
                     channel_pending_recheck = True
+                elif (
+                    channel_inflight_state == "missing"
+                    and channel_inflight_started_at > 0
+                    and now - channel_inflight_started_at >= _channel_stdin_unseen_retry_seconds()
+                ):
+                    with _CHANNEL_STDIN_WAKE_LOCK:
+                        _CHANNEL_STDIN_WAKE_DELIVERED.discard(channel_inflight_id)
+                    router_log(
+                        "WARN",
+                        f"channel_stdin_proxy_unseen_retry message_id={channel_inflight_id} age={now - channel_inflight_started_at:.1f}s",
+                    )
+                    channel_inflight_id = None
+                    channel_inflight_cursor = None
+                    channel_inflight_started_at = 0.0
+                    channel_pending_recheck = True
+                    last_id = ensure_channel_llm_delivery_cursor_initialized()
+                    channel_inflight_logged_at = now
                 elif now - channel_inflight_logged_at >= 30.0:
                     channel_inflight_logged_at = now
                     router_log(
                         "INFO",
-                        f"channel_stdin_proxy_waiting_for_turn_completion message_id={channel_inflight_id}",
+                        f"channel_stdin_proxy_waiting_for_turn_completion message_id={channel_inflight_id} state={channel_inflight_state}",
                     )
             if now - last_channel_poll >= 0.5:
                 last_channel_poll = now
@@ -27678,6 +27714,7 @@ def subprocess_call_with_channel_wake_proxy(
                         channel_inflight_id = injected_ids[-1]
                         channel_inflight_cursor = last_id
                         channel_inflight_logged_at = now
+                        channel_inflight_started_at = now
                 summary_marker = _channel_llm_summary_file_marker()
                 if inject_channel_summaries and summary_marker != last_summary_marker:
                     last_summary_marker = summary_marker
