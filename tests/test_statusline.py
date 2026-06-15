@@ -3,7 +3,9 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+import hashlib
 from pathlib import Path
 
 import claude_any
@@ -85,6 +87,72 @@ class StatuslineTests(unittest.TestCase):
             )
 
         self.assertIn("channel queue 2", proc.stdout)
+
+    def test_statusline_shows_multi_key_rate_limit_summary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "statusline.py"
+            script.write_text(claude_any.STATUSLINE_SCRIPT, encoding="utf-8")
+            config_dir = Path(tmp)
+            keys = ["sk-k1", "sk-k2", "sk-k3", "sk-k4"]
+            config = {
+                "current_provider": "opencode",
+                "providers": {
+                    "opencode": {
+                        "base_url": "https://opencode.ai/zen",
+                        "current_model": "deepseek-v4-flash-free",
+                        "api_keys": keys,
+                        "rate_limit_status": True,
+                        "rate_limit_rpm": 0,
+                    }
+                },
+            }
+            (config_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            now = time.time()
+            cooled = hashlib.sha256(keys[1].encode("utf-8")).hexdigest()[:12]
+            state = {
+                "opencode:__global__": {
+                    "timestamps": [],
+                    "rpm": 0,
+                    "updated_at": now,
+                    "server_remaining": 2,
+                    "server_reset_seconds": 38,
+                    "server_max_concurrent": 10,
+                    "server_active": 9,
+                    "server_queue_limit": 15,
+                    "server_queued": 14,
+                },
+                f"opencode:https://opencode.ai/zen:__key__:{cooled}": {
+                    "cooldown_until": now + 720,
+                    "last_429_at": now,
+                },
+            }
+            (config_dir / "rate-limit-state.json").write_text(json.dumps(state), encoding="utf-8")
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CLAUDE_ANY_CONFIG_DIR": tmp,
+                    "CLAUDE_ANY_STATUSLINE_ANSI": "0",
+                    "CLAUDE_ANY_PROVIDER": "opencode",
+                    "CLAUDE_ANY_MODEL_ALIAS": "claude-any-test",
+                }
+            )
+            session = {
+                "model": {"display_name": "claude-any-test"},
+                "workspace": {"current_dir": tmp},
+            }
+            proc = subprocess.run(
+                [sys.executable, str(script)],
+                input=json.dumps(session),
+                text=True,
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+
+        self.assertIn("RL 3/4 next 12m", proc.stdout)
+        self.assertIn("server remaining 2, reset 38s", proc.stdout)
+        self.assertIn("conc 9/10", proc.stdout)
+        self.assertIn("q 14/15", proc.stdout)
 
 
 if __name__ == "__main__":

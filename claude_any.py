@@ -2936,6 +2936,7 @@ def install_tool_guard_hooks() -> None:
 
 
 STATUSLINE_SCRIPT = r'''#!/usr/bin/env python3
+import hashlib
 import json
 import os
 import re
@@ -2974,6 +2975,92 @@ def load_json(path, default):
         return value if isinstance(value, type(default)) else default
     except Exception:
         return default
+
+
+def _status_meaningful_key(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return text.lower() not in {"none", "null", "unset", "missing", "not set"}
+
+
+def _status_parse_api_key_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = re.split(r"[\r\n,;]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        items = []
+        for item in value:
+            items.extend(_status_parse_api_key_list(item))
+    else:
+        items = [value]
+    keys = []
+    seen = set()
+    for item in items:
+        key = str(item or "").strip()
+        if not _status_meaningful_key(key) or key in seen:
+            continue
+        keys.append(key)
+        seen.add(key)
+    return keys
+
+
+def _status_provider_api_keys(pcfg):
+    keys = []
+    if isinstance(pcfg, dict):
+        keys.extend(_status_parse_api_key_list(pcfg.get("api_keys")))
+        keys.extend(_status_parse_api_key_list(pcfg.get("api_key")))
+    out = []
+    seen = set()
+    for key in keys:
+        if key in seen:
+            continue
+        out.append(key)
+        seen.add(key)
+    return out
+
+
+def _status_provider_rotation_name(provider, pcfg):
+    base = str((pcfg or {}).get("base_url") or "").rstrip("/")
+    return f"{provider}:{base}" if base else f"{provider}:"
+
+
+def _status_key_cooldown_summary(provider, pcfg, state, now):
+    keys = _status_provider_api_keys(pcfg)
+    if len(keys) <= 1 or not isinstance(state, dict):
+        return ""
+    prefix = _status_provider_rotation_name(provider, pcfg) + ":__key__:"
+    live = 0
+    next_until = 0.0
+    cooling = 0
+    for key in keys:
+        digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()[:12]
+        entry = state.get(prefix + digest)
+        until = 0.0
+        if isinstance(entry, dict):
+            try:
+                until = float(entry.get("cooldown_until") or 0.0)
+            except Exception:
+                until = 0.0
+        if until > now:
+            cooling += 1
+            next_until = until if not next_until else min(next_until, until)
+        else:
+            live += 1
+    if not cooling:
+        return f"RL {live}/{len(keys)}"
+    wait_s = max(0.0, next_until - now) if next_until else 0.0
+    if wait_s >= 3600:
+        wait_text = f"{wait_s / 3600.0:.1f}h"
+    elif wait_s >= 60:
+        wait_text = f"{wait_s / 60.0:.0f}m"
+    else:
+        wait_text = f"{wait_s:.0f}s"
+    text = f"RL {live}/{len(keys)} next {wait_text}"
+    if live == 0 and len(keys) > 1:
+        text = f"RL 0/{len(keys)} next {wait_text}"
+    return text
 
 
 def color(text):
@@ -3204,7 +3291,7 @@ def main():
         entry = state.get(legacy_key) if legacy_key else None
     if not isinstance(entry, dict):
         prefix = f"{provider}:"
-        candidates = [(k, v) for k, v in state.items() if isinstance(k, str) and k.startswith(prefix) and isinstance(v, dict)]
+        candidates = [(k, v) for k, v in state.items() if isinstance(k, str) and k.startswith(prefix) and ":__key__:" not in k and isinstance(v, dict)]
         if not candidates:
             candidates = [(k, v) for k, v in state.items() if isinstance(v, dict)]
         if candidates:
@@ -3230,6 +3317,10 @@ def main():
     server_remaining = entry.get("server_remaining") if isinstance(entry, dict) else None
     server_reset_seconds = entry.get("server_reset_seconds") if isinstance(entry, dict) else None
     server_rpm = entry.get("server_rpm") if isinstance(entry, dict) else None
+    server_max_concurrent = entry.get("server_max_concurrent") if isinstance(entry, dict) else None
+    server_active = entry.get("server_active") if isinstance(entry, dict) else None
+    server_queue_limit = entry.get("server_queue_limit") if isinstance(entry, dict) else None
+    server_queued = entry.get("server_queued") if isinstance(entry, dict) else None
     used = len([ts for ts in (timestamps or []) if isinstance(ts, (int, float)) and 0.0 <= now - float(ts) < 60.0])
     model_name = ((session.get("model") or {}).get("display_name") if isinstance(session.get("model"), dict) else None) or model or "model"
     current_dir = ((session.get("workspace") or {}).get("current_dir") if isinstance(session.get("workspace"), dict) else None) or session.get("cwd") or ""
@@ -3247,7 +3338,10 @@ def main():
     if router_debug_external:
         status_parts.append(color("debug external"))
     if rpm_status:
-        if rpm > 0:
+        key_rl_text = _status_key_cooldown_summary(provider, pcfg, state, now)
+        if key_rl_text:
+            rpm_text = key_rl_text
+        elif rpm > 0:
             shown_limit = display_capacity(rpm)
             shown_used = min(used, shown_limit)
             rpm_text = f"RPM used: {shown_used}/{shown_limit}"
@@ -3266,6 +3360,20 @@ def main():
                 pass
             if parts:
                 rpm_text += " | server " + ", ".join(parts)
+        if server_max_concurrent is not None or server_active is not None:
+            try:
+                active_text = "?" if server_active is None else str(int(server_active))
+                max_text = "?" if server_max_concurrent is None else str(int(server_max_concurrent))
+                rpm_text += f" | conc {active_text}/{max_text}"
+            except Exception:
+                pass
+        if server_queue_limit is not None or server_queued is not None:
+            try:
+                queued_text = "?" if server_queued is None else str(int(server_queued))
+                limit_text = "?" if server_queue_limit is None else str(int(server_queue_limit))
+                rpm_text += f" | q {queued_text}/{limit_text}"
+            except Exception:
+                pass
         if penalty_until > now:
             rpm_text += f" | wait {max(0.0, penalty_until - now):.0f}s"
         elif last_wait >= 0.5 and 0.0 <= now - updated_at < 60.0:
@@ -6089,7 +6197,39 @@ def learn_router_rate_limit_headers(provider: str, pcfg: dict[str, Any], model: 
         "x-ratelimit-reset",
         "x-rate-limit-reset",
     ]))
-    if limit is None and remaining is None and reset is None:
+    max_concurrent = first_int_in_header(first_header(headers, [
+        "x-ratelimit-max-concurrent",
+        "x-rate-limit-max-concurrent",
+        "ratelimit-max-concurrent",
+        "rate-limit-max-concurrent",
+    ]))
+    active = first_int_in_header(first_header(headers, [
+        "x-ratelimit-active",
+        "x-rate-limit-active",
+        "ratelimit-active",
+        "rate-limit-active",
+    ]))
+    queue_limit = first_int_in_header(first_header(headers, [
+        "x-ratelimit-queue-limit",
+        "x-rate-limit-queue-limit",
+        "ratelimit-queue-limit",
+        "rate-limit-queue-limit",
+    ]))
+    queued = first_int_in_header(first_header(headers, [
+        "x-ratelimit-queued",
+        "x-rate-limit-queued",
+        "ratelimit-queued",
+        "rate-limit-queued",
+    ]))
+    if (
+        limit is None
+        and remaining is None
+        and reset is None
+        and max_concurrent is None
+        and active is None
+        and queue_limit is None
+        and queued is None
+    ):
         return
     configured = router_rate_limit_configured_rpm(provider, pcfg)
     rpm = limit if limit and limit > 0 else configured
@@ -6122,6 +6262,22 @@ def learn_router_rate_limit_headers(provider: str, pcfg: dict[str, Any], model: 
             "server_remaining": remaining,
             "server_reset_seconds": reset,
         }
+        if max_concurrent is not None:
+            new_entry["server_max_concurrent"] = max_concurrent
+        elif isinstance(entry, dict) and entry.get("server_max_concurrent") is not None:
+            new_entry["server_max_concurrent"] = entry.get("server_max_concurrent")
+        if active is not None:
+            new_entry["server_active"] = active
+        elif isinstance(entry, dict) and entry.get("server_active") is not None:
+            new_entry["server_active"] = entry.get("server_active")
+        if queue_limit is not None:
+            new_entry["server_queue_limit"] = queue_limit
+        elif isinstance(entry, dict) and entry.get("server_queue_limit") is not None:
+            new_entry["server_queue_limit"] = entry.get("server_queue_limit")
+        if queued is not None:
+            new_entry["server_queued"] = queued
+        elif isinstance(entry, dict) and entry.get("server_queued") is not None:
+            new_entry["server_queued"] = entry.get("server_queued")
         if limit and limit > 0:
             new_entry["server_rpm"] = int(limit)
             new_entry["server_rpm_updated_at"] = now
@@ -6134,7 +6290,11 @@ def learn_router_rate_limit_headers(provider: str, pcfg: dict[str, Any], model: 
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
     extra = " multi_key_no_global_penalty=1" if multi_key and remaining == 0 and reset and reset > 0 else ""
-    router_log("INFO", f"rate_limit_headers provider={provider} model={model or ''} limit={limit} remaining={remaining} reset={reset}{extra}")
+    router_log(
+        "INFO",
+        f"rate_limit_headers provider={provider} model={model or ''} limit={limit} remaining={remaining} reset={reset}"
+        f" max_concurrent={max_concurrent} active={active} queue_limit={queue_limit} queued={queued}{extra}",
+    )
 
 
 def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], model: str | None, retry_after: str | None = None) -> float:
@@ -6187,7 +6347,16 @@ def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], mode
         if penalty_until > now:
             state[key]["penalty_until"] = penalty_until
         if isinstance(entry, dict):
-            for preserve_key in ("server_rpm", "server_rpm_updated_at", "server_remaining", "server_reset_seconds"):
+            for preserve_key in (
+                "server_rpm",
+                "server_rpm_updated_at",
+                "server_remaining",
+                "server_reset_seconds",
+                "server_max_concurrent",
+                "server_active",
+                "server_queue_limit",
+                "server_queued",
+            ):
                 if preserve_key in entry:
                     state[key][preserve_key] = entry[preserve_key]
         if inferred_rpm:
