@@ -1595,6 +1595,66 @@ class ChannelBridgeTests(unittest.TestCase):
                 self.assertEqual("missing", claude_any._channel_stdin_wake_state(4971))
                 self.assertEqual("completed", claude_any._channel_stdin_wake_state(4972))
 
+    def test_channel_stdin_recover_cursor_rewinds_queued_only_message(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "queue-operation",
+                                "operation": "enqueue",
+                                "content": "[claude-any external channel message] id=4971 text=\"kevin\"",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "attachment",
+                                "attachment": {
+                                    "type": "queued_command",
+                                    "prompt": "[claude-any external channel message] id=4971 text=\"kevin\"",
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "user", "message": {"content": "id=4972 text=\"later\""}}),
+                        json.dumps({"type": "assistant", "message": {"content": []}}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            claude_any._CHANNEL_STDIN_RECOVERY_CACHE.clear()
+            with (
+                mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript),
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                self.assertEqual(4970, claude_any._channel_stdin_recover_cursor_from_queued_only(4987))
+
+    def test_channel_stdin_recover_cursor_keeps_completed_messages_advanced(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "user", "message": {"content": "id=4971 text=\"kevin\""}}),
+                        json.dumps({"type": "assistant", "message": {"content": []}}),
+                        json.dumps(
+                            {
+                                "type": "queue-operation",
+                                "operation": "enqueue",
+                                "content": "[claude-any external channel message] id=4971 text=\"kevin\"",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            claude_any._CHANNEL_STDIN_RECOVERY_CACHE.clear()
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertEqual(4987, claude_any._channel_stdin_recover_cursor_from_queued_only(4987))
+
     def test_channel_stdin_unseen_retry_seconds_is_bounded(self):
         with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_WAKE_UNSEEN_RETRY_SECONDS": "0"}):
             self.assertEqual(2.0, claude_any._channel_stdin_unseen_retry_seconds())

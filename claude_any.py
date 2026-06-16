@@ -27437,6 +27437,12 @@ def _write_channel_wake_prompt(master_fd: int, prompt: str, enter_bytes: bytes |
 
 
 _CHANNEL_TRANSCRIPT_CACHE: dict[str, Any] = {"checked_at": 0.0, "path": None}
+_CHANNEL_STDIN_RECOVERY_CACHE: dict[str, Any] = {
+    "checked_at": 0.0,
+    "last_id": None,
+    "marker": None,
+    "recovered_last_id": None,
+}
 
 
 def _latest_claude_transcript_path(ttl_seconds: float = 2.0) -> Path | None:
@@ -27484,6 +27490,12 @@ def _channel_stdin_wake_state(message_id: int) -> str:
     text = _read_file_tail_text(path)
     if not text:
         return "unknown"
+    return _channel_stdin_wake_state_from_text(message_id, text)
+
+
+def _channel_stdin_wake_state_from_text(message_id: int, text: str) -> str:
+    if message_id <= 0:
+        return "completed"
     prompt_markers = (
         f"id={message_id} ",
         f"id={message_id}\n",
@@ -27542,6 +27554,80 @@ def _channel_stdin_wake_completed(message_id: int) -> bool:
     return _channel_stdin_wake_state(message_id) == "completed"
 
 
+def _channel_stdin_queued_command_ids_from_text(text: str) -> set[int]:
+    ids: set[int] = set()
+    for raw_line in text.splitlines():
+        try:
+            record = json.loads(raw_line)
+        except Exception:
+            continue
+        if not isinstance(record, dict):
+            continue
+        candidate = ""
+        if record.get("type") == "queue-operation" and record.get("operation") == "enqueue":
+            raw = record.get("content")
+            if isinstance(raw, str):
+                candidate = raw
+        elif record.get("type") == "attachment":
+            attachment = record.get("attachment")
+            if isinstance(attachment, dict) and attachment.get("type") == "queued_command":
+                raw = attachment.get("prompt")
+                if isinstance(raw, str):
+                    candidate = raw
+        if not candidate:
+            continue
+        for match in re.finditer(r"\bid=(\d+)(?:\D|$)", candidate):
+            try:
+                ids.add(int(match.group(1)))
+            except Exception:
+                continue
+    return ids
+
+
+def _channel_stdin_recover_cursor_from_queued_only(last_id: int) -> int:
+    if last_id <= 0:
+        return last_id
+    path = _latest_claude_transcript_path()
+    if path is None:
+        return last_id
+    try:
+        stat = path.stat()
+        marker = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return last_id
+    now = time.time()
+    cached_marker = _CHANNEL_STDIN_RECOVERY_CACHE.get("marker")
+    if (
+        _CHANNEL_STDIN_RECOVERY_CACHE.get("last_id") == last_id
+        and cached_marker == marker
+        and now - float(_CHANNEL_STDIN_RECOVERY_CACHE.get("checked_at") or 0.0) < 5.0
+    ):
+        cached = _CHANNEL_STDIN_RECOVERY_CACHE.get("recovered_last_id")
+        return int(cached) if isinstance(cached, int) else last_id
+    text = _read_file_tail_text(path, max_bytes=8 * 1024 * 1024)
+    recovered = last_id
+    if text:
+        for message_id in sorted(_channel_stdin_queued_command_ids_from_text(text)):
+            if message_id > last_id:
+                continue
+            if _channel_stdin_wake_state_from_text(message_id, text) == "missing":
+                recovered = max(0, message_id - 1)
+                router_log(
+                    "WARN",
+                    f"channel_stdin_proxy_recover_queued_only message_id={message_id} cursor={last_id} recovered_cursor={recovered}",
+                )
+                break
+    _CHANNEL_STDIN_RECOVERY_CACHE.update(
+        {
+            "checked_at": now,
+            "last_id": last_id,
+            "marker": marker,
+            "recovered_last_id": recovered,
+        }
+    )
+    return recovered
+
+
 def _channel_stdin_unseen_retry_seconds() -> float:
     raw = os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_UNSEEN_RETRY_SECONDS")
     if raw is None:
@@ -27573,8 +27659,11 @@ def _inject_pending_channel_messages(
     injected_message_ids: list[int] | None = None,
 ) -> int:
     with _CHANNEL_STDIN_INJECT_LOCK:
+        if not web_chat_only:
+            last_id = _channel_stdin_recover_cursor_from_queued_only(last_id)
         pending: list[dict[str, Any]] = []
         for message in read_chat_messages(last_id, None, None, 100):
+            previous_last_id = last_id
             try:
                 message_id = int(message.get("id") or 0)
                 last_id = max(last_id, message_id)
@@ -27607,6 +27696,19 @@ def _inject_pending_channel_messages(
                     f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
                 )
                 continue
+            wake_state = _channel_stdin_wake_state(message_id)
+            if wake_state == "completed":
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=stdin_wake_completed",
+                )
+                continue
+            if wake_state == "pending":
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_waiting_for_turn_completion message_id={message.get('id')} channel={message.get('channel')} state=pending",
+                )
+                return previous_last_id
             with _CHANNEL_STDIN_WAKE_LOCK:
                 if message_id in _CHANNEL_STDIN_WAKE_DELIVERED:
                     router_log(
