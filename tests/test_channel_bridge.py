@@ -2567,6 +2567,98 @@ class ChannelBridgeTests(unittest.TestCase):
         ]
         self.assertEqual({10}, claude_any._channel_superseded_message_ids(messages))
 
+    def test_channel_superseded_message_ids_coalesces_empty_external_order_by_local_queue_id(self):
+        messages = [
+            {
+                "id": 20,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "old topic notice",
+                "kind": "channel",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/resource/updated",
+                    "kind": "resource_updated",
+                    "key": "shared/resource",
+                    "stream_id": "100-0",
+                },
+            },
+            {
+                "id": 21,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "different topic notice",
+                "kind": "channel",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/resource/updated",
+                    "kind": "resource_updated",
+                    "key": "other/resource",
+                    "stream_id": "",
+                },
+            },
+            {
+                "id": 22,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "new topic notice",
+                "kind": "channel",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/resource/updated",
+                    "kind": "resource_updated",
+                    "key": "shared/resource",
+                    "stream_id": "",
+                },
+            },
+        ]
+        self.assertEqual({20}, claude_any._channel_superseded_message_ids(messages))
+
+    def test_channel_superseded_message_ids_keeps_nested_unique_reference(self):
+        messages = [
+            {
+                "id": 30,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "old referenced notice",
+                "kind": "channel",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/action",
+                    "stream_id": "",
+                    "mcp_json": {
+                        "params": {
+                            "meta": {
+                                "kind": "action_closed",
+                                "poll_id": "poll-1",
+                            }
+                        }
+                    },
+                },
+            },
+            {
+                "id": 31,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "new referenced notice",
+                "kind": "channel",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/action",
+                    "stream_id": "",
+                    "mcp_json": {
+                        "params": {
+                            "meta": {
+                                "kind": "action_closed",
+                                "poll_id": "poll-2",
+                            }
+                        }
+                    },
+                },
+            },
+        ]
+        self.assertEqual(set(), claude_any._channel_superseded_message_ids(messages))
+
     def test_channel_direct_llm_worker_uses_router_without_hidden_print_mode(self):
         message = {
             "id": 9,

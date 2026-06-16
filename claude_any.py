@@ -25472,6 +25472,26 @@ _CHANNEL_EVENT_ORDER_META_KEYS = (
 )
 
 
+def _channel_message_meta_sources(message: dict[str, Any]) -> list[dict[str, Any]]:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    sources: list[dict[str, Any]] = []
+    if meta:
+        sources.append(meta)
+    for envelope_key in ("mcp_json", "sse_json"):
+        envelope = meta.get(envelope_key)
+        if not isinstance(envelope, dict):
+            continue
+        params = envelope.get("params")
+        if isinstance(params, dict):
+            nested_meta = params.get("meta")
+            if isinstance(nested_meta, dict):
+                sources.append(nested_meta)
+        nested_meta = envelope.get("meta")
+        if isinstance(nested_meta, dict):
+            sources.append(nested_meta)
+    return sources
+
+
 def _channel_message_delivery_targets(message: dict[str, Any]) -> set[str]:
     return {item.strip().lower() for item in _as_string_list(message.get("delivery")) if item.strip()}
 
@@ -25490,11 +25510,12 @@ def _channel_message_has_external_provenance(message: dict[str, Any]) -> bool:
 
 
 def _channel_message_has_unique_reference(message: dict[str, Any]) -> bool:
-    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    meta_sources = _channel_message_meta_sources(message)
     for key in _CHANNEL_UNIQUE_REFERENCE_META_KEYS:
-        value = meta.get(key)
-        if value is not None and str(value).strip():
-            return True
+        for meta in meta_sources:
+            value = meta.get(key)
+            if value is not None and str(value).strip():
+                return True
     return False
 
 
@@ -25505,13 +25526,26 @@ def _channel_message_source_key(message: dict[str, Any]) -> str:
 
 def _channel_message_kind_key(message: dict[str, Any]) -> str:
     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
-    return str(
-        message.get("kind")
-        or meta.get("kind")
+    meta_kind = str(
+        meta.get("kind")
         or meta.get("type")
         or meta.get("event_type")
         or meta.get("eventType")
         or meta.get("event")
+        or ""
+    ).strip()
+    if meta_kind:
+        return meta_kind
+    return str(message.get("kind") or "").strip()
+
+
+def _channel_message_topic_key(message: dict[str, Any]) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    return str(
+        meta.get("key")
+        or meta.get("topic")
+        or meta.get("resource")
+        or meta.get("target")
         or ""
     ).strip()
 
@@ -25530,11 +25564,18 @@ def _channel_message_order_value(message: dict[str, Any]) -> tuple[int, int, int
             return (2, int(match.group(1)), int(match.group(2)))
         if text.isdigit():
             return (1, int(text), 0)
+    if _channel_message_has_external_provenance(message):
+        try:
+            message_id = int(message.get("id") or 0)
+        except Exception:
+            message_id = 0
+        if message_id > 0:
+            return (3, message_id, 0)
     return None
 
 
-def _channel_message_coalesce_key(message: dict[str, Any]) -> tuple[str, str, str, str] | None:
-    if _channel_message_delivery_targets(message):
+def _channel_message_coalesce_key(message: dict[str, Any]) -> tuple[str, str, str, str, str] | None:
+    if _channel_message_delivery_targets(message) and not _channel_message_has_external_provenance(message):
         return None
     if _channel_message_is_web_chat_request(message):
         return None
@@ -25552,11 +25593,12 @@ def _channel_message_coalesce_key(message: dict[str, Any]) -> tuple[str, str, st
     if not method and not kind:
         return None
     channel = str(message.get("channel") or meta.get("room_id") or meta.get("room") or meta.get("channel") or "").strip()
-    return (source, channel, method, kind)
+    topic = _channel_message_topic_key(message)
+    return (source, channel, method, kind, topic)
 
 
 def _channel_superseded_message_ids(messages: list[dict[str, Any]]) -> set[int]:
-    latest: dict[tuple[str, str, str, str], tuple[tuple[int, int, int], int]] = {}
+    latest: dict[tuple[str, str, str, str, str], tuple[tuple[int, int, int], int]] = {}
     superseded: set[int] = set()
     for message in messages:
         try:
