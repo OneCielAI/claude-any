@@ -1350,6 +1350,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 "sender_id": "agent",
                 "message": "wake up",
                 "meta": {},
+                "delivery": ["llm"],
             }
         ]
         with (
@@ -1381,9 +1382,9 @@ class ChannelBridgeTests(unittest.TestCase):
 
     def test_inject_pending_channel_messages_batches_and_ignores_connection_noise(self):
         messages = [
-            {"id": 1, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.ws.connected", "meta": {}},
-            {"id": 2, "channel": "ai-net", "sender_id": "robert", "message": "hello Sarah", "meta": {"room_id": "ai-net"}},
-            {"id": 3, "channel": "ai-net", "sender_id": "samuel", "message": "status please", "meta": {"room_id": "ai-net"}},
+            {"id": 1, "channel": "generic-room", "sender_id": "generic-mcp", "message": "generic.ws.connected", "meta": {}},
+            {"id": 2, "channel": "generic-room", "sender_id": "agent-a", "message": "hello recipient", "meta": {"room_id": "generic-room", "mcp_server": "generic-mcp"}},
+            {"id": 3, "channel": "generic-room", "sender_id": "agent-b", "message": "status please", "meta": {"room_id": "generic-room", "mcp_server": "generic-mcp"}},
         ]
         with (
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
@@ -1398,9 +1399,9 @@ class ChannelBridgeTests(unittest.TestCase):
         commit_cursor.assert_called_once_with(2)
         payload = write_all.call_args_list[0].args[1]
         self.assertIn(b"external channel message", payload)
-        self.assertIn(b"hello Sarah", payload)
+        self.assertIn(b"hello recipient", payload)
         self.assertNotIn(b"status please", payload)
-        self.assertNotIn(b"ai-net.ws.connected", payload)
+        self.assertNotIn(b"generic.ws.connected", payload)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_stdin_proxy_skipped_noise" in item for item in log_messages))
         self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2" in item and "enter=crlf" in item for item in log_messages))
@@ -1469,6 +1470,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 "sender_id": "agent",
                 "message": "wake up",
                 "meta": {},
+                "delivery": ["llm"],
             }
         ]
 
@@ -1496,6 +1498,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 "sender_id": "agent",
                 "message": "wake up later",
                 "meta": {},
+                "delivery": ["llm"],
             }
         ]
         injected: list[int] = []
@@ -1808,7 +1811,7 @@ class ChannelBridgeTests(unittest.TestCase):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
         messages = [
             {"id": 2, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.sse.connected", "meta": {}},
-            {"id": 3, "channel": "room", "sender_id": "sarah", "message": "Robert, can you check this?", "meta": {"room_id": "room"}},
+            {"id": 3, "channel": "room", "sender_id": "agent-a", "message": "Please check this.", "meta": {"room_id": "room", "mcp_server": "generic-mcp"}},
             {
                 "id": 4,
                 "channel": "ai-net-sse",
@@ -1839,7 +1842,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("미래 행동을 약속하는 말만 남기고 턴을 끝내지 마세요", injected)
         self.assertIn("같은 턴에서 필요한 조사/도구 호출/채널 보고까지 수행", injected)
         self.assertIn("실제 결제/투자 실행", injected)
-        self.assertIn("Robert, can you check this?", injected)
+        self.assertIn("Please check this.", injected)
         self.assertNotIn("ai-net.sse.connected", injected)
         self.assertNotIn("SSE MCP initialized", injected)
         write_cursor.assert_not_called()
@@ -2011,7 +2014,7 @@ class ChannelBridgeTests(unittest.TestCase):
             "tool_choice": {"type": "tool", "name": "mcp__ai-net-sse__send_dm"},
         }
         messages = [
-            {"id": 3, "channel": "room", "sender_id": "sarah", "message": "Robert, please read this", "meta": {"room_id": "room"}}
+            {"id": 3, "channel": "room", "sender_id": "agent-a", "message": "Please read this", "meta": {"room_id": "room", "mcp_server": "generic-mcp"}}
         ]
         with (
             mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
@@ -2508,10 +2511,61 @@ class ChannelBridgeTests(unittest.TestCase):
             ),
         )
 
+    def test_channel_llm_skip_reason_rejects_unscoped_peer_messages(self):
+        message = {"message": "hello", "channel": "room", "sender_id": "claude-code", "meta": {}}
+        self.assertEqual("unscoped_channel_message", claude_any._channel_llm_message_skip_reason(message))
+        self.assertEqual("unscoped_channel_message", claude_any._channel_mcp_message_skip_reason(message))
+
+    def test_channel_llm_skip_reason_accepts_explicit_delivery_and_mcp_provenance(self):
+        self.assertIsNone(
+            claude_any._channel_llm_message_skip_reason(
+                {"message": "hello", "channel": "room", "sender_id": "agent", "delivery": ["llm"], "meta": {}}
+            )
+        )
+        self.assertIsNone(
+            claude_any._channel_llm_message_skip_reason(
+                {"message": "hello", "channel": "room", "sender_id": "agent", "meta": {"mcp_server": "generic-mcp"}}
+            )
+        )
+
     def test_channel_skip_reason_rejects_system_event_metadata(self):
         message = {"message": "Connected", "meta": {"eventType": "system"}}
         self.assertEqual("system", claude_any._channel_llm_message_skip_reason(message))
         self.assertEqual("system", claude_any._channel_mcp_message_skip_reason(message))
+
+    def test_channel_superseded_message_ids_only_coalesces_unreferenced_notifications(self):
+        messages = [
+            {
+                "id": 10,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "old notice",
+                "kind": "notice",
+                "meta": {"mcp_server": "generic-mcp", "mcp_method": "notifications/message", "stream_id": "100-0"},
+            },
+            {
+                "id": 11,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "referenced message",
+                "kind": "notice",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/message",
+                    "stream_id": "101-0",
+                    "message_id": "msg-1",
+                },
+            },
+            {
+                "id": 12,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "new notice",
+                "kind": "notice",
+                "meta": {"mcp_server": "generic-mcp", "mcp_method": "notifications/message", "stream_id": "102-0"},
+            },
+        ]
+        self.assertEqual({10}, claude_any._channel_superseded_message_ids(messages))
 
     def test_channel_direct_llm_worker_uses_router_without_hidden_print_mode(self):
         message = {
@@ -3863,15 +3917,15 @@ class ChannelBridgeTests(unittest.TestCase):
 
     def test_channel_mcp_notifications_ignore_transport_noise(self):
         messages = [
-            {"id": 1, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.ws.connected", "meta": {}},
-            {"id": 2, "channel": "ai-net", "sender_id": "robert", "message": "hello Sarah", "meta": {"room_id": "ai-net"}},
+            {"id": 1, "channel": "generic-room", "sender_id": "generic-mcp", "message": "generic.ws.connected", "meta": {}},
+            {"id": 2, "channel": "generic-room", "sender_id": "agent-a", "message": "hello recipient", "meta": {"room_id": "generic-room", "mcp_server": "generic-mcp"}},
         ]
         with mock.patch.object(claude_any, "router_log") as router_log:
             last_id, events = claude_any._channel_mcp_notifications_for_messages(messages, "session-1")
         self.assertEqual(2, last_id)
         self.assertEqual(1, len(events))
         self.assertEqual(2, events[0][0])
-        self.assertIn("hello Sarah", events[0][1]["params"]["content"])
+        self.assertIn("hello recipient", events[0][1]["params"]["content"])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_mcp_skipped_noise" in item and "transport_connected" in item for item in log_messages))
         self.assertTrue(any("channel_mcp_notification_prepared" in item and "message_id=2" in item for item in log_messages))

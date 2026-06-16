@@ -3219,6 +3219,31 @@ def _status_as_string_list(value):
     return [str(value).strip()] if str(value).strip() else []
 
 
+def _status_channel_message_has_external_provenance(message):
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    if meta.get("llm_direct_pending") or meta.get("llm_direct_delivered"):
+        return True
+    for key in (
+        "mcp_server",
+        "mcp_method",
+        "mcp_json",
+        "sse_source",
+        "sse_event",
+        "sse_json",
+        "stream_id",
+        "sse_id",
+        "cursor",
+        "event_id",
+        "message_id",
+        "source_message_id",
+        "rpc_id",
+    ):
+        value = meta.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
+
+
 def _status_channel_message_skip_reason(message):
     visibility = str(message.get("visibility") or "user").strip().lower()
     if visibility in {"hidden", "internal", "transport", "control", "system"}:
@@ -3245,6 +3270,8 @@ def _status_channel_message_skip_reason(message):
         return "transport_connected"
     if meta.get("llm_direct_delivered"):
         return "llm_direct_delivered"
+    if not delivery and not _status_channel_message_has_external_provenance(message):
+        return "unscoped_channel_message"
     return ""
 
 
@@ -10894,7 +10921,12 @@ def _channel_mcp_message_skip_reason(message: dict[str, Any]) -> str | None:
         normalized_delivery = {item.strip().lower() for item in delivery}
         if not ({"all", "*", "native", "mcp"} & normalized_delivery):
             return "delivery_not_native"
-    return _channel_wake_message_noise_reason(message)
+    wake_reason = _channel_wake_message_noise_reason(message)
+    if wake_reason:
+        return wake_reason
+    if not delivery and not _channel_message_has_external_provenance(message):
+        return "unscoped_channel_message"
+    return None
 
 
 def _channel_mcp_notifications_for_messages(
@@ -10903,6 +10935,7 @@ def _channel_mcp_notifications_for_messages(
 ) -> tuple[int, list[tuple[int, dict[str, Any]]]]:
     last_id = 0
     events: list[tuple[int, dict[str, Any]]] = []
+    superseded_ids = _channel_superseded_message_ids(messages)
     for message in messages:
         message_id = int(message.get("id") or 0)
         last_id = max(last_id, message_id)
@@ -10911,6 +10944,12 @@ def _channel_mcp_notifications_for_messages(
             router_log(
                 "INFO",
                 f"channel_mcp_skipped_noise session={session or '-'} message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
+            )
+            continue
+        if message_id in superseded_ids:
+            router_log(
+                "INFO",
+                f"channel_mcp_skipped_noise session={session or '-'} message_id={message.get('id')} channel={message.get('channel')} reason=superseded_channel_notice",
             )
             continue
         notification = _channel_mcp_notification(message)
@@ -25394,6 +25433,165 @@ def _channel_wake_message_noise_reason(message: dict[str, Any]) -> str | None:
     return None
 
 
+_CHANNEL_EXTERNAL_PROVENANCE_META_KEYS = (
+    "mcp_server",
+    "mcp_method",
+    "mcp_json",
+    "sse_source",
+    "sse_event",
+    "sse_json",
+    "stream_id",
+    "sse_id",
+    "cursor",
+    "event_id",
+    "message_id",
+    "source_message_id",
+    "rpc_id",
+)
+
+
+_CHANNEL_UNIQUE_REFERENCE_META_KEYS = (
+    "message_id",
+    "source_message_id",
+    "assignment_id",
+    "poll_id",
+    "task_id",
+    "job_id",
+    "schedule_id",
+    "reminder_id",
+)
+
+
+_CHANNEL_EVENT_ORDER_META_KEYS = (
+    "stream_id",
+    "cursor",
+    "sse_id",
+    "event_id",
+    "sequence",
+    "seq",
+)
+
+
+def _channel_message_delivery_targets(message: dict[str, Any]) -> set[str]:
+    return {item.strip().lower() for item in _as_string_list(message.get("delivery")) if item.strip()}
+
+
+def _channel_message_has_external_provenance(message: dict[str, Any]) -> bool:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    if _channel_message_is_web_chat_request(message):
+        return True
+    if meta.get("llm_direct_pending") or meta.get("llm_direct_delivered"):
+        return True
+    for key in _CHANNEL_EXTERNAL_PROVENANCE_META_KEYS:
+        value = meta.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
+
+
+def _channel_message_has_unique_reference(message: dict[str, Any]) -> bool:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    for key in _CHANNEL_UNIQUE_REFERENCE_META_KEYS:
+        value = meta.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
+
+
+def _channel_message_source_key(message: dict[str, Any]) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    return str(meta.get("mcp_server") or meta.get("sse_source") or meta.get("source") or "").strip()
+
+
+def _channel_message_kind_key(message: dict[str, Any]) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    return str(
+        message.get("kind")
+        or meta.get("kind")
+        or meta.get("type")
+        or meta.get("event_type")
+        or meta.get("eventType")
+        or meta.get("event")
+        or ""
+    ).strip()
+
+
+def _channel_message_order_value(message: dict[str, Any]) -> tuple[int, int, int] | None:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    for key in _CHANNEL_EVENT_ORDER_META_KEYS:
+        raw = meta.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        match = re.fullmatch(r"(\d+)-(\d+)", text)
+        if match:
+            return (2, int(match.group(1)), int(match.group(2)))
+        if text.isdigit():
+            return (1, int(text), 0)
+    return None
+
+
+def _channel_message_coalesce_key(message: dict[str, Any]) -> tuple[str, str, str, str] | None:
+    if _channel_message_delivery_targets(message):
+        return None
+    if _channel_message_is_web_chat_request(message):
+        return None
+    if _channel_message_has_unique_reference(message):
+        return None
+    source = _channel_message_source_key(message)
+    if not source:
+        return None
+    order = _channel_message_order_value(message)
+    if order is None:
+        return None
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    method = str(meta.get("mcp_method") or meta.get("sse_event") or "").strip()
+    kind = _channel_message_kind_key(message)
+    if not method and not kind:
+        return None
+    channel = str(message.get("channel") or meta.get("room_id") or meta.get("room") or meta.get("channel") or "").strip()
+    return (source, channel, method, kind)
+
+
+def _channel_superseded_message_ids(messages: list[dict[str, Any]]) -> set[int]:
+    latest: dict[tuple[str, str, str, str], tuple[tuple[int, int, int], int]] = {}
+    superseded: set[int] = set()
+    for message in messages:
+        try:
+            message_id = int(message.get("id") or 0)
+        except Exception:
+            continue
+        if message_id <= 0:
+            continue
+        key = _channel_message_coalesce_key(message)
+        if key is None:
+            continue
+        order = _channel_message_order_value(message)
+        if order is None:
+            continue
+        previous = latest.get(key)
+        if previous is None:
+            latest[key] = (order, message_id)
+            continue
+        previous_order, previous_id = previous
+        if (order, message_id) >= (previous_order, previous_id):
+            superseded.add(previous_id)
+            latest[key] = (order, message_id)
+        else:
+            superseded.add(message_id)
+    return superseded
+
+
+def _channel_pending_scan_limit() -> int:
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_PENDING_SCAN_LIMIT", "500")
+    try:
+        return max(100, min(5000, int(str(raw).strip())))
+    except Exception:
+        return 500
+
+
 def _channel_llm_message_skip_reason(message: dict[str, Any]) -> str | None:
     visibility = str(message.get("visibility") or "user").strip().lower()
     if visibility in {"hidden", "internal", "transport", "control", "system"}:
@@ -25417,6 +25615,8 @@ def _channel_llm_message_skip_reason(message: dict[str, Any]) -> str | None:
     meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or meta.get("event") or meta.get("status") or "").strip().lower()
     if meta_kind in _CHANNEL_CONTROL_KINDS:
         return meta_kind
+    if not delivery and not _channel_message_has_external_provenance(message):
+        return "unscoped_channel_message"
     return None
 
 
@@ -27266,17 +27466,18 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
         last_id = _channel_llm_read_cursor_locked()
         pending: list[dict[str, Any]] = []
         max_seen = last_id
-        for message in read_chat_messages(last_id, None, None, 100):
+        candidates = read_chat_messages(last_id, None, None, _channel_pending_scan_limit())
+        superseded_ids = _channel_superseded_message_ids(candidates)
+        for message in candidates:
             try:
                 message_id = int(message.get("id") or 0)
             except Exception:
                 continue
-            skip_reason = _channel_llm_message_skip_reason(message)
-            if skip_reason:
+            if message_id in superseded_ids:
                 max_seen = max(max_seen, message_id)
                 router_log(
                     "INFO",
-                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason=superseded_channel_notice",
                 )
                 continue
             with _CHANNEL_LLM_DIRECT_LOCK:
@@ -27296,6 +27497,14 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                 )
                 if direct_delivered or persisted_direct_delivered:
                     max_seen = max(max_seen, message_id)
+                continue
+            skip_reason = _channel_llm_message_skip_reason(message)
+            if skip_reason:
+                max_seen = max(max_seen, message_id)
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
+                )
                 continue
             if meta.get("llm_direct_pending"):
                 router_log(
@@ -27662,7 +27871,9 @@ def _inject_pending_channel_messages(
         if not web_chat_only:
             last_id = _channel_stdin_recover_cursor_from_queued_only(last_id)
         pending: list[dict[str, Any]] = []
-        for message in read_chat_messages(last_id, None, None, 100):
+        candidates = read_chat_messages(last_id, None, None, _channel_pending_scan_limit())
+        superseded_ids = _channel_superseded_message_ids(candidates)
+        for message in candidates:
             previous_last_id = last_id
             try:
                 message_id = int(message.get("id") or 0)
@@ -27689,11 +27900,17 @@ def _inject_pending_channel_messages(
                     f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=not_web_chat",
                 )
                 continue
-            noise_reason = _channel_wake_message_noise_reason(message)
-            if noise_reason:
+            skip_reason = _channel_llm_message_skip_reason(message)
+            if skip_reason:
                 router_log(
                     "INFO",
-                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
+                )
+                continue
+            if message_id in superseded_ids:
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=superseded_channel_notice",
                 )
                 continue
             wake_state = _channel_stdin_wake_state(message_id)

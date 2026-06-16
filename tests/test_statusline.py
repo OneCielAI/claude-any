@@ -56,8 +56,8 @@ class StatuslineTests(unittest.TestCase):
             (config_dir / "channel-llm-cursor.json").write_text('{"last_id":1}\n', encoding="utf-8")
             messages = [
                 {"id": 1, "channel": "room", "sender_id": "a", "message": "old"},
-                {"id": 2, "channel": "room", "sender_id": "a", "message": "new 1"},
-                {"id": 3, "channel": "room", "sender_id": "b", "message": "new 2"},
+                {"id": 2, "channel": "room", "sender_id": "a", "message": "new 1", "meta": {"mcp_server": "generic-mcp"}},
+                {"id": 3, "channel": "room", "sender_id": "b", "message": "new 2", "delivery": ["llm"]},
                 {"id": 4, "channel": "sys", "sender_id": "sys", "message": "sys.sse.connected"},
             ]
             (config_dir / "chat-messages.jsonl").write_text(
