@@ -17928,6 +17928,64 @@ def discovered_claude_mcp_servers(
     return servers
 
 
+def _read_mcp_servers_from_generated_file(path: Path, cwd: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists() or not path.is_file():
+        return {}
+    servers: dict[str, dict[str, Any]] = {}
+    for name, server in _read_mcp_servers_from_json(path, cwd):
+        if name.strip().lower() in _NATIVE_ROUTER_CHANNEL_NAMES:
+            continue
+        servers.setdefault(name, server)
+    return servers
+
+
+def discovered_claude_any_managed_mcp_servers(cwd: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Return MCP servers that only exist in claude-any generated config.
+
+    Direct Claude Native launches should restore the user's MCP tool surface when
+    switching back from a routed/non-native session.  The generated channel MCP
+    bridge itself is intentionally skipped, but ordinary generated tools and
+    original servers wrapped by mcp-proxy are safe to pass back to Claude Code.
+    """
+    cwd = cwd or Path.cwd()
+    servers: dict[str, dict[str, Any]] = {}
+    servers.update(_read_mcp_servers_from_generated_file(WEB_TOOLS_MCP_CONFIG, cwd))
+
+    if MCP_PROXY_CONFIG.exists() and MCP_PROXY_CONFIG.is_file():
+        try:
+            proxy_data = json.loads(MCP_PROXY_CONFIG.read_text(encoding="utf-8"))
+        except Exception:
+            proxy_data = {}
+        proxy_servers = proxy_data.get("mcpServers") if isinstance(proxy_data, dict) else None
+        if isinstance(proxy_servers, dict):
+            for raw_name, raw_entry in proxy_servers.items():
+                name = str(raw_name or "").strip()
+                if not name or name.strip().lower() in _NATIVE_ROUTER_CHANNEL_NAMES or not isinstance(raw_entry, dict):
+                    continue
+                args = raw_entry.get("args")
+                if isinstance(args, list):
+                    args_s = [str(item) for item in args]
+                    if "mcp-proxy" in args_s and "--server-config" in args_s:
+                        try:
+                            cfg_path = Path(args_s[args_s.index("--server-config") + 1]).expanduser()
+                            wrapped_name = (
+                                args_s[args_s.index("--server-name") + 1].strip()
+                                if "--server-name" in args_s and args_s.index("--server-name") + 1 < len(args_s)
+                                else name
+                            )
+                            wrapped_server = json.loads(cfg_path.read_text(encoding="utf-8"))
+                        except Exception:
+                            continue
+                        if wrapped_name and isinstance(wrapped_server, dict):
+                            restored = dict(wrapped_server)
+                            restored.pop("claude_any_disable_notification_stream", None)
+                            if wrapped_name.strip().lower() not in _NATIVE_ROUTER_CHANNEL_NAMES:
+                                servers.setdefault(wrapped_name, restored)
+                        continue
+                servers.setdefault(name, dict(raw_entry))
+    return servers
+
+
 def write_native_mcp_config_from_discovery(
     passthrough: list[str] | None = None,
     cwd: Path | None = None,
@@ -17940,7 +17998,13 @@ def write_native_mcp_config_from_discovery(
     Code expects a top-level mcpServers record, so native launches receive this
     normalized generated file instead of the source files.
     """
+    cwd = cwd or Path.cwd()
     servers = discovered_claude_mcp_servers(passthrough, cwd, home)
+    for name, server in discovered_claude_any_managed_mcp_servers(cwd).items():
+        if name in servers:
+            router_log("INFO", f"native_mcp_managed_duplicate_skipped server={name}")
+            continue
+        servers[name] = server
     if not servers:
         return None
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -18234,21 +18298,38 @@ def _server_names_from_channel_specs(specs: Iterable[str]) -> list[str]:
     return _dedupe_strings(names)
 
 
+def channel_candidate_server_names_for_launch(cfg: dict[str, Any], passthrough: list[str]) -> list[str]:
+    """External MCP channel servers relevant to this launch.
+
+    Explicit claude-any channel settings remain honored, but non-native routed
+    launches must also pick up Streamable HTTP/SSE servers already present in
+    Claude Code MCP config files.  That is the zero-manual-setup path for users
+    switching from native Claude Code to routed/non-native providers.
+    """
+    explicit_names = [
+        name for name in _server_names_from_channel_specs(channel_specs_for_launch(cfg, passthrough))
+        if name.strip().lower() not in _NATIVE_ROUTER_CHANNEL_NAMES
+    ]
+    try:
+        discovered_names = external_mcp_channel_server_names_from_configs(passthrough)
+    except Exception as exc:
+        router_log("WARN", f"channel_auto_discovery_failed error={type(exc).__name__}: {exc}")
+        discovered_names = []
+    return _dedupe_strings([*explicit_names, *discovered_names])
+
+
 def channel_probe_cache_needs_launch_refresh(cfg: dict[str, Any], passthrough: list[str]) -> bool:
     cache = read_channel_probe_cache()
     records = cached_channel_probe_servers()
     if not cache.get("probed_at") or not records:
         return True
-    configured_names = [
-        name for name in _server_names_from_channel_specs(channel_specs_for_launch(cfg, passthrough))
-        if name != "claude-any-router"
-    ]
-    if not configured_names:
+    candidate_names = channel_candidate_server_names_for_launch(cfg, passthrough)
+    if not candidate_names:
         return False
     if not cache.get("probed_at"):
         return True
     by_name = {str(r.get("name") or ""): r for r in records if r.get("name")}
-    for name in configured_names:
+    for name in candidate_names:
         record = by_name.get(name)
         if not record or not record.get("capable"):
             return True
@@ -25076,15 +25157,13 @@ def write_mcp_proxy_config(
     extra = [Path(item).expanduser() for item in (extra_config_paths or [])]
     paths = [*extra, *claude_mcp_config_paths(passthrough, cwd, home)]
     servers: dict[str, Any] = {}
-    seen: set[str] = set()
     server_dir = CONFIG_DIR / "mcp-proxy-servers"
     for path in paths:
         if not path.exists() or not path.is_file():
             continue
         for name, server in _read_mcp_servers_from_json(path, cwd):
-            if name in seen:
-                continue
-            seen.add(name)
+            if name in servers:
+                router_log("INFO", f"mcp_proxy_config_duplicate_overwritten server={name} source={path}")
             streamable_http = _mcp_server_is_streamable_http(server)
             force_streamable_proxy = streamable_http and (name in force_proxy_server_names or _mcp_server_force_proxy(server))
             if _mcp_server_is_stdio(server) or force_streamable_proxy:
@@ -29628,10 +29707,15 @@ def launch_claude(
     channel_probe_source_paths: list[Path] = []
     if stdin_channel_proxy or llm_channel_delivery:
         try:
+            candidate_channel_names = channel_candidate_server_names_for_launch(cfg, launch_passthrough)
             ensure_channel_probe_cache_for_launch(cfg, launch_passthrough)
             capable_names = cached_channel_capable_server_names()
-            detected_channel_capable_names = list(capable_names)
-            detected_channel_specs = [f"server:{name}" for name in capable_names]
+            capable_name_set = set(capable_names)
+            detected_channel_capable_names = [
+                name for name in candidate_channel_names
+                if name in capable_name_set and name.strip().lower() not in _NATIVE_ROUTER_CHANNEL_NAMES
+            ]
+            detected_channel_specs = [f"server:{name}" for name in detected_channel_capable_names]
             channel_launch_specs = channel_specs_for_launch(cfg, launch_passthrough, detected_channel_specs)
             channel_probe_source_paths = cached_channel_source_paths_for_specs(channel_launch_specs)
             if channel_probe_source_paths:
@@ -29642,8 +29726,8 @@ def launch_claude(
                 "channel_probe_loaded source=cache cache_age_ts=%d count=%d servers=%s sources=%s"
                 % (
                     int(cache_age),
-                    len(capable_names),
-                    ",".join(capable_names) or "-",
+                    len(detected_channel_capable_names),
+                    ",".join(detected_channel_capable_names) or "-",
                     ",".join(str(path) for path in channel_probe_source_paths) or "-",
                 ),
             )

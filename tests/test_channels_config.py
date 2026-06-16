@@ -134,10 +134,14 @@ class ChannelConfigTests(unittest.TestCase):
                 encoding="utf-8",
             )
             native_config = config_dir / "native-mcp.json"
+            web_tools = config_dir / "missing-web-tools.json"
+            proxy_config = config_dir / "missing-mcp-proxy.json"
 
             with (
                 mock.patch.object(claude_any, "CONFIG_DIR", config_dir),
                 mock.patch.object(claude_any, "NATIVE_MCP_CONFIG", native_config),
+                mock.patch.object(claude_any, "WEB_TOOLS_MCP_CONFIG", web_tools),
+                mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config),
             ):
                 written = claude_any.write_native_mcp_config_from_discovery([], cwd=project, home=root)
                 data = json.loads(native_config.read_text(encoding="utf-8"))
@@ -145,6 +149,119 @@ class ChannelConfigTests(unittest.TestCase):
             self.assertEqual(native_config, written)
         self.assertEqual({"project", "settings", "scoped"}, set(data["mcpServers"]))
         self.assertNotIn("permissions", data)
+
+    def test_native_mcp_config_writer_restores_claude_any_managed_sources(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "work"
+            project.mkdir()
+            config_dir = root / "config"
+            config_dir.mkdir()
+            project_mcp = project / ".mcp.json"
+            native_config = config_dir / "native-mcp.json"
+            web_tools = config_dir / "web-tools-mcp.json"
+            proxy_config = config_dir / "mcp-proxy.json"
+            wrapped_server = config_dir / "wrapped-server.json"
+
+            project_mcp.write_text(json.dumps({"mcpServers": {"project": {"command": "node"}}}), encoding="utf-8")
+            web_tools.write_text(json.dumps({"mcpServers": {"duckduckgo": {"command": "npx", "args": ["ddg"]}}}), encoding="utf-8")
+            wrapped_server.write_text(
+                json.dumps(
+                    {
+                        "type": "http",
+                        "url": "http://example.test/mcp",
+                        "claude_any_disable_notification_stream": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            proxy_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ai-net-http": {
+                                "command": sys.executable,
+                                "args": [
+                                    str(Path(claude_any.__file__).resolve()),
+                                    "mcp-proxy",
+                                    "--server-name",
+                                    "ai-net-http",
+                                    "--server-config",
+                                    str(wrapped_server),
+                                ],
+                            },
+                            "claude-any-router": {"type": "sse", "url": "http://127.0.0.1:8799/ca/mcp/sse"},
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", config_dir),
+                mock.patch.object(claude_any, "NATIVE_MCP_CONFIG", native_config),
+                mock.patch.object(claude_any, "WEB_TOOLS_MCP_CONFIG", web_tools),
+                mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config),
+            ):
+                written = claude_any.write_native_mcp_config_from_discovery([], cwd=project, home=root)
+                data = json.loads(native_config.read_text(encoding="utf-8"))
+
+        self.assertEqual(native_config, written)
+        self.assertEqual({"project", "duckduckgo", "ai-net-http"}, set(data["mcpServers"]))
+        self.assertEqual("http://example.test/mcp", data["mcpServers"]["ai-net-http"]["url"])
+        self.assertNotIn("claude_any_disable_notification_stream", data["mcpServers"]["ai-net-http"])
+
+    def test_native_mcp_config_writer_prefers_user_mcp_over_generated_duplicate(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            project = root / "work"
+            project.mkdir()
+            config_dir = root / "config"
+            config_dir.mkdir()
+            project_mcp = project / ".mcp.json"
+            native_config = config_dir / "native-mcp.json"
+            proxy_config = config_dir / "mcp-proxy.json"
+            wrapped_server = config_dir / "wrapped-server.json"
+            web_tools = config_dir / "missing-web-tools.json"
+
+            project_mcp.write_text(
+                json.dumps({"mcpServers": {"ai-net-http": {"type": "http", "url": "http://user.example/mcp"}}}),
+                encoding="utf-8",
+            )
+            wrapped_server.write_text(json.dumps({"type": "http", "url": "http://generated.example/mcp"}), encoding="utf-8")
+            proxy_config.write_text(
+                json.dumps(
+                    {
+                        "mcpServers": {
+                            "ai-net-http": {
+                                "command": sys.executable,
+                                "args": [
+                                    str(Path(claude_any.__file__).resolve()),
+                                    "mcp-proxy",
+                                    "--server-name",
+                                    "ai-net-http",
+                                    "--server-config",
+                                    str(wrapped_server),
+                                ],
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", config_dir),
+                mock.patch.object(claude_any, "NATIVE_MCP_CONFIG", native_config),
+                mock.patch.object(claude_any, "WEB_TOOLS_MCP_CONFIG", web_tools),
+                mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config),
+            ):
+                written = claude_any.write_native_mcp_config_from_discovery([], cwd=project, home=root)
+                data = json.loads(native_config.read_text(encoding="utf-8"))
+
+        self.assertEqual(native_config, written)
+        self.assertEqual(["ai-net-http"], list(data["mcpServers"]))
+        self.assertEqual("http://user.example/mcp", data["mcpServers"]["ai-net-http"]["url"])
 
     def test_auto_starts_sse_servers_from_mcp_config(self):
         with tempfile.TemporaryDirectory() as td:
@@ -276,6 +393,36 @@ class ChannelConfigTests(unittest.TestCase):
             self.assertEqual("http", preserved["type"])
             self.assertEqual("http://example.test/mcp", preserved["url"])
             self.assertNotIn("command", preserved)
+
+    def test_mcp_proxy_config_later_claude_config_overwrites_generated_duplicate(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            generated_config = root / "generated.json"
+            project = root / "work"
+            project.mkdir()
+            project_config = project / ".mcp.json"
+            proxy_config = root / "mcp-proxy.json"
+            generated_config.write_text(
+                json.dumps({"mcpServers": {"ai-net-http": {"type": "http", "url": "http://generated.example/mcp"}}}),
+                encoding="utf-8",
+            )
+            project_config.write_text(
+                json.dumps({"mcpServers": {"ai-net-http": {"type": "http", "url": "http://native.example/mcp"}}}),
+                encoding="utf-8",
+            )
+
+            with mock.patch.object(claude_any, "CONFIG_DIR", root), mock.patch.object(claude_any, "MCP_PROXY_CONFIG", proxy_config):
+                written = claude_any.write_mcp_proxy_config(
+                    [],
+                    cwd=project,
+                    home=root,
+                    extra_config_paths=[generated_config],
+                )
+
+            self.assertEqual(proxy_config, written)
+            data = json.loads(proxy_config.read_text(encoding="utf-8"))
+            self.assertEqual(["ai-net-http"], list(data["mcpServers"]))
+            self.assertEqual("http://native.example/mcp", data["mcpServers"]["ai-net-http"]["url"])
 
     def test_mcp_proxy_config_wraps_streamable_http_server_when_forced(self):
         with tempfile.TemporaryDirectory() as td:
@@ -776,13 +923,74 @@ class ChannelConfigTests(unittest.TestCase):
         # Channel-capable servers are forced through the proxy (single backend
         # owner) and therefore must NOT be in the disable set -- the proxy owns
         # the notification stream. force and disable are mutually exclusive.
-        self.assertEqual({"claude-any-router", "ai-net-sse"}, write_proxy.call_args.kwargs["force_proxy_server_names"])
+        self.assertEqual({"ai-net-sse"}, write_proxy.call_args.kwargs["force_proxy_server_names"])
         self.assertIsNone(write_proxy.call_args.kwargs["disable_proxy_notification_stream_names"])
         launch_cmd = call.call_args.args[0]
         self.assertIn(str(proxy_path), launch_cmd)
         self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
         self.assertNotIn("server:claude-any-router", launch_cmd)
         self.assertNotIn("server:ai-net-sse", launch_cmd)
+
+    def test_non_native_llm_delivery_auto_discovers_streamable_http_from_claude_mcp(self):
+        cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False, "channel_delivery": "llm"}}
+        with tempfile.TemporaryDirectory() as td:
+            channel_path = Path(td) / "channel-mcp.json"
+            source_path = Path(td) / ".mcp.json"
+            proxy_path = Path(td) / "mcp-proxy.json"
+            with ExitStack() as stack:
+                stack.enter_context(mock.patch.object(claude_any, "run_prelaunch_menu", return_value=0))
+                stack.enter_context(mock.patch.object(claude_any, "load_config", return_value=cfg))
+                stack.enter_context(mock.patch.object(claude_any, "get_current_provider", return_value=("kimi", {})))
+                stack.enter_context(mock.patch.object(claude_any, "launch_readiness_errors", return_value=[]))
+                stack.enter_context(mock.patch.object(claude_any, "native_anthropic_enabled", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "provider_native_compat_enabled", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "cleanup_managed_services_for_provider"))
+                stack.enter_context(mock.patch.object(claude_any, "start_router_if_needed"))
+                stack.enter_context(mock.patch.object(claude_any, "prepare_channel_llm_delivery_for_launch"))
+                stack.enter_context(mock.patch.object(claude_any, "auto_start_sse_channels_from_mcp_configs", return_value=[]))
+                stack.enter_context(mock.patch.object(claude_any, "env_vars", return_value={"CLAUDE_ANY_MODEL_ALIAS": "claude-any-test"}))
+                stack.enter_context(mock.patch.object(claude_any, "install_claude_any_slash_commands"))
+                stack.enter_context(mock.patch.object(claude_any, "install_tool_guard_hooks"))
+                stack.enter_context(mock.patch.object(claude_any, "install_claude_any_statusline"))
+                stack.enter_context(mock.patch.object(claude_any, "find_executable", return_value="claude"))
+                stack.enter_context(mock.patch.object(claude_any, "run_claude_update_check"))
+                stack.enter_context(mock.patch.object(claude_any, "should_attach_web_search", return_value=False))
+                stack.enter_context(mock.patch.object(claude_any, "should_append_compat_prompt", return_value=False))
+                auto_names = stack.enter_context(
+                    mock.patch.object(claude_any, "external_mcp_channel_server_names_from_configs", return_value=["ai-net-http"])
+                )
+                ensure_probe = stack.enter_context(mock.patch.object(claude_any, "ensure_channel_probe_cache_for_launch", return_value=True))
+                stack.enter_context(mock.patch.object(claude_any, "cached_channel_capable_server_names", return_value=["claude-any-router", "ai-net-http"]))
+                stack.enter_context(mock.patch.object(claude_any, "cached_channel_source_paths_for_specs", return_value=[source_path]))
+                stack.enter_context(mock.patch.object(claude_any, "read_channel_probe_cache", return_value={"probed_at": 1700000000}))
+                stack.enter_context(mock.patch.object(claude_any, "write_channel_mcp_config", return_value=channel_path))
+                write_proxy = stack.enter_context(mock.patch.object(claude_any, "write_mcp_proxy_config", return_value=proxy_path))
+                call = stack.enter_context(mock.patch.object(claude_any.subprocess, "call", return_value=0))
+                rc = claude_any.launch_claude([])
+
+        self.assertEqual(0, rc)
+        auto_names.assert_called()
+        ensure_probe.assert_called_once_with(cfg, [])
+        self.assertEqual([channel_path, source_path], write_proxy.call_args.kwargs["extra_config_paths"])
+        self.assertEqual({"ai-net-http"}, write_proxy.call_args.kwargs["force_proxy_server_names"])
+        launch_cmd = call.call_args.args[0]
+        self.assertIn(str(proxy_path), launch_cmd)
+        self.assertNotIn("--dangerously-load-development-channels", launch_cmd)
+
+    def test_channel_candidate_names_dedupe_explicit_and_auto_discovered_servers(self):
+        cfg = {
+            "claude_code": {
+                "channels": ["server:ai-net-http", "server:claude-any-router"],
+                "channel_delivery": "llm",
+            }
+        }
+        with mock.patch.object(
+            claude_any,
+            "external_mcp_channel_server_names_from_configs",
+            return_value=["ai-net-http", "other-http"],
+        ):
+            names = claude_any.channel_candidate_server_names_for_launch(cfg, [])
+        self.assertEqual(["ai-net-http", "other-http"], names)
 
     def test_launch_ignores_stdin_delivery_setting_for_router_llm_delivery(self):
         cfg = {"providers": {}, "claude_code": {"channels": [], "development_channels": False, "channel_delivery": "stdin"}}
@@ -1317,6 +1525,7 @@ class ChannelProbeCacheTests(unittest.TestCase):
                     },
                 ],
             })
+            stack.enter_context(mock.patch.object(claude_any, "external_mcp_channel_server_names_from_configs", return_value=[]))
             refresh_mock = stack.enter_context(mock.patch.object(claude_any, "refresh_channel_probe_cache"))
             rows, values, messages = claude_any.channel_panel_rows_for_menu(cfg, [])
 
@@ -1341,7 +1550,8 @@ class ChannelProbeCacheTests(unittest.TestCase):
                     },
                 ],
             })
-            self.assertFalse(claude_any.channel_probe_cache_needs_launch_refresh(cfg, []))
+            with mock.patch.object(claude_any, "external_mcp_channel_server_names_from_configs", return_value=[]):
+                self.assertFalse(claude_any.channel_probe_cache_needs_launch_refresh(cfg, []))
 
     def test_probe_records_include_router_self_and_skip_recursion(self):
         with tempfile.TemporaryDirectory() as td:
