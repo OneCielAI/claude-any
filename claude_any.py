@@ -27491,16 +27491,51 @@ def _channel_stdin_wake_state(message_id: int) -> str:
         f"id={message_id}\"",
         f"id={message_id}'",
     )
-    pos = max(text.rfind(marker) for marker in prompt_markers)
-    if pos < 0:
-        return "missing"
-    suffix = text[pos:]
-    if (
-        re.search(r'"type"\s*:\s*"assistant"', suffix)
-        or re.search(r'"subtype"\s*:\s*"turn_duration"', suffix)
-    ):
-        return "completed"
-    return "pending"
+
+    def _record_text(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    raw = item.get("text")
+                    if isinstance(raw, str):
+                        parts.append(raw)
+                    raw = item.get("content")
+                    if isinstance(raw, str):
+                        parts.append(raw)
+            return "\n".join(parts)
+        return ""
+
+    seen_real_prompt = False
+    for raw_line in text.splitlines():
+        try:
+            record = json.loads(raw_line)
+        except Exception:
+            continue
+        if not isinstance(record, dict):
+            continue
+        record_type = str(record.get("type") or "")
+        if seen_real_prompt and (
+            record_type == "assistant" or str(record.get("subtype") or "") == "turn_duration"
+        ):
+            return "completed"
+        if record_type != "user":
+            continue
+        message = record.get("message")
+        if not isinstance(message, dict):
+            continue
+        # A queued_command attachment only means Claude Code accepted text into
+        # its line editor queue.  It is not a real user turn and can be
+        # superseded by later typed/queued prompts.  Only commit delivery after
+        # the prompt is present as an actual user message.
+        content_text = _record_text(message.get("content"))
+        if any(marker in content_text for marker in prompt_markers):
+            seen_real_prompt = True
+    return "pending" if seen_real_prompt else "missing"
 
 
 def _channel_stdin_wake_completed(message_id: int) -> bool:

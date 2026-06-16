@@ -1562,6 +1562,39 @@ class ChannelBridgeTests(unittest.TestCase):
             with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
                 self.assertEqual("completed", claude_any._channel_stdin_wake_state(10))
 
+    def test_channel_stdin_wake_state_does_not_complete_queued_command_only(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "queue-operation",
+                                "operation": "enqueue",
+                                "content": "[claude-any external channel message] id=4971 text=\"hello\"",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "attachment",
+                                "attachment": {
+                                    "type": "queued_command",
+                                    "prompt": "[claude-any external channel message] id=4971 text=\"hello\"",
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "user", "message": {"content": "id=4972 text=\"next\""}}),
+                        json.dumps({"type": "assistant", "message": {"content": []}}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertEqual("missing", claude_any._channel_stdin_wake_state(4971))
+                self.assertEqual("completed", claude_any._channel_stdin_wake_state(4972))
+
     def test_channel_stdin_unseen_retry_seconds_is_bounded(self):
         with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_WAKE_UNSEEN_RETRY_SECONDS": "0"}):
             self.assertEqual(2.0, claude_any._channel_stdin_unseen_retry_seconds())
