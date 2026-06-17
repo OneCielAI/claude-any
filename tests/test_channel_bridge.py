@@ -1520,6 +1520,46 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertEqual([8], injected)
         commit_cursor.assert_not_called()
 
+    def test_inject_pending_channel_messages_waits_for_queued_command(self):
+        messages = [
+            {
+                "id": 9,
+                "channel": "room",
+                "sender_id": "agent",
+                "message": "wake up",
+                "meta": {},
+                "delivery": ["llm"],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "queue-operation",
+                        "operation": "enqueue",
+                        "content": "[claude-any external channel message] id=9 text=\"wake up\"",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            claude_any._CHANNEL_STDIN_WAKE_DELIVERED.clear()
+            with (
+                mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+                mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript),
+                mock.patch.object(claude_any, "_write_fd_all") as write_all,
+                mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                last_id = claude_any._inject_pending_channel_messages(99, 8)
+
+        self.assertEqual(8, last_id)
+        write_all.assert_not_called()
+        commit_cursor.assert_not_called()
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("state=queued" in item for item in log_messages))
+
     def test_channel_stdin_wake_completed_requires_assistant_after_prompt(self):
         with tempfile.TemporaryDirectory() as td:
             transcript = Path(td) / "session.jsonl"
@@ -1583,7 +1623,7 @@ class ChannelBridgeTests(unittest.TestCase):
 
         self.assertEqual("completed", claude_any._channel_stdin_wake_state_from_text(4345, transcript))
 
-    def test_channel_stdin_wake_state_does_not_complete_queued_command_only(self):
+    def test_channel_stdin_wake_state_treats_queued_command_as_queued_not_missing(self):
         with tempfile.TemporaryDirectory() as td:
             transcript = Path(td) / "session.jsonl"
             transcript.write_text(
@@ -1613,10 +1653,10 @@ class ChannelBridgeTests(unittest.TestCase):
                 encoding="utf-8",
             )
             with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
-                self.assertEqual("missing", claude_any._channel_stdin_wake_state(4971))
+                self.assertEqual("queued", claude_any._channel_stdin_wake_state(4971))
                 self.assertEqual("completed", claude_any._channel_stdin_wake_state(4972))
 
-    def test_channel_stdin_recover_cursor_rewinds_queued_only_message(self):
+    def test_channel_stdin_recover_cursor_keeps_queued_command_message_advanced(self):
         with tempfile.TemporaryDirectory() as td:
             transcript = Path(td) / "session.jsonl"
             transcript.write_text(
@@ -1650,7 +1690,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript),
                 mock.patch.object(claude_any, "router_log"),
             ):
-                self.assertEqual(4970, claude_any._channel_stdin_recover_cursor_from_queued_only(4987))
+                self.assertEqual(4987, claude_any._channel_stdin_recover_cursor_from_queued_only(4987))
 
     def test_channel_stdin_recover_cursor_respects_channel_clear_floor(self):
         with tempfile.TemporaryDirectory() as td:

@@ -28332,6 +28332,7 @@ def _channel_stdin_wake_state_from_text(message_id: int, text: str) -> str:
             return "\n".join(parts)
         return ""
 
+    seen_queued_prompt = False
     seen_real_prompt = False
     for raw_line in text.splitlines():
         try:
@@ -28350,6 +28351,18 @@ def _channel_stdin_wake_state_from_text(message_id: int, text: str) -> str:
             or str(record.get("subtype") or "") == "turn_duration"
         ):
             return "completed"
+        if record_type == "queue-operation" and record.get("operation") == "enqueue":
+            raw = record.get("content")
+            if isinstance(raw, str) and any(marker in raw for marker in prompt_markers):
+                seen_queued_prompt = True
+            continue
+        if record_type == "attachment":
+            attachment = record.get("attachment")
+            if isinstance(attachment, dict) and attachment.get("type") == "queued_command":
+                raw = attachment.get("prompt")
+                if isinstance(raw, str) and any(marker in raw for marker in prompt_markers):
+                    seen_queued_prompt = True
+            continue
         if record_type != "user":
             continue
         if not message_obj:
@@ -28361,7 +28374,9 @@ def _channel_stdin_wake_state_from_text(message_id: int, text: str) -> str:
         content_text = _record_text(message_obj.get("content"))
         if any(marker in content_text for marker in prompt_markers):
             seen_real_prompt = True
-    return "pending" if seen_real_prompt else "missing"
+    if seen_real_prompt:
+        return "pending"
+    return "queued" if seen_queued_prompt else "missing"
 
 
 def _channel_stdin_wake_completed(message_id: int) -> bool:
@@ -28526,10 +28541,10 @@ def _inject_pending_channel_messages(
                     f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=stdin_wake_completed",
                 )
                 continue
-            if wake_state == "pending":
+            if wake_state in {"pending", "queued"}:
                 router_log(
                     "INFO",
-                    f"channel_stdin_proxy_waiting_for_turn_completion message_id={message.get('id')} channel={message.get('channel')} state=pending",
+                    f"channel_stdin_proxy_waiting_for_turn_completion message_id={message.get('id')} channel={message.get('channel')} state={wake_state}",
                 )
                 return previous_last_id
             with _CHANNEL_STDIN_WAKE_LOCK:
