@@ -1565,6 +1565,24 @@ class ChannelBridgeTests(unittest.TestCase):
             with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
                 self.assertEqual("completed", claude_any._channel_stdin_wake_state(10))
 
+    def test_channel_stdin_wake_state_accepts_message_role_assistant_records(self):
+        transcript = "\n".join(
+            [
+                json.dumps({"type": "user", "message": {"content": "[claude-any external channel message] id=4345 text=\"hello\""}}),
+                json.dumps(
+                    {
+                        "message": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "handled"}],
+                        }
+                    }
+                ),
+            ]
+        )
+
+        self.assertEqual("completed", claude_any._channel_stdin_wake_state_from_text(4345, transcript))
+
     def test_channel_stdin_wake_state_does_not_complete_queued_command_only(self):
         with tempfile.TemporaryDirectory() as td:
             transcript = Path(td) / "session.jsonl"

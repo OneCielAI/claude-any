@@ -28302,20 +28302,24 @@ def _channel_stdin_wake_state_from_text(message_id: int, text: str) -> str:
         if not isinstance(record, dict):
             continue
         record_type = str(record.get("type") or "")
+        message = record.get("message")
+        message_obj = message if isinstance(message, dict) else {}
+        message_role = str(message_obj.get("role") or "")
         if seen_real_prompt and (
-            record_type == "assistant" or str(record.get("subtype") or "") == "turn_duration"
+            record_type == "assistant"
+            or message_role == "assistant"
+            or str(record.get("subtype") or "") == "turn_duration"
         ):
             return "completed"
         if record_type != "user":
             continue
-        message = record.get("message")
-        if not isinstance(message, dict):
+        if not message_obj:
             continue
         # A queued_command attachment only means Claude Code accepted text into
         # its line editor queue.  It is not a real user turn and can be
         # superseded by later typed/queued prompts.  Only commit delivery after
         # the prompt is present as an actual user message.
-        content_text = _record_text(message.get("content"))
+        content_text = _record_text(message_obj.get("content"))
         if any(marker in content_text for marker in prompt_markers):
             seen_real_prompt = True
     return "pending" if seen_real_prompt else "missing"
