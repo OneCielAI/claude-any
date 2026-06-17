@@ -1652,6 +1652,44 @@ class ChannelBridgeTests(unittest.TestCase):
             ):
                 self.assertEqual(4970, claude_any._channel_stdin_recover_cursor_from_queued_only(4987))
 
+    def test_channel_stdin_recover_cursor_respects_channel_clear_floor(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transcript = root / "session.jsonl"
+            floor_path = root / "channel-llm-clear-floor.json"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "queue-operation",
+                                "operation": "enqueue",
+                                "content": "[claude-any external channel message] id=4971 text=\"old\"",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "attachment",
+                                "attachment": {
+                                    "type": "queued_command",
+                                    "prompt": "[claude-any external channel message] id=4971 text=\"old\"",
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            floor_path.write_text('{"last_id":4987}\n', encoding="utf-8")
+            claude_any._CHANNEL_STDIN_RECOVERY_CACHE.clear()
+            with (
+                mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript),
+                mock.patch.object(claude_any, "CHANNEL_LLM_CLEAR_FLOOR_PATH", floor_path),
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                self.assertEqual(4987, claude_any._channel_stdin_recover_cursor_from_queued_only(4987))
+
     def test_channel_stdin_recover_cursor_keeps_completed_messages_advanced(self):
         with tempfile.TemporaryDirectory() as td:
             transcript = Path(td) / "session.jsonl"
@@ -4170,6 +4208,7 @@ class ChannelBridgeTests(unittest.TestCase):
             root = Path(td)
             chat_path = root / "chat-messages.jsonl"
             llm_cursor = root / "channel-llm-cursor.json"
+            clear_floor = root / "channel-llm-clear-floor.json"
             mcp_cursor = root / "channel-mcp-cursor.json"
             summary_queue = root / "channel-llm-summary-queue.jsonl"
             summary_cursor = root / "channel-llm-summary-cursor.json"
@@ -4213,6 +4252,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 with (
                     mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", chat_path),
                     mock.patch.object(claude_any, "CHANNEL_LLM_CURSOR_PATH", llm_cursor),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_CLEAR_FLOOR_PATH", clear_floor),
                     mock.patch.object(claude_any, "CHANNEL_MCP_CURSOR_PATH", mcp_cursor),
                     mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_QUEUE_PATH", summary_queue),
                     mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_CURSOR_PATH", summary_cursor),
@@ -4227,6 +4267,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 self.assertEqual(2, stats["discarded_summaries"])
                 self.assertEqual(1, stats["direct_queue_drained"])
                 self.assertEqual({"last_id": 4}, json.loads(llm_cursor.read_text(encoding="utf-8")))
+                self.assertEqual(4, json.loads(clear_floor.read_text(encoding="utf-8"))["last_id"])
                 self.assertEqual({"last_id": 4}, json.loads(mcp_cursor.read_text(encoding="utf-8")))
                 self.assertEqual({"last_id": 5}, json.loads(summary_cursor.read_text(encoding="utf-8")))
                 with claude_any._CHANNEL_MCP_LOCK:

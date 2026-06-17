@@ -147,6 +147,7 @@ CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
 NATIVE_MCP_CONFIG = CONFIG_DIR / "native-mcp.json"
 CHANNEL_MCP_CURSOR_PATH = CONFIG_DIR / "channel-mcp-cursor.json"
 CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
+CHANNEL_LLM_CLEAR_FLOOR_PATH = CONFIG_DIR / "channel-llm-clear-floor.json"
 CHANNEL_LLM_LAUNCH_GUARD_PATH = CONFIG_DIR / "channel-llm-launch-guard.json"
 CHANNEL_LLM_SUMMARY_QUEUE_PATH = CONFIG_DIR / "channel-llm-summary-queue.jsonl"
 CHANNEL_LLM_SUMMARY_CURSOR_PATH = CONFIG_DIR / "channel-llm-summary-cursor.json"
@@ -3006,6 +3007,7 @@ ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
 CONTEXT_PATH = CONFIG_DIR / "context-usage.json"
 CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
 CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
+CHANNEL_LLM_CLEAR_FLOOR_PATH = CONFIG_DIR / "channel-llm-clear-floor.json"
 PALETTE = (203, 209, 215, 221, 229, 187, 151, 116, 111, 147, 183, 219)
 
 
@@ -27521,6 +27523,38 @@ def _channel_llm_read_cursor_locked() -> int:
     return _CHANNEL_LLM_CURSOR_LAST_ID
 
 
+def _channel_llm_clear_floor_read() -> int:
+    try:
+        if not CHANNEL_LLM_CLEAR_FLOOR_PATH.exists():
+            return 0
+        data = json.loads(CHANNEL_LLM_CLEAR_FLOOR_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return 0
+        return max(0, int(data.get("last_id") or 0))
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_clear_floor_read_failed error={type(exc).__name__}: {exc}")
+        return 0
+
+
+def _channel_llm_clear_floor_write(last_id: int) -> None:
+    CHANNEL_LLM_CLEAR_FLOOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"last_id": max(0, int(last_id)), "updated_at": time.time()}
+    tmp_path = CHANNEL_LLM_CLEAR_FLOOR_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+    tmp_path.replace(CHANNEL_LLM_CLEAR_FLOOR_PATH)
+
+
+def _channel_llm_clamp_to_clear_floor(recovered: int) -> int:
+    clear_floor = _channel_llm_clear_floor_read()
+    if clear_floor > 0 and recovered < clear_floor:
+        router_log(
+            "INFO",
+            f"channel_stdin_proxy_recovery_clamped recovered_cursor={recovered} clear_floor={clear_floor}",
+        )
+        return clear_floor
+    return recovered
+
+
 def reset_channel_llm_delivery_cursor(last_id: int | None = None) -> int:
     global _CHANNEL_LLM_CURSOR_LAST_ID
     with _CHANNEL_LLM_CURSOR_LOCK:
@@ -27591,6 +27625,11 @@ def clear_channel_backlog() -> dict[str, Any]:
             _channel_llm_write_cursor_locked(chat_tail)
         except Exception as exc:
             router_log("WARN", f"channel_llm_cursor_write_failed error={type(exc).__name__}: {exc}")
+        try:
+            _channel_llm_clear_floor_write(chat_tail)
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_clear_floor_write_failed error={type(exc).__name__}: {exc}")
+    _CHANNEL_STDIN_RECOVERY_CACHE.clear()
 
     with _CHANNEL_MCP_CURSOR_LOCK:
         old_mcp = _channel_mcp_read_cursor_locked()
@@ -28378,7 +28417,8 @@ def _channel_stdin_recover_cursor_from_queued_only(last_id: int) -> int:
         and now - float(_CHANNEL_STDIN_RECOVERY_CACHE.get("checked_at") or 0.0) < 5.0
     ):
         cached = _CHANNEL_STDIN_RECOVERY_CACHE.get("recovered_last_id")
-        return int(cached) if isinstance(cached, int) else last_id
+        recovered = int(cached) if isinstance(cached, int) else last_id
+        return _channel_llm_clamp_to_clear_floor(recovered)
     text = _read_file_tail_text(path, max_bytes=8 * 1024 * 1024)
     recovered = last_id
     if text:
@@ -28400,7 +28440,7 @@ def _channel_stdin_recover_cursor_from_queued_only(last_id: int) -> int:
             "recovered_last_id": recovered,
         }
     )
-    return recovered
+    return _channel_llm_clamp_to_clear_floor(recovered)
 
 
 def _channel_stdin_unseen_retry_seconds() -> float:
