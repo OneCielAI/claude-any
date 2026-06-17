@@ -26,6 +26,20 @@
 
 ## Today's Top 3 Benefits
 
+### 2026-06-17
+
+1. **Channel backlog control** — routed sessions now install `/channel-clear`.
+   Use `/channel-clear status` to inspect pending external channel work, or
+   `/channel-clear` to discard already queued bridge backlog without replaying
+   it into the model. New events arriving after the clear point are still
+   delivered normally.
+2. **Live LLM preset commands** — routed sessions can switch or restore runtime
+   LLM presets from Claude Code with `/llm-options`, `/llm-restore`, and the
+   generated `/llm-*` preset commands.
+3. **Channel stale replay diagnostics** — channel cursors, summary cursors, and
+   direct-worker queues are now surfaced together so operators can distinguish
+   new MCP delivery from stale local bridge backlog.
+
 ### 2026-06-12
 
 1. **Fireworks.ai provider** — Fireworks is now a first-class
@@ -635,6 +649,11 @@ steps under that larger model's supervision.
 - API key entry outside the Claude Code chat input.
 - LLM option presets for context window, output tokens, timeout, sampling, and
   native compatibility.
+- Runtime LLM preset slash commands in routed sessions: `/llm-options` lists
+  the active settings, `/llm-<preset>` applies a preset from the Claude Code
+  slash menu, and `/llm-restore` returns to the options captured before the
+  first live change. Direct Claude Native mode keeps Claude Code untouched and
+  does not install these router commands.
 - Compatibility test before launch, including text response, tool use, and
   tool-result round trip checks.
 - Runtime context reporting for vLLM/NIM when `/v1/models` exposes

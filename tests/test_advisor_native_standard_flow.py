@@ -45,11 +45,13 @@ class AdvisorSlashCommandInstallTests(unittest.TestCase):
         claude_any.install_claude_any_slash_commands(include_advisor=True)
         self.assertTrue((Path(self._tmp.name) / "advisor.md").exists())
         self.assertTrue((Path(self._tmp.name) / "router-debug.md").exists())
+        self.assertTrue((Path(self._tmp.name) / "channel-clear.md").exists())
 
     def test_install_without_advisor_skips_advisor_command(self):
         claude_any.install_claude_any_slash_commands(include_advisor=False)
         self.assertFalse((Path(self._tmp.name) / "advisor.md").exists())
         self.assertTrue((Path(self._tmp.name) / "router-debug.md").exists())
+        self.assertTrue((Path(self._tmp.name) / "channel-clear.md").exists())
 
     def test_install_without_advisor_removes_claude_any_owned_command(self):
         # A previous non-anthropic launch installed claude-any's /advisor;

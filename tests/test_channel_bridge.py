@@ -4144,6 +4144,93 @@ class ChannelBridgeTests(unittest.TestCase):
                 self.assertEqual(12, claude_any._channel_mcp_ensure_cursor_initialized())
                 self.assertEqual({"last_id": 12}, json.loads(cursor_path.read_text(encoding="utf-8")))
 
+    def test_clear_channel_backlog_advances_cursors_and_drains_direct_queue(self):
+        original_llm = claude_any._CHANNEL_LLM_CURSOR_LAST_ID
+        original_mcp = claude_any._CHANNEL_MCP_CURSOR_LAST_ID
+        original_summary = claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+        with tempfile.TemporaryDirectory(prefix="ca-channel-clear-") as td:
+            root = Path(td)
+            chat_path = root / "chat-messages.jsonl"
+            llm_cursor = root / "channel-llm-cursor.json"
+            mcp_cursor = root / "channel-mcp-cursor.json"
+            summary_queue = root / "channel-llm-summary-queue.jsonl"
+            summary_cursor = root / "channel-llm-summary-cursor.json"
+            chat_path.write_text(
+                "\n".join(
+                    json.dumps({"id": i, "channel": "room", "sender_id": "mcp", "message": f"m{i}", "meta": {"mcp_server": "mcp"}})
+                    for i in range(1, 5)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            llm_cursor.write_text('{"last_id":1}\n', encoding="utf-8")
+            mcp_cursor.write_text('{"last_id":2}\n', encoding="utf-8")
+            summary_queue.write_text(
+                json.dumps({"message_id": 3, "summary": "old"}, ensure_ascii=False) + "\n"
+                + json.dumps({"message_id": 5, "summary": "new"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            summary_cursor.write_text('{"last_id":3}\n', encoding="utf-8")
+
+            while not claude_any._CHANNEL_LLM_DIRECT_QUEUE.empty():
+                try:
+                    claude_any._CHANNEL_LLM_DIRECT_QUEUE.get_nowait()
+                    claude_any._CHANNEL_LLM_DIRECT_QUEUE.task_done()
+                except Exception:
+                    break
+            original_inflight = set(claude_any._CHANNEL_LLM_DIRECT_INFLIGHT)
+            original_delivered = set(claude_any._CHANNEL_LLM_DIRECT_DELIVERED)
+            with claude_any._CHANNEL_MCP_LOCK:
+                original_sessions = dict(claude_any._CHANNEL_MCP_SESSIONS)
+                claude_any._CHANNEL_MCP_SESSIONS.clear()
+                claude_any._CHANNEL_MCP_SESSIONS["session-1"] = {"last_id": 1, "outbox": []}
+            try:
+                claude_any._CHANNEL_LLM_CURSOR_LAST_ID = None
+                claude_any._CHANNEL_MCP_CURSOR_LAST_ID = None
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = None
+                claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.clear()
+                claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+                direct_queue = claude_any.queue.Queue()
+                direct_queue.put({"id": 4, "channel": "room"})
+                with (
+                    mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", chat_path),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_CURSOR_PATH", llm_cursor),
+                    mock.patch.object(claude_any, "CHANNEL_MCP_CURSOR_PATH", mcp_cursor),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_QUEUE_PATH", summary_queue),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_CURSOR_PATH", summary_cursor),
+                    mock.patch.object(claude_any, "_CHANNEL_LLM_DIRECT_QUEUE", direct_queue),
+                ):
+                    stats = claude_any.clear_channel_backlog()
+
+                self.assertEqual(4, stats["chat_tail"])
+                self.assertEqual(5, stats["summary_tail"])
+                self.assertEqual(3, stats["discarded_llm"])
+                self.assertEqual(2, stats["discarded_mcp"])
+                self.assertEqual(2, stats["discarded_summaries"])
+                self.assertEqual(1, stats["direct_queue_drained"])
+                self.assertEqual({"last_id": 4}, json.loads(llm_cursor.read_text(encoding="utf-8")))
+                self.assertEqual({"last_id": 4}, json.loads(mcp_cursor.read_text(encoding="utf-8")))
+                self.assertEqual({"last_id": 5}, json.loads(summary_cursor.read_text(encoding="utf-8")))
+                with claude_any._CHANNEL_MCP_LOCK:
+                    self.assertEqual(4, claude_any._CHANNEL_MCP_SESSIONS["session-1"]["last_id"])
+            finally:
+                claude_any._CHANNEL_LLM_CURSOR_LAST_ID = original_llm
+                claude_any._CHANNEL_MCP_CURSOR_LAST_ID = original_mcp
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = original_summary
+                claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.clear()
+                claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.update(original_inflight)
+                claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+                claude_any._CHANNEL_LLM_DIRECT_DELIVERED.update(original_delivered)
+                while not claude_any._CHANNEL_LLM_DIRECT_QUEUE.empty():
+                    try:
+                        claude_any._CHANNEL_LLM_DIRECT_QUEUE.get_nowait()
+                        claude_any._CHANNEL_LLM_DIRECT_QUEUE.task_done()
+                    except Exception:
+                        break
+                with claude_any._CHANNEL_MCP_LOCK:
+                    claude_any._CHANNEL_MCP_SESSIONS.clear()
+                    claude_any._CHANNEL_MCP_SESSIONS.update(original_sessions)
+
     def test_mcp_proxy_notification_maps_to_chat_payload(self):
         payload = claude_any._mcp_proxy_notification_payload(
             "ai-net",

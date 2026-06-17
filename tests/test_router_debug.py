@@ -74,6 +74,41 @@ class RouterDebugTests(unittest.TestCase):
 
         self.assertEqual("toggle", claude_any.router_debug_value_from_body(body))
 
+    def test_channel_clear_slash_value_parsing(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG\n\nValue: status"}],
+                }
+            ]
+        }
+
+        self.assertTrue(claude_any.is_channel_clear_request(body))
+        self.assertEqual("status", claude_any.channel_clear_value_from_body(body))
+
+    def test_channel_clear_slash_short_circuits(self):
+        handler = object()
+        body = {
+            "model": "claude-any-test",
+            "stream": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [{"type": "text", "text": "CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG\n\nValue: all"}],
+                }
+            ],
+        }
+
+        with (
+            patch.object(claude_any, "clear_channel_backlog", return_value={"chat_tail": 9, "summary_tail": 0}),
+            patch.object(claude_any, "write_anthropic_text_response") as write,
+        ):
+            self.assertTrue(claude_any.maybe_handle_channel_clear_request(handler, body))  # type: ignore[arg-type]
+
+        write.assert_called_once()
+        self.assertIn("channel backlog discarded", write.call_args.args[2])
+
     def test_router_event_message_preview_defaults_to_off(self):
         body = {"messages": [{"role": "user", "content": "secret prompt"}]}
 

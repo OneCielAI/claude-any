@@ -186,6 +186,15 @@ long-context preset. For vLLM native mode, the server must still be launched
 with a matching `--max-model-len`; Claude Any cannot raise the server-side
 context limit from the client.
 
+When Claude Code is running through the Claude Any router, including
+non-native providers and Anthropic routed mode, the same preset family can be
+changed from inside the live session. Use `/llm-options` for the current state,
+`/llm-options list` for the available presets, `/llm-<preset>` to apply one
+from the slash-command menu, and `/llm-restore` to return to the options
+captured before the first live change. The changed settings are used by the
+next model request. Direct Claude Native mode keeps Claude Code's own behavior
+unchanged and does not install these router-owned commands.
+
 ## Provider Setup
 
 ### Anthropic
@@ -932,6 +941,12 @@ Cloudflare tunnels, Tailscale routes, DNS records, or public hostnames. If the
 selected provider is Anthropic and the browser chat should use the router, turn
 on the Anthropic `route_through_router` option and configure an Anthropic API
 key.
+
+Routed sessions also install `/channel-clear`. Use `/channel-clear status` to
+inspect the local channel bridge backlog, and `/channel-clear` to advance the
+local bridge cursors to the current tail without replaying already queued
+external channel messages into the model. This only clears Claude Any's local
+bridge backlog; it does not delete messages from the upstream MCP server.
 
 ## External Web Access
 

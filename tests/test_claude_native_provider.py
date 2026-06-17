@@ -401,14 +401,17 @@ class NativeSlashCommandContractTests(unittest.TestCase):
             commands_dir.mkdir()
             advisor = commands_dir / "advisor.md"
             router_debug = commands_dir / "router-debug.md"
+            channel_clear = commands_dir / "channel-clear.md"
             advisor.write_text(claude_any.ADVISOR_SLASH_COMMAND, encoding="utf-8")
             router_debug.write_text(claude_any.ROUTER_DEBUG_SLASH_COMMAND, encoding="utf-8")
+            channel_clear.write_text(claude_any.CHANNEL_CLEAR_SLASH_COMMAND, encoding="utf-8")
 
             with mock.patch.object(claude_any, "CLAUDE_COMMANDS_DIR", commands_dir):
                 claude_any.disable_claude_any_slash_commands_for_native()
 
             self.assertFalse(advisor.exists())
             self.assertFalse(router_debug.exists())
+            self.assertFalse(channel_clear.exists())
 
     def test_non_native_install_restores_router_backed_slash_commands(self):
         with tempfile.TemporaryDirectory() as td:

@@ -420,6 +420,10 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 - 프로바이더별 모델 목록과 사용자 모델 직접 입력.
 - Claude Code 채팅 입력 밖에서 API 키 설정.
 - context window, output tokens, timeout, sampling, native compatibility를 위한 LLM 옵션/프리셋.
+- routed 세션에서 실행 중 LLM 프리셋 변경: `/llm-options`로 현재 설정을 보고,
+  `/llm-<preset>`을 Claude Code slash 메뉴에서 선택해 적용하며, `/llm-restore`로
+  첫 live 변경 전 옵션으로 되돌립니다. direct Claude Native 모드에서는 Claude Code
+  원래 동작을 유지하기 위해 이 router 명령들을 설치하지 않습니다.
 - 실행 전 텍스트, `tool_use`, `tool_result` 호환성 테스트.
 - vLLM/NIM의 `/v1/models`가 `max_model_len`을 제공하면 런타임 컨텍스트 표시.
 - SSH와 터미널 작업에 맞춘 콘솔 우선 메뉴.
@@ -924,6 +928,12 @@ Cloudflare tunnel, public DNS, Tailscale route는 자동 생성하지 않습니�
 선택된 provider가 Anthropic이고 이 웹 채팅이나 router 기능으로 Anthropic
 트래픽을 처리하려면 Anthropic LLM 옵션의 `route_through_router`를 켜고
 Anthropic API 키를 설정해야 합니다.
+
+routed session에서는 `/channel-clear`도 설치됩니다. `/channel-clear status`로
+로컬 channel bridge backlog를 확인하고, `/channel-clear`로 이미 큐에 쌓인
+외부 channel 메시지를 모델에 재생하지 않고 로컬 bridge cursor만 현재 tail로
+전진시킬 수 있습니다. 이 명령은 Claude Any의 로컬 bridge backlog만 지우며,
+upstream MCP 서버의 메시지는 삭제하지 않습니다.
 
 ## 외부 웹 접속
 

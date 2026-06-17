@@ -3584,6 +3584,42 @@ Do not run tools, shell commands, file searches, config scans, or environment ch
 This session bypasses the claude-any router. Launch a non-native provider or enable Anthropic routed mode to use /router-debug.
 """
 
+LLM_OPTIONS_SLASH_COMMAND = """---
+description: Show or change claude-any live LLM options
+argument-hint: [status|list|restore|preset-id]
+---
+
+CLAUDE_ANY_LIVE_LLM_OPTIONS
+
+Value: $ARGUMENTS
+
+Show or change the live claude-any LLM preset for this routed session. With no argument, show status and available presets. Use `restore` to return to the options captured before the first live preset change.
+"""
+
+LLM_RESTORE_SLASH_COMMAND = """---
+description: Restore claude-any live LLM options
+argument-hint: [ignored]
+---
+
+CLAUDE_ANY_LIVE_LLM_OPTIONS
+
+Value: restore
+
+Restore the LLM options captured before the first live preset change in this routed session.
+"""
+
+CHANNEL_CLEAR_SLASH_COMMAND = """---
+description: Discard pending claude-any external channel backlog
+argument-hint: [all|status]
+---
+
+CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG
+
+Value: $ARGUMENTS
+
+Discard pending claude-any external channel backlog without sending it to the model. Use `status` to show pending counts without clearing.
+"""
+
 CLAUDE_ANY_ADVISOR_COMMAND_MARKERS = (
     "CLAUDE_ANY_ADVISOR_CALL",
     "Run the selected claude-any Advisor Model",
@@ -3593,6 +3629,15 @@ CLAUDE_ANY_ROUTER_DEBUG_COMMAND_MARKERS = (
     "CLAUDE_ANY_ROUTER_DEBUG_ACCESS",
     "Toggle claude-any router external debug access",
     "claude-any router debug controls are unavailable in direct Claude Native mode",
+)
+CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS = (
+    "CLAUDE_ANY_LIVE_LLM_OPTIONS",
+    "Show or change claude-any live LLM options",
+    "Restore claude-any live LLM options",
+)
+CLAUDE_ANY_CHANNEL_CLEAR_COMMAND_MARKERS = (
+    "CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG",
+    "Discard pending claude-any external channel backlog",
 )
 
 
@@ -3620,7 +3665,12 @@ def install_claude_any_slash_commands(include_advisor: bool = True) -> None:
         CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
         commands = {
             "router-debug.md": ROUTER_DEBUG_SLASH_COMMAND,
+            "llm-options.md": LLM_OPTIONS_SLASH_COMMAND,
+            "llm-restore.md": LLM_RESTORE_SLASH_COMMAND,
+            "channel-clear.md": CHANNEL_CLEAR_SLASH_COMMAND,
         }
+        for preset_id in LLM_PRESETS:
+            commands[f"{llm_preset_command_name(preset_id)}.md"] = llm_preset_slash_command(preset_id)
         if include_advisor:
             commands["advisor.md"] = ADVISOR_SLASH_COMMAND
         else:
@@ -3641,6 +3691,10 @@ def install_claude_any_slash_commands(include_advisor: bool = True) -> None:
                     CLAUDE_ANY_ADVISOR_COMMAND_MARKERS
                     if name == "advisor.md"
                     else CLAUDE_ANY_ROUTER_DEBUG_COMMAND_MARKERS
+                    if name == "router-debug.md"
+                    else CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS
+                    if name == "llm-options.md" or name == "llm-restore.md" or name.startswith("llm-")
+                    else CLAUDE_ANY_CHANNEL_CLEAR_COMMAND_MARKERS
                 )
                 if existing == content:
                     continue
@@ -3662,12 +3716,20 @@ def disable_claude_any_slash_commands_for_native() -> None:
         commands = {
             "advisor.md": CLAUDE_ANY_ADVISOR_COMMAND_MARKERS,
             "router-debug.md": CLAUDE_ANY_ROUTER_DEBUG_COMMAND_MARKERS,
+            "llm-options.md": CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS,
+            "llm-restore.md": CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS,
+            "channel-clear.md": CLAUDE_ANY_CHANNEL_CLEAR_COMMAND_MARKERS,
         }
         for name, markers in commands.items():
             path = CLAUDE_COMMANDS_DIR / name
             if not path.exists() or not command_file_is_claude_any_owned(path, markers):
                 continue
             path.unlink()
+        for path in CLAUDE_COMMANDS_DIR.glob("llm-*.md"):
+            if path.name in commands:
+                continue
+            if command_file_is_claude_any_owned(path, CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS):
+                path.unlink()
     except Exception as exc:
         print(f"Claude Any warning: could not remove claude-any slash commands for native mode ({type(exc).__name__}: {exc}).", flush=True)
 
@@ -10712,6 +10774,27 @@ def _channel_mcp_tool_schemas() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "name": "llm_options",
+            "description": (
+                "Show, apply, or restore claude-any live LLM option presets for the current routed session. "
+                "Use action='list' to show keyboard-selectable slash commands, action='apply' with preset, "
+                "or action='restore' to return to the captured original options."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "One of status, list, apply, or restore.",
+                    },
+                    "preset": {
+                        "type": "string",
+                        "description": "Preset id or alias when action is apply, for example balanced, long-context-128k, or million-context-1m.",
+                    },
+                },
+            },
+        },
     ]
 
 
@@ -10814,6 +10897,14 @@ def _channel_mcp_tool_call_response(request_id: Any, params: dict[str, Any]) -> 
         return _channel_mcp_tool_response(
             request_id,
             json.dumps({"ok": True, "messages": messages}, ensure_ascii=False, separators=(",", ":")),
+        )
+    if name == "llm_options":
+        action = str(args.get("action") or "status")
+        preset = str(args.get("preset") or "")
+        lines, changed = handle_live_llm_options_action(action, preset)
+        return _channel_mcp_tool_response(
+            request_id,
+            json.dumps({"ok": True, "changed": changed, "lines": lines}, ensure_ascii=False, separators=(",", ":")),
         )
     return _channel_mcp_tool_response(request_id, f"Unknown claude-any-router tool: {name}", True)
 
@@ -11384,6 +11475,14 @@ def is_router_debug_request(body: dict[str, Any]) -> bool:
     return "CLAUDE_ANY_ROUTER_DEBUG_ACCESS" in latest_user_text(body)
 
 
+def is_channel_clear_request(body: dict[str, Any]) -> bool:
+    return "CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG" in latest_user_text(body)
+
+
+def is_live_llm_options_request(body: dict[str, Any]) -> bool:
+    return "CLAUDE_ANY_LIVE_LLM_OPTIONS" in latest_user_text(body)
+
+
 def parse_channel_bridge_args(raw: str) -> tuple[str, dict[str, str]]:
     text = (raw or "").strip()
     if not text:
@@ -11445,6 +11544,38 @@ def router_debug_value_from_body(body: dict[str, Any]) -> str:
             value = stripped.split(":", 1)[1].strip()
             return value or "toggle"
     return tail.strip() or "toggle"
+
+
+def channel_clear_value_from_body(body: dict[str, Any]) -> str:
+    text = latest_user_text(body)
+    marker = "CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG"
+    if marker not in text:
+        return "all"
+    tail = text.split(marker, 1)[1]
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("value:"):
+            value = stripped.split(":", 1)[1].strip()
+            return value or "all"
+    return tail.strip() or "all"
+
+
+def live_llm_options_value_from_body(body: dict[str, Any]) -> str:
+    text = latest_user_text(body)
+    marker = "CLAUDE_ANY_LIVE_LLM_OPTIONS"
+    if marker not in text:
+        return "status"
+    tail = text.split(marker, 1)[1]
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("value:"):
+            value = stripped.split(":", 1)[1].strip()
+            return value or "status"
+    return tail.strip() or "status"
 
 
 def advisor_focus_from_body(body: dict[str, Any]) -> str:
@@ -13506,6 +13637,98 @@ def maybe_handle_router_debug_request(handler: BaseHTTPRequestHandler, body: dic
     write_anthropic_text_response(handler, str(body.get("model") or current_alias(load_config())), "\n".join(lines), stream)
     if should_restart:
         schedule_router_process_restart()
+    return True
+
+
+def _format_channel_backlog_status_lines(stats: dict[str, Any], cleared: bool) -> list[str]:
+    if cleared:
+        return [
+            "Claude Any channel backlog discarded.",
+            f"- chat tail: {stats.get('chat_tail')}",
+            f"- LLM cursor advanced by: {stats.get('discarded_llm')}",
+            f"- MCP cursor advanced by: {stats.get('discarded_mcp')}",
+            f"- summary cursor advanced by: {stats.get('discarded_summaries')}",
+            f"- direct worker queue drained: {stats.get('direct_queue_drained')}",
+            f"- direct worker items marked handled: {stats.get('direct_queue_remembered')}",
+            f"- direct worker inflight still running: {stats.get('direct_inflight')}",
+            f"- active MCP channel sessions updated: {stats.get('mcp_sessions_updated')}",
+            "New channel events arriving after this point will still be delivered.",
+        ]
+    return [
+        "Claude Any channel backlog status.",
+        f"- chat tail: {stats.get('chat_tail')}",
+        f"- pending LLM items by id range: {stats.get('pending_llm')}",
+        f"- pending MCP items by id range: {stats.get('pending_mcp')}",
+        f"- pending direct summaries by id range: {stats.get('pending_summaries')}",
+        f"- direct worker queue depth: {stats.get('direct_queue')}",
+        f"- direct worker inflight: {stats.get('direct_inflight')}",
+        f"- active MCP channel sessions: {stats.get('mcp_sessions')}",
+    ]
+
+
+def maybe_handle_channel_clear_request(handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> bool:
+    if not is_channel_clear_request(body):
+        return False
+    stream = bool(body.get("stream", True))
+    value = channel_clear_value_from_body(body).strip().lower()
+    if value in {"", "all", "clear", "discard", "drop", "purge", "reset", "now"}:
+        stats = clear_channel_backlog()
+        lines = _format_channel_backlog_status_lines(stats, cleared=True)
+    elif value in {"status", "state", "show", "?", "dry-run", "dryrun"}:
+        stats = channel_backlog_status()
+        lines = _format_channel_backlog_status_lines(stats, cleared=False)
+    else:
+        lines = ["Usage: `/channel-clear`, `/channel-clear all`, or `/channel-clear status`."]
+    write_anthropic_text_response(handler, str(body.get("model") or current_alias(load_config())), "\n".join(lines), stream)
+    return True
+
+
+def handle_live_llm_options_action(action: str = "status", preset: str = "") -> tuple[list[str], bool]:
+    cfg = load_config()
+    provider, pcfg = get_current_provider(cfg)
+    raw_action = str(action or "").strip()
+    raw_preset = str(preset or "").strip()
+    if not raw_action and raw_preset:
+        raw_action = "apply"
+    value = raw_preset or raw_action
+    normalized = normalize_llm_preset_token(value)
+    if normalized in {"", "status", "state", "show", "current", "now"}:
+        return runtime_llm_status_lines(provider, pcfg), False
+    if normalized in {"list", "presets", "preset", "help", "options", "menu", "select"}:
+        return runtime_llm_preset_list_lines(provider, pcfg), False
+    if normalized in {"restore", "original", "reset", "revert", "undo"}:
+        had_snapshot = isinstance(pcfg.get(RUNTIME_LLM_ORIGINAL_KEY), dict)
+        lines = restore_runtime_llm_original_options(provider)
+        cfg_after = load_config()
+        _provider_after, pcfg_after = get_current_provider(cfg_after)
+        return lines + [""] + runtime_llm_status_lines(provider, pcfg_after), had_snapshot
+    preset_id = resolve_llm_preset_id(value)
+    if not preset_id:
+        return [
+            f"Unknown live LLM preset/action: {value or raw_action or raw_preset}",
+            "Use `/llm-options list` to see available presets, or `/llm-restore` to revert.",
+        ], False
+    lines = apply_runtime_llm_preset_config(provider, preset_id)
+    cfg_after = load_config()
+    _provider_after, pcfg_after = get_current_provider(cfg_after)
+    return lines + ["", "Updated live LLM options. The next model request uses these settings."] + runtime_llm_status_lines(provider, pcfg_after), True
+
+
+def maybe_handle_live_llm_options_request(handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> bool:
+    if not is_live_llm_options_request(body):
+        return False
+    stream = bool(body.get("stream", True))
+    value = live_llm_options_value_from_body(body)
+    lines, changed = handle_live_llm_options_action(value)
+    if changed:
+        EVENT_BUS.publish(
+            level="info",
+            category="config.llm",
+            message="live LLM options updated from slash command",
+            provider=get_current_provider(load_config())[0],
+            data={"value": value},
+        )
+    write_anthropic_text_response(handler, str(body.get("model") or current_alias(load_config())), "\n".join(lines), stream)
     return True
 
 
@@ -16083,6 +16306,12 @@ class RouterHandler(BaseHTTPRequestHandler):
         write_context_usage(provider, pcfg, body, "messages")
         if maybe_handle_router_debug_request(self, body):
             EVENT_BUS.publish(level="info", category="router_debug.short_circuit", message="router debug request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
+            return
+        if maybe_handle_channel_clear_request(self, body):
+            EVENT_BUS.publish(level="info", category="channel_clear.short_circuit", message="channel backlog clear request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
+            return
+        if maybe_handle_live_llm_options_request(self, body):
+            EVENT_BUS.publish(level="info", category="llm_options.short_circuit", message="live LLM options request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
         if maybe_handle_advisor_request(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
@@ -19308,6 +19537,64 @@ LLM_PRESETS: dict[str, tuple[str, str]] = {
 }
 
 
+def llm_preset_command_name(preset_id: str) -> str:
+    return "llm-" + re.sub(r"[^a-z0-9]+", "-", str(preset_id or "").lower()).strip("-")
+
+
+def llm_preset_slash_command(preset_id: str) -> str:
+    label, description = llm_preset_text(preset_id, "en")
+    return f"""---
+description: Apply claude-any live preset: {label}
+argument-hint: [ignored]
+---
+
+CLAUDE_ANY_LIVE_LLM_OPTIONS
+
+Value: {preset_id}
+
+Apply the claude-any live LLM preset `{preset_id}` ({description}) to this routed session. The original options are captured before the first live preset change and can be restored with `/llm-restore`.
+"""
+
+
+def normalize_llm_preset_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+def resolve_llm_preset_id(value: str) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = normalize_llm_preset_token(raw)
+    aliases = {
+        "65k": "long-context-65k",
+        "long-65k": "long-context-65k",
+        "context-65k": "long-context-65k",
+        "128k": "long-context-128k",
+        "long-128k": "long-context-128k",
+        "context-128k": "long-context-128k",
+        "1m": "million-context-1m",
+        "million": "million-context-1m",
+        "million-context": "million-context-1m",
+        "ultra": "million-context-1m",
+        "ultra-context": "million-context-1m",
+        "output": "large-output",
+        "large": "large-output",
+        "report": "large-output",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    for preset_id, (label, _description) in LLM_PRESETS.items():
+        candidates = {
+            normalize_llm_preset_token(preset_id),
+            normalize_llm_preset_token(label),
+            normalize_llm_preset_token(llm_preset_command_name(preset_id)),
+            normalize_llm_preset_token(llm_preset_command_name(preset_id).removeprefix("llm-")),
+        }
+        if normalized in candidates:
+            return preset_id
+    return None
+
+
 LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
     "ko": {
         "balanced": ("균형형 Claude Code", "4K 출력, 안정적인 코딩/채팅 기본값"),
@@ -20685,6 +20972,126 @@ def apply_llm_preset_config(provider: str, preset_id: str) -> list[str]:
     lines = apply_llm_preset_to_provider(provider, pcfg, preset_id, cfg.get("language", "en"))
     save_config(cfg)
     clear_model_cache()
+    return lines
+
+
+RUNTIME_LLM_ORIGINAL_KEY = "runtime_llm_original_options"
+RUNTIME_LLM_OPTION_KEYS = {
+    "llm_preset",
+    "context_window",
+    "context_reserve_tokens",
+    "max_output_tokens",
+    "request_timeout_ms",
+    "stream_idle_timeout_ms",
+    "temperature",
+    "top_p",
+    "top_k",
+    "native_compat",
+    "stream_enabled",
+    "stream_word_chunking",
+    "num_ctx",
+    "num_ctx_min",
+    "num_ctx_max",
+    "keep_alive",
+    "think",
+    "ollama_options",
+    "rate_limit_rpm",
+    "rate_limit_status",
+    "force_query_string",
+    "ip_family",
+    "model_context_max",
+    "model_context_model",
+    "max_model_len",
+}
+
+
+def runtime_llm_snapshot_from_provider(provider: str, pcfg: dict[str, Any]) -> dict[str, Any]:
+    values = {
+        key: json.loads(json.dumps(pcfg[key]))
+        for key in sorted(RUNTIME_LLM_OPTION_KEYS)
+        if key in pcfg
+    }
+    return {
+        "version": 1,
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "provider": provider,
+        "model": str(pcfg.get("current_model") or ""),
+        "values": values,
+    }
+
+
+def ensure_runtime_llm_original_snapshot(provider: str, pcfg: dict[str, Any]) -> bool:
+    existing = pcfg.get(RUNTIME_LLM_ORIGINAL_KEY)
+    if isinstance(existing, dict) and isinstance(existing.get("values"), dict):
+        return False
+    pcfg[RUNTIME_LLM_ORIGINAL_KEY] = runtime_llm_snapshot_from_provider(provider, pcfg)
+    return True
+
+
+def restore_runtime_llm_original_options(provider: str) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    snapshot = pcfg.get(RUNTIME_LLM_ORIGINAL_KEY)
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("values"), dict):
+        return ["No captured live LLM options to restore."]
+    values = json.loads(json.dumps(snapshot.get("values") or {}))
+    for key in RUNTIME_LLM_OPTION_KEYS:
+        pcfg.pop(key, None)
+    pcfg.update(values)
+    pcfg.pop(RUNTIME_LLM_ORIGINAL_KEY, None)
+    save_config(cfg)
+    clear_model_cache()
+    return [
+        "Restored live LLM options to the values captured before the first runtime preset change.",
+        f"Captured provider/model: {snapshot.get('provider') or provider} / {snapshot.get('model') or 'unknown'}",
+    ]
+
+
+def apply_runtime_llm_preset_config(provider: str, preset_id: str) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    captured = ensure_runtime_llm_original_snapshot(provider, pcfg)
+    lines = apply_llm_preset_to_provider(provider, pcfg, preset_id, cfg.get("language", "en"))
+    if captured:
+        lines.insert(0, "Captured current live LLM options for /llm-restore.")
+    save_config(cfg)
+    clear_model_cache()
+    return lines
+
+
+def runtime_llm_status_lines(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    cfg = load_config()
+    lang = cfg.get("language", "en")
+    applied = applied_preset_id(provider, pcfg)
+    lines = [
+        f"Provider: {provider_mode_label(provider, pcfg)}",
+        f"Model: {pcfg.get('current_model') or 'unknown'}",
+        f"Preset: {applied} ({llm_preset_text(applied, lang)[0]})",
+        f"Context: {context_setting_status(provider, pcfg)}",
+        f"Timeout: {timeout_profile_status(pcfg, lang)}",
+    ]
+    if provider in ("ollama", "ollama-cloud"):
+        opts = ollama_extra_options(pcfg)
+        lines.append(f"Output tokens: {opts.get('num_predict', 'default')}")
+    else:
+        lines.append(f"Output tokens: {pcfg.get('max_output_tokens', 'default')}")
+    lines.append(f"Restore available: {'yes' if isinstance(pcfg.get(RUNTIME_LLM_ORIGINAL_KEY), dict) else 'no'}")
+    return lines
+
+
+def runtime_llm_preset_list_lines(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    lang = load_config().get("language", "en")
+    applied = applied_preset_id(provider, pcfg)
+    lines = runtime_llm_status_lines(provider, pcfg)
+    lines.append("")
+    lines.append("Available live presets:")
+    for preset_id in LLM_PRESETS:
+        label, description = llm_preset_text(preset_id, lang)
+        mark = "*" if preset_id == applied else " "
+        command_name = llm_preset_command_name(preset_id)
+        lines.append(f"{mark} /{command_name}  {preset_id} — {label}: {description}")
+    lines.append("  /llm-restore  restore captured original options")
+    lines.append("  /llm-options <preset-id|status|list|restore>")
     return lines
 
 
@@ -27139,6 +27546,119 @@ def prepare_channel_llm_delivery_for_launch() -> int:
     _write_channel_llm_launch_guard(last_id)
     router_log("INFO", f"channel_llm_cursor_fast_forward_on_launch last_id={last_id}")
     return last_id
+
+
+def _drain_channel_direct_queue() -> tuple[int, int]:
+    drained = 0
+    remembered = 0
+    with _CHANNEL_LLM_DIRECT_LOCK:
+        while True:
+            try:
+                item = _CHANNEL_LLM_DIRECT_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+            drained += 1
+            try:
+                message_id = int(item.get("id") or 0) if isinstance(item, dict) else 0
+            except Exception:
+                message_id = 0
+            if message_id > 0:
+                _CHANNEL_LLM_DIRECT_INFLIGHT.discard(message_id)
+                _CHANNEL_LLM_DIRECT_DELIVERED.add(message_id)
+                remembered += 1
+            try:
+                _CHANNEL_LLM_DIRECT_QUEUE.task_done()
+            except Exception:
+                pass
+        if len(_CHANNEL_LLM_DIRECT_DELIVERED) > 1000:
+            for old_id in sorted(_CHANNEL_LLM_DIRECT_DELIVERED)[: len(_CHANNEL_LLM_DIRECT_DELIVERED) - 1000]:
+                _CHANNEL_LLM_DIRECT_DELIVERED.discard(old_id)
+    return drained, remembered
+
+
+def clear_channel_backlog() -> dict[str, Any]:
+    global _CHANNEL_LLM_CURSOR_LAST_ID, _CHANNEL_MCP_CURSOR_LAST_ID, _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+    chat_tail = max(0, _chat_scan_max_id())
+    with _CHANNEL_LLM_SUMMARY_LOCK:
+        summary_tail = max(0, _channel_llm_summary_scan_max_id_locked())
+
+    with _CHANNEL_LLM_CURSOR_LOCK:
+        old_llm = _channel_llm_read_cursor_locked()
+        _CHANNEL_LLM_CURSOR_LAST_ID = chat_tail
+        try:
+            _channel_llm_write_cursor_locked(chat_tail)
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_cursor_write_failed error={type(exc).__name__}: {exc}")
+
+    with _CHANNEL_MCP_CURSOR_LOCK:
+        old_mcp = _channel_mcp_read_cursor_locked()
+        _CHANNEL_MCP_CURSOR_LAST_ID = chat_tail
+        try:
+            _channel_mcp_write_cursor_locked(chat_tail)
+        except Exception as exc:
+            router_log("WARN", f"channel_mcp_cursor_write_failed error={type(exc).__name__}: {exc}")
+
+    with _CHANNEL_MCP_LOCK:
+        for state in _CHANNEL_MCP_SESSIONS.values():
+            try:
+                state["last_id"] = max(int(state.get("last_id") or 0), chat_tail)
+            except Exception:
+                state["last_id"] = chat_tail
+
+    with _CHANNEL_LLM_SUMMARY_LOCK:
+        old_summary = _channel_llm_summary_read_cursor_locked()
+        _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = summary_tail
+        try:
+            _channel_llm_summary_write_cursor_locked(summary_tail)
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
+
+    drained_direct, remembered_direct = _drain_channel_direct_queue()
+    with _CHAT_CONDITION:
+        _CHAT_CONDITION.notify_all()
+    stats = {
+        "chat_tail": chat_tail,
+        "summary_tail": summary_tail,
+        "discarded_llm": max(0, chat_tail - int(old_llm or 0)),
+        "discarded_mcp": max(0, chat_tail - int(old_mcp or 0)),
+        "discarded_summaries": max(0, summary_tail - int(old_summary or 0)),
+        "direct_queue_drained": drained_direct,
+        "direct_queue_remembered": remembered_direct,
+        "direct_inflight": len(_CHANNEL_LLM_DIRECT_INFLIGHT),
+        "mcp_sessions_updated": len(_CHANNEL_MCP_SESSIONS),
+    }
+    router_log(
+        "INFO",
+        "channel_backlog_cleared "
+        f"chat_tail={chat_tail} summary_tail={summary_tail} "
+        f"discarded_llm={stats['discarded_llm']} discarded_mcp={stats['discarded_mcp']} "
+        f"discarded_summaries={stats['discarded_summaries']} direct_queue_drained={drained_direct} "
+        f"direct_inflight={stats['direct_inflight']} mcp_sessions_updated={stats['mcp_sessions_updated']}",
+    )
+    return stats
+
+
+def channel_backlog_status() -> dict[str, Any]:
+    chat_tail = max(0, _chat_scan_max_id())
+    with _CHANNEL_LLM_CURSOR_LOCK:
+        llm_cursor = _channel_llm_read_cursor_locked()
+    with _CHANNEL_MCP_CURSOR_LOCK:
+        mcp_cursor = _channel_mcp_read_cursor_locked()
+    with _CHANNEL_LLM_SUMMARY_LOCK:
+        summary_tail = _channel_llm_summary_scan_max_id_locked()
+        summary_cursor = _channel_llm_summary_read_cursor_locked()
+    return {
+        "chat_tail": chat_tail,
+        "summary_tail": summary_tail,
+        "pending_llm": max(0, chat_tail - int(llm_cursor or 0)),
+        "pending_mcp": max(0, chat_tail - int(mcp_cursor or 0)),
+        "pending_summaries": max(0, summary_tail - int(summary_cursor or 0)),
+        "direct_queue": _CHANNEL_LLM_DIRECT_QUEUE.qsize(),
+        "direct_inflight": len(_CHANNEL_LLM_DIRECT_INFLIGHT),
+        "mcp_sessions": len(_CHANNEL_MCP_SESSIONS),
+    }
 
 
 def _metadata_int(metadata: dict[str, Any], key: str) -> int | None:
