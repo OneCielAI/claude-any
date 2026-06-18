@@ -11492,6 +11492,97 @@ def compact_message_text_for_prompt(text: str) -> str:
     return truncate_for_prompt(text, PROMPT_MESSAGE_TEXT_LIMIT)
 
 
+def _message_tool_markers_for_summary(message: dict[str, Any]) -> list[str]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    markers: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = str(block.get("type") or "")
+        if btype == "tool_use":
+            name = str(block.get("name") or "tool")
+            tool_id = str(block.get("id") or "")
+            markers.append(f"tool_use:{name}{('/' + tool_id) if tool_id else ''}")
+        elif btype == "tool_result":
+            tool_id = str(block.get("tool_use_id") or "tool")
+            markers.append(f"tool_result:{tool_id}")
+    return markers
+
+
+def compact_message_summary_line(index: int, message: dict[str, Any], *, text_limit: int = 700) -> str:
+    role = str(message.get("role") or "unknown")
+    text = " ".join(anthropic_content_to_text(message.get("content")).split())
+    markers = _message_tool_markers_for_summary(message)
+    parts = [f"message {index}", f"role={role}"]
+    if markers:
+        parts.append("markers=" + ",".join(markers[:6]))
+    if text:
+        parts.append("text=" + truncate_for_prompt(text, text_limit))
+    return "- " + " | ".join(parts)
+
+
+def _compact_chunk_ranges(count: int, chunks: int) -> list[tuple[int, int]]:
+    chunks = max(1, min(chunks, count))
+    ranges: list[tuple[int, int]] = []
+    for idx in range(chunks):
+        start = (idx * count) // chunks
+        end = ((idx + 1) * count) // chunks
+        if start < end:
+            ranges.append((start, end))
+    return ranges
+
+
+def build_chunked_context_guard_summary(
+    omitted_messages: list[dict[str, Any]],
+    budget_tokens: int,
+    *,
+    start_index: int = 0,
+) -> str:
+    omitted_count = len(omitted_messages)
+    omitted_tokens = sum(estimate_tokens(message) for message in omitted_messages)
+    if omitted_count <= 0:
+        return (
+            "[claude-any context guard: older conversation history was compacted because "
+            f"the provider context budget is {budget_tokens} tokens.]"
+        )
+    max_summary_tokens = max(1024, min(24576, max(1, budget_tokens) // 10))
+    max_summary_chars = max_summary_tokens * 4
+    chunk_count = max(1, min(12, (omitted_tokens + 32767) // 32768))
+    lines: list[str] = [
+        (
+            f"[claude-any context guard: compacted {omitted_count} older messages, approx "
+            f"{omitted_tokens} tokens, because the provider context budget is {budget_tokens} tokens.]"
+        ),
+        "The recent tail is preserved verbatim. Older history is represented below as deterministic chunk summaries; use file reads or MCP queries if exact old content is needed.",
+    ]
+    for chunk_no, (start, end) in enumerate(_compact_chunk_ranges(omitted_count, chunk_count), start=1):
+        chunk = omitted_messages[start:end]
+        chunk_tokens = sum(estimate_tokens(message) for message in chunk)
+        lines.append(
+            f"Chunk {chunk_no}/{chunk_count}: messages {start_index + start}-{start_index + end - 1}, approx {chunk_tokens} tokens."
+        )
+        if len(chunk) <= 4:
+            sample_offsets = list(range(len(chunk)))
+        else:
+            sample_offsets = [0, 1, len(chunk) - 2, len(chunk) - 1]
+        seen: set[int] = set()
+        for offset in sample_offsets:
+            if offset in seen:
+                continue
+            seen.add(offset)
+            lines.append(compact_message_summary_line(start_index + start + offset, chunk[offset]))
+        current = "\n".join(lines)
+        if len(current) > max_summary_chars:
+            lines.append(f"...[context guard summary truncated to {max_summary_tokens} tokens]...")
+            break
+    summary = "\n".join(lines)
+    if len(summary) > max_summary_chars:
+        summary = truncate_for_prompt(summary, max_summary_chars)
+    return summary
+
+
 def is_advisor_request(body: dict[str, Any]) -> bool:
     return "CLAUDE_ANY_ADVISOR_CALL" in latest_user_text(body)
 
@@ -12874,8 +12965,7 @@ def compact_ollama_messages_for_budget(
     first_user: dict[str, Any] | None = next((m for m in non_system if m.get("role") == "user"), None)
 
     preserved_tail: list[dict[str, Any]] = []
-    omitted = 0
-    omitted_tokens = 0
+    omitted_messages_reversed: list[dict[str, Any]] = []
     summary: dict[str, Any] = {
         "role": "user",
         "content": (
@@ -12897,25 +12987,119 @@ def compact_ollama_messages_for_budget(
         if estimate_tokens({"messages": candidate, "tools": tools}) <= budget_tokens:
             preserved_tail.append(msg)
         else:
-            omitted += 1
-            omitted_tokens += estimate_tokens(msg)
+            omitted_messages_reversed.append(msg)
 
     if first_user is None:
         fixed_prefix = list(system_messages)
         fixed_prefix.append(summary)
 
-    summary["content"] = (
-        f"[claude-any context guard: omitted {omitted} older messages, approx {omitted_tokens} tokens, "
-        f"because the provider context budget is {budget_tokens} tokens. Large file contents and prior "
-        "Write/Edit inputs were truncated. Continue from the current task list and recent tool results; "
-        "use Read on specific files if exact old content is needed.]"
-    )
+    omitted_messages = list(reversed(omitted_messages_reversed))
+    summary["content"] = build_chunked_context_guard_summary(omitted_messages, budget_tokens)
     compacted = fixed_prefix + list(reversed(preserved_tail))
+    while estimate_tokens({"messages": compacted, "tools": tools}) > budget_tokens and preserved_tail:
+        removed = preserved_tail.pop()
+        omitted_messages.append(removed)
+        summary["content"] = build_chunked_context_guard_summary(omitted_messages, budget_tokens)
+        compacted = fixed_prefix + list(reversed(preserved_tail))
     router_log(
         "WARN",
         f"compacted ollama payload messages {len(messages)}->{len(compacted)} tokens {initial_tokens}->{estimate_tokens({'messages': compacted, 'tools': tools})} budget={budget_tokens}",
     )
     return compacted
+
+
+def anthropic_message_has_tool_result(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    return isinstance(content, list) and any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
+
+
+def anthropic_safe_tail_start(message: dict[str, Any]) -> bool:
+    return str(message.get("role") or "") == "user" and not anthropic_message_has_tool_result(message)
+
+
+def compact_anthropic_body_for_budget(body: dict[str, Any], budget_tokens: int) -> dict[str, Any]:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return body
+    typed_messages = [message for message in messages if isinstance(message, dict)]
+    if len(typed_messages) != len(messages):
+        return body
+    budget_tokens = max(8192, budget_tokens)
+    initial_tokens = estimate_tokens(body)
+    if initial_tokens <= budget_tokens:
+        return body
+
+    # Reserve part of the budget for distributed summaries of the older history.
+    summary_budget = max(1024, min(24576, budget_tokens // 10))
+    tail_budget = max(8192, budget_tokens - summary_budget)
+    tail_start = len(typed_messages)
+    base = dict(body)
+    for idx in range(len(typed_messages) - 1, -1, -1):
+        candidate = typed_messages[idx:]
+        candidate_body = dict(base)
+        candidate_body["messages"] = candidate
+        if estimate_tokens(candidate_body) <= tail_budget:
+            tail_start = idx
+            continue
+        break
+
+    while tail_start < len(typed_messages) and not anthropic_safe_tail_start(typed_messages[tail_start]):
+        tail_start += 1
+
+    if tail_start >= len(typed_messages):
+        tail_start = max(0, len(typed_messages) - 1)
+        if anthropic_message_has_tool_result(typed_messages[tail_start]):
+            safe_text = anthropic_content_to_text(typed_messages[tail_start].get("content"))
+            tail = [{"role": "user", "content": compact_message_text_for_prompt(safe_text)}]
+        else:
+            tail = [typed_messages[tail_start]]
+    else:
+        tail = typed_messages[tail_start:]
+
+    omitted = typed_messages[:tail_start]
+    summary_text = build_chunked_context_guard_summary(omitted, budget_tokens)
+    out = dict(body)
+    out["messages"] = tail
+    out["system"] = append_anthropic_system_texts(body.get("system"), [summary_text])
+
+    while estimate_tokens(out) > budget_tokens and len(tail) > 1:
+        tail = tail[1:]
+        while tail and not anthropic_safe_tail_start(tail[0]):
+            tail = tail[1:]
+        if not tail:
+            tail = [typed_messages[-1]]
+            break
+        out["messages"] = tail
+        omitted = typed_messages[: len(typed_messages) - len(tail)]
+        out["system"] = append_anthropic_system_texts(body.get("system"), [build_chunked_context_guard_summary(omitted, budget_tokens)])
+
+    final_tokens = estimate_tokens(out)
+    if final_tokens > budget_tokens:
+        compact_summary = build_chunked_context_guard_summary(omitted, max(8192, budget_tokens // 2))
+        out["system"] = append_anthropic_system_texts(body.get("system"), [truncate_for_prompt(compact_summary, max(4096, budget_tokens * 2))])
+        final_tokens = estimate_tokens(out)
+    if final_tokens > budget_tokens and tail:
+        base_without_messages = dict(out)
+        base_without_messages["messages"] = []
+        remaining_chars = max(1024, (budget_tokens - estimate_tokens(base_without_messages)) * 4 - 1024)
+        latest = tail[-1]
+        latest_role = str(latest.get("role") or "unknown")
+        latest_text = anthropic_content_to_text(latest.get("content"))
+        out["messages"] = [
+            {
+                "role": "user",
+                "content": truncate_for_prompt(
+                    f"[Latest retained message compacted from role={latest_role} because it alone exceeded the provider context budget.]\n{latest_text}",
+                    remaining_chars,
+                ),
+            }
+        ]
+        final_tokens = estimate_tokens(out)
+    router_log(
+        "WARN",
+        f"compacted anthropic payload messages {len(typed_messages)}->{len(out.get('messages') or [])} tokens {initial_tokens}->{final_tokens} budget={budget_tokens}",
+    )
+    return out
 
 
 def provider_request_timeout_seconds(pcfg: dict[str, Any]) -> float:
@@ -13008,14 +13192,25 @@ def sleep_until_or_client_disconnect(handler: BaseHTTPRequestHandler, seconds: f
 
 def cap_anthropic_body_for_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     capped = dict(body)
-    if provider not in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+    if provider == "anthropic":
         return capped
-    if provider == "vllm":
-        context_limit = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len")) or 32768
-    else:
-        context_limit = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
+    context_limit = (
+        positive_int(pcfg.get("context_window"))
+        or positive_int(pcfg.get("max_model_len"))
+        or context_limit_for_status(provider, pcfg)
+        or (32768 if provider == "vllm" else 0)
+    )
+    if not context_limit:
+        return capped
     configured = configured_output_tokens(pcfg, capped)
-    output_tokens = cap_output_tokens_for_context(pcfg, capped, {k: v for k, v in capped.items() if k != "max_tokens"}, context_limit, configured)
+    ratio_capped = cap_output_tokens_to_context_ratio(provider, pcfg, configured)
+    if ratio_capped:
+        capped["max_tokens"] = ratio_capped
+    reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
+    output_reserve = positive_int(capped.get("max_tokens")) or configured or 4096
+    input_budget = max(8192, context_limit - output_reserve - reserve)
+    capped = compact_anthropic_body_for_budget(capped, input_budget)
+    output_tokens = cap_output_tokens_for_context(pcfg, capped, {k: v for k, v in capped.items() if k != "max_tokens"}, context_limit, positive_int(capped.get("max_tokens")) or configured)
     if output_tokens:
         capped["max_tokens"] = output_tokens
     return capped
@@ -19910,6 +20105,54 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
     return messages
 
 
+def small_context_output_token_cap(context_window: int | None) -> int | None:
+    context = positive_int(context_window)
+    if not context or context > 262144:
+        return None
+    divisor = 16 if context <= 131072 else 32
+    cap = max(1024, min(8192, context // divisor))
+    return max(1024, (cap // 1024) * 1024)
+
+
+def cap_output_tokens_to_context_ratio(provider: str, pcfg: dict[str, Any], configured: int | None) -> int | None:
+    value = positive_int(configured)
+    if not value or provider == "anthropic":
+        return value
+    context = context_limit_for_status(provider, pcfg)
+    cap = small_context_output_token_cap(context)
+    if not cap:
+        return value
+    return min(value, cap)
+
+
+def cap_output_settings_to_context_ratio(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    if provider == "anthropic":
+        return []
+    context = context_limit_for_status(provider, pcfg)
+    cap = small_context_output_token_cap(context)
+    if not cap:
+        return []
+    messages: list[str] = []
+    if provider in ("ollama", "ollama-cloud"):
+        opts = pcfg.setdefault("ollama_options", {})
+        current = positive_int(opts.get("num_predict")) or positive_int(pcfg.get("max_output_tokens"))
+        if current and current > cap:
+            opts["num_predict"] = cap
+            pcfg["max_output_tokens"] = cap
+            messages.append(
+                f"Max output capped to {cap:,} tokens for context {format_context_tokens(context)}."
+            )
+        return messages
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+        current = positive_int(pcfg.get("max_output_tokens"))
+        if current and current > cap:
+            pcfg["max_output_tokens"] = cap
+            messages.append(
+                f"Max output capped to {cap:,} tokens for context {format_context_tokens(context)}."
+            )
+    return messages
+
+
 def cached_current_model_info(provider: str, pcfg: dict[str, Any]) -> dict[str, Any]:
     info = read_model_info_cache(provider, pcfg)
     if not info:
@@ -20116,8 +20359,10 @@ PROVIDER_TIMEOUT_WEIGHTS = {
 def configured_output_tokens_for_timeout(provider: str, pcfg: dict[str, Any]) -> int | None:
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
-        return positive_int(opts.get("num_predict")) or positive_int(pcfg.get("max_output_tokens"))
-    return positive_int(pcfg.get("max_output_tokens")) or positive_int(pcfg.get("num_predict"))
+        configured = positive_int(opts.get("num_predict")) or positive_int(pcfg.get("max_output_tokens"))
+        return cap_output_tokens_to_context_ratio(provider, pcfg, configured)
+    configured = positive_int(pcfg.get("max_output_tokens")) or positive_int(pcfg.get("num_predict"))
+    return cap_output_tokens_to_context_ratio(provider, pcfg, configured)
 
 
 def clamp_auto_timeout_ms(ms: int | float | None) -> int:
@@ -20295,6 +20540,7 @@ def apply_context_setup_to_provider(provider: str, pcfg: dict[str, Any], mode: s
     else:
         return ["Context setup is managed by Claude Code for this provider."]
     messages = cap_context_settings_to_model_capacity(provider, pcfg)
+    messages.extend(cap_output_settings_to_context_ratio(provider, pcfg))
     messages.extend(apply_recommended_timeout_for_model_context(provider, pcfg))
     return [
         f"{ui_text('context_setup', lang)}: {label}",
@@ -20913,6 +21159,7 @@ def apply_llm_preset_to_provider(
                 else:
                     pcfg["max_output_tokens"] = min(positive_int(pcfg.get("max_output_tokens")) or 4096, max(1024, server_limit // 8))
     context_msgs.extend(cap_context_settings_to_model_capacity(provider, pcfg))
+    context_msgs.extend(cap_output_settings_to_context_ratio(provider, pcfg))
     if provider == "lm-studio":
         context_msgs.extend(apply_lm_studio_loaded_context_guard(pcfg, load=load_lm_studio))
     context_msgs.extend(apply_recommended_timeout_for_model_context(provider, pcfg))
@@ -22506,12 +22753,12 @@ def cmd_test(args: argparse.Namespace) -> None:
 def claude_code_output_token_limit(provider: str, pcfg: dict[str, Any]) -> int | None:
     configured = positive_int(pcfg.get("max_output_tokens"))
     if configured:
-        return configured
+        return cap_output_tokens_to_context_ratio(provider, pcfg, configured)
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         configured = positive_int(opts.get("num_predict"))
         if configured:
-            return configured
+            return cap_output_tokens_to_context_ratio(provider, pcfg, configured)
     return None
 
 

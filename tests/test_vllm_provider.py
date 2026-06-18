@@ -350,6 +350,54 @@ class VllmProviderTests(unittest.TestCase):
         self.assertIn("supports_tool_choice", values)
         self.assertIn("off", rows[values.index("supports_tool_choice")])
 
+    def test_small_context_output_cap_for_vllm_launch_env(self):
+        cfg = {
+            "current_provider": "vllm",
+            "providers": {"vllm": dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])},
+        }
+        pcfg = cfg["providers"]["vllm"]
+        pcfg["context_window"] = 262144
+        pcfg["max_model_len"] = 262144
+        pcfg["max_output_tokens"] = 32768
+
+        env = claude_any.env_vars(cfg)
+
+        self.assertEqual("8192", env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"])
+
+    def test_small_context_output_cap_rounds_down_for_200k_custom_model(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["context_window"] = 200000
+        pcfg["max_model_len"] = 200000
+        pcfg["max_output_tokens"] = 32768
+
+        self.assertEqual(6144, claude_any.claude_code_output_token_limit("vllm", pcfg))
+
+    def test_vllm_native_compacts_large_anthropic_history_before_upstream(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["context_window"] = 32768
+        pcfg["max_model_len"] = 32768
+        pcfg["max_output_tokens"] = 32768
+        old_messages = []
+        for idx in range(60):
+            old_messages.append({"role": "user", "content": f"old user {idx} " + ("x" * 4000)})
+            old_messages.append({"role": "assistant", "content": f"old assistant {idx} " + ("y" * 4000)})
+        body = {
+            "model": "qwen36-35b-a3b-mtp-nvfp4",
+            "system": "system prompt",
+            "max_tokens": 32768,
+            "messages": old_messages + [{"role": "user", "content": "current task"}],
+        }
+
+        out = claude_any.cap_anthropic_body_for_provider("vllm", pcfg, body)
+
+        self.assertLess(len(out["messages"]), len(body["messages"]))
+        self.assertEqual({"role": "user", "content": "current task"}, out["messages"][-1])
+        self.assertEqual(2048, out["max_tokens"])
+        self.assertLessEqual(claude_any.estimate_tokens(out), 32768)
+        system_text = claude_any.anthropic_content_to_text(out["system"])
+        self.assertIn("claude-any context guard", system_text)
+        self.assertIn("Chunk", system_text)
+
 
 if __name__ == "__main__":
     unittest.main()
