@@ -1116,8 +1116,6 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("please review the latest update", prompt)
         self.assertIn('metadata={"room_id":"room_phase1sim"}', prompt)
         self.assertIn("room_phase1sim", prompt)
-        self.assertIn("actual available Claude Code/MCP tool", prompt)
-        self.assertIn("do not write XML-like <invoke>", prompt)
         self.assertNotIn("send_message", prompt)
         self.assertNotIn("recipients='web'", prompt)
         self.assertNotIn("send_file", prompt)
@@ -1178,8 +1176,6 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn("send_message", prompt)
         self.assertNotIn("recipients='web'", prompt)
         self.assertNotIn("send_file", prompt)
-        self.assertIn("actual available Claude Code/MCP tool", prompt)
-        self.assertIn("do not write XML-like <invoke>", prompt)
 
     def test_web_chat_wake_prompt_is_compact_and_omits_raw_metadata(self):
         prompt = claude_any.format_channel_web_chat_wake_batch_prompt(
@@ -2452,6 +2448,63 @@ class ChannelBridgeTests(unittest.TestCase):
         write_cursor.assert_called_with(3)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("llm_direct_delivered" in item for item in log_messages))
+
+    def test_body_with_pending_channel_messages_skips_message_already_in_request(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "[claude-any external channel message] channel=room "
+                                "room=room from=ai-net-http id=5058 text=\"wake\""
+                            ),
+                        }
+                    ],
+                }
+            ],
+            "stream": True,
+        }
+        messages = [
+            {
+                "id": 5058,
+                "channel": "room",
+                "sender_id": "ai-net-http",
+                "message": "wake",
+                "meta": {"room_id": "room", "mcp_server": "ai-net-http"},
+            }
+        ]
+        with (
+            mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+            mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=5057),
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            out = claude_any.body_with_pending_channel_messages(body)
+
+        self.assertIs(out, body)
+        write_cursor.assert_called_with(5058)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("already_in_request" in item and "message_id=5058" in item for item in log_messages))
+
+    def test_channel_message_ids_already_in_request_ignores_unrelated_ids(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "ordinary text id=12"},
+                {
+                    "role": "user",
+                    "content": (
+                        "[claude-any external channel messages] 2 new messages: "
+                        "(id=14 room=room) \"one\" | (id=15 room=room) \"two\""
+                    ),
+                },
+            ]
+        }
+
+        self.assertEqual({14, 15}, claude_any._channel_message_ids_already_in_request(body))
 
     def test_body_with_pending_channel_messages_skips_stdin_wake_delivered_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}

@@ -26267,11 +26267,7 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     prompt_meta = _channel_prompt_metadata(message)
     if prompt_meta:
         fields.append(f"metadata={prompt_meta}")
-    suffix = (
-        "If relevant to current work, respond or act now; otherwise keep working. "
-        "When action requires a tool, call the actual available Claude Code/MCP tool; "
-        "do not write XML-like <invoke> snippets or pseudo tool calls as text."
-    )
+    suffix = "If relevant to current work, respond or act now; otherwise keep working."
     if _channel_message_is_web_chat_request(message):
         suffix = (
             "Answer back through the claude-any-router send_message tool on the same channel/thread "
@@ -26572,11 +26568,7 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
         if prompt_meta:
             fields.append(f"metadata={prompt_meta}")
         parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False))
-    suffix = (
-        "If relevant to current work, respond or act now; otherwise keep working. "
-        "When action requires a tool, call the actual available Claude Code/MCP tool; "
-        "do not write XML-like <invoke> snippets or pseudo tool calls as text."
-    )
+    suffix = "If relevant to current work, respond or act now; otherwise keep working."
     if any(_channel_message_is_web_chat_request(message) for message in messages):
         suffix = (
             "For claude-any-web-chat item(s), answer back through the claude-any-router send_message tool "
@@ -28534,6 +28526,27 @@ def body_with_pending_channel_summaries(body: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_CHANNEL_WAKE_PROMPT_ID_RE = re.compile(r"\bid=(\d+)(?:\D|$)")
+
+
+def _channel_message_ids_already_in_request(body: dict[str, Any]) -> set[int]:
+    ids: set[int] = set()
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        text = anthropic_content_to_text(message.get("content"))
+        if "claude-any external channel message" not in text:
+            continue
+        for match in _CHANNEL_WAKE_PROMPT_ID_RE.finditer(text):
+            try:
+                message_id = int(match.group(1))
+            except Exception:
+                continue
+            if message_id > 0:
+                ids.add(message_id)
+    return ids
+
+
 def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     global _CHANNEL_LLM_CURSOR_LAST_ID
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
@@ -28545,6 +28558,7 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     cfg = load_config()
     if channel_delivery_mode(cfg) != "llm":
         return body
+    ids_already_in_request = _channel_message_ids_already_in_request(body)
     with _CHANNEL_LLM_CURSOR_LOCK:
         last_id = _channel_llm_read_cursor_locked()
         pending: list[dict[str, Any]] = []
@@ -28555,6 +28569,13 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
             try:
                 message_id = int(message.get("id") or 0)
             except Exception:
+                continue
+            if message_id in ids_already_in_request:
+                max_seen = max(max_seen, message_id)
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason=already_in_request",
+                )
                 continue
             if message_id in superseded_ids:
                 max_seen = max(max_seen, message_id)
