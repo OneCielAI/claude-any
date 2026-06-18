@@ -11907,6 +11907,70 @@ def normalize_anthropic_system_role_messages(body: dict[str, Any]) -> dict[str, 
     return out
 
 
+_PSEUDO_TOOL_INVOKE_RE = re.compile(
+    r"(?is)(?:^|\n)[ \t]*(?:court[ \t]*(?:\r?\n)+)?<invoke\s+name=[\"'][^\"']+[\"'][\s\S]*?</invoke>[ \t]*(?=\n|$)"
+)
+
+
+def sanitize_assistant_pseudo_tool_text_history(body: dict[str, Any]) -> dict[str, Any]:
+    """Remove prior assistant text that looks like a fake tool invocation.
+
+    Claude Code only executes structured ``tool_use`` blocks. If an earlier
+    routed turn accidentally emitted XML-like ``<invoke ...>`` text, continuing
+    the same transcript can teach the model to repeat that invalid pattern.
+    Keep real tool_use blocks untouched and only rewrite assistant text blocks.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+    changed = False
+    sanitized_messages: list[Any] = []
+    removed_blocks = 0
+    replacement = "\n[claude-any removed prior assistant pseudo tool-call text; it was not an actual tool_use block.]\n"
+    for message in messages:
+        if not isinstance(message, dict) or str(message.get("role") or "") != "assistant":
+            sanitized_messages.append(message)
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            next_text, count = _PSEUDO_TOOL_INVOKE_RE.subn(replacement, content)
+            if count:
+                changed = True
+                removed_blocks += count
+                next_message = dict(message)
+                next_message["content"] = next_text.strip()
+                sanitized_messages.append(next_message)
+                continue
+        elif isinstance(content, list):
+            next_content: list[Any] = []
+            content_changed = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = str(block.get("text") or "")
+                    next_text, count = _PSEUDO_TOOL_INVOKE_RE.subn(replacement, text)
+                    if count:
+                        content_changed = True
+                        removed_blocks += count
+                        next_block = dict(block)
+                        next_block["text"] = next_text.strip()
+                        next_content.append(next_block)
+                        continue
+                next_content.append(block)
+            if content_changed:
+                changed = True
+                next_message = dict(message)
+                next_message["content"] = next_content
+                sanitized_messages.append(next_message)
+                continue
+        sanitized_messages.append(message)
+    if not changed:
+        return body
+    out = dict(body)
+    out["messages"] = sanitized_messages
+    router_log("INFO", f"sanitized assistant pseudo tool-call text blocks={removed_blocks}")
+    return out
+
+
 def anthropic_advisor_messages_and_system(body: dict[str, Any]) -> tuple[list[dict[str, Any]], list[str]]:
     messages: list[dict[str, Any]] = []
     system_texts: list[str] = []
@@ -16702,6 +16766,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
         body = strip_autonomous_advisor_server_tools(provider, body)
+        body = sanitize_assistant_pseudo_tool_text_history(body)
         body = body_with_pending_channel_messages(body)
         body = body_with_pending_channel_summaries(body)
         body = body_with_channel_tool_result_context(body)

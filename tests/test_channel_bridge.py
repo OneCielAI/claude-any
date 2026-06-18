@@ -2506,6 +2506,46 @@ class ChannelBridgeTests(unittest.TestCase):
 
         self.assertEqual({14, 15}, claude_any._channel_message_ids_already_in_request(body))
 
+    def test_sanitize_assistant_pseudo_tool_text_history_removes_invoke_snippets_only(self):
+        body = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "I will send it now.\n\n"
+                                "court\n"
+                                "<invoke name=\"mcp__ai-net-http__send_message\">\n"
+                                "<parameter name=\"room_id\">room1</parameter>\n"
+                                "</invoke>\n"
+                                "Done."
+                            ),
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_real",
+                            "name": "mcp__ai-net-http__send_message",
+                            "input": {"room_id": "room1", "content": "real"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": "<invoke name=\"mcp__ai-net-http__send_message\"></invoke> is user text",
+                },
+            ]
+        }
+
+        out = claude_any.sanitize_assistant_pseudo_tool_text_history(body)
+
+        assistant_content = out["messages"][0]["content"]
+        self.assertNotIn("<invoke", assistant_content[0]["text"])
+        self.assertIn("removed prior assistant pseudo tool-call", assistant_content[0]["text"])
+        self.assertEqual("tool_use", assistant_content[1]["type"])
+        self.assertIn("<invoke", out["messages"][1]["content"])
+
     def test_body_with_pending_channel_messages_skips_stdin_wake_delivered_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
         messages = [
