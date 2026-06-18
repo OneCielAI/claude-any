@@ -580,8 +580,8 @@ DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC: tuple[str, ...] = (
     "PushNotification",
 )
 CLAUDE_SERVER_SIDE_WEB_TOOLS: tuple[str, ...] = ("WebSearch", "WebFetch")
-NON_ANTHROPIC_COMPAT_PROMPT = (
-    "You are running inside Claude Code through a non-Anthropic model provider. "
+ROUTED_COMPAT_PROMPT = (
+    "You are running inside Claude Code through the claude-any router. "
     "Do not stop after announcing what you plan to do. When the user asks you to create, edit, or run code, "
     "immediately use the available Claude Code tools such as Write, Edit, Read, and Bash as appropriate, "
     "except while Claude Code is in Plan Mode. In Plan Mode, first explore/read as needed, write or update the plan file named "
@@ -604,6 +604,7 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "If an MCP server appears disconnected, use only tools present in the current tool list, retry ordinary MCP tools when available, or report the concrete connection state. "
     "Never write pseudo tool calls, partial JSON, or markdown code fences when a real Claude Code tool call is required."
 )
+NON_ANTHROPIC_COMPAT_PROMPT = ROUTED_COMPAT_PROMPT
 LANGUAGES = {
     "en": "English",
     "ko": "한국어",
@@ -25708,8 +25709,8 @@ def should_attach_web_search(provider: str, cfg: dict[str, Any], override: bool 
     return provider != "anthropic" and bool(cfg.get("web_search", {}).get("auto_for_non_native", True))
 
 
-def should_append_compat_prompt(provider: str, cfg: dict[str, Any]) -> bool:
-    return provider != "anthropic" and bool(cfg.get("claude_code", {}).get("compat_prompt_for_non_anthropic", True))
+def should_append_compat_prompt(provider: str, pcfg: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    return not direct_native_anthropic_enabled(provider, pcfg) and bool(cfg.get("claude_code", {}).get("compat_prompt_for_non_anthropic", True))
 
 
 _CLAUDE_PERMISSION_MODE_SUPPORT_CACHE: dict[str, bool] = {}
@@ -31250,8 +31251,8 @@ def launch_claude(
             claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
     if mcp_config_paths:
         extra_args.extend(["--mcp-config", *mcp_config_paths])
-    if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
-        extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
+    if should_append_compat_prompt(provider, pcfg, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
+        extra_args.extend(["--append-system-prompt", ROUTED_COMPAT_PROMPT])
     extra_args.extend(
         claude_channel_args(
             cfg,
