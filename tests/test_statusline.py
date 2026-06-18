@@ -154,6 +154,102 @@ class StatuslineTests(unittest.TestCase):
         self.assertIn("conc 9/10", proc.stdout)
         self.assertIn("q 14/15", proc.stdout)
 
+    def test_statusline_shows_context_compact_chunks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "statusline.py"
+            script.write_text(claude_any.STATUSLINE_SCRIPT, encoding="utf-8")
+            config_dir = Path(tmp)
+            config = {
+                "current_provider": "vllm",
+                "providers": {
+                    "vllm": {
+                        "base_url": "http://localhost:8000",
+                        "current_model": "qwen36-35b-a3b-mtp-nvfp4",
+                    }
+                },
+            }
+            (config_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            (config_dir / "context-compact-activity.json").write_text(
+                json.dumps(
+                    {
+                        "updated_at": time.time(),
+                        "event": "compact",
+                        "provider": "vllm",
+                        "model": "qwen36-35b-a3b-mtp-nvfp4",
+                        "chunks": 3,
+                        "parallel_sessions": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CLAUDE_ANY_CONFIG_DIR": tmp,
+                    "CLAUDE_ANY_STATUSLINE_ANSI": "0",
+                    "CLAUDE_ANY_PROVIDER": "vllm",
+                    "CLAUDE_ANY_MODEL_ALIAS": "claude-any-test",
+                }
+            )
+            session = {
+                "model": {"display_name": "claude-any-test"},
+                "workspace": {"current_dir": tmp},
+            }
+            proc = subprocess.run(
+                [sys.executable, str(script)],
+                input=json.dumps(session),
+                text=True,
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+
+        self.assertIn("compact 3 chunks", proc.stdout)
+
+    def test_statusline_shows_parallel_context_compact_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "statusline.py"
+            script.write_text(claude_any.STATUSLINE_SCRIPT, encoding="utf-8")
+            config_dir = Path(tmp)
+            config = {
+                "current_provider": "vllm",
+                "providers": {"vllm": {"current_model": "model"}},
+            }
+            (config_dir / "config.json").write_text(json.dumps(config), encoding="utf-8")
+            (config_dir / "context-compact-activity.json").write_text(
+                json.dumps(
+                    {
+                        "updated_at": time.time(),
+                        "event": "compact",
+                        "provider": "vllm",
+                        "model": "model",
+                        "chunks": 3,
+                        "parallel_sessions": 3,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CLAUDE_ANY_CONFIG_DIR": tmp,
+                    "CLAUDE_ANY_STATUSLINE_ANSI": "0",
+                    "CLAUDE_ANY_PROVIDER": "vllm",
+                    "CLAUDE_ANY_MODEL_ALIAS": "claude-any-test",
+                }
+            )
+            session = {"model": {"display_name": "claude-any-test"}, "workspace": {"current_dir": tmp}}
+            proc = subprocess.run(
+                [sys.executable, str(script)],
+                input=json.dumps(session),
+                text=True,
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+
+        self.assertIn("compact 3 chunks parallel 3/3", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

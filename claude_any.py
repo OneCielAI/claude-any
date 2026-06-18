@@ -130,6 +130,7 @@ SSE_LAST_PATH = CONFIG_DIR / "router-last-sse.json"
 TOOL_CALL_LOG_PATH = CONFIG_DIR / "tool-calls.jsonl"
 RATE_LIMIT_STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
 ROUTER_ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
+CONTEXT_COMPACT_ACTIVITY_PATH = CONFIG_DIR / "context-compact-activity.json"
 CONTEXT_USAGE_PATH = CONFIG_DIR / "context-usage.json"
 OLLAMA_MODEL_CATALOG_PATH = CONFIG_DIR / "ollama-model-catalog.json"
 CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
@@ -3016,6 +3017,7 @@ CONFIG_DIR = default_config_dir()
 CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
 ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
+COMPACT_ACTIVITY_PATH = CONFIG_DIR / "context-compact-activity.json"
 CONTEXT_PATH = CONFIG_DIR / "context-usage.json"
 CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
 CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
@@ -3363,6 +3365,7 @@ def main():
         rpm = 0
     state = load_json(STATE_PATH, {})
     activity = load_json(ACTIVITY_PATH, {})
+    compact_activity = load_json(COMPACT_ACTIVITY_PATH, {})
     context = load_json(CONTEXT_PATH, {})
     now = time.time()
     key = f"{provider}:__global__" if provider else ""
@@ -3497,6 +3500,29 @@ def main():
                 activity_text = color(f"{event} {age:.0f}s")
     if activity_text:
         status_parts.append(activity_text)
+    compact_text = ""
+    if isinstance(compact_activity, dict):
+        try:
+            compact_age = now - float(compact_activity.get("updated_at") or 0)
+        except Exception:
+            compact_age = 999999
+        if 0 <= compact_age < 180:
+            try:
+                compact_chunks = int(compact_activity.get("chunks") or 0)
+            except Exception:
+                compact_chunks = 0
+            try:
+                parallel_sessions = int(compact_activity.get("parallel_sessions") or 1)
+            except Exception:
+                parallel_sessions = 1
+            if compact_chunks > 0:
+                compact_text = color(f"compact {compact_chunks:,} chunks")
+                if parallel_sessions > 1:
+                    compact_text += " " + color(f"parallel {parallel_sessions:,}/{compact_chunks:,}")
+            elif str(compact_activity.get("event") or "") == "compact":
+                compact_text = color("compact")
+    if compact_text:
+        status_parts.append(compact_text)
     status_text = " | ".join(status_parts)
     if status_text:
         print(f"{left} | {status_text}")
@@ -7981,6 +8007,34 @@ def write_router_activity(event: str, provider: str, model: str | None = None, *
         pass
 
 
+def write_context_compact_activity(provider: str, model: str | None = None, **fields: Any) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            "updated_at": time.time(),
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "event": "compact",
+            "provider": provider,
+            "model": model or "",
+        }
+        data.update(fields)
+        tmp = CONTEXT_COMPACT_ACTIVITY_PATH.with_name(
+            f"{CONTEXT_COMPACT_ACTIVITY_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(CONTEXT_COMPACT_ACTIVITY_PATH)
+        EVENT_BUS.publish(
+            level="info",
+            category="context.compact",
+            message=f"compact {provider} {model or ''}".strip(),
+            provider=provider,
+            model=model,
+            data=fields,
+        )
+    except Exception:
+        pass
+
+
 def context_limit_for_status(provider: str, pcfg: dict[str, Any]) -> int | None:
     if provider in ("ollama", "ollama-cloud"):
         return ollama_context_limit_for_budget(pcfg)
@@ -11534,6 +11588,13 @@ def _compact_chunk_ranges(count: int, chunks: int) -> list[tuple[int, int]]:
     return ranges
 
 
+def context_guard_chunk_count(omitted_messages: list[dict[str, Any]]) -> int:
+    if not omitted_messages:
+        return 0
+    omitted_tokens = sum(estimate_tokens(message) for message in omitted_messages)
+    return max(1, min(12, (omitted_tokens + 32767) // 32768))
+
+
 def build_chunked_context_guard_summary(
     omitted_messages: list[dict[str, Any]],
     budget_tokens: int,
@@ -11549,7 +11610,7 @@ def build_chunked_context_guard_summary(
         )
     max_summary_tokens = max(1024, min(24576, max(1, budget_tokens) // 10))
     max_summary_chars = max_summary_tokens * 4
-    chunk_count = max(1, min(12, (omitted_tokens + 32767) // 32768))
+    chunk_count = context_guard_chunk_count(omitted_messages)
     lines: list[str] = [
         (
             f"[claude-any context guard: compacted {omitted_count} older messages, approx "
@@ -12939,6 +13000,10 @@ def ollama_context_limit_for_budget(pcfg: dict[str, Any]) -> int:
 
 
 def openai_context_limit_for_budget(provider: str, pcfg: dict[str, Any]) -> int:
+    if provider in ("vllm", "self-hosted-nim"):
+        runtime = provider_model_context_capacity(provider, pcfg)
+        if runtime:
+            return runtime
     configured = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
     if configured:
         return configured
@@ -12951,6 +13016,9 @@ def compact_ollama_messages_for_budget(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     budget_tokens: int,
+    *,
+    provider: str = "",
+    model: str = "",
 ) -> list[dict[str, Any]]:
     if not messages:
         return messages
@@ -13005,6 +13073,19 @@ def compact_ollama_messages_for_budget(
         "WARN",
         f"compacted ollama payload messages {len(messages)}->{len(compacted)} tokens {initial_tokens}->{estimate_tokens({'messages': compacted, 'tools': tools})} budget={budget_tokens}",
     )
+    chunk_count = context_guard_chunk_count(omitted_messages)
+    if chunk_count and (provider or model):
+        write_context_compact_activity(
+            provider or "provider",
+            model,
+            chunks=chunk_count,
+            parallel_sessions=1,
+            tokens=initial_tokens,
+            final_tokens=estimate_tokens({"messages": compacted, "tools": tools}),
+            budget=budget_tokens,
+            omitted_messages=len(omitted_messages),
+            retained_messages=len(compacted),
+        )
     return compacted
 
 
@@ -13017,7 +13098,13 @@ def anthropic_safe_tail_start(message: dict[str, Any]) -> bool:
     return str(message.get("role") or "") == "user" and not anthropic_message_has_tool_result(message)
 
 
-def compact_anthropic_body_for_budget(body: dict[str, Any], budget_tokens: int) -> dict[str, Any]:
+def compact_anthropic_body_for_budget(
+    body: dict[str, Any],
+    budget_tokens: int,
+    *,
+    provider: str = "",
+    model: str = "",
+) -> dict[str, Any]:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
         return body
@@ -13099,6 +13186,19 @@ def compact_anthropic_body_for_budget(body: dict[str, Any], budget_tokens: int) 
         "WARN",
         f"compacted anthropic payload messages {len(typed_messages)}->{len(out.get('messages') or [])} tokens {initial_tokens}->{final_tokens} budget={budget_tokens}",
     )
+    chunk_count = context_guard_chunk_count(omitted)
+    if chunk_count and (provider or model):
+        write_context_compact_activity(
+            provider or "provider",
+            model or str(body.get("model") or ""),
+            chunks=chunk_count,
+            parallel_sessions=1,
+            tokens=initial_tokens,
+            final_tokens=final_tokens,
+            budget=budget_tokens,
+            omitted_messages=len(omitted),
+            retained_messages=len(out.get("messages") or []),
+        )
     return out
 
 
@@ -13195,9 +13295,9 @@ def cap_anthropic_body_for_provider(provider: str, pcfg: dict[str, Any], body: d
     if provider == "anthropic":
         return capped
     context_limit = (
-        positive_int(pcfg.get("context_window"))
+        context_limit_for_status(provider, pcfg)
         or positive_int(pcfg.get("max_model_len"))
-        or context_limit_for_status(provider, pcfg)
+        or positive_int(pcfg.get("context_window"))
         or (32768 if provider == "vllm" else 0)
     )
     if not context_limit:
@@ -13209,7 +13309,12 @@ def cap_anthropic_body_for_provider(provider: str, pcfg: dict[str, Any], body: d
     reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
     output_reserve = positive_int(capped.get("max_tokens")) or configured or 4096
     input_budget = max(8192, context_limit - output_reserve - reserve)
-    capped = compact_anthropic_body_for_budget(capped, input_budget)
+    capped = compact_anthropic_body_for_budget(
+        capped,
+        input_budget,
+        provider=provider,
+        model=str(capped.get("model") or pcfg.get("current_model") or ""),
+    )
     output_tokens = cap_output_tokens_for_context(pcfg, capped, {k: v for k, v in capped.items() if k != "max_tokens"}, context_limit, positive_int(capped.get("max_tokens")) or configured)
     if output_tokens:
         capped["max_tokens"] = output_tokens
@@ -13252,7 +13357,7 @@ def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], 
     reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
     output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
     input_budget = max(8192, context_limit - output_reserve - reserve)
-    messages = compact_ollama_messages_for_budget(messages, tools, input_budget)
+    messages = compact_ollama_messages_for_budget(messages, tools, input_budget, provider="ollama", model=model)
     req: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -13292,7 +13397,13 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
     configured = configured_output_tokens(pcfg, body)
     reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
     output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
-    messages = compact_ollama_messages_for_budget(messages, tools, max(8192, context_limit - output_reserve - reserve))
+    messages = compact_ollama_messages_for_budget(
+        messages,
+        tools,
+        max(8192, context_limit - output_reserve - reserve),
+        provider=provider,
+        model=model,
+    )
     messages = repair_openai_tool_call_adjacency(messages)
     req: dict[str, Any] = {
         "model": model,
@@ -13360,7 +13471,13 @@ def advisor_upstream_model(provider: str, model: str) -> str:
 def advisor_request(provider: str, model: str, body: dict[str, Any], pcfg: dict[str, Any], focus_override: str = "") -> dict[str, Any]:
     messages = advisor_messages_for_provider(provider, body, focus_override=focus_override)
     if advisor_provider_kind(provider) != "anthropic":
-        messages = compact_ollama_messages_for_budget(messages, [], advisor_input_budget(provider, pcfg))
+        messages = compact_ollama_messages_for_budget(
+            messages,
+            [],
+            advisor_input_budget(provider, pcfg),
+            provider=provider,
+            model=model,
+        )
     upstream_model = advisor_upstream_model(provider, model)
     if advisor_provider_kind(provider) == "anthropic":
         _, extra_system_texts = anthropic_advisor_messages_and_system(body)
