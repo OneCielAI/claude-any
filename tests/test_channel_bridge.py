@@ -1605,6 +1605,15 @@ class ChannelBridgeTests(unittest.TestCase):
             with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
                 self.assertEqual("completed", claude_any._channel_stdin_wake_state(10))
 
+    def test_channel_stdin_inflight_stale_only_expires_queued_or_unknown(self):
+        with mock.patch.object(claude_any, "_channel_stdin_inflight_stale_seconds", return_value=60.0):
+            self.assertTrue(claude_any._channel_stdin_inflight_is_stale("queued", 100.0, 161.0))
+            self.assertTrue(claude_any._channel_stdin_inflight_is_stale("unknown", 100.0, 161.0))
+            self.assertFalse(claude_any._channel_stdin_inflight_is_stale("queued", 100.0, 120.0))
+            self.assertFalse(claude_any._channel_stdin_inflight_is_stale("pending", 100.0, 1000.0))
+            self.assertFalse(claude_any._channel_stdin_inflight_is_stale("missing", 100.0, 1000.0))
+            self.assertFalse(claude_any._channel_stdin_inflight_is_stale("completed", 100.0, 1000.0))
+
     def test_channel_stdin_wake_state_accepts_message_role_assistant_records(self):
         transcript = "\n".join(
             [

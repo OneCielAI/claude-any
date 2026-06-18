@@ -314,6 +314,42 @@ class VllmProviderTests(unittest.TestCase):
         self.assertEqual("long-context-128k", pcfg["llm_preset"])
         self.assertTrue(any("Long context 128K" in line for line in lines))
 
+    def test_vllm_tool_choice_is_off_by_default(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        body = {
+            "model": "qwen36-35b-a3b-mtp-nvfp4",
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"},
+        }
+
+        out = claude_any.normalize_tool_choice_for_provider("vllm", pcfg, body)
+
+        self.assertIn("tool_choice", body)
+        self.assertNotIn("tool_choice", out)
+        self.assertIn("tools", out)
+
+    def test_vllm_tool_choice_can_be_enabled_for_server_parser(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        claude_any.apply_provider_option("vllm", pcfg, "supports_tool_choice=true")
+        body = {
+            "model": "qwen36-35b-a3b-mtp-nvfp4",
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"},
+        }
+
+        out = claude_any.normalize_tool_choice_for_provider("vllm", pcfg, body)
+
+        self.assertIs(out, body)
+        self.assertIn("tool_choice", out)
+
+    def test_vllm_tool_choice_option_visible_in_llm_menu(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+
+        rows, values = claude_any.llm_option_panel_rows("vllm", pcfg, "en")
+
+        self.assertIn("supports_tool_choice", values)
+        self.assertIn("off", rows[values.index("supports_tool_choice")])
+
 
 if __name__ == "__main__":
     unittest.main()

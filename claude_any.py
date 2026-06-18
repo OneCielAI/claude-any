@@ -2084,6 +2084,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "advisor_model": "",
             "custom_models": ["my-model"],
             "native_compat": True,
+            "supports_tool_choice": False,
             "context_window": 32768,
             "max_output_tokens": 4096,
             "temperature": 0.7,
@@ -2571,21 +2572,32 @@ def inbound_query_has_beta_flag(request_path: str) -> bool:
     return False
 
 
-def upstream_messages_query(pcfg: dict[str, Any], request_path: str) -> str:
+def upstream_messages_query(pcfg: dict[str, Any], request_path: str, provider: str | None = None) -> str:
     """Query string to append to the upstream /v1/messages URL.
 
-    A configured ``force_query_string`` (testing override) wins, letting an
+    A configured ``force_query_string`` (operator override) wins, letting an
     operator inject an arbitrary raw query (e.g. "beta=true") from the options
-    screen. Otherwise the inbound ``beta=true`` flag is propagated so beta
-    features like the context-1m long-context request reach the upstream
-    unchanged (do_POST parses only the path and drops the original query).
+    screen. Otherwise the inbound Claude Code ``beta=true`` flag is propagated
+    only for the Anthropic provider. Non-Anthropic providers default to an empty
+    query string unless the operator explicitly configures one.
     """
     forced = str(pcfg.get("force_query_string") or "").strip().lstrip("?").strip()
     if forced:
         return forced
-    if inbound_query_has_beta_flag(request_path):
+    provider_name = str(provider or pcfg.get("provider") or "").strip()
+    provider_key = normalize_provider(provider_name) if provider_name else ""
+    if provider_key == "anthropic" and inbound_query_has_beta_flag(request_path):
         return "beta=true"
     return ""
+
+
+def upstream_query_string_status(provider: str, pcfg: dict[str, Any]) -> str:
+    forced = str(pcfg.get("force_query_string") or "").strip()
+    if forced:
+        return forced
+    if normalize_provider(str(provider)) == "anthropic":
+        return "auto (beta=true when routed)"
+    return "empty"
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -4198,6 +4210,8 @@ def provider_supports_tool_choice(provider: str, pcfg: dict[str, Any], body: dic
     configured = pcfg.get("supports_tool_choice")
     if configured is not None:
         return bool(configured)
+    if provider == "vllm":
+        return False
     if provider != "deepseek":
         return True
     model_hint = strip_claude_context_suffix(str(body.get("model") or pcfg.get("current_model") or "")).lower()
@@ -4206,6 +4220,15 @@ def provider_supports_tool_choice(provider: str, pcfg: dict[str, Any], body: dic
     # default, so treat forced tool_choice as unsupported for V4 models unless
     # the user explicitly overrides supports_tool_choice in provider options.
     return "deepseek-v4" not in model_hint
+
+
+def provider_tool_choice_status(provider: str, pcfg: dict[str, Any]) -> str:
+    configured = pcfg.get("supports_tool_choice")
+    if configured is not None:
+        return "on" if bool(configured) else "off"
+    model = current_upstream_model_id(provider, pcfg) if provider in PROVIDER_LABELS else str(pcfg.get("current_model") or "")
+    default = provider_supports_tool_choice(provider, pcfg, {"model": model})
+    return f"auto ({'on' if default else 'off'})"
 
 
 def normalize_tool_choice_for_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
@@ -13206,7 +13229,7 @@ def advisor_endpoint(provider: str, pcfg: dict[str, Any]) -> str:
         url = join_url(base, "/v1/messages")
         # Honor force_query_string like the main forwarding path; the advisor
         # call has no inbound request path, so only the explicit override applies.
-        query = upstream_messages_query(pcfg, "")
+        query = upstream_messages_query(pcfg, "", provider)
         return f"{url}?{query}" if query else url
     if advisor_provider_kind(provider) == "openai-compatible":
         return join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions")
@@ -16387,7 +16410,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             upstream_body = body_without_claude_any_internal_metadata(body)
             base = native_anthropic_base_url(provider, pcfg) if provider_native_compat_enabled(provider, pcfg) else provider_upstream_request_base(provider, pcfg)
             url = join_url(base, "/v1/messages")
-            upstream_query = upstream_messages_query(pcfg, self.path)
+            upstream_query = upstream_messages_query(pcfg, self.path, provider)
             if upstream_query:
                 url = f"{url}?{upstream_query}"
             headers = provider_headers(provider, pcfg, self.headers)
@@ -19442,9 +19465,11 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
         parts.append(f"endpoint_overrides={count}")
     if provider == "anthropic":
         parts.append(f"routed={'on' if anthropic_routed_enabled(provider, pcfg) else 'off'}")
+    elif provider in PROVIDER_OPTION_PROVIDERS:
+        parts.append(f"tool_choice={provider_tool_choice_status(provider, pcfg)}")
     forced_query = str(pcfg.get("force_query_string") or "").strip()
     if forced_query:
-        parts.append(f"force_query={forced_query}")
+        parts.append(f"query={forced_query}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
@@ -21000,6 +21025,7 @@ RUNTIME_LLM_OPTION_KEYS = {
     "rate_limit_rpm",
     "rate_limit_status",
     "force_query_string",
+    "supports_tool_choice",
     "ip_family",
     "model_context_max",
     "model_context_model",
@@ -21224,6 +21250,12 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ja": "このproviderのAnthropic互換/v1/messagesに直接接続します。offだとclaude-anyルーターを経由します。",
         "zh": "对该 provider 直接走 Anthropic 兼容 /v1/messages；关闭则经由 claude-any 路由器转换。",
     },
+    "supports_tool_choice": {
+        "en": "Forward Claude Code tool_choice upstream. For vLLM, enable only when the server was launched with --enable-auto-tool-choice and the matching --tool-call-parser.",
+        "ko": "Claude Code의 tool_choice를 upstream에 전달합니다. vLLM은 서버를 --enable-auto-tool-choice 및 모델에 맞는 --tool-call-parser로 실행한 경우에만 켜세요.",
+        "ja": "Claude Code の tool_choice を上流へ転送します。vLLM では --enable-auto-tool-choice と対応する --tool-call-parser で起動した場合のみ有効にしてください。",
+        "zh": "将 Claude Code 的 tool_choice 转发到上游。vLLM 仅在服务器使用 --enable-auto-tool-choice 和匹配的 --tool-call-parser 启动时启用。",
+    },
     "stream_enabled": {
         "en": "Toggle streaming. Off forces stream:false upstream and returns the full response, useful when SSE fragmentation causes tool-call/JSON parse errors.",
         "ko": "스트리밍 on/off. off면 업스트림에 stream:false를 강제하고 응답 전체를 받습니다. SSE 단편화로 tool-call/JSON 파싱이 실패할 때 유용합니다.",
@@ -21396,6 +21428,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Context min", "num_ctx_min", pcfg.get("num_ctx_min", "default"))
         add("Context max", "num_ctx_max", pcfg.get("num_ctx_max", "default"))
         add("Max output tokens", "num_predict", opts.get("num_predict", "default"))
+        add("Query string", "force_query_string", upstream_query_string_status(provider, pcfg))
+        add("Tool choice", "supports_tool_choice", provider_tool_choice_status(provider, pcfg))
         add("Temperature", "temperature", opts.get("temperature", "default"))
         add("Top P", "top_p", opts.get("top_p", "default"))
         add("Top K", "top_k", opts.get("top_k", "default"))
@@ -21415,6 +21449,9 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
             add("Context window", "context_window", pcfg.get("context_window", "default"))
             add("Context reserve", "context_reserve_tokens", pcfg.get("context_reserve_tokens", "default"))
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
+        add("Query string", "force_query_string", upstream_query_string_status(provider, pcfg))
+        if provider in PROVIDER_OPTION_PROVIDERS and provider != "anthropic":
+            add("Tool choice", "supports_tool_choice", provider_tool_choice_status(provider, pcfg))
         if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
             add("RPM limiter", "rate_limit_enabled", rate_limit_status_label(provider, pcfg))
@@ -21433,7 +21470,6 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         elif provider == "anthropic":
             add("Route through router", "route_through_router", "on" if anthropic_routed_enabled(provider, pcfg) else "off")
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
-            add("Force query string (test)", "force_query_string", pcfg.get("force_query_string", "auto (beta=true)"))
             if anthropic_routed_enabled(provider, pcfg):
                 add("IP family", "ip_family", provider_ip_family(provider, pcfg))
 
@@ -21465,6 +21501,9 @@ def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> 
         return claude_code_capability_string(provider, pcfg, current_upstream_model_id(provider, pcfg))
     if key == "force_query_string":
         return str(pcfg.get("force_query_string") or "")
+    if key == "supports_tool_choice":
+        value = pcfg.get("supports_tool_choice")
+        return "auto" if value is None else ("true" if bool(value) else "false")
     if key == "ip_family":
         return provider_ip_family(provider, pcfg)
     if provider in ("ollama", "ollama-cloud"):
@@ -21573,7 +21612,11 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
     token = f"unset:{key}" if value.lower() in clear_words else f"{key}={value}"
     context_changed = key in ("context_window", "context", "max_model_len", "num_ctx", "ctx", "num_ctx_min", "ctx_min", "min", "num_ctx_max", "ctx_max", "max")
     explicit_timeout = key in ("timeout", "timeout_ms", "request_timeout", "request_timeout_ms", "stream_idle_timeout", "stream_idle_timeout_ms", "idle_timeout", "idle_timeout_ms")
-    if provider in ("ollama", "ollama-cloud"):
+    if key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
+        apply_provider_option(provider, pcfg, token)
+    elif key in ("supports_tool_choice", "tool_choice", "tool-choice", "auto_tool_choice"):
+        apply_provider_option(provider, pcfg, token)
+    elif provider in ("ollama", "ollama-cloud"):
         apply_ollama_option(pcfg, token)
     elif provider == "anthropic":
         if key in ("route", "routed", "route_through_router", "router"):
@@ -21581,8 +21624,6 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
         elif key in ("max_output_tokens", "max_tokens", "maxtoken", "max_token"):
             apply_provider_option(provider, pcfg, token)
         elif key in ("timeout", "timeout_ms", "request_timeout", "request_timeout_ms"):
-            apply_provider_option(provider, pcfg, token)
-        elif key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
             apply_provider_option(provider, pcfg, token)
         else:
             raise SystemExit(f"Unknown Anthropic option: {key}")
@@ -21609,7 +21650,22 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg["model_endpoints"] = endpoints
         endpoints[normalize_model_id(provider, model_id)] = endpoint
         return
-    if provider in ("ollama", "ollama-cloud"):
+    token_key = ""
+    if token.startswith("unset:"):
+        token_key = token.split(":", 1)[1].strip()
+    elif "=" in token:
+        token_key = token.split("=", 1)[0].strip()
+    provider_common_keys = {
+        "force_query_string",
+        "force_query",
+        "upstream_query",
+        "test_query_string",
+        "supports_tool_choice",
+        "tool_choice",
+        "tool-choice",
+        "auto_tool_choice",
+    }
+    if provider in ("ollama", "ollama-cloud") and token_key not in provider_common_keys:
         apply_ollama_option(pcfg, token)
         return
     if token.startswith("unset:"):
@@ -21646,6 +21702,8 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg.pop("ip_family", None)
         elif key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
             pcfg.pop("force_query_string", None)
+        elif key in ("supports_tool_choice", "tool_choice", "tool-choice", "auto_tool_choice"):
+            pcfg.pop("supports_tool_choice", None)
         elif provider == "fireworks" and key in ("account_id", "account"):
             pcfg.pop("account_id", None)
         elif provider == "fireworks" and key in ("model_api_base_url", "model_base_url", "models_base_url", "management_base_url"):
@@ -21671,6 +21729,21 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
     key, raw_value = token.split("=", 1)
     key = key.strip()
     value = parse_config_value(raw_value)
+    if key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
+        # Operator-controlled raw query string for upstream /v1/messages. A
+        # leading "?" is tolerated and empty/default-like values clear it.
+        text = "" if value is None else str(value).strip().lstrip("?").strip()
+        if not text or text.lower() in ("default", "unset", "none", "null"):
+            pcfg.pop("force_query_string", None)
+        else:
+            pcfg["force_query_string"] = text
+        return
+    if key in ("supports_tool_choice", "tool_choice", "tool-choice", "auto_tool_choice"):
+        if value is None or str(value).strip().lower() in ("", "auto", "default", "unset", "none", "null"):
+            pcfg.pop("supports_tool_choice", None)
+        else:
+            pcfg["supports_tool_choice"] = parse_bool(value, default=True)
+        return
     if key in ("context_window", "context", "max_model_len"):
         fixed = positive_int(value)
         if not fixed:
@@ -21732,17 +21805,6 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
         return
     if key in ("ip_family", "network_family", "address_family", "addr_family"):
         pcfg["ip_family"] = normalize_ip_family(value)
-        return
-    if key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
-        # Testing aid: force a raw query string onto the upstream /v1/messages URL
-        # (e.g. "beta=true" or "beta=true&foo=bar"). Lets the operator probe how the
-        # upstream reacts to arbitrary query params without code changes. A leading
-        # "?" is tolerated and stripped. Empty value clears the override.
-        text = "" if value is None else str(value).strip().lstrip("?").strip()
-        if not text:
-            pcfg.pop("force_query_string", None)
-        else:
-            pcfg["force_query_string"] = text
         return
     if provider == "fireworks" and key in ("account_id", "account"):
         text = "" if value is None else str(value).strip()
@@ -28468,6 +28530,23 @@ def _channel_stdin_unseen_retry_seconds() -> float:
         return 20.0
 
 
+def _channel_stdin_inflight_stale_seconds() -> float:
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_INFLIGHT_STALE_SECONDS")
+    if raw is None:
+        return 180.0
+    try:
+        return max(30.0, min(1800.0, float(raw)))
+    except Exception:
+        return 180.0
+
+
+def _channel_stdin_inflight_is_stale(state: str, started_at: float, now: float | None = None) -> bool:
+    if state not in {"queued", "unknown"} or started_at <= 0:
+        return False
+    current = time.time() if now is None else float(now)
+    return current - started_at >= _channel_stdin_inflight_stale_seconds()
+
+
 def _channel_stdin_should_check_pending(
     marker: tuple[float, int],
     last_marker: tuple[float, int],
@@ -28809,6 +28888,23 @@ def subprocess_call_with_channel_wake_proxy(
                     router_log(
                         "WARN",
                         f"channel_stdin_proxy_unseen_retry message_id={channel_inflight_id} age={now - channel_inflight_started_at:.1f}s",
+                    )
+                    channel_inflight_id = None
+                    channel_inflight_cursor = None
+                    channel_inflight_started_at = 0.0
+                    channel_pending_recheck = True
+                    last_id = ensure_channel_llm_delivery_cursor_initialized()
+                    channel_inflight_logged_at = now
+                elif _channel_stdin_inflight_is_stale(channel_inflight_state, channel_inflight_started_at, now):
+                    if channel_inflight_cursor is not None:
+                        _commit_channel_llm_cursor_if_newer(channel_inflight_cursor)
+                    with _CHANNEL_STDIN_WAKE_LOCK:
+                        _CHANNEL_STDIN_WAKE_DELIVERED.discard(channel_inflight_id)
+                    router_log(
+                        "WARN",
+                        "channel_stdin_proxy_stale_inflight_skipped "
+                        f"message_id={channel_inflight_id} state={channel_inflight_state} "
+                        f"age={now - channel_inflight_started_at:.1f}s cursor={channel_inflight_cursor or '-'}",
                     )
                     channel_inflight_id = None
                     channel_inflight_cursor = None

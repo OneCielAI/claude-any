@@ -27,11 +27,14 @@ class InboundBetaFlagTests(unittest.TestCase):
 
 
 class UpstreamMessagesQueryTests(unittest.TestCase):
-    def test_inbound_beta_propagated(self):
+    def test_inbound_beta_propagated_for_anthropic(self):
         self.assertEqual(
             "beta=true",
-            claude_any.upstream_messages_query({}, "/v1/messages?beta=true"),
+            claude_any.upstream_messages_query({}, "/v1/messages?beta=true", "anthropic"),
         )
+
+    def test_inbound_beta_is_not_propagated_without_anthropic_provider(self):
+        self.assertEqual("", claude_any.upstream_messages_query({}, "/v1/messages?beta=true"))
 
     def test_no_query_yields_empty(self):
         self.assertEqual("", claude_any.upstream_messages_query({}, "/v1/messages"))
@@ -53,6 +56,21 @@ class UpstreamMessagesQueryTests(unittest.TestCase):
     def test_force_query_leading_question_mark_stripped(self):
         pcfg = {"force_query_string": "?beta=1"}
         self.assertEqual("beta=1", claude_any.upstream_messages_query(pcfg, "/v1/messages"))
+
+    def test_non_anthropic_does_not_propagate_inbound_beta_by_default(self):
+        for provider in ("vllm", "ollama-cloud", "opencode", "openrouter", "fireworks"):
+            with self.subTest(provider=provider):
+                self.assertEqual(
+                    "",
+                    claude_any.upstream_messages_query({}, "/v1/messages?beta=true", provider),
+                )
+
+    def test_non_anthropic_force_query_still_wins(self):
+        pcfg = {"force_query_string": "beta=true"}
+        self.assertEqual(
+            "beta=true",
+            claude_any.upstream_messages_query(pcfg, "/v1/messages?beta=false", "vllm"),
+        )
 
 
 class ForceQueryProviderOptionTests(unittest.TestCase):
@@ -79,12 +97,12 @@ class ForceQueryProviderOptionTests(unittest.TestCase):
     def test_status_shows_force_query(self):
         pcfg = {"route_through_router": True, "force_query_string": "beta=true"}
         status = claude_any.provider_options_status("anthropic", pcfg)
-        self.assertIn("force_query=beta=true", status)
+        self.assertIn("query=beta=true", status)
 
     def test_status_omits_force_query_when_unset(self):
         pcfg = {"route_through_router": True}
         status = claude_any.provider_options_status("anthropic", pcfg)
-        self.assertNotIn("force_query", status)
+        self.assertNotIn("query=beta", status)
 
 
 class ForceQueryMenuTests(unittest.TestCase):
@@ -93,6 +111,14 @@ class ForceQueryMenuTests(unittest.TestCase):
             "anthropic", {"route_through_router": True}
         )
         self.assertIn("force_query_string", values)
+        self.assertIn("auto (beta=true when routed)", rows[values.index("force_query_string")])
+
+    def test_option_appears_in_non_anthropic_menus_with_empty_default(self):
+        for provider in ("vllm", "ollama-cloud", "opencode"):
+            with self.subTest(provider=provider):
+                rows, values = claude_any.llm_option_panel_rows(provider, {})
+                self.assertIn("force_query_string", values)
+                self.assertIn("empty", rows[values.index("force_query_string")])
 
     def test_ip_family_appears_only_for_routed_anthropic_menu(self):
         _rows, native_values = claude_any.llm_option_panel_rows(
@@ -140,6 +166,15 @@ class ForceQueryMenuTests(unittest.TestCase):
         pcfg = {"route_through_router": True, "force_query_string": "beta=true"}
         self._run_menu_set(pcfg, "unset")
         self.assertNotIn("force_query_string", pcfg)
+
+    def test_menu_set_stores_value_for_ollama(self):
+        pcfg = {}
+        cfg = {"providers": {"ollama-cloud": pcfg}, "current_provider": "ollama-cloud"}
+        with mock.patch.object(claude_any, "load_config", lambda: cfg), \
+             mock.patch.object(claude_any, "save_config", lambda c: None), \
+             mock.patch.object(claude_any, "clear_model_cache", lambda: None):
+            claude_any.set_llm_option_config("ollama-cloud", "force_query_string", "trace=1")
+        self.assertEqual("trace=1", pcfg.get("force_query_string"))
 
 
 if __name__ == "__main__":
