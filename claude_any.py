@@ -5772,6 +5772,27 @@ def cached_or_configured_model_ids(provider: str, pcfg: dict[str, Any]) -> list[
     return sorted_model_ids(ids)
 
 
+def ensure_model_cache_for_launch(provider: str, pcfg: dict[str, Any]) -> None:
+    """Populate the model list before building Claude Code launch env.
+
+    Claude Code consumes ANTHROPIC_DEFAULT_*_MODEL only at process start. If
+    those values are computed before the provider model list is available,
+    family defaults collapse to the current model and /model cannot switch
+    families reliably inside that session.
+    """
+    if read_model_list_cache(provider, pcfg):
+        return
+    if read_model_registry_models(provider, pcfg, max_age_seconds=0):
+        return
+    try:
+        ids = upstream_model_ids(provider, pcfg)
+    except Exception as exc:
+        router_log("WARN", f"launch_model_cache_refresh_failed provider={provider} error={type(exc).__name__}: {exc}")
+        return
+    if ids:
+        router_log("INFO", f"launch_model_cache_ready provider={provider} count={len(ids)}")
+
+
 def model_ids_from_response(data: Any) -> list[str]:
     ids: list[str] = []
     candidates: Any
@@ -30037,6 +30058,10 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
     manager_thread: threading.Thread | None = None
     pending_notifications: list[dict[str, Any]] = []
     pending_wait_count = 0
+    initialized_wait_seconds = max(
+        0.0,
+        min(5.0, float(server.get("initialized_wait_seconds") or server.get("mcp_initialized_wait_seconds") or 1.0)),
+    )
     notification_condition = threading.Condition()
     router_log("INFO", f"mcp_http_proxy_started server={server_name} endpoint={endpoint}")
 
@@ -30202,6 +30227,18 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                     if not stream_stop.is_set() and not session_requested:
                         session_cond.wait(timeout=read_timeout)
                 continue
+            if initialized_payload is None and initialized_wait_seconds > 0:
+                # MCP clients send notifications/initialized immediately after
+                # initialize. Opening the Streamable HTTP GET before that point
+                # can leave some stateful servers with a live but unsubscribed
+                # notification stream. Wait briefly for the standard handshake;
+                # if an older/nonstandard client never sends it, keep the old
+                # behavior after the grace window.
+                with session_cond:
+                    if initialized_payload is None and not stream_stop.is_set():
+                        session_cond.wait(timeout=initialized_wait_seconds)
+                    if session_requested:
+                        continue
             worker_session = current_session
             event_name = "message"
             data_lines: list[str] = []
@@ -30295,6 +30332,8 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                             _mcp_proxy_streamable_http_request(endpoint, headers, payload, timeout, protocol_version, active)
                         except Exception:
                             pass
+                    with session_cond:
+                        session_cond.notify_all()
                     continue
                 if method == "initialize":
                     # Hand the initialize off to the single session owner: cache
@@ -31033,7 +31072,6 @@ def launch_claude(
     cleanup_managed_services_for_provider(provider, pcfg, cfg, quiet=True)
     env = os.environ.copy()
     env["PATH"] = path_with_claude_any_user_dirs(env)
-    launch_env = env_vars(cfg)
     launch_passthrough = normalize_channel_passthrough(passthrough)
     native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
     stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg)
@@ -31053,6 +31091,9 @@ def launch_claude(
     manage_router_lifetime = False
     if use_router_mode or llm_channel_delivery:
         manage_router_lifetime = bool(start_router_if_needed())
+    if not use_native_anthropic:
+        ensure_model_cache_for_launch(provider, pcfg)
+    launch_env = env_vars(cfg)
     if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge or llm_channel_delivery or native_auto_channel_specs:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
