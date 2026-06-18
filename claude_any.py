@@ -25734,7 +25734,9 @@ def should_attach_web_search(provider: str, cfg: dict[str, Any], override: bool 
 
 
 def should_append_compat_prompt(provider: str, pcfg: dict[str, Any], cfg: dict[str, Any]) -> bool:
-    return not direct_native_anthropic_enabled(provider, pcfg) and bool(cfg.get("claude_code", {}).get("compat_prompt_for_non_anthropic", True))
+    if provider == "anthropic":
+        return False
+    return bool(cfg.get("claude_code", {}).get("compat_prompt_for_non_anthropic", True))
 
 
 _CLAUDE_PERMISSION_MODE_SUPPORT_CACHE: dict[str, bool] = {}

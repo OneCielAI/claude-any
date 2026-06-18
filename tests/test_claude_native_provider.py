@@ -77,11 +77,11 @@ class ProviderLabelTests(unittest.TestCase):
         self.assertIn("Provider  [Claude Native]", claude_any.main_menu_rows(cfg, "anthropic", native, "en")[1])
         self.assertIn("Provider  [Anthropic routed]", claude_any.main_menu_rows(cfg, "anthropic", routed, "en")[1])
 
-    def test_compat_prompt_is_router_mode_not_provider_family(self):
+    def test_compat_prompt_is_not_added_to_anthropic_modes(self):
         cfg = {"claude_code": {"compat_prompt_for_non_anthropic": True}}
 
         self.assertFalse(claude_any.should_append_compat_prompt("anthropic", {"route_through_router": False}, cfg))
-        self.assertTrue(claude_any.should_append_compat_prompt("anthropic", {"route_through_router": True}, cfg))
+        self.assertFalse(claude_any.should_append_compat_prompt("anthropic", {"route_through_router": True}, cfg))
         self.assertTrue(claude_any.should_append_compat_prompt("vllm", {}, cfg))
         self.assertIn("claude-any router", claude_any.ROUTED_COMPAT_PROMPT)
         self.assertNotIn("non-Anthropic model provider", claude_any.ROUTED_COMPAT_PROMPT)
