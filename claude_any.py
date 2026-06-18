@@ -4924,6 +4924,13 @@ def should_auto_continue_choice_question_with_tasklist(body: dict[str, Any], res
     return bool(latest_user_tool_result_names(body) and latest_user_looks_like_work_request(body))
 
 
+def should_synthesize_tasklist_for_provider(provider: str) -> bool:
+    # TaskList synthesis is a recovery path for non-Anthropic backends that
+    # return empty or prose-only turns. Anthropic routed mode can emit native
+    # tool_use blocks, so synthesizing an extra TaskList there corrupts the turn.
+    return (provider or "").strip().lower() != "anthropic"
+
+
 def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
     if tool_calls:
         return False
@@ -5002,7 +5009,15 @@ def empty_end_turn_notice_for_body(body: dict[str, Any] | None) -> str:
     return empty_end_turn_notice()
 
 
-def append_synthetic_tasklist_to_message(message: dict[str, Any], model: str, source_body: dict[str, Any], reason: str) -> dict[str, Any]:
+def append_synthetic_tasklist_to_message(
+    message: dict[str, Any],
+    model: str,
+    source_body: dict[str, Any],
+    reason: str,
+    provider: str = "",
+) -> dict[str, Any]:
+    if not should_synthesize_tasklist_for_provider(provider):
+        return message
     content = message.get("content")
     if not isinstance(content, list):
         content = [{"type": "text", "text": anthropic_content_to_text(content)}] if content else []
@@ -14346,6 +14361,7 @@ def _rebatch_anthropic_sse_text(
     pending_message_stop: tuple[str | None, str] | None = None
     last_suppressed_keepalive_at = 0.0
     stream_success = False
+    allow_tasklist_synthesis = should_synthesize_tasklist_for_provider(provider)
 
     class ClientStreamDisconnected(Exception):
         pass
@@ -14530,9 +14546,9 @@ def _rebatch_anthropic_sse_text(
                 has_tasklist_tool = has_tool(source_body, "TaskList")
                 if emitted_tool_use:
                     recovery_reason = ""
-                elif should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, []):
+                elif allow_tasklist_synthesis and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, []):
                     recovery_reason = "hidden-only" if suppressed_thinking_passback_blocks else "empty"
-                elif should_keep_work_alive_with_tasklist(source_body, text_so_far, []):
+                elif allow_tasklist_synthesis and should_keep_work_alive_with_tasklist(source_body, text_so_far, []):
                     recovery_reason = "keepalive"
             except Exception as exc:
                 router_log(
@@ -14734,6 +14750,8 @@ def _rebatch_anthropic_sse_text(
             stop_reason = str(delta.get("stop_reason") or "")
             tool_calls = [{"type": "tool_use"}] if emitted_tool_use else []
             if (
+                allow_tasklist_synthesis
+                and
                 stop_reason == "end_turn"
                 and source_body is not None
                 and should_auto_continue_choice_question_with_tasklist(source_body, text_so_far, tool_calls)
@@ -14750,8 +14768,14 @@ def _rebatch_anthropic_sse_text(
                 patched["delta"] = patched_delta
                 pending_message_delta = (event_type, json.dumps(patched, ensure_ascii=False))
                 return
-            should_recover = source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls)
+            should_recover = (
+                allow_tasklist_synthesis
+                and source_body is not None
+                and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls)
+            )
             should_keep_alive = (
+                allow_tasklist_synthesis
+                and
                 source_body is not None
                 and not should_recover
                 and should_keep_work_alive_with_tasklist(source_body, text_so_far, tool_calls)
@@ -16797,7 +16821,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                             payload = json.loads(raw_resp.decode("utf-8", errors="replace"))
                             if isinstance(payload, dict):
                                 payload = normalize_response_thinking_for_non_anthropic_provider(provider, pcfg, payload, upstream_model)
-                                payload = append_synthetic_tasklist_to_message(payload, upstream_model, body, "native_json")
+                                payload = append_synthetic_tasklist_to_message(payload, upstream_model, body, "native_json", provider=provider)
                                 if notice:
                                     payload = prepend_anthropic_text(payload, notice)
                                 raw_resp = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -26243,7 +26267,11 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     prompt_meta = _channel_prompt_metadata(message)
     if prompt_meta:
         fields.append(f"metadata={prompt_meta}")
-    suffix = "If relevant to current work, respond or act now; otherwise keep working."
+    suffix = (
+        "If relevant to current work, respond or act now; otherwise keep working. "
+        "When action requires a tool, call the actual available Claude Code/MCP tool; "
+        "do not write XML-like <invoke> snippets or pseudo tool calls as text."
+    )
     if _channel_message_is_web_chat_request(message):
         suffix = (
             "Answer back through the claude-any-router send_message tool on the same channel/thread "
@@ -26544,7 +26572,11 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
         if prompt_meta:
             fields.append(f"metadata={prompt_meta}")
         parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False))
-    suffix = "If relevant to current work, respond or act now; otherwise keep working."
+    suffix = (
+        "If relevant to current work, respond or act now; otherwise keep working. "
+        "When action requires a tool, call the actual available Claude Code/MCP tool; "
+        "do not write XML-like <invoke> snippets or pseudo tool calls as text."
+    )
     if any(_channel_message_is_web_chat_request(message) for message in messages):
         suffix = (
             "For claude-any-web-chat item(s), answer back through the claude-any-router send_message tool "

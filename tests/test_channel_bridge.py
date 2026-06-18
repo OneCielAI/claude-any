@@ -1116,6 +1116,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("please review the latest update", prompt)
         self.assertIn('metadata={"room_id":"room_phase1sim"}', prompt)
         self.assertIn("room_phase1sim", prompt)
+        self.assertIn("actual available Claude Code/MCP tool", prompt)
+        self.assertIn("do not write XML-like <invoke>", prompt)
         self.assertNotIn("send_message", prompt)
         self.assertNotIn("recipients='web'", prompt)
         self.assertNotIn("send_file", prompt)
@@ -1176,6 +1178,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn("send_message", prompt)
         self.assertNotIn("recipients='web'", prompt)
         self.assertNotIn("send_file", prompt)
+        self.assertIn("actual available Claude Code/MCP tool", prompt)
+        self.assertIn("do not write XML-like <invoke>", prompt)
 
     def test_web_chat_wake_prompt_is_compact_and_omits_raw_metadata(self):
         prompt = claude_any.format_channel_web_chat_wake_batch_prompt(
