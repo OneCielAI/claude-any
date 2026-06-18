@@ -48,6 +48,67 @@ class StatuslineTests(unittest.TestCase):
 
         self.assertIn("[claude-sonnet-4-6]", out)
 
+    def test_statusline_prefers_router_context_for_claude_any_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "statusline.py"
+            script.write_text(claude_any.STATUSLINE_SCRIPT, encoding="utf-8")
+            config_dir = Path(tmp)
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "current_provider": "vllm",
+                        "providers": {
+                            "vllm": {
+                                "base_url": "http://localhost:8000",
+                                "current_model": "qwen36-35b-a3b-nvfp4",
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (config_dir / "context-usage.json").write_text(
+                json.dumps(
+                    {
+                        "updated_at": time.time(),
+                        "provider": "vllm",
+                        "model": "qwen36-35b-a3b-nvfp4",
+                        "tokens": 100724,
+                        "context_limit": 262144,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CLAUDE_ANY_CONFIG_DIR": tmp,
+                    "CLAUDE_ANY_STATUSLINE_ANSI": "0",
+                    "CLAUDE_ANY_PROVIDER": "vllm",
+                    "CLAUDE_ANY_MODEL_ALIAS": "claude-any-test",
+                }
+            )
+            session = {
+                "model": {"display_name": "claude-any-test"},
+                "workspace": {"current_dir": tmp},
+                "context_window": {
+                    "current_usage": {"input_tokens": 100724},
+                    "context_window_size": 200000,
+                    "used_percentage": 50.362,
+                },
+            }
+            proc = subprocess.run(
+                [sys.executable, str(script)],
+                input=json.dumps(session),
+                text=True,
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+
+        self.assertIn("ctx 100,724/262,144 tok", proc.stdout)
+        self.assertNotIn("ctx 100,724/200,000 tok", proc.stdout)
+
     def test_statusline_shows_pending_channel_queue_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "statusline.py"

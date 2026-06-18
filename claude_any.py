@@ -3413,7 +3413,9 @@ def main():
     if dir_name:
         left += f" {dir_name}"
     status_parts = []
-    ctx_text = session_context_status_text(session) or context_status_text(context, provider, model)
+    router_ctx_text = context_status_text(context, provider, model)
+    session_ctx_text = session_context_status_text(session)
+    ctx_text = router_ctx_text or session_ctx_text
     if ctx_text:
         status_parts.append(gray(ctx_text))
     channel_pending = channel_pending_status_count()
