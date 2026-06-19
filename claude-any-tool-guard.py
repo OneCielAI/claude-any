@@ -345,6 +345,16 @@ def transcript_latest_user_text(transcript_path: str | None) -> str:
     return ""
 
 
+def latest_user_is_channel_wake(transcript_path: str | None) -> bool:
+    text = transcript_latest_user_text(transcript_path)
+    if not text:
+        return False
+    return (
+        "[claude-any external channel message" in text
+        or "[claude-any channel inbox]" in text
+    )
+
+
 def transcript_plan_mode_active(transcript_path: str | None) -> bool:
     if not transcript_path:
         return False
@@ -647,6 +657,13 @@ def handle_pre_tool(event: dict[str, Any]) -> None:
             return
         transcript_path = str(event.get("transcript_path") or "")
         if transcript_path:
+            if tool == "EnterPlanMode" and latest_user_is_channel_wake(transcript_path):
+                log_event(f"PreToolUse denied EnterPlanMode for external channel prompt transcript={transcript_path}")
+                pre_deny(
+                    "External channel messages must not enter plan mode.",
+                    "Handle the channel message directly. If no action is needed, briefly state that and end the turn. Do not call EnterPlanMode for background channel notifications.",
+                )
+                return
             in_plan_mode = transcript_plan_mode_active(transcript_path)
             if tool == "EnterPlanMode" and in_plan_mode:
                 log_event(f"PreToolUse denied repeated EnterPlanMode transcript={transcript_path}")

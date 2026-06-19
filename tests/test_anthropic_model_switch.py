@@ -71,6 +71,65 @@ class AnthropicModelSwitchTests(unittest.TestCase):
         )
         self.assertEqual("claude-opus-4-8", result)
 
+    def test_default_family_aliases_use_cached_models_not_current_model(self):
+        pcfg = {
+            "base_url": "https://api.anthropic.com",
+            "api_key": "",
+            "current_model": "claude-opus-4-8",
+            "route_through_router": True,
+        }
+        with mock.patch.object(claude_any, "read_model_list_cache", return_value=ANTHROPIC_MODELS):
+            aliases = claude_any.claude_code_default_model_aliases(
+                "anthropic",
+                pcfg,
+                "claude-any-anthropic-claude-opus-4-8",
+            )
+
+        self.assertEqual(
+            "claude-any-anthropic-claude-opus-4-8",
+            aliases["ANTHROPIC_DEFAULT_OPUS_MODEL"],
+        )
+        self.assertEqual(
+            "claude-any-anthropic-claude-sonnet-4-6",
+            aliases["ANTHROPIC_DEFAULT_SONNET_MODEL"],
+        )
+        self.assertEqual(
+            "claude-any-anthropic-claude-haiku-4-5",
+            aliases["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+        )
+
+    def test_launch_model_cache_refreshes_when_no_cache_or_registry_exists(self):
+        pcfg = {
+            "base_url": "https://api.anthropic.com",
+            "api_key": "",
+            "current_model": "claude-opus-4-8",
+            "route_through_router": True,
+        }
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "read_model_registry_models", return_value=None),
+            mock.patch.object(claude_any, "upstream_model_ids", return_value=ANTHROPIC_MODELS) as upstream,
+        ):
+            claude_any.ensure_model_cache_for_launch("anthropic", pcfg)
+
+        upstream.assert_called_once_with("anthropic", pcfg)
+
+    def test_launch_model_cache_uses_existing_registry_without_network(self):
+        pcfg = {
+            "base_url": "https://api.anthropic.com",
+            "api_key": "",
+            "current_model": "claude-opus-4-8",
+            "route_through_router": True,
+        }
+        with (
+            mock.patch.object(claude_any, "read_model_list_cache", return_value=None),
+            mock.patch.object(claude_any, "read_model_registry_models", return_value=ANTHROPIC_MODELS),
+            mock.patch.object(claude_any, "upstream_model_ids") as upstream,
+        ):
+            claude_any.ensure_model_cache_for_launch("anthropic", pcfg)
+
+        upstream.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

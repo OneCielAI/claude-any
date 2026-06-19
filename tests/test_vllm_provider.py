@@ -314,6 +314,124 @@ class VllmProviderTests(unittest.TestCase):
         self.assertEqual("long-context-128k", pcfg["llm_preset"])
         self.assertTrue(any("Long context 128K" in line for line in lines))
 
+    def test_vllm_tool_choice_is_off_by_default(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        body = {
+            "model": "qwen36-35b-a3b-mtp-nvfp4",
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"},
+        }
+
+        out = claude_any.normalize_tool_choice_for_provider("vllm", pcfg, body)
+
+        self.assertIn("tool_choice", body)
+        self.assertNotIn("tool_choice", out)
+        self.assertIn("tools", out)
+
+    def test_vllm_tool_choice_can_be_enabled_for_server_parser(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        claude_any.apply_provider_option("vllm", pcfg, "supports_tool_choice=true")
+        body = {
+            "model": "qwen36-35b-a3b-mtp-nvfp4",
+            "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"},
+        }
+
+        out = claude_any.normalize_tool_choice_for_provider("vllm", pcfg, body)
+
+        self.assertIs(out, body)
+        self.assertIn("tool_choice", out)
+
+    def test_vllm_tool_choice_option_visible_in_llm_menu(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+
+        rows, values = claude_any.llm_option_panel_rows("vllm", pcfg, "en")
+
+        self.assertIn("supports_tool_choice", values)
+        self.assertIn("off", rows[values.index("supports_tool_choice")])
+
+    def test_small_context_output_cap_for_vllm_launch_env(self):
+        cfg = {
+            "current_provider": "vllm",
+            "providers": {"vllm": dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])},
+        }
+        pcfg = cfg["providers"]["vllm"]
+        pcfg["context_window"] = 262144
+        pcfg["max_model_len"] = 262144
+        pcfg["max_output_tokens"] = 32768
+
+        env = claude_any.env_vars(cfg)
+
+        self.assertEqual("8192", env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"])
+
+    def test_small_context_output_cap_rounds_down_for_200k_custom_model(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["context_window"] = 200000
+        pcfg["max_model_len"] = 200000
+        pcfg["max_output_tokens"] = 32768
+
+        self.assertEqual(6144, claude_any.claude_code_output_token_limit("vllm", pcfg))
+
+    def test_vllm_context_budget_prefers_runtime_model_limit_over_stale_window(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["current_model"] = "qwen36-35b-a3b-mtp-nvfp4"
+        pcfg["context_window"] = 200000
+        pcfg.pop("max_model_len", None)
+
+        with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=262144):
+            self.assertEqual(262144, claude_any.openai_context_limit_for_budget("vllm", pcfg))
+            self.assertEqual(262144, claude_any.context_limit_for_status("vllm", pcfg))
+            self.assertEqual(8192, claude_any.claude_code_output_token_limit("vllm", {**pcfg, "max_output_tokens": 32768}))
+            self.assertEqual(262144, claude_any.claude_code_auto_compact_window("vllm", pcfg))
+
+    def test_vllm_anthropic_body_cap_uses_runtime_model_limit_over_stale_window(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["current_model"] = "qwen36-35b-a3b-mtp-nvfp4"
+        pcfg["context_window"] = 200000
+        pcfg.pop("max_model_len", None)
+        pcfg["max_output_tokens"] = 32768
+        body = {
+            "model": "qwen36-35b-a3b-mtp-nvfp4",
+            "max_tokens": 32768,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+
+        with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=262144):
+            out = claude_any.cap_anthropic_body_for_provider("vllm", pcfg, body)
+
+        self.assertEqual(8192, out["max_tokens"])
+
+    def test_vllm_native_compacts_large_anthropic_history_before_upstream(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["context_window"] = 32768
+        pcfg["max_model_len"] = 32768
+        pcfg["max_output_tokens"] = 32768
+        old_messages = []
+        for idx in range(60):
+            old_messages.append({"role": "user", "content": f"old user {idx} " + ("x" * 4000)})
+            old_messages.append({"role": "assistant", "content": f"old assistant {idx} " + ("y" * 4000)})
+        body = {
+            "model": "qwen36-35b-a3b-mtp-nvfp4",
+            "system": "system prompt",
+            "max_tokens": 32768,
+            "messages": old_messages + [{"role": "user", "content": "current task"}],
+        }
+
+        with mock.patch.object(claude_any, "write_context_compact_activity") as write_compact:
+            out = claude_any.cap_anthropic_body_for_provider("vllm", pcfg, body)
+
+        self.assertLess(len(out["messages"]), len(body["messages"]))
+        self.assertEqual({"role": "user", "content": "current task"}, out["messages"][-1])
+        self.assertEqual(2048, out["max_tokens"])
+        self.assertLessEqual(claude_any.estimate_tokens(out), 32768)
+        system_text = claude_any.anthropic_content_to_text(out["system"])
+        self.assertIn("claude-any context guard", system_text)
+        self.assertIn("Chunk", system_text)
+        write_compact.assert_called_once()
+        self.assertEqual("vllm", write_compact.call_args.args[0])
+        self.assertGreater(write_compact.call_args.kwargs["chunks"], 0)
+        self.assertEqual(1, write_compact.call_args.kwargs["parallel_sessions"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -16,6 +16,9 @@ import claude_any
 
 
 class ChannelBridgeTests(unittest.TestCase):
+    def setUp(self):
+        claude_any._CHANNEL_STDIN_WAKE_DELIVERED.clear()
+
     def test_parse_channel_args_accepts_sse_command(self):
         command, options = claude_any.parse_channel_bridge_args("sse")
         self.assertEqual(command, "sse")
@@ -207,6 +210,211 @@ class ChannelBridgeTests(unittest.TestCase):
                 rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(42, saved["id"])
         self.assertEqual([41, 42], [row["id"] for row in rows])
+
+    def test_append_chat_message_dedupes_mcp_notification_with_stable_cursor(self):
+        payload = {
+            "message": "same notification",
+            "channel": "room",
+            "sender_id": "mcp-server",
+            "kind": "channel",
+            "meta": {
+                "mcp_server": "mcp-server",
+                "mcp_method": "notifications/claude/channel",
+                "cursor": "1781319043580-0",
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                first = claude_any.append_chat_message(payload)
+                second = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(1, first["id"])
+        self.assertEqual(1, second["id"])
+        self.assertTrue(second["_claude_any_duplicate"])
+        self.assertEqual(1, len(rows))
+
+    def test_append_chat_message_dedupes_recent_mcp_notification_without_stable_id(self):
+        payload = {
+            "message": "board updated",
+            "channel": "room",
+            "sender_id": "mcp-server",
+            "kind": "channel",
+            "meta": {
+                "mcp_server": "mcp-server",
+                "mcp_method": "notifications/claude/channel",
+            },
+        }
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                first = claude_any.append_chat_message(payload)
+                second = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(1, first["id"])
+        self.assertEqual(1, second["id"])
+        self.assertTrue(second["_claude_any_duplicate"])
+        self.assertEqual(1, len(rows))
+
+    def test_append_chat_message_dedupes_identical_mcp_json_notification(self):
+        payload = {
+            "message": 'Board "positions" updated. board_get(room_id, key) to read.',
+            "channel": "room",
+            "sender_id": "mcp-server",
+            "kind": "channel",
+            "meta": {
+                "mcp_server": "mcp-server",
+                "mcp_method": "notifications/claude/channel",
+                "stream_id": "",
+                "mcp_json": {
+                    "jsonrpc": "2.0",
+                    "method": "notifications/claude/channel",
+                    "params": {
+                        "content": 'Board "positions" updated. board_get(room_id, key) to read.',
+                        "meta": {"kind": "board_updated", "room_id": "room", "key": "positions", "stream_id": ""},
+                    },
+                },
+            },
+        }
+        old = dict(payload)
+        old.update({"id": 1, "time": "2000-01-01T00:00:00", "recipients": ["all"], "thread_id": "1", "parent_id": None})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            path.write_text(json.dumps(old, ensure_ascii=False) + "\n", encoding="utf-8")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                saved = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(1, saved["id"])
+        self.assertTrue(saved["_claude_any_duplicate"])
+        self.assertEqual(1, len(rows))
+
+    def test_append_chat_message_keeps_old_fallback_duplicate_without_launch_guard(self):
+        payload = {
+            "message": "board updated",
+            "channel": "room",
+            "sender_id": "mcp-server",
+            "kind": "channel",
+            "meta": {
+                "mcp_server": "mcp-server",
+                "mcp_method": "notifications/claude/channel",
+            },
+        }
+        old = dict(payload)
+        old.update({"id": 1, "time": "2000-01-01T00:00:00", "recipients": ["all"], "thread_id": "1", "parent_id": None})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            guard_path = root / "channel-llm-launch-guard.json"
+            path.write_text(json.dumps(old, ensure_ascii=False) + "\n", encoding="utf-8")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "CHANNEL_LLM_LAUNCH_GUARD_PATH", guard_path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                saved = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(2, saved["id"])
+        self.assertNotIn("_claude_any_duplicate", saved)
+        self.assertEqual(2, len(rows))
+
+    def test_append_chat_message_dedupes_startup_replay_without_stable_id(self):
+        payload = {
+            "message": "board updated",
+            "channel": "room",
+            "sender_id": "mcp-server",
+            "kind": "channel",
+            "meta": {
+                "mcp_server": "mcp-server",
+                "mcp_method": "notifications/claude/channel",
+            },
+        }
+        old = dict(payload)
+        old.update({"id": 7, "time": "2000-01-01T00:00:00", "recipients": ["all"], "thread_id": "7", "parent_id": None})
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            guard_path = root / "channel-llm-launch-guard.json"
+            path.write_text(json.dumps(old, ensure_ascii=False) + "\n", encoding="utf-8")
+            guard_path.write_text(
+                json.dumps({"max_existing_id": 7, "expires_at": time.time() + 60}, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "CHANNEL_LLM_LAUNCH_GUARD_PATH", guard_path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                saved = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(7, saved["id"])
+        self.assertTrue(saved["_claude_any_duplicate"])
+        self.assertEqual(1, len(rows))
+
+    def test_append_chat_message_does_not_dedupe_plain_user_messages(self):
+        payload = {"message": "repeat is valid", "channel": "web-chat", "sender_id": "web-user"}
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "_CHAT_NEXT_ID", None),
+            ):
+                first = claude_any.append_chat_message(payload)
+                second = claude_any.append_chat_message(payload)
+                rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+        self.assertEqual(1, first["id"])
+        self.assertEqual(2, second["id"])
+        self.assertNotIn("_claude_any_duplicate", second)
+        self.assertEqual(2, len(rows))
+
+    def test_prepare_channel_llm_delivery_for_launch_fast_forwards_stale_queue(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            path = root / "chat-messages.jsonl"
+            cursor_path = root / "channel-llm-cursor.json"
+            path.write_text(
+                "\n".join(json.dumps({"id": item_id, "message": f"old-{item_id}"}) for item_id in (1, 2, 3)) + "\n",
+                encoding="utf-8",
+            )
+            cursor_path.write_text(json.dumps({"last_id": 1}), encoding="utf-8")
+            with (
+                mock.patch.object(claude_any, "CONFIG_DIR", root),
+                mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", path),
+                mock.patch.object(claude_any, "CHANNEL_LLM_CURSOR_PATH", cursor_path),
+                mock.patch.object(claude_any, "CHANNEL_LLM_LAUNCH_GUARD_PATH", root / "channel-llm-launch-guard.json"),
+                mock.patch.object(claude_any, "_CHANNEL_LLM_CURSOR_LAST_ID", None),
+            ):
+                last_id = claude_any.prepare_channel_llm_delivery_for_launch()
+                saved = json.loads(cursor_path.read_text(encoding="utf-8"))
+                guard = json.loads((root / "channel-llm-launch-guard.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(3, last_id)
+        self.assertEqual(3, saved["last_id"])
+        self.assertEqual(3, guard["max_existing_id"])
 
     def test_mcp_endpoint_event_initializes_sse_session(self):
         name = "unit-mcp"
@@ -881,6 +1089,9 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("DM label", prompt)
         self.assertIn("현재 에이전트가 수신자가 아니라고 결론내리지 마세요", prompt)
         self.assertIn("자동 회신 루프", prompt)
+        self.assertNotIn("claude-any-router send_message", prompt)
+        self.assertNotIn("recipients='web'", prompt)
+        self.assertNotIn("웹 채팅 요청", prompt)
 
     def test_reply_action_prompt_warns_against_dm_label_recipient_misread(self):
         prompt = claude_any._channel_direct_reply_action_prompt("I am not the recipient.")
@@ -903,9 +1114,68 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("from=robert", prompt)
         self.assertIn("id=9", prompt)
         self.assertIn("please review the latest update", prompt)
-        self.assertIn("metadata=", prompt)
+        self.assertIn('metadata={"room_id":"room_phase1sim"}', prompt)
         self.assertIn("room_phase1sim", prompt)
+        self.assertNotIn("send_message", prompt)
+        self.assertNotIn("recipients='web'", prompt)
+        self.assertNotIn("send_file", prompt)
         self.assertNotIn("\n", prompt)
+
+    def test_channel_wake_prompt_includes_small_event_metadata_only(self):
+        prompt = claude_any.format_channel_wake_prompt(
+            {
+                "id": 9,
+                "channel": "room",
+                "sender_id": "mcp-server",
+                "message": "New message from Kevin",
+                "meta": {
+                    "kind": "activity",
+                    "room_id": "room",
+                    "room_name": "Project Room",
+                    "message_id": "msg_123",
+                    "stream_id": "1781389494764-0",
+                    "mcp_json": {"params": {"content": "large raw payload"}},
+                    "reply_instruction": "web routing text",
+                    "api_key": "secret",
+                    "large": "x" * 500,
+                },
+            }
+        )
+        self.assertIn('"kind":"activity"', prompt)
+        self.assertIn('"message_id":"msg_123"', prompt)
+        self.assertIn('"stream_id":"1781389494764-0"', prompt)
+        self.assertIn('"room_name":"Project Room"', prompt)
+        self.assertNotIn("mcp_json", prompt)
+        self.assertNotIn("reply_instruction", prompt)
+        self.assertNotIn("secret", prompt)
+        self.assertNotIn("x" * 100, prompt)
+
+    def test_channel_wake_prompt_adds_browser_reply_instructions_only_for_web_chat(self):
+        prompt = claude_any.format_channel_wake_prompt(
+            {
+                "id": 10,
+                "channel": "web-chat-session",
+                "sender_id": "web-user",
+                "thread_id": "thread-1",
+                "message": "현재상태는",
+                "kind": "web_chat",
+                "meta": {"source": "claude-any-web-chat", "reply_channel": "web-chat-session"},
+            }
+        )
+        self.assertIn("send_message", prompt)
+        self.assertIn("recipients='web'", prompt)
+        self.assertIn("send_file", prompt)
+
+    def test_channel_wake_batch_omits_browser_reply_instructions_without_web_chat(self):
+        prompt = claude_any.format_channel_wake_batch_prompt(
+            [
+                {"id": 1, "channel": "room", "sender_id": "agent-a", "message": "one", "meta": {}},
+                {"id": 2, "channel": "room", "sender_id": "agent-b", "message": "two", "meta": {}},
+            ]
+        )
+        self.assertNotIn("send_message", prompt)
+        self.assertNotIn("recipients='web'", prompt)
+        self.assertNotIn("send_file", prompt)
 
     def test_web_chat_wake_prompt_is_compact_and_omits_raw_metadata(self):
         prompt = claude_any.format_channel_web_chat_wake_batch_prompt(
@@ -1080,6 +1350,7 @@ class ChannelBridgeTests(unittest.TestCase):
                 "sender_id": "agent",
                 "message": "wake up",
                 "meta": {},
+                "delivery": ["llm"],
             }
         ]
         with (
@@ -1087,19 +1358,23 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
             mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
             mock.patch.object(claude_any, "router_log"),
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 1)
         self.assertEqual(2, last_id)
+        commit_cursor.assert_called_once_with(2)
         self.assertEqual(2, write_all.call_count)
         self.assertIn(b"wake up", write_all.call_args_list[0].args[1])
         self.assertTrue(write_all.call_args_list[0].args[1].startswith(b"\x15"))
         self.assertEqual(b"\r\n", write_all.call_args_list[1].args[1])
 
+        claude_any._CHANNEL_STDIN_WAKE_DELIVERED.clear()
         with (
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_write_fd_all") as write_all_cr,
             mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer"),
             mock.patch.object(claude_any, "router_log"),
         ):
             claude_any._inject_pending_channel_messages(99, 1, b"\r")
@@ -1107,27 +1382,29 @@ class ChannelBridgeTests(unittest.TestCase):
 
     def test_inject_pending_channel_messages_batches_and_ignores_connection_noise(self):
         messages = [
-            {"id": 1, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.ws.connected", "meta": {}},
-            {"id": 2, "channel": "ai-net", "sender_id": "robert", "message": "hello Sarah", "meta": {"room_id": "ai-net"}},
-            {"id": 3, "channel": "ai-net", "sender_id": "samuel", "message": "status please", "meta": {"room_id": "ai-net"}},
+            {"id": 1, "channel": "generic-room", "sender_id": "generic-mcp", "message": "generic.ws.connected", "meta": {}},
+            {"id": 2, "channel": "generic-room", "sender_id": "agent-a", "message": "hello recipient", "meta": {"room_id": "generic-room", "mcp_server": "generic-mcp"}},
+            {"id": 3, "channel": "generic-room", "sender_id": "agent-b", "message": "status please", "meta": {"room_id": "generic-room", "mcp_server": "generic-mcp"}},
         ]
         with (
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
             mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0)
-        self.assertEqual(3, last_id)
+        self.assertEqual(2, last_id)
+        commit_cursor.assert_called_once_with(2)
         payload = write_all.call_args_list[0].args[1]
-        self.assertIn(b"external channel messages", payload)
-        self.assertIn(b"hello Sarah", payload)
-        self.assertIn(b"status please", payload)
-        self.assertNotIn(b"ai-net.ws.connected", payload)
+        self.assertIn(b"external channel message", payload)
+        self.assertIn(b"hello recipient", payload)
+        self.assertNotIn(b"status please", payload)
+        self.assertNotIn(b"generic.ws.connected", payload)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_stdin_proxy_skipped_noise" in item for item in log_messages))
-        self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2,3" in item and "enter=crlf" in item for item in log_messages))
+        self.assertTrue(any("channel_stdin_proxy_injected" in item and "message_ids=2" in item and "enter=crlf" in item for item in log_messages))
 
     def test_inject_pending_channel_messages_can_limit_to_web_chat_requests(self):
         messages = [
@@ -1146,10 +1423,12 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "_channel_platform_default_enter_bytes", return_value=b"\r\n"),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
             mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0, web_chat_only=True)
         self.assertEqual(3, last_id)
+        commit_cursor.assert_not_called()
         payload = write_all.call_args_list[0].args[1]
         self.assertIn("마지막 작업 요약".encode("utf-8"), payload)
         self.assertIn(b"claude-any web chat", payload)
@@ -1172,14 +1451,351 @@ class ChannelBridgeTests(unittest.TestCase):
             mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
             mock.patch.object(claude_any, "_write_fd_all") as write_all,
             mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
             mock.patch.object(claude_any, "router_log") as router_log,
         ):
             last_id = claude_any._inject_pending_channel_messages(99, 0)
         self.assertEqual(4, last_id)
+        commit_cursor.assert_called_once_with(4)
         self.assertEqual(2, write_all.call_count)
         self.assertIn(b"New message from Sarah", write_all.call_args_list[0].args[1])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_stdin_proxy_inject_fallback" in item and "reason=llm_direct_pending" in item for item in log_messages))
+
+    def test_inject_pending_channel_messages_claims_before_terminal_write(self):
+        messages = [
+            {
+                "id": 7,
+                "channel": "room",
+                "sender_id": "agent",
+                "message": "wake up",
+                "meta": {},
+                "delivery": ["llm"],
+            }
+        ]
+
+        def assert_claimed_before_write(fd, data):
+            self.assertIn(7, claude_any._CHANNEL_STDIN_WAKE_DELIVERED)
+
+        with (
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_write_fd_all", side_effect=assert_claimed_before_write) as write_all,
+            mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            last_id = claude_any._inject_pending_channel_messages(99, 1)
+
+        self.assertEqual(7, last_id)
+        self.assertEqual(2, write_all.call_count)
+        commit_cursor.assert_called_once_with(7)
+
+    def test_inject_pending_channel_messages_can_defer_cursor_commit(self):
+        messages = [
+            {
+                "id": 8,
+                "channel": "room",
+                "sender_id": "agent",
+                "message": "wake up later",
+                "meta": {},
+                "delivery": ["llm"],
+            }
+        ]
+        injected: list[int] = []
+        with (
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "_write_fd_all"),
+            mock.patch.object(claude_any, "_channel_wake_submit_delay_seconds", return_value=0),
+            mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
+            mock.patch.object(claude_any, "router_log"),
+        ):
+            last_id = claude_any._inject_pending_channel_messages(
+                99,
+                7,
+                commit_cursor=False,
+                injected_message_ids=injected,
+            )
+
+        self.assertEqual(8, last_id)
+        self.assertEqual([8], injected)
+        commit_cursor.assert_not_called()
+
+    def test_inject_pending_channel_messages_waits_for_queued_command(self):
+        messages = [
+            {
+                "id": 9,
+                "channel": "room",
+                "sender_id": "agent",
+                "message": "wake up",
+                "meta": {},
+                "delivery": ["llm"],
+            }
+        ]
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "queue-operation",
+                        "operation": "enqueue",
+                        "content": "[claude-any external channel message] id=9 text=\"wake up\"",
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            claude_any._CHANNEL_STDIN_WAKE_DELIVERED.clear()
+            with (
+                mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+                mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript),
+                mock.patch.object(claude_any, "_write_fd_all") as write_all,
+                mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
+                mock.patch.object(claude_any, "router_log") as router_log,
+            ):
+                last_id = claude_any._inject_pending_channel_messages(99, 8)
+
+        self.assertEqual(8, last_id)
+        write_all.assert_not_called()
+        commit_cursor.assert_not_called()
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("state=queued" in item for item in log_messages))
+
+    def test_channel_stdin_wake_completed_requires_assistant_after_prompt(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "user", "message": {"content": "id=9 text=\"hello\""}}),
+                        json.dumps({"type": "queue-operation", "operation": "enqueue"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertFalse(claude_any._channel_stdin_wake_completed(9))
+
+            transcript.write_text(
+                transcript.read_text(encoding="utf-8")
+                + json.dumps({"type": "assistant", "message": {"content": []}})
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertTrue(claude_any._channel_stdin_wake_completed(9))
+
+    def test_channel_stdin_wake_state_distinguishes_missing_pending_completed(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                json.dumps({"type": "user", "message": {"content": "id=10 text=\"hello\""}}) + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertEqual("pending", claude_any._channel_stdin_wake_state(10))
+                self.assertEqual("missing", claude_any._channel_stdin_wake_state(11))
+
+            transcript.write_text(
+                transcript.read_text(encoding="utf-8")
+                + json.dumps({"type": "assistant", "message": {"content": []}})
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertEqual("completed", claude_any._channel_stdin_wake_state(10))
+
+    def test_channel_stdin_inflight_stale_only_expires_queued_or_unknown(self):
+        with mock.patch.object(claude_any, "_channel_stdin_inflight_stale_seconds", return_value=60.0):
+            self.assertTrue(claude_any._channel_stdin_inflight_is_stale("queued", 100.0, 161.0))
+            self.assertTrue(claude_any._channel_stdin_inflight_is_stale("unknown", 100.0, 161.0))
+            self.assertFalse(claude_any._channel_stdin_inflight_is_stale("queued", 100.0, 120.0))
+            self.assertFalse(claude_any._channel_stdin_inflight_is_stale("pending", 100.0, 1000.0))
+            self.assertFalse(claude_any._channel_stdin_inflight_is_stale("missing", 100.0, 1000.0))
+            self.assertFalse(claude_any._channel_stdin_inflight_is_stale("completed", 100.0, 1000.0))
+
+    def test_channel_stdin_wake_state_accepts_message_role_assistant_records(self):
+        transcript = "\n".join(
+            [
+                json.dumps({"type": "user", "message": {"content": "[claude-any external channel message] id=4345 text=\"hello\""}}),
+                json.dumps(
+                    {
+                        "message": {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": "handled"}],
+                        }
+                    }
+                ),
+            ]
+        )
+
+        self.assertEqual("completed", claude_any._channel_stdin_wake_state_from_text(4345, transcript))
+
+    def test_channel_stdin_wake_state_treats_queued_command_as_queued_not_missing(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "queue-operation",
+                                "operation": "enqueue",
+                                "content": "[claude-any external channel message] id=4971 text=\"hello\"",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "attachment",
+                                "attachment": {
+                                    "type": "queued_command",
+                                    "prompt": "[claude-any external channel message] id=4971 text=\"hello\"",
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "user", "message": {"content": "id=4972 text=\"next\""}}),
+                        json.dumps({"type": "assistant", "message": {"content": []}}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertEqual("queued", claude_any._channel_stdin_wake_state(4971))
+                self.assertEqual("completed", claude_any._channel_stdin_wake_state(4972))
+
+    def test_channel_stdin_recover_cursor_keeps_queued_command_message_advanced(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "queue-operation",
+                                "operation": "enqueue",
+                                "content": "[claude-any external channel message] id=4971 text=\"kevin\"",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "attachment",
+                                "attachment": {
+                                    "type": "queued_command",
+                                    "prompt": "[claude-any external channel message] id=4971 text=\"kevin\"",
+                                },
+                            }
+                        ),
+                        json.dumps({"type": "user", "message": {"content": "id=4972 text=\"later\""}}),
+                        json.dumps({"type": "assistant", "message": {"content": []}}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            claude_any._CHANNEL_STDIN_RECOVERY_CACHE.clear()
+            with (
+                mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript),
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                self.assertEqual(4987, claude_any._channel_stdin_recover_cursor_from_queued_only(4987))
+
+    def test_channel_stdin_recover_cursor_respects_channel_clear_floor(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            transcript = root / "session.jsonl"
+            floor_path = root / "channel-llm-clear-floor.json"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "type": "queue-operation",
+                                "operation": "enqueue",
+                                "content": "[claude-any external channel message] id=4971 text=\"old\"",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "type": "attachment",
+                                "attachment": {
+                                    "type": "queued_command",
+                                    "prompt": "[claude-any external channel message] id=4971 text=\"old\"",
+                                },
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            floor_path.write_text('{"last_id":4987}\n', encoding="utf-8")
+            claude_any._CHANNEL_STDIN_RECOVERY_CACHE.clear()
+            with (
+                mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript),
+                mock.patch.object(claude_any, "CHANNEL_LLM_CLEAR_FLOOR_PATH", floor_path),
+                mock.patch.object(claude_any, "router_log"),
+            ):
+                self.assertEqual(4987, claude_any._channel_stdin_recover_cursor_from_queued_only(4987))
+
+    def test_channel_stdin_recover_cursor_keeps_completed_messages_advanced(self):
+        with tempfile.TemporaryDirectory() as td:
+            transcript = Path(td) / "session.jsonl"
+            transcript.write_text(
+                "\n".join(
+                    [
+                        json.dumps({"type": "user", "message": {"content": "id=4971 text=\"kevin\""}}),
+                        json.dumps({"type": "assistant", "message": {"content": []}}),
+                        json.dumps(
+                            {
+                                "type": "queue-operation",
+                                "operation": "enqueue",
+                                "content": "[claude-any external channel message] id=4971 text=\"kevin\"",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            claude_any._CHANNEL_STDIN_RECOVERY_CACHE.clear()
+            with mock.patch.object(claude_any, "_latest_claude_transcript_path", return_value=transcript):
+                self.assertEqual(4987, claude_any._channel_stdin_recover_cursor_from_queued_only(4987))
+
+    def test_channel_stdin_unseen_retry_seconds_is_bounded(self):
+        with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_WAKE_UNSEEN_RETRY_SECONDS": "0"}):
+            self.assertEqual(2.0, claude_any._channel_stdin_unseen_retry_seconds())
+        with mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_WAKE_UNSEEN_RETRY_SECONDS": "999"}):
+            self.assertEqual(300.0, claude_any._channel_stdin_unseen_retry_seconds())
+
+    def test_channel_stdin_rechecks_pending_after_inflight_completion_without_marker_change(self):
+        marker = (123.0, 456)
+
+        self.assertTrue(
+            claude_any._channel_stdin_should_check_pending(
+                marker,
+                marker,
+                force_recheck=True,
+                channel_inflight_id=None,
+            )
+        )
+        self.assertFalse(
+            claude_any._channel_stdin_should_check_pending(
+                marker,
+                marker,
+                force_recheck=False,
+                channel_inflight_id=None,
+            )
+        )
+        self.assertFalse(
+            claude_any._channel_stdin_should_check_pending(
+                marker,
+                marker,
+                force_recheck=True,
+                channel_inflight_id=3807,
+            )
+        )
 
     def test_inject_pending_channel_messages_skips_direct_delivered_messages(self):
         messages = [
@@ -1197,12 +1813,14 @@ class ChannelBridgeTests(unittest.TestCase):
             with (
                 mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
                 mock.patch.object(claude_any, "_write_fd_all") as write_all,
+                mock.patch.object(claude_any, "_commit_channel_llm_cursor_if_newer") as commit_cursor,
                 mock.patch.object(claude_any, "router_log") as router_log,
             ):
                 last_id = claude_any._inject_pending_channel_messages(99, 0)
         finally:
             claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
         self.assertEqual(4, last_id)
+        commit_cursor.assert_not_called()
         write_all.assert_not_called()
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("reason=llm_direct_delivered" in item for item in log_messages))
@@ -1298,7 +1916,7 @@ class ChannelBridgeTests(unittest.TestCase):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
         messages = [
             {"id": 2, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.sse.connected", "meta": {}},
-            {"id": 3, "channel": "room", "sender_id": "sarah", "message": "Robert, can you check this?", "meta": {"room_id": "room"}},
+            {"id": 3, "channel": "room", "sender_id": "agent-a", "message": "Please check this.", "meta": {"room_id": "room", "mcp_server": "generic-mcp"}},
             {
                 "id": 4,
                 "channel": "ai-net-sse",
@@ -1329,21 +1947,21 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("미래 행동을 약속하는 말만 남기고 턴을 끝내지 마세요", injected)
         self.assertIn("같은 턴에서 필요한 조사/도구 호출/채널 보고까지 수행", injected)
         self.assertIn("실제 결제/투자 실행", injected)
-        self.assertIn("Robert, can you check this?", injected)
+        self.assertIn("Please check this.", injected)
         self.assertNotIn("ai-net.sse.connected", injected)
         self.assertNotIn("SSE MCP initialized", injected)
         write_cursor.assert_not_called()
-        self.assertEqual("4", out["metadata"]["claude_any_channel_cursor_last_id"])
+        self.assertEqual("3", out["metadata"]["claude_any_channel_cursor_last_id"])
         handler = type("Handler", (), {"_claude_any_response_status": 200})()
         with (
             mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
             mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as commit_cursor,
         ):
             claude_any.commit_pending_channel_delivery_cursors(out, handler)  # type: ignore[arg-type]
-        commit_cursor.assert_called_with(4)
+        commit_cursor.assert_called_with(3)
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
-        self.assertTrue(any("channel_llm_inject_skipped" in item and "initialized" in item for item in log_messages))
+        self.assertTrue(any("channel_llm_inject_skipped" in item and "transport_connected" in item for item in log_messages))
 
     def test_body_without_claude_any_internal_metadata_strips_private_keys(self):
         body = {
@@ -1426,6 +2044,68 @@ class ChannelBridgeTests(unittest.TestCase):
         write_summary_cursor.assert_not_called()
         self.assertTrue(any("channel_delivery_cursor_deferred" in str(call.args[1]) for call in router_log.call_args_list))
 
+    def test_commit_pending_channel_delivery_cursors_skips_unconfirmed_channel_response(self):
+        body = {
+            "metadata": {
+                "claude_any_channel_cursor_last_id": "9",
+                "claude_any_channel_summary_cursor_last_id": "12",
+            }
+        }
+        handler = type(
+            "Handler",
+            (),
+            {
+                "_claude_any_response_status": 200,
+                "_claude_any_channel_delivery_guard": True,
+                "_claude_any_channel_delivery_ok": False,
+                "_claude_any_channel_delivery_reason": "ollama_stream_error:TimeoutError",
+            },
+        )()
+        with (
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+            mock.patch.object(claude_any, "_channel_llm_summary_write_cursor_locked") as write_summary_cursor,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            claude_any.commit_pending_channel_delivery_cursors(body, handler)  # type: ignore[arg-type]
+
+        write_cursor.assert_not_called()
+        write_summary_cursor.assert_not_called()
+        self.assertTrue(
+            any(
+                "channel_delivery_cursor_deferred" in str(call.args[1])
+                and "ollama_stream_error:TimeoutError" in str(call.args[1])
+                for call in router_log.call_args_list
+            )
+        )
+
+    def test_commit_pending_channel_delivery_cursors_commits_confirmed_channel_response(self):
+        body = {
+            "metadata": {
+                "claude_any_channel_cursor_last_id": "9",
+                "claude_any_channel_summary_cursor_last_id": "12",
+            }
+        }
+        handler = type(
+            "Handler",
+            (),
+            {
+                "_claude_any_response_status": 200,
+                "_claude_any_channel_delivery_guard": True,
+                "_claude_any_channel_delivery_ok": True,
+                "_claude_any_channel_delivery_reason": "ollama_stream_message_stop",
+            },
+        )()
+        with (
+            mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=1),
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+            mock.patch.object(claude_any, "_channel_llm_summary_read_cursor_locked", return_value=1),
+            mock.patch.object(claude_any, "_channel_llm_summary_write_cursor_locked") as write_summary_cursor,
+        ):
+            claude_any.commit_pending_channel_delivery_cursors(body, handler)  # type: ignore[arg-type]
+
+        write_cursor.assert_called_with(9)
+        write_summary_cursor.assert_called_with(12)
+
     def test_body_with_pending_channel_messages_keeps_ai_net_write_tools(self):
         body = {
             "messages": [{"role": "user", "content": "continue"}],
@@ -1439,7 +2119,7 @@ class ChannelBridgeTests(unittest.TestCase):
             "tool_choice": {"type": "tool", "name": "mcp__ai-net-sse__send_dm"},
         }
         messages = [
-            {"id": 3, "channel": "room", "sender_id": "sarah", "message": "Robert, please read this", "meta": {"room_id": "room"}}
+            {"id": 3, "channel": "room", "sender_id": "agent-a", "message": "Please read this", "meta": {"room_id": "room", "mcp_server": "generic-mcp"}}
         ]
         with (
             mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
@@ -1491,6 +2171,32 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn('to=["agent_n3wy9gfjmcil"]', prompt)
         self.assertIn("message_id/source_message_id", prompt)
         self.assertIn("after_id/cursor", prompt)
+        self.assertNotIn("claude-any-router send_message", prompt)
+        self.assertNotIn("recipients='web'", prompt)
+        self.assertNotIn("웹 채팅 요청", prompt)
+
+    def test_channel_llm_prompt_adds_browser_reply_instructions_only_for_web_chat(self):
+        prompt = claude_any.format_channel_llm_batch_prompt(
+            [
+                {
+                    "id": 220,
+                    "channel": "web-chat-session",
+                    "sender_id": "web-user",
+                    "recipients": ["agent"],
+                    "message": "현재 작업 상태를 알려줘",
+                    "kind": "web_chat",
+                    "meta": {
+                        "source": "claude-any-web-chat",
+                        "reply_channel": "web-chat-session",
+                        "reply_recipient": "web",
+                    },
+                }
+            ]
+        )
+        self.assertIn("claude-any-router send_message", prompt)
+        self.assertIn("recipients='web'", prompt)
+        self.assertIn("웹 채팅 요청", prompt)
+        self.assertIn("현재 작업 상태를 알려줘", prompt)
 
     def test_channel_tool_result_context_is_injected_for_remembered_tool_use(self):
         claude_any._CHANNEL_LLM_TOOL_CONTEXT.clear()
@@ -1743,6 +2449,103 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("llm_direct_delivered" in item for item in log_messages))
 
+    def test_body_with_pending_channel_messages_skips_message_already_in_request(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "[claude-any external channel message] channel=room "
+                                "room=room from=ai-net-http id=5058 text=\"wake\""
+                            ),
+                        }
+                    ],
+                }
+            ],
+            "stream": True,
+        }
+        messages = [
+            {
+                "id": 5058,
+                "channel": "room",
+                "sender_id": "ai-net-http",
+                "message": "wake",
+                "meta": {"room_id": "room", "mcp_server": "ai-net-http"},
+            }
+        ]
+        with (
+            mock.patch.object(claude_any, "load_config", return_value={"claude_code": {"channel_delivery": "llm"}}),
+            mock.patch.object(claude_any, "_channel_llm_read_cursor_locked", return_value=5057),
+            mock.patch.object(claude_any, "_channel_llm_write_cursor_locked") as write_cursor,
+            mock.patch.object(claude_any, "read_chat_messages", return_value=messages),
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            out = claude_any.body_with_pending_channel_messages(body)
+
+        self.assertIs(out, body)
+        write_cursor.assert_called_with(5058)
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("already_in_request" in item and "message_id=5058" in item for item in log_messages))
+
+    def test_channel_message_ids_already_in_request_ignores_unrelated_ids(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "ordinary text id=12"},
+                {
+                    "role": "user",
+                    "content": (
+                        "[claude-any external channel messages] 2 new messages: "
+                        "(id=14 room=room) \"one\" | (id=15 room=room) \"two\""
+                    ),
+                },
+            ]
+        }
+
+        self.assertEqual({14, 15}, claude_any._channel_message_ids_already_in_request(body))
+
+    def test_sanitize_assistant_pseudo_tool_text_history_removes_invoke_snippets_only(self):
+        body = {
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "I will send it now.\n\n"
+                                "court\n"
+                                "<invoke name=\"mcp__ai-net-http__send_message\">\n"
+                                "<parameter name=\"room_id\">room1</parameter>\n"
+                                "</invoke>\n"
+                                "Done."
+                            ),
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_real",
+                            "name": "mcp__ai-net-http__send_message",
+                            "input": {"room_id": "room1", "content": "real"},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": "<invoke name=\"mcp__ai-net-http__send_message\"></invoke> is user text",
+                },
+            ]
+        }
+
+        out = claude_any.sanitize_assistant_pseudo_tool_text_history(body)
+
+        assistant_content = out["messages"][0]["content"]
+        self.assertNotIn("<invoke", assistant_content[0]["text"])
+        self.assertIn("removed prior assistant pseudo tool-call", assistant_content[0]["text"])
+        self.assertEqual("tool_use", assistant_content[1]["type"])
+        self.assertIn("<invoke", out["messages"][1]["content"])
+
     def test_body_with_pending_channel_messages_skips_stdin_wake_delivered_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
         messages = [
@@ -1769,7 +2572,7 @@ class ChannelBridgeTests(unittest.TestCase):
         finally:
             claude_any._CHANNEL_STDIN_WAKE_DELIVERED.clear()
         self.assertIs(out, body)
-        write_cursor.assert_called_with(3)
+        write_cursor.assert_not_called()
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("stdin_wake_delivered" in item for item in log_messages))
 
@@ -1790,7 +2593,7 @@ class ChannelBridgeTests(unittest.TestCase):
         finally:
             claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.clear()
         self.assertIs(out, body)
-        write_cursor.assert_called_with(3)
+        write_cursor.assert_not_called()
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("llm_direct_inflight" in item for item in log_messages))
 
@@ -1909,6 +2712,154 @@ class ChannelBridgeTests(unittest.TestCase):
                 {"message": "x", "sender_id": "mcp-claude-any-router", "meta": {"sse_source": "mcp-claude-any-router"}}
             ),
         )
+
+    def test_channel_llm_skip_reason_rejects_unscoped_peer_messages(self):
+        message = {"message": "hello", "channel": "room", "sender_id": "claude-code", "meta": {}}
+        self.assertEqual("unscoped_channel_message", claude_any._channel_llm_message_skip_reason(message))
+        self.assertEqual("unscoped_channel_message", claude_any._channel_mcp_message_skip_reason(message))
+
+    def test_channel_llm_skip_reason_accepts_explicit_delivery_and_mcp_provenance(self):
+        self.assertIsNone(
+            claude_any._channel_llm_message_skip_reason(
+                {"message": "hello", "channel": "room", "sender_id": "agent", "delivery": ["llm"], "meta": {}}
+            )
+        )
+        self.assertIsNone(
+            claude_any._channel_llm_message_skip_reason(
+                {"message": "hello", "channel": "room", "sender_id": "agent", "meta": {"mcp_server": "generic-mcp"}}
+            )
+        )
+
+    def test_channel_skip_reason_rejects_system_event_metadata(self):
+        message = {"message": "Connected", "meta": {"eventType": "system"}}
+        self.assertEqual("system", claude_any._channel_llm_message_skip_reason(message))
+        self.assertEqual("system", claude_any._channel_mcp_message_skip_reason(message))
+
+    def test_channel_superseded_message_ids_only_coalesces_unreferenced_notifications(self):
+        messages = [
+            {
+                "id": 10,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "old notice",
+                "kind": "notice",
+                "meta": {"mcp_server": "generic-mcp", "mcp_method": "notifications/message", "stream_id": "100-0"},
+            },
+            {
+                "id": 11,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "referenced message",
+                "kind": "notice",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/message",
+                    "stream_id": "101-0",
+                    "message_id": "msg-1",
+                },
+            },
+            {
+                "id": 12,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "new notice",
+                "kind": "notice",
+                "meta": {"mcp_server": "generic-mcp", "mcp_method": "notifications/message", "stream_id": "102-0"},
+            },
+        ]
+        self.assertEqual({10}, claude_any._channel_superseded_message_ids(messages))
+
+    def test_channel_superseded_message_ids_coalesces_empty_external_order_by_local_queue_id(self):
+        messages = [
+            {
+                "id": 20,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "old topic notice",
+                "kind": "channel",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/resource/updated",
+                    "kind": "resource_updated",
+                    "key": "shared/resource",
+                    "stream_id": "100-0",
+                },
+            },
+            {
+                "id": 21,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "different topic notice",
+                "kind": "channel",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/resource/updated",
+                    "kind": "resource_updated",
+                    "key": "other/resource",
+                    "stream_id": "",
+                },
+            },
+            {
+                "id": 22,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "new topic notice",
+                "kind": "channel",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/resource/updated",
+                    "kind": "resource_updated",
+                    "key": "shared/resource",
+                    "stream_id": "",
+                },
+            },
+        ]
+        self.assertEqual({20}, claude_any._channel_superseded_message_ids(messages))
+
+    def test_channel_superseded_message_ids_keeps_nested_unique_reference(self):
+        messages = [
+            {
+                "id": 30,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "old referenced notice",
+                "kind": "channel",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/action",
+                    "stream_id": "",
+                    "mcp_json": {
+                        "params": {
+                            "meta": {
+                                "kind": "action_closed",
+                                "poll_id": "poll-1",
+                            }
+                        }
+                    },
+                },
+            },
+            {
+                "id": 31,
+                "channel": "room",
+                "sender_id": "generic-mcp",
+                "message": "new referenced notice",
+                "kind": "channel",
+                "meta": {
+                    "mcp_server": "generic-mcp",
+                    "mcp_method": "notifications/action",
+                    "stream_id": "",
+                    "mcp_json": {
+                        "params": {
+                            "meta": {
+                                "kind": "action_closed",
+                                "poll_id": "poll-2",
+                            }
+                        }
+                    },
+                },
+            },
+        ]
+        self.assertEqual(set(), claude_any._channel_superseded_message_ids(messages))
 
     def test_channel_direct_llm_worker_uses_router_without_hidden_print_mode(self):
         message = {
@@ -3260,15 +4211,15 @@ class ChannelBridgeTests(unittest.TestCase):
 
     def test_channel_mcp_notifications_ignore_transport_noise(self):
         messages = [
-            {"id": 1, "channel": "ai-net", "sender_id": "ai-net", "message": "ai-net.ws.connected", "meta": {}},
-            {"id": 2, "channel": "ai-net", "sender_id": "robert", "message": "hello Sarah", "meta": {"room_id": "ai-net"}},
+            {"id": 1, "channel": "generic-room", "sender_id": "generic-mcp", "message": "generic.ws.connected", "meta": {}},
+            {"id": 2, "channel": "generic-room", "sender_id": "agent-a", "message": "hello recipient", "meta": {"room_id": "generic-room", "mcp_server": "generic-mcp"}},
         ]
         with mock.patch.object(claude_any, "router_log") as router_log:
             last_id, events = claude_any._channel_mcp_notifications_for_messages(messages, "session-1")
         self.assertEqual(2, last_id)
         self.assertEqual(1, len(events))
         self.assertEqual(2, events[0][0])
-        self.assertIn("hello Sarah", events[0][1]["params"]["content"])
+        self.assertIn("hello recipient", events[0][1]["params"]["content"])
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("channel_mcp_skipped_noise" in item and "transport_connected" in item for item in log_messages))
         self.assertTrue(any("channel_mcp_notification_prepared" in item and "message_id=2" in item for item in log_messages))
@@ -3394,6 +4345,96 @@ class ChannelBridgeTests(unittest.TestCase):
                 claude_any._channel_mcp_update_cursor(12)
                 self.assertEqual(12, claude_any._channel_mcp_ensure_cursor_initialized())
                 self.assertEqual({"last_id": 12}, json.loads(cursor_path.read_text(encoding="utf-8")))
+
+    def test_clear_channel_backlog_advances_cursors_and_drains_direct_queue(self):
+        original_llm = claude_any._CHANNEL_LLM_CURSOR_LAST_ID
+        original_mcp = claude_any._CHANNEL_MCP_CURSOR_LAST_ID
+        original_summary = claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+        with tempfile.TemporaryDirectory(prefix="ca-channel-clear-") as td:
+            root = Path(td)
+            chat_path = root / "chat-messages.jsonl"
+            llm_cursor = root / "channel-llm-cursor.json"
+            clear_floor = root / "channel-llm-clear-floor.json"
+            mcp_cursor = root / "channel-mcp-cursor.json"
+            summary_queue = root / "channel-llm-summary-queue.jsonl"
+            summary_cursor = root / "channel-llm-summary-cursor.json"
+            chat_path.write_text(
+                "\n".join(
+                    json.dumps({"id": i, "channel": "room", "sender_id": "mcp", "message": f"m{i}", "meta": {"mcp_server": "mcp"}})
+                    for i in range(1, 5)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            llm_cursor.write_text('{"last_id":1}\n', encoding="utf-8")
+            mcp_cursor.write_text('{"last_id":2}\n', encoding="utf-8")
+            summary_queue.write_text(
+                json.dumps({"message_id": 3, "summary": "old"}, ensure_ascii=False) + "\n"
+                + json.dumps({"message_id": 5, "summary": "new"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            summary_cursor.write_text('{"last_id":3}\n', encoding="utf-8")
+
+            while not claude_any._CHANNEL_LLM_DIRECT_QUEUE.empty():
+                try:
+                    claude_any._CHANNEL_LLM_DIRECT_QUEUE.get_nowait()
+                    claude_any._CHANNEL_LLM_DIRECT_QUEUE.task_done()
+                except Exception:
+                    break
+            original_inflight = set(claude_any._CHANNEL_LLM_DIRECT_INFLIGHT)
+            original_delivered = set(claude_any._CHANNEL_LLM_DIRECT_DELIVERED)
+            with claude_any._CHANNEL_MCP_LOCK:
+                original_sessions = dict(claude_any._CHANNEL_MCP_SESSIONS)
+                claude_any._CHANNEL_MCP_SESSIONS.clear()
+                claude_any._CHANNEL_MCP_SESSIONS["session-1"] = {"last_id": 1, "outbox": []}
+            try:
+                claude_any._CHANNEL_LLM_CURSOR_LAST_ID = None
+                claude_any._CHANNEL_MCP_CURSOR_LAST_ID = None
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = None
+                claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.clear()
+                claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+                direct_queue = claude_any.queue.Queue()
+                direct_queue.put({"id": 4, "channel": "room"})
+                with (
+                    mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", chat_path),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_CURSOR_PATH", llm_cursor),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_CLEAR_FLOOR_PATH", clear_floor),
+                    mock.patch.object(claude_any, "CHANNEL_MCP_CURSOR_PATH", mcp_cursor),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_QUEUE_PATH", summary_queue),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_SUMMARY_CURSOR_PATH", summary_cursor),
+                    mock.patch.object(claude_any, "_CHANNEL_LLM_DIRECT_QUEUE", direct_queue),
+                ):
+                    stats = claude_any.clear_channel_backlog()
+
+                self.assertEqual(4, stats["chat_tail"])
+                self.assertEqual(5, stats["summary_tail"])
+                self.assertEqual(3, stats["discarded_llm"])
+                self.assertEqual(2, stats["discarded_mcp"])
+                self.assertEqual(2, stats["discarded_summaries"])
+                self.assertEqual(1, stats["direct_queue_drained"])
+                self.assertEqual({"last_id": 4}, json.loads(llm_cursor.read_text(encoding="utf-8")))
+                self.assertEqual(4, json.loads(clear_floor.read_text(encoding="utf-8"))["last_id"])
+                self.assertEqual({"last_id": 4}, json.loads(mcp_cursor.read_text(encoding="utf-8")))
+                self.assertEqual({"last_id": 5}, json.loads(summary_cursor.read_text(encoding="utf-8")))
+                with claude_any._CHANNEL_MCP_LOCK:
+                    self.assertEqual(4, claude_any._CHANNEL_MCP_SESSIONS["session-1"]["last_id"])
+            finally:
+                claude_any._CHANNEL_LLM_CURSOR_LAST_ID = original_llm
+                claude_any._CHANNEL_MCP_CURSOR_LAST_ID = original_mcp
+                claude_any._CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = original_summary
+                claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.clear()
+                claude_any._CHANNEL_LLM_DIRECT_INFLIGHT.update(original_inflight)
+                claude_any._CHANNEL_LLM_DIRECT_DELIVERED.clear()
+                claude_any._CHANNEL_LLM_DIRECT_DELIVERED.update(original_delivered)
+                while not claude_any._CHANNEL_LLM_DIRECT_QUEUE.empty():
+                    try:
+                        claude_any._CHANNEL_LLM_DIRECT_QUEUE.get_nowait()
+                        claude_any._CHANNEL_LLM_DIRECT_QUEUE.task_done()
+                    except Exception:
+                        break
+                with claude_any._CHANNEL_MCP_LOCK:
+                    claude_any._CHANNEL_MCP_SESSIONS.clear()
+                    claude_any._CHANNEL_MCP_SESSIONS.update(original_sessions)
 
     def test_mcp_proxy_notification_maps_to_chat_payload(self):
         payload = claude_any._mcp_proxy_notification_payload(
@@ -3832,6 +4873,118 @@ class ChannelBridgeTests(unittest.TestCase):
                 self.assertTrue(seen_gets)
                 self.assertEqual("sess-proxy", seen_gets[0]["session"])
                 self.assertIn("text/event-stream", str(seen_gets[0]["accept"]))
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_mcp_proxy_streamable_http_waits_for_initialized_before_get(self):
+        lock = threading.Lock()
+        state = {"initialized": False}
+        seen_gets: list[bool] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if payload.get("method") == "initialize":
+                    result = {
+                        "protocolVersion": claude_any.MCP_STREAMABLE_HTTP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "streamable-test", "version": "1"},
+                    }
+                    response = {"jsonrpc": "2.0", "id": payload.get("id"), "result": result}
+                    data = json.dumps(response).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Mcp-Session-Id", "sess-init-order")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if payload.get("method") == "notifications/initialized":
+                    with lock:
+                        state["initialized"] = True
+                data = json.dumps({"jsonrpc": "2.0", "id": payload.get("id"), "result": {}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                with lock:
+                    ready = bool(state["initialized"])
+                seen_gets.append(ready)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                if ready:
+                    self.wfile.write(
+                        b'id: notify-ready\n'
+                        b'event: message\n'
+                        b'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"content":"post initialized notice"}}\n\n'
+                    )
+                    self.wfile.flush()
+                else:
+                    self.wfile.write(b": pre-initialized stream is intentionally quiet\n\n")
+                    self.wfile.flush()
+                time.sleep(0.4)
+
+        def frame(payload: dict[str, object]) -> bytes:
+            body = json.dumps(payload).encode("utf-8")
+            return b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+
+        with tempfile.TemporaryDirectory(prefix="ca-mcp-http-init-order-test-") as td:
+            root = Path(td)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                config = root / "server.json"
+                config.write_text(
+                    json.dumps({"type": "http", "url": f"http://127.0.0.1:{server.server_address[1]}/mcp"}),
+                    encoding="utf-8",
+                )
+                env = os.environ.copy()
+                env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(claude_any.__file__).resolve()),
+                        "mcp-proxy",
+                        "--server-name",
+                        "fake-http",
+                        "--server-config",
+                        str(config),
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+                assert proc.stdin is not None
+                assert proc.stdout is not None
+                assert proc.stderr is not None
+                proc.stdin.write(frame({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+                proc.stdin.flush()
+                time.sleep(0.15)
+                proc.stdin.write(frame({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}))
+                proc.stdin.flush()
+                time.sleep(0.6)
+                proc.stdin.close()
+                stderr = proc.stderr.read()
+                proc.wait(timeout=10)
+                proc.stdout.close()
+                proc.stderr.close()
+                self.assertEqual(0, proc.returncode, stderr.decode("utf-8", errors="replace"))
+                self.assertTrue(seen_gets)
+                self.assertTrue(seen_gets[0], f"first GET opened before notifications/initialized: {seen_gets}")
+                chat_log = root / "config" / "chat-messages.jsonl"
+                self.assertTrue(chat_log.exists())
+                self.assertIn("post initialized notice", chat_log.read_text(encoding="utf-8"))
             finally:
                 server.shutdown()
                 server.server_close()

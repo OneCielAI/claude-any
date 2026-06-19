@@ -186,6 +186,15 @@ long-context preset. For vLLM native mode, the server must still be launched
 with a matching `--max-model-len`; Claude Any cannot raise the server-side
 context limit from the client.
 
+When Claude Code is running through the Claude Any router, including
+non-native providers and Anthropic routed mode, the same preset family can be
+changed from inside the live session. Use `/llm-options` for the current state,
+`/llm-options list` for the available presets, `/llm-<preset>` to apply one
+from the slash-command menu, and `/llm-restore` to return to the options
+captured before the first live change. The changed settings are used by the
+next model request. Direct Claude Native mode keeps Claude Code's own behavior
+unchanged and does not install these router-owned commands.
+
 ## Provider Setup
 
 ### Anthropic
@@ -417,6 +426,44 @@ Links:
 
 - OpenCode Go docs: https://opencode.ai/docs/ko/go/
 - OpenCode Go model catalog: https://opencode.ai/zen/go/v1/models
+
+### Kimi.com Code
+
+Kimi.com Code is available as a routed provider through Kimi's
+Anthropic-compatible coding endpoint:
+
+```text
+https://api.kimi.com/coding
+```
+
+Choose `Kimi.com` in the provider menu, or configure it headlessly:
+
+```sh
+claude-any --ca-provider kimi --ca-model kimi-for-coding
+```
+
+Full one-shot setup:
+
+```sh
+claude-any --ca-provider kimi --ca-base-url https://api.kimi.com/coding --ca-model kimi-for-coding --ca-api-key-env KIMI_API_KEY --ca-no-launch
+```
+
+Kimi requires a Kimi Code API key. Claude Any uses
+`https://api.kimi.com/coding/v1/models` for the live model picker and keeps
+`kimi-for-coding` as the canonical model ID for K2.7 Code. The provider is
+treated as Anthropic-compatible: thinking blocks are preserved, tool use is
+sent through `/v1/messages`, and the documented defaults are applied
+automatically: 262144 context tokens, 32768 max output tokens, and medium
+reasoning effort.
+
+Claude Any does not read or reuse Kimi Code CLI's own login/OAuth state. Kimi's
+third-party Claude Code integration documents the API-key path, so configure a
+Kimi Code API key directly or via `KIMI_API_KEY` / `KIMI_API_KEYS`.
+
+Links:
+
+- Kimi Code Claude Code integration: https://www.kimi.com/code/docs/third-party-tools/other-coding-agents.html
+- Kimi Code CLI configuration: https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/config-files.html
 
 ### vLLM
 
@@ -728,11 +775,11 @@ Common Claude Any setup flags:
 | `--ca-model MODEL` | Set the current provider model. |
 | `--ca-advisor-model MODEL` | Set the Advisor model; use `off` to disable it. |
 | `--ca-base-url URL` | Set the current provider base URL. |
-| `--ca-api-key KEY` | Store the current provider API key directly. Prefer env vars for scripts. |
+| `--ca-api-key KEY` | Store the current provider API key directly. Prefer env vars for scripts. Use `clear`, `unset`, `none`, or `off` to remove stored key(s). |
 | `--ca-api-key-env ENVVAR` | Store the current provider API key from an environment variable. |
 | `--ca-api-keys KEY1,KEY2` | Store multiple current-provider API keys and rotate them per routed upstream request. |
 | `--ca-api-keys-env ENVVAR` | Store multiple current-provider API keys from a comma-, semicolon-, or newline-separated environment variable. |
-| `--ca-set-api-key PROVIDER KEY` | Store a key for a specific provider. |
+| `--ca-set-api-key PROVIDER KEY` | Store a key for a specific provider. Use `clear`, `unset`, `none`, or `off` to remove stored key(s). |
 | `--ca-set-api-key-env PROVIDER ENVVAR` | Store a provider key from an environment variable. |
 | `--ca-set-api-keys PROVIDER KEY1,KEY2` | Store multiple API keys for a specific provider. |
 | `--ca-set-api-keys-env PROVIDER ENVVAR` | Store multiple provider keys from an environment variable. |
@@ -763,6 +810,8 @@ Notes for automation:
   environment variable to `KEY1,KEY2,KEY3` or one key per line.
 - `--ca-api-key` and `--ca-set-api-key` are available for direct key passing,
   but prefer the environment-variable forms in shared scripts and terminals.
+- To remove stored credentials, use the launch-menu API key panel's
+  `Clear stored API key(s)` action or run `claude-any set-api-key PROVIDER clear`.
 - `claude-any stop` is safe to run before scripted tests to remove stale
   router/proxy processes.
 - npm-installed interactive launches check the npm registry for a newer
@@ -892,6 +941,12 @@ Cloudflare tunnels, Tailscale routes, DNS records, or public hostnames. If the
 selected provider is Anthropic and the browser chat should use the router, turn
 on the Anthropic `route_through_router` option and configure an Anthropic API
 key.
+
+Routed sessions also install `/channel-clear`. Use `/channel-clear status` to
+inspect the local channel bridge backlog, and `/channel-clear` to advance the
+local bridge cursors to the current tail without replaying already queued
+external channel messages into the model. This only clears Claude Any's local
+bridge backlog; it does not delete messages from the upstream MCP server.
 
 ## External Web Access
 

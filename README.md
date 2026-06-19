@@ -26,6 +26,20 @@
 
 ## Today's Top 3 Benefits
 
+### 2026-06-17
+
+1. **Channel backlog control** — routed sessions now install `/channel-clear`.
+   Use `/channel-clear status` to inspect pending external channel work, or
+   `/channel-clear` to discard already queued bridge backlog without replaying
+   it into the model. New events arriving after the clear point are still
+   delivered normally.
+2. **Live LLM preset commands** — routed sessions can switch or restore runtime
+   LLM presets from Claude Code with `/llm-options`, `/llm-restore`, and the
+   generated `/llm-*` preset commands.
+3. **Channel stale replay diagnostics** — channel cursors, summary cursors, and
+   direct-worker queues are now surfaced together so operators can distinguish
+   new MCP delivery from stale local bridge backlog.
+
 ### 2026-06-12
 
 1. **Fireworks.ai provider** — Fireworks is now a first-class
@@ -260,6 +274,18 @@ For OpenCode Go:
 claude-any --ca-provider opencode-go --ca-base-url https://opencode.ai/zen/go --ca-model qwen3.6-plus --ca-api-key-env OPENCODE_GO_API_KEY --ca-provider-option endpoint:custom-model=chat --ca-no-launch
 ```
 
+For [Kimi.com Code](https://www.kimi.com/code/docs/third-party-tools/other-coding-agents.html):
+
+```sh
+claude-any --ca-provider kimi --ca-base-url https://api.kimi.com/coding --ca-model kimi-for-coding --ca-api-key-env KIMI_API_KEY --ca-no-launch
+```
+
+Kimi K2.7 Code is exposed through the documented `kimi-for-coding` model ID.
+Claude Any keeps the upstream Anthropic thinking/tool round trip intact and
+applies Kimi's documented 256K context window and 32K output defaults.
+Claude Any does not reuse Kimi Code CLI's own login/OAuth state; use a Kimi
+Code API key directly or via `KIMI_API_KEY` / `KIMI_API_KEYS`.
+
 For [OpenRouter](https://openrouter.ai/) (OpenAI-compatible; access to hundreds of
 models through one key). The default model is the free
 `nvidia/nemotron-3-ultra-550b-a55b:free`; pick any slug from OpenRouter's catalog:
@@ -424,7 +450,9 @@ RPM limit, RPM status display, streaming, web search, web fetch, Claude skills,
 update check, language, Ollama context/options, and normal Claude Code
 passthrough arguments are all configurable without opening the menu. API keys
 can be passed directly with `--ca-api-key`, but `--ca-api-key-env` is safer for
-scripts because the secret does not appear in shell history.
+scripts because the secret does not appear in shell history. To remove stored
+credentials, use the launch-menu `Clear stored API key(s)` action or run
+`claude-any set-api-key PROVIDER clear`.
 
 For high-token routed sessions such as ultracode, or for rate-limited free models
 like OpenRouter `:free`, store multiple keys for the same provider and Claude Any
@@ -621,6 +649,11 @@ steps under that larger model's supervision.
 - API key entry outside the Claude Code chat input.
 - LLM option presets for context window, output tokens, timeout, sampling, and
   native compatibility.
+- Runtime LLM preset slash commands in routed sessions: `/llm-options` lists
+  the active settings, `/llm-<preset>` applies a preset from the Claude Code
+  slash menu, and `/llm-restore` returns to the options captured before the
+  first live change. Direct Claude Native mode keeps Claude Code untouched and
+  does not install these router commands.
 - Compatibility test before launch, including text response, tool use, and
   tool-result round trip checks.
 - Runtime context reporting for vLLM/NIM when `/v1/models` exposes
@@ -1256,6 +1289,7 @@ steps under that larger model's supervision.
 | DeepSeek.com | Router | Calls `https://api.deepseek.com/anthropic`; requires a DeepSeek API key. Claude Any passes that key as `ANTHROPIC_AUTH_TOKEN` and keeps `ANTHROPIC_API_KEY` unset to avoid Claude Code auth conflicts. |
 | OpenCode Zen | Router | Calls `https://opencode.ai/zen`; requires an OpenCode Zen API key. The model picker reads `/v1/models`; Claude/Qwen Zen models use `/v1/messages`, documented chat-compatible Zen models use `/v1/chat/completions`, and unknown model IDs default to `/v1/messages` unless overridden. |
 | OpenCode Go | Router | Calls `https://opencode.ai/zen/go`; requires an OpenCode Go API key. The model picker reads `/v1/models`; Qwen/MiniMax Go models use `/v1/messages`, documented GLM/Kimi/DeepSeek/MiMo Go models use `/v1/chat/completions`, and unknown model IDs default to `/v1/messages` unless overridden. |
+| Kimi.com | Router | Calls `https://api.kimi.com/coding`; requires a Kimi Code API key. The model picker reads `/v1/models`; `kimi-for-coding` is treated as a 256K-context, 32K-output Anthropic-compatible coding model with thinking preserved. |
 | vLLM | Native Anthropic-compatible endpoint | Use a vLLM endpoint that exposes Anthropic-compatible `/v1/messages`; match `--tool-call-parser` to the model family. |
 | NVIDIA hosted | Router | Uses the NVIDIA hosted API Catalog through the Claude Any local router. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | Use the self-hosted NIM Anthropic-compatible endpoint. |
@@ -1312,6 +1346,7 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
 - Ollama local Anthropic compatibility: [Ollama Anthropic API docs](https://docs.ollama.com/api/anthropic-compatibility).
 - OpenCode Zen: [Zen docs](https://opencode.ai/docs/ko/zen), [model catalog](https://opencode.ai/zen/v1/models).
 - OpenCode Go: [Go docs](https://opencode.ai/docs/ko/go/), [model catalog](https://opencode.ai/zen/go/v1/models).
+- Kimi.com Code: [Claude Code integration](https://www.kimi.com/code/docs/third-party-tools/other-coding-agents.html), [Kimi Code config](https://www.kimi.com/code/docs/en/kimi-code-cli/configuration/config-files.html).
 - vLLM: [Claude Code integration](https://docs.vllm.ai/en/latest/serving/integrations/claude_code/), [tool calling](https://docs.vllm.ai/en/stable/features/tool_calling/), [project GitHub](https://github.com/vllm-project/vllm).
 - NVIDIA hosted NIM: [NVIDIA API Catalog](https://build.nvidia.com/), [API Catalog quickstart](https://docs.api.nvidia.com/nim/docs/api-quickstart).
 - Self-hosted NVIDIA NIM: [Claude Code with NIM](https://docs.nvidia.com/nim/large-language-models/latest/ai-assistant-integrations/claude-code.html), [NIM for LLMs getting started](https://docs.nvidia.com/nim/large-language-models/1.14.0/getting-started.html), [NGC personal keys](https://org.ngc.nvidia.com/setup/personal-keys).

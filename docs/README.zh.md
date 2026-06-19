@@ -732,6 +732,7 @@ Hermes 格式模型或部分较旧的 Qwen tool template。
 | DeepSeek.com | Router | 调用 `https://api.deepseek.com/anthropic`。DeepSeek API key 会作为 `ANTHROPIC_AUTH_TOKEN` 传入，并保持 `ANTHROPIC_API_KEY` 未设置以避免 Claude Code 认证冲突。 |
 | OpenCode Zen | Router | 调用 `https://opencode.ai/zen`，需要 OpenCode Zen API key。模型列表来自 `/v1/models`；Claude/Qwen 系列走 `/v1/messages`，chat-compatible 模型走 `/v1/chat/completions`。Responses/Gemini 专用 endpoint 系列会显示 metadata，但暂不自动路由。 |
 | OpenCode Go | Router | 调用 `https://opencode.ai/zen/go`，需要 OpenCode Go API key。模型列表来自 `/v1/models`；Qwen/MiniMax Go 模型走 `/v1/messages`，GLM/Kimi/DeepSeek/MiMo Go 模型走 `/v1/chat/completions`。 |
+| Kimi.com | Router | 调用 `https://api.kimi.com/coding`，需要 Kimi Code API key。模型列表来自 `/v1/models`；`kimi-for-coding` 按保留 thinking 的 Anthropic-compatible 256K context / 32K output coding model 配置。 |
 | vLLM | Native Anthropic-compatible endpoint | 使用 Anthropic 兼容 `/v1/messages` endpoint，并让 `--tool-call-parser` 匹配模型系列。 |
 | NVIDIA hosted | Router | 通过 Claude Any local router 使用 NVIDIA hosted API Catalog。 |
 | self-hosted NIM | Native Anthropic-compatible endpoint | 使用 self-hosted NIM 的 Anthropic 兼容 endpoint。 |

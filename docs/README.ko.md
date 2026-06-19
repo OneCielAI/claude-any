@@ -222,7 +222,9 @@ RPM status 표시, streaming, web search, web fetch, Claude skills, update check
 language, Ollama context/options, provider-specific option, 일반 Claude Code
 passthrough 인자를 모두 메뉴 없이 설정할 수 있습니다. API key는
 `--ca-api-key`로 직접 전달할 수 있지만, 스크립트에서는 shell history에
-비밀값이 남지 않는 `--ca-api-key-env`를 권장합니다.
+비밀값이 남지 않는 `--ca-api-key-env`를 권장합니다. 저장된 키를 지우려면
+런치 메뉴의 `Clear stored API key(s)` 항목을 쓰거나
+`claude-any set-api-key PROVIDER clear`를 실행합니다.
 
 ultracode처럼 고토큰 작업을 routed provider로 실행할 때는 같은 provider 안에
 여러 키를 저장해 upstream 요청마다 라운드로빈할 수 있습니다. 이는 quota/rate
@@ -418,6 +420,10 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 - 프로바이더별 모델 목록과 사용자 모델 직접 입력.
 - Claude Code 채팅 입력 밖에서 API 키 설정.
 - context window, output tokens, timeout, sampling, native compatibility를 위한 LLM 옵션/프리셋.
+- routed 세션에서 실행 중 LLM 프리셋 변경: `/llm-options`로 현재 설정을 보고,
+  `/llm-<preset>`을 Claude Code slash 메뉴에서 선택해 적용하며, `/llm-restore`로
+  첫 live 변경 전 옵션으로 되돌립니다. direct Claude Native 모드에서는 Claude Code
+  원래 동작을 유지하기 위해 이 router 명령들을 설치하지 않습니다.
 - 실행 전 텍스트, `tool_use`, `tool_result` 호환성 테스트.
 - vLLM/NIM의 `/v1/models`가 `max_model_len`을 제공하면 런타임 컨텍스트 표시.
 - SSH와 터미널 작업에 맞춘 콘솔 우선 메뉴.
@@ -840,6 +846,7 @@ Windows 이벤트 로그 리뷰, 바이러스/랜섬웨어 침입 시도 정리,
 | DeepSeek.com | Router | `https://api.deepseek.com/anthropic` 호출. DeepSeek API 키를 `ANTHROPIC_AUTH_TOKEN`으로 전달하고 `ANTHROPIC_API_KEY`는 비워 Claude Code 인증 충돌을 피합니다. |
 | OpenCode Zen | Router | `https://opencode.ai/zen` 호출. OpenCode Zen API 키 필요. 모델 목록은 `/v1/models`에서 가져오며, Claude/Qwen 계열은 `/v1/messages`, chat 호환 모델은 `/v1/chat/completions`로 라우팅합니다. Responses/Gemini 전용 endpoint 계열은 메타데이터로 표시하고 아직 자동 라우팅하지 않습니다. |
 | OpenCode Go | Router | `https://opencode.ai/zen/go` 호출. OpenCode Go API 키 필요. 모델 목록은 `/v1/models`에서 가져오며, Qwen/MiniMax Go 모델은 `/v1/messages`, GLM/Kimi/DeepSeek/MiMo Go 모델은 `/v1/chat/completions`로 라우팅합니다. |
+| Kimi.com | Router | `https://api.kimi.com/coding` 호출. Kimi Code API 키 필요. 모델 목록은 `/v1/models`에서 가져오며, `kimi-for-coding`은 thinking을 보존하는 Anthropic 호환 256K context / 32K output coding 모델로 설정합니다. |
 | vLLM | Native Anthropic-compatible endpoint | Anthropic 호환 `/v1/messages`를 제공하는 vLLM endpoint 사용. 모델 계열에 맞는 `--tool-call-parser` 필요. |
 | NVIDIA hosted | Router | NVIDIA hosted API Catalog를 Claude Any local router로 사용. |
 | self-hosted NIM | Native Anthropic-compatible endpoint | self-hosted NIM Anthropic 호환 endpoint 사용. |
@@ -921,6 +928,12 @@ Cloudflare tunnel, public DNS, Tailscale route는 자동 생성하지 않습니�
 선택된 provider가 Anthropic이고 이 웹 채팅이나 router 기능으로 Anthropic
 트래픽을 처리하려면 Anthropic LLM 옵션의 `route_through_router`를 켜고
 Anthropic API 키를 설정해야 합니다.
+
+routed session에서는 `/channel-clear`도 설치됩니다. `/channel-clear status`로
+로컬 channel bridge backlog를 확인하고, `/channel-clear`로 이미 큐에 쌓인
+외부 channel 메시지를 모델에 재생하지 않고 로컬 bridge cursor만 현재 tail로
+전진시킬 수 있습니다. 이 명령은 Claude Any의 로컬 bridge backlog만 지우며,
+upstream MCP 서버의 메시지는 삭제하지 않습니다.
 
 ## 외부 웹 접속
 

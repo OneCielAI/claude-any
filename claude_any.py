@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import errno
 import getpass
 import hashlib
 import html as html_lib
@@ -129,6 +130,7 @@ SSE_LAST_PATH = CONFIG_DIR / "router-last-sse.json"
 TOOL_CALL_LOG_PATH = CONFIG_DIR / "tool-calls.jsonl"
 RATE_LIMIT_STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
 ROUTER_ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
+CONTEXT_COMPACT_ACTIVITY_PATH = CONFIG_DIR / "context-compact-activity.json"
 CONTEXT_USAGE_PATH = CONFIG_DIR / "context-usage.json"
 OLLAMA_MODEL_CATALOG_PATH = CONFIG_DIR / "ollama-model-catalog.json"
 CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
@@ -146,6 +148,8 @@ CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
 NATIVE_MCP_CONFIG = CONFIG_DIR / "native-mcp.json"
 CHANNEL_MCP_CURSOR_PATH = CONFIG_DIR / "channel-mcp-cursor.json"
 CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
+CHANNEL_LLM_CLEAR_FLOOR_PATH = CONFIG_DIR / "channel-llm-clear-floor.json"
+CHANNEL_LLM_LAUNCH_GUARD_PATH = CONFIG_DIR / "channel-llm-launch-guard.json"
 CHANNEL_LLM_SUMMARY_QUEUE_PATH = CONFIG_DIR / "channel-llm-summary-queue.jsonl"
 CHANNEL_LLM_SUMMARY_CURSOR_PATH = CONFIG_DIR / "channel-llm-summary-cursor.json"
 CHANNEL_PROBE_CACHE_PATH = CONFIG_DIR / "channel-probe-cache.json"
@@ -181,6 +185,8 @@ ANTHROPIC_LIMITED_ACCESS_MODEL_IDS: tuple[str, ...] = (
 )
 OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen"
 OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go"
+KIMI_CODING_BASE_URL = "https://api.kimi.com/coding"
+KIMI_DEFAULT_MODEL = "kimi-for-coding"
 FIREWORKS_INFERENCE_BASE_URL = "https://api.fireworks.ai/inference"
 FIREWORKS_API_BASE_URL = "https://api.fireworks.ai"
 FIREWORKS_DEFAULT_ACCOUNT_ID = "fireworks"
@@ -209,6 +215,12 @@ PROVIDER_ALIASES = {
     "opencode.go": "opencode-go",
     "opencode_go": "opencode-go",
     "opencodego": "opencode-go",
+    "kimi": "kimi",
+    "kimi.com": "kimi",
+    "kimi-code": "kimi",
+    "kimi-coding": "kimi",
+    "moonshot": "kimi",
+    "moonshot-kimi": "kimi",
     "vllm": "vllm",
     "vllm-local": "vllm",
     "lm-studio": "lm-studio",
@@ -237,6 +249,7 @@ PROVIDER_LABELS = {
     "deepseek": "DeepSeek.com",
     "opencode": "OpenCode Zen",
     "opencode-go": "OpenCode Go",
+    "kimi": "Kimi.com",
     "vllm": "vLLM",
     "lm-studio": "LM Studio",
     "nvidia-hosted": "Nvidia Hosted",
@@ -452,6 +465,8 @@ SSE_TRACE_MAX_BYTES = 2 * 1024 * 1024
 SSE_TRACE_EVENT_LIMIT = 240
 SSE_TRACE_PAYLOAD_LIMIT = 4_000
 CHAT_MESSAGES_MAX_BYTES = 20_000_000
+CHAT_MESSAGE_DEDUPE_SCAN_LIMIT = 500
+CHAT_MESSAGE_FALLBACK_DEDUPE_TTL_SECONDS = 30.0
 DEFAULT_REQUEST_TIMEOUT_MS = 300000
 _LOG_LEVEL_CACHE: dict[str, Any] = {"value": None, "checked_at": 0.0, "file_mtime": 0.0}
 _RATE_LIMIT_LOCK = threading.Lock()
@@ -477,6 +492,7 @@ _CHANNEL_LLM_DIRECT_DELIVERED: set[int] = set()
 _CHANNEL_LLM_DIRECT_QUEUE: queue.Queue[dict[str, Any]] = queue.Queue()
 _CHANNEL_LLM_DIRECT_WORKERS_STARTED = 0
 _CHANNEL_STDIN_WAKE_LOCK = threading.Lock()
+_CHANNEL_STDIN_INJECT_LOCK = threading.Lock()
 _CHANNEL_STDIN_WAKE_DELIVERED: set[int] = set()
 _NATIVE_CHANNEL_NOTIFICATION_METHOD = "notifications/claude/channel"
 BUILTIN_CHANNEL_SPEC = "server:claude-any-router"
@@ -556,11 +572,16 @@ DEFAULT_BLOCKED_TOOLS_NON_ANTHROPIC: tuple[str, ...] = (
     "SendMessageTool",
     "ScheduleWakeup",
     "WaitForMcpServers",
+    "WebSearch",
+    "web_search",
+    "WebFetch",
+    "web_fetch",
     "RemoteTrigger",
     "PushNotification",
 )
-NON_ANTHROPIC_COMPAT_PROMPT = (
-    "You are running inside Claude Code through a non-Anthropic model provider. "
+CLAUDE_SERVER_SIDE_WEB_TOOLS: tuple[str, ...] = ("WebSearch", "WebFetch")
+ROUTED_COMPAT_PROMPT = (
+    "You are running inside Claude Code through the claude-any router. "
     "Do not stop after announcing what you plan to do. When the user asks you to create, edit, or run code, "
     "immediately use the available Claude Code tools such as Write, Edit, Read, and Bash as appropriate, "
     "except while Claude Code is in Plan Mode. In Plan Mode, first explore/read as needed, write or update the plan file named "
@@ -583,6 +604,7 @@ NON_ANTHROPIC_COMPAT_PROMPT = (
     "If an MCP server appears disconnected, use only tools present in the current tool list, retry ordinary MCP tools when available, or report the concrete connection state. "
     "Never write pseudo tool calls, partial JSON, or markdown code fences when a real Claude Code tool call is required."
 )
+NON_ANTHROPIC_COMPAT_PROMPT = ROUTED_COMPAT_PROMPT
 LANGUAGES = {
     "en": "English",
     "ko": "한국어",
@@ -1061,13 +1083,22 @@ def ollama_context_model_matches(current_model: str, cached_model: str | None) -
 def sync_ollama_library_context_limit(provider: str, pcfg: dict[str, Any], model_id: str) -> list[str]:
     if provider not in ("ollama", "ollama-cloud"):
         return []
-    catalog = load_ollama_model_catalog()
-    if ollama_catalog_is_stale(catalog):
-        try:
-            catalog = refresh_ollama_model_catalog(include_contexts=False)
-        except Exception as exc:
-            router_log("WARN", f"ollama catalog: api refresh failed: {exc}")
-    limit, matched_model, url = ollama_catalog_context_for_model(model_id)
+    api_specs: dict[str, Any] = {}
+    try:
+        api_specs = fetch_ollama_api_model_specs(provider, pcfg, model_id)
+    except Exception as exc:
+        router_log("DEBUG", f"{provider} /api/show model specs unavailable for {model_id}: {type(exc).__name__}: {exc}")
+    limit = positive_int(api_specs.get("max_model_len"))
+    matched_model = normalize_model_id(provider, model_id) if limit else ""
+    url = "/api/show" if limit else ""
+    if not limit:
+        catalog = load_ollama_model_catalog()
+        if ollama_catalog_is_stale(catalog):
+            try:
+                catalog = refresh_ollama_model_catalog(include_contexts=False)
+            except Exception as exc:
+                router_log("WARN", f"ollama catalog: api refresh failed: {exc}")
+        limit, matched_model, url = ollama_catalog_context_for_model(model_id)
     if not limit:
         limit, matched_model, url = fetch_ollama_library_context_limit(model_id)
         if limit:
@@ -1487,6 +1518,50 @@ def _validate_and_fix_tool_input(tool_name: str, input_dict: dict[str, Any]) -> 
         router_log("WARN", f"tool_guard: {matched_name}: injected missing required fields: {', '.join(injected)}")
 
     return fixed
+
+
+def _missing_required_tool_fields(tool_name: str, input_dict: dict[str, Any], source_body: dict[str, Any] | None = None) -> list[str]:
+    schema = tool_schema_in_body(source_body, tool_name) if isinstance(source_body, dict) else None
+    if schema is None:
+        schema = _lookup_tool_schema(tool_name)
+    if not isinstance(schema, dict):
+        return []
+    required = schema.get("required") or []
+    if not isinstance(required, list):
+        return []
+    missing: list[str] = []
+    for field in required:
+        if not isinstance(field, str):
+            continue
+        if field not in input_dict or _is_empty_value(input_dict.get(field)):
+            missing.append(field)
+    return missing
+
+
+def should_drop_emitted_tool_call(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    raw_name: str = "",
+    source_body: dict[str, Any] | None = None,
+) -> bool:
+    missing = _missing_required_tool_fields(tool_name, tool_input, source_body)
+    if not missing:
+        return False
+    router_log(
+        "WARN",
+        f"dropped emitted tool call with missing required fields raw_name={raw_name or tool_name!r} "
+        f"matched_name={tool_name!r} fields={','.join(missing)}",
+    )
+    append_tool_call_log(
+        "dropped_tool_call_missing_required",
+        {
+            "raw_name": raw_name or tool_name,
+            "matched_name": tool_name,
+            "missing_required": missing,
+            "emitted_input": tool_input,
+        },
+    )
+    return True
 
 
 MCP_NOTIFICATION_WAIT_TOOL_NAMES = {
@@ -1954,7 +2029,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "api_key": "",
             "current_model": "claude-sonnet-4-6",
             "advisor_model": "",
-            "custom_models": ["claude-sonnet-4-6"],
+            "custom_models": ["claude-sonnet-4-6", "qwen3.6-plus-free"],
             "native_compat": True,
             "context_window": 200000,
             "max_output_tokens": 8192,
@@ -1985,6 +2060,25 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "subagent_model": "qwen3.6-plus",
             "model_endpoints": {},
         },
+        "kimi": {
+            "base_url": KIMI_CODING_BASE_URL,
+            "api_key": "",
+            "current_model": KIMI_DEFAULT_MODEL,
+            "advisor_model": "",
+            "custom_models": [KIMI_DEFAULT_MODEL],
+            "native_compat": True,
+            "preserve_anthropic_thinking": True,
+            "claude_code_supported_capabilities": ["effort", "thinking"],
+            "context_window": 262144,
+            "max_output_tokens": 32768,
+            "context_reserve_tokens": 32768,
+            "request_timeout_ms": 600000,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
+            "effort_level": "medium",
+            "haiku_model": KIMI_DEFAULT_MODEL,
+            "subagent_model": KIMI_DEFAULT_MODEL,
+        },
         "vllm": {
             "base_url": "http://127.0.0.1:8000",
             "api_key": "dummy",
@@ -1992,6 +2086,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "advisor_model": "",
             "custom_models": ["my-model"],
             "native_compat": True,
+            "supports_tool_choice": False,
             "context_window": 32768,
             "max_output_tokens": 4096,
             "temperature": 0.7,
@@ -2222,6 +2317,37 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
             pcfg["context_window"] = 1048576
         migrations[marker] = True
 
+    marker = "opencode_zen_qwen36_plus_free_model_20260614"
+    if not migrations.get(marker):
+        providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        pcfg = providers.get("opencode")
+        if isinstance(pcfg, dict):
+            custom = pcfg.get("custom_models")
+            if not isinstance(custom, list):
+                custom = []
+                pcfg["custom_models"] = custom
+            normalized_custom = {normalize_model_id("opencode", str(mid)) for mid in custom if str(mid).strip()}
+            if "qwen3.6-plus-free" not in normalized_custom:
+                custom.append("qwen3.6-plus-free")
+        migrations[marker] = True
+
+    marker = "opencode_qwen36_plus_parameters_20260614"
+    if not migrations.get(marker):
+        providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        for provider_name in OPENCODE_PROVIDER_NAMES:
+            pcfg = providers.get(provider_name)
+            if not isinstance(pcfg, dict):
+                continue
+            if not is_qwen36_plus_model_id(str(pcfg.get("current_model") or "")):
+                continue
+            if (positive_int(pcfg.get("context_window")) or 0) < 1048576:
+                pcfg["context_window"] = 1048576
+            if (positive_int(pcfg.get("context_reserve_tokens")) or 0) < 16384:
+                pcfg["context_reserve_tokens"] = 16384
+            if (positive_int(pcfg.get("max_output_tokens")) or 0) < 8192:
+                pcfg["max_output_tokens"] = 8192
+        migrations[marker] = True
+
     marker = "anthropic_drop_preset_output_tokens_20260610"
     if not migrations.get(marker):
         # Older anthropic presets force-wrote max_output_tokens (2048/4096/6144/8192),
@@ -2354,6 +2480,18 @@ def unique_model_ids(provider: str, ids: list[str]) -> list[str]:
 
 def normalize_model_id(provider: str, model_id: str) -> str:
     model_id = str(model_id or "").strip() if provider == "deepseek" else strip_claude_context_suffix(model_id).strip()
+    if provider == "kimi":
+        lowered = model_id.lower().replace("_", "-").strip()
+        if lowered in (
+            "kimi-code/kimi-for-coding",
+            "kimi/kimi-for-coding",
+            "moonshot/kimi-for-coding",
+            "kimi-k2.7-code",
+            "kimi-k2.7-coding",
+            "k2.7-code",
+            "k2.7-coding",
+        ):
+            return KIMI_DEFAULT_MODEL
     if provider == "ollama-cloud" and model_id.endswith(":cloud"):
         return model_id[:-6]
     return model_id
@@ -2436,21 +2574,32 @@ def inbound_query_has_beta_flag(request_path: str) -> bool:
     return False
 
 
-def upstream_messages_query(pcfg: dict[str, Any], request_path: str) -> str:
+def upstream_messages_query(pcfg: dict[str, Any], request_path: str, provider: str | None = None) -> str:
     """Query string to append to the upstream /v1/messages URL.
 
-    A configured ``force_query_string`` (testing override) wins, letting an
+    A configured ``force_query_string`` (operator override) wins, letting an
     operator inject an arbitrary raw query (e.g. "beta=true") from the options
-    screen. Otherwise the inbound ``beta=true`` flag is propagated so beta
-    features like the context-1m long-context request reach the upstream
-    unchanged (do_POST parses only the path and drops the original query).
+    screen. Otherwise the inbound Claude Code ``beta=true`` flag is propagated
+    only for the Anthropic provider. Non-Anthropic providers default to an empty
+    query string unless the operator explicitly configures one.
     """
     forced = str(pcfg.get("force_query_string") or "").strip().lstrip("?").strip()
     if forced:
         return forced
-    if inbound_query_has_beta_flag(request_path):
+    provider_name = str(provider or pcfg.get("provider") or "").strip()
+    provider_key = normalize_provider(provider_name) if provider_name else ""
+    if provider_key == "anthropic" and inbound_query_has_beta_flag(request_path):
         return "beta=true"
     return ""
+
+
+def upstream_query_string_status(provider: str, pcfg: dict[str, Any]) -> str:
+    forced = str(pcfg.get("force_query_string") or "").strip()
+    if forced:
+        return forced
+    if normalize_provider(str(provider)) == "anthropic":
+        return "auto (beta=true when routed)"
+    return "empty"
 
 
 def read_env_file(path: Path) -> dict[str, str]:
@@ -2471,6 +2620,13 @@ def meaningful_key_value(value: Any) -> bool:
         return False
     text = str(value).strip()
     return bool(text and text not in ("dummy", "not-used", "ollama"))
+
+
+API_KEY_CLEAR_TOKENS = {"clear", "unset", "none", "null", "off", "delete", "remove"}
+
+
+def api_key_clear_requested(value: Any) -> bool:
+    return str(value or "").strip().lower() in API_KEY_CLEAR_TOKENS
 
 
 def parse_api_key_list(value: Any) -> list[str]:
@@ -2835,8 +2991,10 @@ def install_tool_guard_hooks() -> None:
 
 
 STATUSLINE_SCRIPT = r'''#!/usr/bin/env python3
+import hashlib
 import json
 import os
+import re
 import sys
 import time
 from pathlib import Path
@@ -2860,7 +3018,11 @@ CONFIG_DIR = default_config_dir()
 CONFIG_PATH = CONFIG_DIR / "config.json"
 STATE_PATH = CONFIG_DIR / "rate-limit-state.json"
 ACTIVITY_PATH = CONFIG_DIR / "router-activity.json"
+COMPACT_ACTIVITY_PATH = CONFIG_DIR / "context-compact-activity.json"
 CONTEXT_PATH = CONFIG_DIR / "context-usage.json"
+CHAT_MESSAGES_PATH = CONFIG_DIR / "chat-messages.jsonl"
+CHANNEL_LLM_CURSOR_PATH = CONFIG_DIR / "channel-llm-cursor.json"
+CHANNEL_LLM_CLEAR_FLOOR_PATH = CONFIG_DIR / "channel-llm-clear-floor.json"
 PALETTE = (203, 209, 215, 221, 229, 187, 151, 116, 111, 147, 183, 219)
 
 
@@ -2870,6 +3032,92 @@ def load_json(path, default):
         return value if isinstance(value, type(default)) else default
     except Exception:
         return default
+
+
+def _status_meaningful_key(value):
+    text = str(value or "").strip()
+    if not text:
+        return False
+    return text.lower() not in {"none", "null", "unset", "missing", "not set"}
+
+
+def _status_parse_api_key_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        items = re.split(r"[\r\n,;]+", value)
+    elif isinstance(value, (list, tuple, set)):
+        items = []
+        for item in value:
+            items.extend(_status_parse_api_key_list(item))
+    else:
+        items = [value]
+    keys = []
+    seen = set()
+    for item in items:
+        key = str(item or "").strip()
+        if not _status_meaningful_key(key) or key in seen:
+            continue
+        keys.append(key)
+        seen.add(key)
+    return keys
+
+
+def _status_provider_api_keys(pcfg):
+    keys = []
+    if isinstance(pcfg, dict):
+        keys.extend(_status_parse_api_key_list(pcfg.get("api_keys")))
+        keys.extend(_status_parse_api_key_list(pcfg.get("api_key")))
+    out = []
+    seen = set()
+    for key in keys:
+        if key in seen:
+            continue
+        out.append(key)
+        seen.add(key)
+    return out
+
+
+def _status_provider_rotation_name(provider, pcfg):
+    base = str((pcfg or {}).get("base_url") or "").rstrip("/")
+    return f"{provider}:{base}" if base else f"{provider}:"
+
+
+def _status_key_cooldown_summary(provider, pcfg, state, now):
+    keys = _status_provider_api_keys(pcfg)
+    if len(keys) <= 1 or not isinstance(state, dict):
+        return ""
+    prefix = _status_provider_rotation_name(provider, pcfg) + ":__key__:"
+    live = 0
+    next_until = 0.0
+    cooling = 0
+    for key in keys:
+        digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()[:12]
+        entry = state.get(prefix + digest)
+        until = 0.0
+        if isinstance(entry, dict):
+            try:
+                until = float(entry.get("cooldown_until") or 0.0)
+            except Exception:
+                until = 0.0
+        if until > now:
+            cooling += 1
+            next_until = until if not next_until else min(next_until, until)
+        else:
+            live += 1
+    if not cooling:
+        return f"RL {live}/{len(keys)}"
+    wait_s = max(0.0, next_until - now) if next_until else 0.0
+    if wait_s >= 3600:
+        wait_text = f"{wait_s / 3600.0:.1f}h"
+    elif wait_s >= 60:
+        wait_text = f"{wait_s / 60.0:.0f}m"
+    else:
+        wait_text = f"{wait_s:.0f}s"
+    text = f"RL {live}/{len(keys)} next {wait_text}"
+    if live == 0 and len(keys) > 1:
+        text = f"RL 0/{len(keys)} next {wait_text}"
+    return text
 
 
 def color(text):
@@ -2966,6 +3214,110 @@ def session_context_status_text(session):
     return f"ctx {tokens:,} tok"
 
 
+def _status_as_string_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return []
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return _status_as_string_list(parsed)
+        except Exception:
+            pass
+        return [text]
+    if isinstance(value, (list, tuple, set)):
+        out = []
+        for item in value:
+            out.extend(_status_as_string_list(item))
+        return out
+    return [str(value).strip()] if str(value).strip() else []
+
+
+def _status_channel_message_has_external_provenance(message):
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    if meta.get("llm_direct_pending") or meta.get("llm_direct_delivered"):
+        return True
+    for key in (
+        "mcp_server",
+        "mcp_method",
+        "mcp_json",
+        "sse_source",
+        "sse_event",
+        "sse_json",
+        "stream_id",
+        "sse_id",
+        "cursor",
+        "event_id",
+        "message_id",
+        "source_message_id",
+        "rpc_id",
+    ):
+        value = meta.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
+
+
+def _status_channel_message_skip_reason(message):
+    visibility = str(message.get("visibility") or "user").strip().lower()
+    if visibility in {"hidden", "internal", "transport", "control", "system"}:
+        return f"visibility_{visibility}"
+    recipients = {item.strip().lower() for item in _status_as_string_list(message.get("recipients"))}
+    if "internal" in recipients:
+        return "recipient_internal"
+    delivery = _status_as_string_list(message.get("delivery"))
+    if delivery:
+        normalized_delivery = {item.strip().lower() for item in delivery}
+        if not ({"all", "*", "llm"} & normalized_delivery):
+            return "delivery_not_llm"
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or meta.get("event") or meta.get("status") or "").strip().lower()
+    if meta_kind in {"connection", "connected", "disconnect", "disconnected", "endpoint", "heartbeat", "initialized", "init", "keepalive", "ping", "pong", "ready", "status", "system"}:
+        return meta_kind
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip().lower()
+    kind = str(message.get("kind") or "").strip().lower()
+    if not body:
+        return "empty"
+    if kind in {"connection", "connected", "heartbeat", "keepalive"}:
+        return kind
+    if re.fullmatch(r"[a-z0-9_.:-]{1,80}\.(ws|sse)\.connected", body):
+        return "transport_connected"
+    if meta.get("llm_direct_delivered"):
+        return "llm_direct_delivered"
+    if not delivery and not _status_channel_message_has_external_provenance(message):
+        return "unscoped_channel_message"
+    return ""
+
+
+def channel_pending_status_count():
+    cursor = load_json(CHANNEL_LLM_CURSOR_PATH, {})
+    last_id = _as_int(cursor.get("last_id") if isinstance(cursor, dict) else 0)
+    count = 0
+    try:
+        if not CHAT_MESSAGES_PATH.exists():
+            return 0
+        with CHAT_MESSAGES_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                    item_id = int(item.get("id") or 0)
+                except Exception:
+                    continue
+                if item_id <= last_id:
+                    continue
+                if _status_channel_message_skip_reason(item):
+                    continue
+                count += 1
+                if count >= 999:
+                    return count
+    except Exception:
+        return 0
+    return count
+
+
 def is_claude_any_session(session):
     if os.environ.get("CLAUDE_ANY_PROVIDER") or os.environ.get("CLAUDE_ANY_MODEL_ALIAS"):
         return True
@@ -3014,6 +3366,7 @@ def main():
         rpm = 0
     state = load_json(STATE_PATH, {})
     activity = load_json(ACTIVITY_PATH, {})
+    compact_activity = load_json(COMPACT_ACTIVITY_PATH, {})
     context = load_json(CONTEXT_PATH, {})
     now = time.time()
     key = f"{provider}:__global__" if provider else ""
@@ -3023,7 +3376,7 @@ def main():
         entry = state.get(legacy_key) if legacy_key else None
     if not isinstance(entry, dict):
         prefix = f"{provider}:"
-        candidates = [(k, v) for k, v in state.items() if isinstance(k, str) and k.startswith(prefix) and isinstance(v, dict)]
+        candidates = [(k, v) for k, v in state.items() if isinstance(k, str) and k.startswith(prefix) and ":__key__:" not in k and isinstance(v, dict)]
         if not candidates:
             candidates = [(k, v) for k, v in state.items() if isinstance(v, dict)]
         if candidates:
@@ -3049,6 +3402,10 @@ def main():
     server_remaining = entry.get("server_remaining") if isinstance(entry, dict) else None
     server_reset_seconds = entry.get("server_reset_seconds") if isinstance(entry, dict) else None
     server_rpm = entry.get("server_rpm") if isinstance(entry, dict) else None
+    server_max_concurrent = entry.get("server_max_concurrent") if isinstance(entry, dict) else None
+    server_active = entry.get("server_active") if isinstance(entry, dict) else None
+    server_queue_limit = entry.get("server_queue_limit") if isinstance(entry, dict) else None
+    server_queued = entry.get("server_queued") if isinstance(entry, dict) else None
     used = len([ts for ts in (timestamps or []) if isinstance(ts, (int, float)) and 0.0 <= now - float(ts) < 60.0])
     model_name = ((session.get("model") or {}).get("display_name") if isinstance(session.get("model"), dict) else None) or model or "model"
     current_dir = ((session.get("workspace") or {}).get("current_dir") if isinstance(session.get("workspace"), dict) else None) or session.get("cwd") or ""
@@ -3057,13 +3414,21 @@ def main():
     if dir_name:
         left += f" {dir_name}"
     status_parts = []
-    ctx_text = session_context_status_text(session) or context_status_text(context, provider, model)
+    router_ctx_text = context_status_text(context, provider, model)
+    session_ctx_text = session_context_status_text(session)
+    ctx_text = router_ctx_text or session_ctx_text
     if ctx_text:
         status_parts.append(gray(ctx_text))
+    channel_pending = channel_pending_status_count()
+    if channel_pending > 0:
+        status_parts.append(color(f"channel queue {channel_pending}"))
     if router_debug_external:
         status_parts.append(color("debug external"))
     if rpm_status:
-        if rpm > 0:
+        key_rl_text = _status_key_cooldown_summary(provider, pcfg, state, now)
+        if key_rl_text:
+            rpm_text = key_rl_text
+        elif rpm > 0:
             shown_limit = display_capacity(rpm)
             shown_used = min(used, shown_limit)
             rpm_text = f"RPM used: {shown_used}/{shown_limit}"
@@ -3082,6 +3447,20 @@ def main():
                 pass
             if parts:
                 rpm_text += " | server " + ", ".join(parts)
+        if server_max_concurrent is not None or server_active is not None:
+            try:
+                active_text = "?" if server_active is None else str(int(server_active))
+                max_text = "?" if server_max_concurrent is None else str(int(server_max_concurrent))
+                rpm_text += f" | conc {active_text}/{max_text}"
+            except Exception:
+                pass
+        if server_queue_limit is not None or server_queued is not None:
+            try:
+                queued_text = "?" if server_queued is None else str(int(server_queued))
+                limit_text = "?" if server_queue_limit is None else str(int(server_queue_limit))
+                rpm_text += f" | q {queued_text}/{limit_text}"
+            except Exception:
+                pass
         if penalty_until > now:
             rpm_text += f" | wait {max(0.0, penalty_until - now):.0f}s"
         elif last_wait >= 0.5 and 0.0 <= now - updated_at < 60.0:
@@ -3124,6 +3503,29 @@ def main():
                 activity_text = color(f"{event} {age:.0f}s")
     if activity_text:
         status_parts.append(activity_text)
+    compact_text = ""
+    if isinstance(compact_activity, dict):
+        try:
+            compact_age = now - float(compact_activity.get("updated_at") or 0)
+        except Exception:
+            compact_age = 999999
+        if 0 <= compact_age < 180:
+            try:
+                compact_chunks = int(compact_activity.get("chunks") or 0)
+            except Exception:
+                compact_chunks = 0
+            try:
+                parallel_sessions = int(compact_activity.get("parallel_sessions") or 1)
+            except Exception:
+                parallel_sessions = 1
+            if compact_chunks > 0:
+                compact_text = color(f"compact {compact_chunks:,} chunks")
+                if parallel_sessions > 1:
+                    compact_text += " " + color(f"parallel {parallel_sessions:,}/{compact_chunks:,}")
+            elif str(compact_activity.get("event") or "") == "compact":
+                compact_text = color("compact")
+    if compact_text:
+        status_parts.append(compact_text)
     status_text = " | ".join(status_parts)
     if status_text:
         print(f"{left} | {status_text}")
@@ -3225,6 +3627,42 @@ Do not run tools, shell commands, file searches, config scans, or environment ch
 This session bypasses the claude-any router. Launch a non-native provider or enable Anthropic routed mode to use /router-debug.
 """
 
+LLM_OPTIONS_SLASH_COMMAND = """---
+description: Show or change claude-any live LLM options
+argument-hint: [status|list|restore|preset-id]
+---
+
+CLAUDE_ANY_LIVE_LLM_OPTIONS
+
+Value: $ARGUMENTS
+
+Show or change the live claude-any LLM preset for this routed session. With no argument, show status and available presets. Use `restore` to return to the options captured before the first live preset change.
+"""
+
+LLM_RESTORE_SLASH_COMMAND = """---
+description: Restore claude-any live LLM options
+argument-hint: [ignored]
+---
+
+CLAUDE_ANY_LIVE_LLM_OPTIONS
+
+Value: restore
+
+Restore the LLM options captured before the first live preset change in this routed session.
+"""
+
+CHANNEL_CLEAR_SLASH_COMMAND = """---
+description: Discard pending claude-any external channel backlog
+argument-hint: [all|status]
+---
+
+CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG
+
+Value: $ARGUMENTS
+
+Discard pending claude-any external channel backlog without sending it to the model. Use `status` to show pending counts without clearing.
+"""
+
 CLAUDE_ANY_ADVISOR_COMMAND_MARKERS = (
     "CLAUDE_ANY_ADVISOR_CALL",
     "Run the selected claude-any Advisor Model",
@@ -3234,6 +3672,15 @@ CLAUDE_ANY_ROUTER_DEBUG_COMMAND_MARKERS = (
     "CLAUDE_ANY_ROUTER_DEBUG_ACCESS",
     "Toggle claude-any router external debug access",
     "claude-any router debug controls are unavailable in direct Claude Native mode",
+)
+CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS = (
+    "CLAUDE_ANY_LIVE_LLM_OPTIONS",
+    "Show or change claude-any live LLM options",
+    "Restore claude-any live LLM options",
+)
+CLAUDE_ANY_CHANNEL_CLEAR_COMMAND_MARKERS = (
+    "CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG",
+    "Discard pending claude-any external channel backlog",
 )
 
 
@@ -3261,7 +3708,12 @@ def install_claude_any_slash_commands(include_advisor: bool = True) -> None:
         CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
         commands = {
             "router-debug.md": ROUTER_DEBUG_SLASH_COMMAND,
+            "llm-options.md": LLM_OPTIONS_SLASH_COMMAND,
+            "llm-restore.md": LLM_RESTORE_SLASH_COMMAND,
+            "channel-clear.md": CHANNEL_CLEAR_SLASH_COMMAND,
         }
+        for preset_id in LLM_PRESETS:
+            commands[f"{llm_preset_command_name(preset_id)}.md"] = llm_preset_slash_command(preset_id)
         if include_advisor:
             commands["advisor.md"] = ADVISOR_SLASH_COMMAND
         else:
@@ -3282,6 +3734,10 @@ def install_claude_any_slash_commands(include_advisor: bool = True) -> None:
                     CLAUDE_ANY_ADVISOR_COMMAND_MARKERS
                     if name == "advisor.md"
                     else CLAUDE_ANY_ROUTER_DEBUG_COMMAND_MARKERS
+                    if name == "router-debug.md"
+                    else CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS
+                    if name == "llm-options.md" or name == "llm-restore.md" or name.startswith("llm-")
+                    else CLAUDE_ANY_CHANNEL_CLEAR_COMMAND_MARKERS
                 )
                 if existing == content:
                     continue
@@ -3303,12 +3759,20 @@ def disable_claude_any_slash_commands_for_native() -> None:
         commands = {
             "advisor.md": CLAUDE_ANY_ADVISOR_COMMAND_MARKERS,
             "router-debug.md": CLAUDE_ANY_ROUTER_DEBUG_COMMAND_MARKERS,
+            "llm-options.md": CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS,
+            "llm-restore.md": CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS,
+            "channel-clear.md": CLAUDE_ANY_CHANNEL_CLEAR_COMMAND_MARKERS,
         }
         for name, markers in commands.items():
             path = CLAUDE_COMMANDS_DIR / name
             if not path.exists() or not command_file_is_claude_any_owned(path, markers):
                 continue
             path.unlink()
+        for path in CLAUDE_COMMANDS_DIR.glob("llm-*.md"):
+            if path.name in commands:
+                continue
+            if command_file_is_claude_any_owned(path, CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS):
+                path.unlink()
     except Exception as exc:
         print(f"Claude Any warning: could not remove claude-any slash commands for native mode ({type(exc).__name__}: {exc}).", flush=True)
 
@@ -3512,6 +3976,20 @@ def _match_available_tool_name(name: str, available: set[str]) -> str | None:
     for candidate in sorted(available):
         if candidate.lower() == low:
             return candidate
+    # Non-native models often change only casing/separators for built-in tool
+    # names, e.g. ``WebSearch`` -> ``web_search``. Normalize punctuation for
+    # non-MCP names only; MCP server/tool segments have stricter semantics.
+    if not name.startswith("mcp__"):
+        normalized = re.sub(r"[^a-z0-9]+", "", low)
+        if normalized:
+            matches = [
+                candidate
+                for candidate in sorted(available)
+                if not candidate.startswith("mcp__")
+                and re.sub(r"[^a-z0-9]+", "", candidate.lower()) == normalized
+            ]
+            if len(matches) == 1:
+                return matches[0]
     mcp_key = _mcp_tool_name_server_normalized_key(name)
     if mcp_key is not None:
         matches = [
@@ -3761,6 +4239,8 @@ def provider_supports_tool_choice(provider: str, pcfg: dict[str, Any], body: dic
     configured = pcfg.get("supports_tool_choice")
     if configured is not None:
         return bool(configured)
+    if provider == "vllm":
+        return False
     if provider != "deepseek":
         return True
     model_hint = strip_claude_context_suffix(str(body.get("model") or pcfg.get("current_model") or "")).lower()
@@ -3769,6 +4249,15 @@ def provider_supports_tool_choice(provider: str, pcfg: dict[str, Any], body: dic
     # default, so treat forced tool_choice as unsupported for V4 models unless
     # the user explicitly overrides supports_tool_choice in provider options.
     return "deepseek-v4" not in model_hint
+
+
+def provider_tool_choice_status(provider: str, pcfg: dict[str, Any]) -> str:
+    configured = pcfg.get("supports_tool_choice")
+    if configured is not None:
+        return "on" if bool(configured) else "off"
+    model = current_upstream_model_id(provider, pcfg) if provider in PROVIDER_LABELS else str(pcfg.get("current_model") or "")
+    default = provider_supports_tool_choice(provider, pcfg, {"model": model})
+    return f"auto ({'on' if default else 'off'})"
 
 
 def normalize_tool_choice_for_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
@@ -4001,6 +4490,9 @@ def backfill_exit_plan_mode_allowed_prompts(body: dict[str, Any], tool_input: di
 
 def plan_mode_tool_name_for_emit(body: dict[str, Any], name: str, tool_input: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     active = plan_mode_active(body)
+    if name == "EnterPlanMode" and body_is_channel_prompt(body):
+        router_log("WARN", "dropped EnterPlanMode for external channel prompt")
+        return None, tool_input
     if name == "EnterPlanMode" and active:
         router_log("WARN", "dropped repeated EnterPlanMode while plan mode is active")
         return None, tool_input
@@ -4139,8 +4631,20 @@ def non_actionable_short_response(text: str) -> bool:
     return False
 
 
+def body_is_channel_prompt(body: dict[str, Any]) -> bool:
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    latest_text = latest_user_text(body)
+    return bool(
+        metadata.get("claude_any_channel_injected")
+        or latest_text.startswith("[claude-any channel inbox]")
+        or latest_text.startswith("[claude-any external channel message")
+    )
+
+
 def should_auto_enter_plan_mode(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
     if tool_calls:
+        return False
+    if body_is_channel_prompt(body):
         return False
     if ultracode_workflow_preferred(body):
         return False
@@ -4420,6 +4924,13 @@ def should_auto_continue_choice_question_with_tasklist(body: dict[str, Any], res
     return bool(latest_user_tool_result_names(body) and latest_user_looks_like_work_request(body))
 
 
+def should_synthesize_tasklist_for_provider(provider: str) -> bool:
+    # TaskList synthesis is a recovery path for non-Anthropic backends that
+    # return empty or prose-only turns. Anthropic routed mode can emit native
+    # tool_use blocks, so synthesizing an extra TaskList there corrupts the turn.
+    return (provider or "").strip().lower() != "anthropic"
+
+
 def should_keep_work_alive_with_tasklist(body: dict[str, Any], response_text: str, tool_calls: list[dict[str, Any]]) -> bool:
     if tool_calls:
         return False
@@ -4498,7 +5009,15 @@ def empty_end_turn_notice_for_body(body: dict[str, Any] | None) -> str:
     return empty_end_turn_notice()
 
 
-def append_synthetic_tasklist_to_message(message: dict[str, Any], model: str, source_body: dict[str, Any], reason: str) -> dict[str, Any]:
+def append_synthetic_tasklist_to_message(
+    message: dict[str, Any],
+    model: str,
+    source_body: dict[str, Any],
+    reason: str,
+    provider: str = "",
+) -> dict[str, Any]:
+    if not should_synthesize_tasklist_for_provider(provider):
+        return message
     content = message.get("content")
     if not isinstance(content, list):
         content = [{"type": "text", "text": anthropic_content_to_text(content)}] if content else []
@@ -5269,6 +5788,27 @@ def cached_or_configured_model_ids(provider: str, pcfg: dict[str, Any]) -> list[
     return sorted_model_ids(ids)
 
 
+def ensure_model_cache_for_launch(provider: str, pcfg: dict[str, Any]) -> None:
+    """Populate the model list before building Claude Code launch env.
+
+    Claude Code consumes ANTHROPIC_DEFAULT_*_MODEL only at process start. If
+    those values are computed before the provider model list is available,
+    family defaults collapse to the current model and /model cannot switch
+    families reliably inside that session.
+    """
+    if read_model_list_cache(provider, pcfg):
+        return
+    if read_model_registry_models(provider, pcfg, max_age_seconds=0):
+        return
+    try:
+        ids = upstream_model_ids(provider, pcfg)
+    except Exception as exc:
+        router_log("WARN", f"launch_model_cache_refresh_failed provider={provider} error={type(exc).__name__}: {exc}")
+        return
+    if ids:
+        router_log("INFO", f"launch_model_cache_ready provider={provider} count={len(ids)}")
+
+
 def model_ids_from_response(data: Any) -> list[str]:
     ids: list[str] = []
     candidates: Any
@@ -5517,7 +6057,7 @@ def opencode_zen_endpoint_kind(model_id: str) -> str:
         return "openai-responses"
     if model.startswith("gemini-"):
         return "google-generative"
-    if model.startswith(("minimax-", "glm-", "kimi-", "grok-", "big-pickle", "deepseek-", "mimo-", "nemotron-")):
+    if model.startswith(("minimax-", "glm-", "kimi-", "grok-", "big-pickle", "deepseek-", "mimo-", "nemotron-", "north-")):
         return "openai-chat"
     return "anthropic-messages"
 
@@ -5876,7 +6416,39 @@ def learn_router_rate_limit_headers(provider: str, pcfg: dict[str, Any], model: 
         "x-ratelimit-reset",
         "x-rate-limit-reset",
     ]))
-    if limit is None and remaining is None and reset is None:
+    max_concurrent = first_int_in_header(first_header(headers, [
+        "x-ratelimit-max-concurrent",
+        "x-rate-limit-max-concurrent",
+        "ratelimit-max-concurrent",
+        "rate-limit-max-concurrent",
+    ]))
+    active = first_int_in_header(first_header(headers, [
+        "x-ratelimit-active",
+        "x-rate-limit-active",
+        "ratelimit-active",
+        "rate-limit-active",
+    ]))
+    queue_limit = first_int_in_header(first_header(headers, [
+        "x-ratelimit-queue-limit",
+        "x-rate-limit-queue-limit",
+        "ratelimit-queue-limit",
+        "rate-limit-queue-limit",
+    ]))
+    queued = first_int_in_header(first_header(headers, [
+        "x-ratelimit-queued",
+        "x-rate-limit-queued",
+        "ratelimit-queued",
+        "rate-limit-queued",
+    ]))
+    if (
+        limit is None
+        and remaining is None
+        and reset is None
+        and max_concurrent is None
+        and active is None
+        and queue_limit is None
+        and queued is None
+    ):
         return
     configured = router_rate_limit_configured_rpm(provider, pcfg)
     rpm = limit if limit and limit > 0 else configured
@@ -5909,6 +6481,22 @@ def learn_router_rate_limit_headers(provider: str, pcfg: dict[str, Any], model: 
             "server_remaining": remaining,
             "server_reset_seconds": reset,
         }
+        if max_concurrent is not None:
+            new_entry["server_max_concurrent"] = max_concurrent
+        elif isinstance(entry, dict) and entry.get("server_max_concurrent") is not None:
+            new_entry["server_max_concurrent"] = entry.get("server_max_concurrent")
+        if active is not None:
+            new_entry["server_active"] = active
+        elif isinstance(entry, dict) and entry.get("server_active") is not None:
+            new_entry["server_active"] = entry.get("server_active")
+        if queue_limit is not None:
+            new_entry["server_queue_limit"] = queue_limit
+        elif isinstance(entry, dict) and entry.get("server_queue_limit") is not None:
+            new_entry["server_queue_limit"] = entry.get("server_queue_limit")
+        if queued is not None:
+            new_entry["server_queued"] = queued
+        elif isinstance(entry, dict) and entry.get("server_queued") is not None:
+            new_entry["server_queued"] = entry.get("server_queued")
         if limit and limit > 0:
             new_entry["server_rpm"] = int(limit)
             new_entry["server_rpm_updated_at"] = now
@@ -5921,7 +6509,11 @@ def learn_router_rate_limit_headers(provider: str, pcfg: dict[str, Any], model: 
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         RATE_LIMIT_STATE_PATH.write_text(json.dumps(state, ensure_ascii=False) + "\n", encoding="utf-8")
     extra = " multi_key_no_global_penalty=1" if multi_key and remaining == 0 and reset and reset > 0 else ""
-    router_log("INFO", f"rate_limit_headers provider={provider} model={model or ''} limit={limit} remaining={remaining} reset={reset}{extra}")
+    router_log(
+        "INFO",
+        f"rate_limit_headers provider={provider} model={model or ''} limit={limit} remaining={remaining} reset={reset}"
+        f" max_concurrent={max_concurrent} active={active} queue_limit={queue_limit} queued={queued}{extra}",
+    )
 
 
 def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], model: str | None, retry_after: str | None = None) -> float:
@@ -5974,7 +6566,16 @@ def register_router_rate_limit_backoff(provider: str, pcfg: dict[str, Any], mode
         if penalty_until > now:
             state[key]["penalty_until"] = penalty_until
         if isinstance(entry, dict):
-            for preserve_key in ("server_rpm", "server_rpm_updated_at", "server_remaining", "server_reset_seconds"):
+            for preserve_key in (
+                "server_rpm",
+                "server_rpm_updated_at",
+                "server_remaining",
+                "server_reset_seconds",
+                "server_max_concurrent",
+                "server_active",
+                "server_queue_limit",
+                "server_queued",
+            ):
                 if preserve_key in entry:
                     state[key][preserve_key] = entry[preserve_key]
         if inferred_rpm:
@@ -6374,7 +6975,7 @@ def provider_headers(provider: str, pcfg: dict[str, Any], inbound_headers: Any |
             raise RuntimeError("OpenRouter requires a configured API key.")
         headers["x-api-key"] = key
         headers["Authorization"] = f"Bearer {key}"
-    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "fireworks"):
+    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "fireworks"):
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
     elif provider == "lm-studio":
@@ -6534,12 +7135,23 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
                         break
                 except Exception:
                     continue
+            if not fetched and provider in OPENCODE_PROVIDER_NAMES:
+                # OpenCode publishes the model catalog at /v1/models. Keep the
+                # picker independent from key-specific auth/rate-limit failures.
+                try:
+                    public_headers = with_upstream_user_agent({"content-type": "application/json"})
+                    data = http_json(join_url(base, "/v1/models"), headers=public_headers, timeout=6.0, provider=provider, pcfg=pcfg)
+                    ids = model_ids_from_response(data)
+                    model_info.update(model_info_from_response(provider, data))
+                    fetched = True
+                except Exception as exc:
+                    router_log("DEBUG", f"{provider} public model catalog fetch failed: {type(exc).__name__}: {exc}")
     except Exception:
         ids = []
     if provider == "ollama-cloud" and not ids:
         ids = ollama_catalog_model_ids(provider)
         fetched = bool(ids)
-    if not fetched and provider in OPENCODE_PROVIDER_NAMES:
+    if not fetched and provider in (*OPENCODE_PROVIDER_NAMES, "kimi"):
         ids = unique_model_ids(provider, [
             *(pcfg.get("custom_models", []) or []),
             pcfg.get("current_model") or "",
@@ -6582,6 +7194,14 @@ def model_context_field(item: dict[str, Any]) -> int | None:
         value = positive_int(item.get(key))
         if value:
             return value
+    for key, value in item.items():
+        if not isinstance(key, str):
+            continue
+        leaf = key.rsplit(".", 1)[-1]
+        if leaf in ("max_model_len", "max_context_length", "context_length", "max_context_tokens", "max_position_embeddings"):
+            fixed = positive_int(value)
+            if fixed:
+                return fixed
     details = item.get("details")
     if isinstance(details, dict):
         for key in ("max_model_len", "max_context_length", "context_length", "contextLength", "max_context_tokens", "max_position_embeddings"):
@@ -6596,6 +7216,71 @@ def ollama_api_base(pcfg: dict[str, Any]) -> str:
     if base.endswith("/api"):
         return base[:-4].rstrip("/")
     return base.rstrip("/")
+
+
+def ollama_provider_api_base(provider: str, pcfg: dict[str, Any]) -> str:
+    base = provider_upstream_request_base(provider, pcfg)
+    if base.endswith("/api"):
+        return base[:-4].rstrip("/")
+    return base.rstrip("/")
+
+
+def ollama_show_parameters(data: dict[str, Any]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    raw = data.get("parameters")
+    if isinstance(raw, dict):
+        out.update(raw)
+    elif isinstance(raw, str):
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 1)
+            if len(parts) == 2:
+                out[parts[0].strip()] = parts[1].strip().strip('"')
+    modelfile = data.get("modelfile")
+    if isinstance(modelfile, str):
+        for line in modelfile.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split(None, 2)
+            if len(parts) == 3 and parts[0].lower() == "parameter":
+                out.setdefault(parts[1].strip(), parts[2].strip().strip('"'))
+    return out
+
+
+def fetch_ollama_api_model_specs(provider: str, pcfg: dict[str, Any], model_id: str, timeout: float = 3.0) -> dict[str, Any]:
+    if provider not in ("ollama", "ollama-cloud") or not model_id:
+        return {}
+    base = ollama_provider_api_base(provider, pcfg)
+    if not base:
+        return {}
+    data = post_json(
+        join_url(base, "/api/show"),
+        {"model": model_id},
+        headers=provider_model_list_headers(provider, pcfg),
+        timeout=timeout,
+        provider=provider,
+        pcfg=pcfg,
+    )
+    if not isinstance(data, dict):
+        return {}
+    model_info = data.get("model_info") if isinstance(data.get("model_info"), dict) else {}
+    params = ollama_show_parameters(data)
+    max_context = (
+        model_context_field(data)
+        or model_context_field(model_info)
+        or positive_int(params.get("num_ctx"))
+        or positive_int(params.get("context_length"))
+    )
+    num_predict = positive_int(params.get("num_predict"))
+    out: dict[str, Any] = {}
+    if max_context:
+        out["max_model_len"] = max_context
+    if num_predict:
+        out["num_predict"] = num_predict
+    return out
 
 
 def ollama_model_id_matches(left: str, right: str) -> bool:
@@ -7019,6 +7704,10 @@ def opencode_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     )
 
 
+def kimi_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return provider == "kimi" and bool(pcfg.get("native_compat", True))
+
+
 def fireworks_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return provider == "fireworks" and bool(pcfg.get("native_compat", True))
 
@@ -7031,6 +7720,7 @@ def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
         or nvidia_hosted_native_compat_enabled(provider, pcfg)
         or deepseek_native_compat_enabled(provider, pcfg)
         or opencode_native_compat_enabled(provider, pcfg)
+        or kimi_native_compat_enabled(provider, pcfg)
         or fireworks_native_compat_enabled(provider, pcfg)
     )
 
@@ -7146,7 +7836,7 @@ def provider_upstream_request_base(provider: str, pcfg: dict[str, Any]) -> str:
 
 def native_anthropic_base_url(provider: str, pcfg: dict[str, Any]) -> str:
     base = pcfg.get("base_url", "http://127.0.0.1:8000").rstrip("/")
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "openrouter", "fireworks") and base.endswith("/v1"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "openrouter", "kimi", "fireworks") and base.endswith("/v1"):
         return base[:-3].rstrip("/")
     return base
 
@@ -7205,12 +7895,96 @@ def write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> 
     handler.wfile.write(body)
 
 
+CLIENT_DISCONNECT_ERRNOS = {
+    errno.EPIPE,
+    errno.ECONNRESET,
+    getattr(errno, "ECONNABORTED", errno.ECONNRESET),
+}
+
+
+def is_client_disconnect_error(exc: BaseException) -> bool:
+    if isinstance(exc, (BrokenPipeError, ConnectionResetError, ConnectionAbortedError)):
+        return True
+    if isinstance(exc, OSError):
+        return getattr(exc, "errno", None) in CLIENT_DISCONNECT_ERRNOS
+    return False
+
+
+def try_write_json(handler: BaseHTTPRequestHandler, obj: Any, status: int = 200) -> bool:
+    try:
+        write_json(handler, obj, status)
+        return True
+    except Exception as exc:
+        if is_client_disconnect_error(exc):
+            router_log("WARN", f"write_json_client_disconnected status={status} error={type(exc).__name__}: {exc}")
+            return False
+        raise
+
+
 def _handler_response_status(handler: BaseHTTPRequestHandler) -> int | None:
     status = getattr(handler, "_claude_any_response_status", None)
     try:
         return int(status)
     except Exception:
         return None
+
+
+def _channel_delivery_metadata(metadata: dict[str, Any] | None) -> bool:
+    if not isinstance(metadata, dict):
+        return False
+    return bool(
+        metadata.get("claude_any_channel_cursor_last_id")
+        or metadata.get("claude_any_channel_summary_cursor_last_id")
+    )
+
+
+def begin_pending_channel_delivery(
+    handler: BaseHTTPRequestHandler | None,
+    body: dict[str, Any],
+) -> None:
+    if handler is None:
+        return
+    metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
+    if not _channel_delivery_metadata(metadata):
+        return
+    try:
+        setattr(handler, "_claude_any_channel_delivery_guard", True)
+        setattr(handler, "_claude_any_channel_delivery_ok", False)
+        setattr(handler, "_claude_any_channel_delivery_reason", "pending")
+    except Exception:
+        pass
+
+
+def mark_pending_channel_delivery_success(
+    handler: BaseHTTPRequestHandler | None,
+    reason: str = "response_complete",
+) -> None:
+    if handler is None or not getattr(handler, "_claude_any_channel_delivery_guard", False):
+        return
+    try:
+        setattr(handler, "_claude_any_channel_delivery_ok", True)
+        setattr(handler, "_claude_any_channel_delivery_reason", reason)
+    except Exception:
+        pass
+
+
+def mark_pending_channel_delivery_failed(
+    handler: BaseHTTPRequestHandler | None,
+    reason: str = "response_failed",
+) -> None:
+    if handler is None or not getattr(handler, "_claude_any_channel_delivery_guard", False):
+        return
+    try:
+        setattr(handler, "_claude_any_channel_delivery_ok", False)
+        setattr(handler, "_claude_any_channel_delivery_reason", reason)
+    except Exception:
+        pass
+
+
+def pending_channel_delivery_confirmed(handler: BaseHTTPRequestHandler | None) -> bool:
+    if handler is None or not getattr(handler, "_claude_any_channel_delivery_guard", False):
+        return True
+    return bool(getattr(handler, "_claude_any_channel_delivery_ok", False))
 
 
 def write_empty_response(handler: BaseHTTPRequestHandler, status: int = 202) -> None:
@@ -7268,6 +8042,34 @@ def write_router_activity(event: str, provider: str, model: str | None = None, *
         tmp = ROUTER_ACTIVITY_PATH.with_name(f"{ROUTER_ACTIVITY_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
         tmp.replace(ROUTER_ACTIVITY_PATH)
+    except Exception:
+        pass
+
+
+def write_context_compact_activity(provider: str, model: str | None = None, **fields: Any) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            "updated_at": time.time(),
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "event": "compact",
+            "provider": provider,
+            "model": model or "",
+        }
+        data.update(fields)
+        tmp = CONTEXT_COMPACT_ACTIVITY_PATH.with_name(
+            f"{CONTEXT_COMPACT_ACTIVITY_PATH.name}.{os.getpid()}.{time.time_ns()}.tmp"
+        )
+        tmp.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+        tmp.replace(CONTEXT_COMPACT_ACTIVITY_PATH)
+        EVENT_BUS.publish(
+            level="info",
+            category="context.compact",
+            message=f"compact {provider} {model or ''}".strip(),
+            provider=provider,
+            model=model,
+            data=fields,
+        )
     except Exception:
         pass
 
@@ -8662,6 +9464,140 @@ def read_chat_messages_before(before_id: int = 0, channel: str | None = None, re
     return messages
 
 
+def _chat_message_payload_hash(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
+
+
+def _chat_message_time_seconds(value: Any) -> float:
+    text = str(value or "").strip()
+    if not text:
+        return 0.0
+    try:
+        return time.mktime(time.strptime(text[:19], "%Y-%m-%dT%H:%M:%S"))
+    except Exception:
+        return 0.0
+
+
+def _chat_message_recent_rows_locked(limit: int = CHAT_MESSAGE_DEDUPE_SCAN_LIMIT) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if limit <= 0 or not CHAT_MESSAGES_PATH.exists():
+        return rows
+    try:
+        with CHAT_MESSAGES_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    item = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(item, dict):
+                    rows.append(item)
+                    if len(rows) > limit:
+                        rows = rows[-limit:]
+    except Exception as exc:
+        router_log("WARN", f"chat duplicate scan failed: {exc}")
+    return rows
+
+
+def _chat_message_stable_dedupe_key(message: dict[str, Any]) -> tuple[str, ...] | None:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    source = str(meta.get("mcp_server") or meta.get("sse_source") or meta.get("source") or message.get("sender_id") or "").strip()
+    method = str(meta.get("mcp_method") or "").strip()
+    channel = str(message.get("channel") or meta.get("room_id") or meta.get("room") or meta.get("channel") or "").strip()
+    kind = str(message.get("kind") or meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or "").strip()
+    body_hash = _chat_message_payload_hash(message.get("message"))
+    for key in ("cursor", "stream_id", "sse_id", "event_id", "message_id", "source_message_id", "sequence", "seq", "rpc_id"):
+        value = meta.get(key)
+        if value is None:
+            continue
+        stable_value = str(value).strip()
+        if stable_value:
+            return ("stable", source, method, channel, kind, key, stable_value, body_hash)
+    mcp_json = meta.get("mcp_json")
+    if method.startswith("notifications/") and isinstance(mcp_json, dict):
+        try:
+            normalized = json.dumps(mcp_json, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str)
+            if normalized:
+                digest = hashlib.sha256(normalized.encode("utf-8", errors="replace")).hexdigest()
+                return ("stable", source, method, channel, kind, "mcp_json", digest, body_hash)
+        except Exception:
+            pass
+    return None
+
+
+def _chat_message_fallback_dedupe_key(message: dict[str, Any]) -> tuple[str, ...] | None:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    method = str(meta.get("mcp_method") or "").strip()
+    if not method.startswith("notifications/"):
+        return None
+    body = re.sub(r"\s+", " ", str(message.get("message") or "")).strip()
+    if not body:
+        return None
+    source = str(meta.get("mcp_server") or meta.get("sse_source") or meta.get("source") or message.get("sender_id") or "").strip()
+    channel = str(message.get("channel") or meta.get("room_id") or meta.get("room") or meta.get("channel") or "").strip()
+    sender = str(message.get("sender_id") or meta.get("sender_id") or meta.get("agent_id") or "").strip()
+    kind = str(message.get("kind") or meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or "").strip()
+    return ("fallback", source, method, channel, sender, kind, _chat_message_payload_hash(body))
+
+
+def _channel_llm_launch_guard() -> dict[str, Any] | None:
+    try:
+        if not CHANNEL_LLM_LAUNCH_GUARD_PATH.exists():
+            return None
+        data = json.loads(CHANNEL_LLM_LAUNCH_GUARD_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return None
+        expires_at = float(data.get("expires_at") or 0)
+        if expires_at <= time.time():
+            return None
+        max_existing_id = int(data.get("max_existing_id") or 0)
+        if max_existing_id <= 0:
+            return None
+        return {"max_existing_id": max_existing_id, "expires_at": expires_at}
+    except Exception:
+        return None
+
+
+def _write_channel_llm_launch_guard(max_existing_id: int, ttl_seconds: float = 180.0) -> None:
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "created_at": time.time(),
+            "expires_at": time.time() + max(1.0, float(ttl_seconds)),
+            "max_existing_id": max(0, int(max_existing_id)),
+        }
+        tmp_path = CHANNEL_LLM_LAUNCH_GUARD_PATH.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+        tmp_path.replace(CHANNEL_LLM_LAUNCH_GUARD_PATH)
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_launch_guard_write_failed error={type(exc).__name__}: {exc}")
+
+
+def _chat_message_duplicate_locked(message: dict[str, Any]) -> dict[str, Any] | None:
+    stable_key = _chat_message_stable_dedupe_key(message)
+    fallback_key = _chat_message_fallback_dedupe_key(message)
+    if not stable_key and not fallback_key:
+        return None
+    now = time.time()
+    launch_guard = _channel_llm_launch_guard() if fallback_key else None
+    guard_max_existing_id = int(launch_guard.get("max_existing_id") or 0) if launch_guard else 0
+    for row in reversed(_chat_message_recent_rows_locked()):
+        if stable_key and _chat_message_stable_dedupe_key(row) == stable_key:
+            return row
+        if not fallback_key or _chat_message_fallback_dedupe_key(row) != fallback_key:
+            continue
+        row_time = _chat_message_time_seconds(row.get("time"))
+        if row_time > 0 and now - row_time <= CHAT_MESSAGE_FALLBACK_DEDUPE_TTL_SECONDS:
+            return row
+        try:
+            row_id = int(row.get("id") or 0)
+        except Exception:
+            row_id = 0
+        if guard_max_existing_id > 0 and 0 < row_id <= guard_max_existing_id:
+            return row
+    return None
+
+
 def append_chat_message(payload: dict[str, Any]) -> dict[str, Any]:
     global _CHAT_NEXT_ID
     with _CHAT_CONDITION:
@@ -8688,6 +9624,16 @@ def append_chat_message(payload: dict[str, Any]) -> dict[str, Any]:
                 message["visibility"] = str(payload.get("visibility") or "user")
             if payload.get("delivery") is not None:
                 message["delivery"] = _as_string_list(payload.get("delivery"))
+            duplicate = _chat_message_duplicate_locked(message)
+            if duplicate:
+                existing_id = duplicate.get("id")
+                returned = dict(duplicate)
+                returned["_claude_any_duplicate"] = True
+                router_log(
+                    "INFO",
+                    f"chat_message_skipped_duplicate existing_id={existing_id} channel={message.get('channel')} kind={message.get('kind')}",
+                )
+                return returned
             with CHAT_MESSAGES_PATH.open("a", encoding="utf-8") as f:
                 f.write(json.dumps(message, ensure_ascii=False, separators=(",", ":")) + "\n")
         _CHAT_CONDITION.notify_all()
@@ -8801,6 +9747,7 @@ def _event_meta_from_sources(*sources: Any) -> dict[str, Any]:
             "target",
             "type",
             "event_type",
+            "eventType",
             "kind",
             "timestamp",
             "created_at",
@@ -8870,6 +9817,7 @@ _CHANNEL_CONTROL_KINDS = {
     "pong",
     "ready",
     "status",
+    "system",
 }
 
 
@@ -8877,7 +9825,7 @@ def _channel_event_is_user_visible(kind: str, method: str, event_name: str, cont
     normalized_kind = str(kind or "").strip().lower().replace("_", ".").replace("/", ".")
     normalized_method = str(method or "").strip().lower()
     normalized_event = str(event_name or "").strip().lower()
-    meta_type = str(meta.get("type") or meta.get("event_type") or meta.get("kind") or meta.get("status") or "").strip().lower()
+    meta_type = str(meta.get("type") or meta.get("event_type") or meta.get("eventType") or meta.get("kind") or meta.get("status") or "").strip().lower()
     if normalized_kind in _CHANNEL_CONTROL_KINDS or normalized_event in _CHANNEL_CONTROL_KINDS or meta_type in _CHANNEL_CONTROL_KINDS:
         return False
     if meta.get("jsonrpc") is not None:
@@ -9375,6 +10323,12 @@ def _channel_sse_dispatch(name: str, event_name: str, data_lines: list[str], eve
         return
     payload = _mark_channel_payload_direct_llm_pending(payload)
     saved = append_chat_message(payload)
+    if saved.get("_claude_any_duplicate"):
+        router_log(
+            "INFO",
+            f"channel_sse_message_skipped_duplicate name={name} event={event_name or 'message'} existing_id={saved.get('id')} channel={saved.get('channel')}",
+        )
+        return
     now = time.strftime("%Y-%m-%dT%H:%M:%S")
     with _CHANNEL_SSE_LOCK:
         state = _CHANNEL_SSE_CONNECTIONS.get(name)
@@ -9938,6 +10892,27 @@ def _channel_mcp_tool_schemas() -> list[dict[str, Any]]:
                 },
             },
         },
+        {
+            "name": "llm_options",
+            "description": (
+                "Show, apply, or restore claude-any live LLM option presets for the current routed session. "
+                "Use action='list' to show keyboard-selectable slash commands, action='apply' with preset, "
+                "or action='restore' to return to the captured original options."
+            ),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "description": "One of status, list, apply, or restore.",
+                    },
+                    "preset": {
+                        "type": "string",
+                        "description": "Preset id or alias when action is apply, for example balanced, long-context-128k, or million-context-1m.",
+                    },
+                },
+            },
+        },
     ]
 
 
@@ -10041,6 +11016,14 @@ def _channel_mcp_tool_call_response(request_id: Any, params: dict[str, Any]) -> 
             request_id,
             json.dumps({"ok": True, "messages": messages}, ensure_ascii=False, separators=(",", ":")),
         )
+    if name == "llm_options":
+        action = str(args.get("action") or "status")
+        preset = str(args.get("preset") or "")
+        lines, changed = handle_live_llm_options_action(action, preset)
+        return _channel_mcp_tool_response(
+            request_id,
+            json.dumps({"ok": True, "changed": changed, "lines": lines}, ensure_ascii=False, separators=(",", ":")),
+        )
     return _channel_mcp_tool_response(request_id, f"Unknown claude-any-router tool: {name}", True)
 
 
@@ -10134,6 +11117,9 @@ def _channel_mcp_message_skip_reason(message: dict[str, Any]) -> str | None:
     if visibility in {"hidden", "internal", "transport", "control", "system"}:
         return f"visibility_{visibility}"
     meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or meta.get("event") or meta.get("status") or "").strip().lower()
+    if meta_kind in _CHANNEL_CONTROL_KINDS:
+        return meta_kind
     if meta.get("llm_direct_pending"):
         return "llm_direct_pending"
     recipients = {item.strip().lower() for item in _as_string_list(message.get("recipients"))}
@@ -10144,7 +11130,12 @@ def _channel_mcp_message_skip_reason(message: dict[str, Any]) -> str | None:
         normalized_delivery = {item.strip().lower() for item in delivery}
         if not ({"all", "*", "native", "mcp"} & normalized_delivery):
             return "delivery_not_native"
-    return _channel_wake_message_noise_reason(message)
+    wake_reason = _channel_wake_message_noise_reason(message)
+    if wake_reason:
+        return wake_reason
+    if not delivery and not _channel_message_has_external_provenance(message):
+        return "unscoped_channel_message"
+    return None
 
 
 def _channel_mcp_notifications_for_messages(
@@ -10153,6 +11144,7 @@ def _channel_mcp_notifications_for_messages(
 ) -> tuple[int, list[tuple[int, dict[str, Any]]]]:
     last_id = 0
     events: list[tuple[int, dict[str, Any]]] = []
+    superseded_ids = _channel_superseded_message_ids(messages)
     for message in messages:
         message_id = int(message.get("id") or 0)
         last_id = max(last_id, message_id)
@@ -10161,6 +11153,12 @@ def _channel_mcp_notifications_for_messages(
             router_log(
                 "INFO",
                 f"channel_mcp_skipped_noise session={session or '-'} message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
+            )
+            continue
+        if message_id in superseded_ids:
+            router_log(
+                "INFO",
+                f"channel_mcp_skipped_noise session={session or '-'} message_id={message.get('id')} channel={message.get('channel')} reason=superseded_channel_notice",
             )
             continue
         notification = _channel_mcp_notification(message)
@@ -10587,12 +11585,118 @@ def compact_message_text_for_prompt(text: str) -> str:
     return truncate_for_prompt(text, PROMPT_MESSAGE_TEXT_LIMIT)
 
 
+def _message_tool_markers_for_summary(message: dict[str, Any]) -> list[str]:
+    content = message.get("content")
+    if not isinstance(content, list):
+        return []
+    markers: list[str] = []
+    for block in content:
+        if not isinstance(block, dict):
+            continue
+        btype = str(block.get("type") or "")
+        if btype == "tool_use":
+            name = str(block.get("name") or "tool")
+            tool_id = str(block.get("id") or "")
+            markers.append(f"tool_use:{name}{('/' + tool_id) if tool_id else ''}")
+        elif btype == "tool_result":
+            tool_id = str(block.get("tool_use_id") or "tool")
+            markers.append(f"tool_result:{tool_id}")
+    return markers
+
+
+def compact_message_summary_line(index: int, message: dict[str, Any], *, text_limit: int = 700) -> str:
+    role = str(message.get("role") or "unknown")
+    text = " ".join(anthropic_content_to_text(message.get("content")).split())
+    markers = _message_tool_markers_for_summary(message)
+    parts = [f"message {index}", f"role={role}"]
+    if markers:
+        parts.append("markers=" + ",".join(markers[:6]))
+    if text:
+        parts.append("text=" + truncate_for_prompt(text, text_limit))
+    return "- " + " | ".join(parts)
+
+
+def _compact_chunk_ranges(count: int, chunks: int) -> list[tuple[int, int]]:
+    chunks = max(1, min(chunks, count))
+    ranges: list[tuple[int, int]] = []
+    for idx in range(chunks):
+        start = (idx * count) // chunks
+        end = ((idx + 1) * count) // chunks
+        if start < end:
+            ranges.append((start, end))
+    return ranges
+
+
+def context_guard_chunk_count(omitted_messages: list[dict[str, Any]]) -> int:
+    if not omitted_messages:
+        return 0
+    omitted_tokens = sum(estimate_tokens(message) for message in omitted_messages)
+    return max(1, min(12, (omitted_tokens + 32767) // 32768))
+
+
+def build_chunked_context_guard_summary(
+    omitted_messages: list[dict[str, Any]],
+    budget_tokens: int,
+    *,
+    start_index: int = 0,
+) -> str:
+    omitted_count = len(omitted_messages)
+    omitted_tokens = sum(estimate_tokens(message) for message in omitted_messages)
+    if omitted_count <= 0:
+        return (
+            "[claude-any context guard: older conversation history was compacted because "
+            f"the provider context budget is {budget_tokens} tokens.]"
+        )
+    max_summary_tokens = max(1024, min(24576, max(1, budget_tokens) // 10))
+    max_summary_chars = max_summary_tokens * 4
+    chunk_count = context_guard_chunk_count(omitted_messages)
+    lines: list[str] = [
+        (
+            f"[claude-any context guard: compacted {omitted_count} older messages, approx "
+            f"{omitted_tokens} tokens, because the provider context budget is {budget_tokens} tokens.]"
+        ),
+        "The recent tail is preserved verbatim. Older history is represented below as deterministic chunk summaries; use file reads or MCP queries if exact old content is needed.",
+    ]
+    for chunk_no, (start, end) in enumerate(_compact_chunk_ranges(omitted_count, chunk_count), start=1):
+        chunk = omitted_messages[start:end]
+        chunk_tokens = sum(estimate_tokens(message) for message in chunk)
+        lines.append(
+            f"Chunk {chunk_no}/{chunk_count}: messages {start_index + start}-{start_index + end - 1}, approx {chunk_tokens} tokens."
+        )
+        if len(chunk) <= 4:
+            sample_offsets = list(range(len(chunk)))
+        else:
+            sample_offsets = [0, 1, len(chunk) - 2, len(chunk) - 1]
+        seen: set[int] = set()
+        for offset in sample_offsets:
+            if offset in seen:
+                continue
+            seen.add(offset)
+            lines.append(compact_message_summary_line(start_index + start + offset, chunk[offset]))
+        current = "\n".join(lines)
+        if len(current) > max_summary_chars:
+            lines.append(f"...[context guard summary truncated to {max_summary_tokens} tokens]...")
+            break
+    summary = "\n".join(lines)
+    if len(summary) > max_summary_chars:
+        summary = truncate_for_prompt(summary, max_summary_chars)
+    return summary
+
+
 def is_advisor_request(body: dict[str, Any]) -> bool:
     return "CLAUDE_ANY_ADVISOR_CALL" in latest_user_text(body)
 
 
 def is_router_debug_request(body: dict[str, Any]) -> bool:
     return "CLAUDE_ANY_ROUTER_DEBUG_ACCESS" in latest_user_text(body)
+
+
+def is_channel_clear_request(body: dict[str, Any]) -> bool:
+    return "CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG" in latest_user_text(body)
+
+
+def is_live_llm_options_request(body: dict[str, Any]) -> bool:
+    return "CLAUDE_ANY_LIVE_LLM_OPTIONS" in latest_user_text(body)
 
 
 def parse_channel_bridge_args(raw: str) -> tuple[str, dict[str, str]]:
@@ -10656,6 +11760,38 @@ def router_debug_value_from_body(body: dict[str, Any]) -> str:
             value = stripped.split(":", 1)[1].strip()
             return value or "toggle"
     return tail.strip() or "toggle"
+
+
+def channel_clear_value_from_body(body: dict[str, Any]) -> str:
+    text = latest_user_text(body)
+    marker = "CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG"
+    if marker not in text:
+        return "all"
+    tail = text.split(marker, 1)[1]
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("value:"):
+            value = stripped.split(":", 1)[1].strip()
+            return value or "all"
+    return tail.strip() or "all"
+
+
+def live_llm_options_value_from_body(body: dict[str, Any]) -> str:
+    text = latest_user_text(body)
+    marker = "CLAUDE_ANY_LIVE_LLM_OPTIONS"
+    if marker not in text:
+        return "status"
+    tail = text.split(marker, 1)[1]
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.lower().startswith("value:"):
+            value = stripped.split(":", 1)[1].strip()
+            return value or "status"
+    return tail.strip() or "status"
 
 
 def advisor_focus_from_body(body: dict[str, Any]) -> str:
@@ -10768,6 +11904,70 @@ def normalize_anthropic_system_role_messages(body: dict[str, Any]) -> dict[str, 
     out = dict(body)
     out["messages"] = next_messages
     out["system"] = append_anthropic_system_texts(body.get("system"), system_texts)
+    return out
+
+
+_PSEUDO_TOOL_INVOKE_RE = re.compile(
+    r"(?is)(?:^|\n)[ \t]*(?:court[ \t]*(?:\r?\n)+)?<invoke\s+name=[\"'][^\"']+[\"'][\s\S]*?</invoke>[ \t]*(?=\n|$)"
+)
+
+
+def sanitize_assistant_pseudo_tool_text_history(body: dict[str, Any]) -> dict[str, Any]:
+    """Remove prior assistant text that looks like a fake tool invocation.
+
+    Claude Code only executes structured ``tool_use`` blocks. If an earlier
+    routed turn accidentally emitted XML-like ``<invoke ...>`` text, continuing
+    the same transcript can teach the model to repeat that invalid pattern.
+    Keep real tool_use blocks untouched and only rewrite assistant text blocks.
+    """
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+    changed = False
+    sanitized_messages: list[Any] = []
+    removed_blocks = 0
+    replacement = "\n[claude-any removed prior assistant pseudo tool-call text; it was not an actual tool_use block.]\n"
+    for message in messages:
+        if not isinstance(message, dict) or str(message.get("role") or "") != "assistant":
+            sanitized_messages.append(message)
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            next_text, count = _PSEUDO_TOOL_INVOKE_RE.subn(replacement, content)
+            if count:
+                changed = True
+                removed_blocks += count
+                next_message = dict(message)
+                next_message["content"] = next_text.strip()
+                sanitized_messages.append(next_message)
+                continue
+        elif isinstance(content, list):
+            next_content: list[Any] = []
+            content_changed = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    text = str(block.get("text") or "")
+                    next_text, count = _PSEUDO_TOOL_INVOKE_RE.subn(replacement, text)
+                    if count:
+                        content_changed = True
+                        removed_blocks += count
+                        next_block = dict(block)
+                        next_block["text"] = next_text.strip()
+                        next_content.append(next_block)
+                        continue
+                next_content.append(block)
+            if content_changed:
+                changed = True
+                next_message = dict(message)
+                next_message["content"] = next_content
+                sanitized_messages.append(next_message)
+                continue
+        sanitized_messages.append(message)
+    if not changed:
+        return body
+    out = dict(body)
+    out["messages"] = sanitized_messages
+    router_log("INFO", f"sanitized assistant pseudo tool-call text blocks={removed_blocks}")
     return out
 
 
@@ -11793,12 +12993,26 @@ def ctx_bucket(target: int, minimum: int, maximum: int) -> int:
     return maximum
 
 
+def ollama_provider_context_limit(pcfg: dict[str, Any]) -> int | None:
+    current_model = str(pcfg.get("current_model") or "")
+    cached_model = str(pcfg.get("model_context_model") or "")
+    cached_limit = positive_int(pcfg.get("model_context_max"))
+    if not cached_limit:
+        return None
+    if cached_model and (not current_model or not ollama_context_model_matches(current_model, cached_model)):
+        return None
+    return cached_limit
+
+
 def ollama_num_ctx_for_payload(pcfg: dict[str, Any], payload: Any, _token_cache: dict[int, int] | None = None) -> int | None:
     override = os.environ.get("CLAUDE_ANY_OLLAMA_NUM_CTX")
     if override:
         return positive_int(override)
     raw = pcfg.get("num_ctx", "auto")
     if isinstance(raw, str) and raw.strip().lower() in ("", "auto", "dynamic"):
+        provider_limit = ollama_provider_context_limit(pcfg)
+        if provider_limit:
+            return provider_limit
         minimum = positive_int(pcfg.get("num_ctx_min")) or 8192
         maximum = positive_int(pcfg.get("num_ctx_max")) or 65536
         if maximum < minimum:
@@ -11813,6 +13027,9 @@ def ollama_num_ctx_for_payload(pcfg: dict[str, Any], payload: Any, _token_cache:
 def ollama_num_ctx_status(pcfg: dict[str, Any]) -> str:
     raw = pcfg.get("num_ctx", "auto")
     if isinstance(raw, str) and raw.strip().lower() in ("", "auto", "dynamic"):
+        provider_limit = ollama_provider_context_limit(pcfg)
+        if provider_limit:
+            return f"auto (provider {provider_limit:,})"
         minimum = positive_int(pcfg.get("num_ctx_min")) or 8192
         maximum = positive_int(pcfg.get("num_ctx_max")) or 65536
         return f"auto ({minimum}-{maximum})"
@@ -11880,12 +13097,16 @@ def cap_output_tokens_for_context(
 
 def ollama_context_limit_for_budget(pcfg: dict[str, Any]) -> int:
     raw = pcfg.get("num_ctx", "auto")
-    if isinstance(raw, str) and raw.strip().lower() == "auto":
-        return positive_int(pcfg.get("num_ctx_max")) or 65536
+    if isinstance(raw, str) and raw.strip().lower() in ("", "auto", "dynamic"):
+        return ollama_provider_context_limit(pcfg) or positive_int(pcfg.get("num_ctx_max")) or 65536
     return positive_int(raw) or positive_int(pcfg.get("num_ctx_max")) or 65536
 
 
 def openai_context_limit_for_budget(provider: str, pcfg: dict[str, Any]) -> int:
+    if provider in ("vllm", "self-hosted-nim"):
+        runtime = provider_model_context_capacity(provider, pcfg)
+        if runtime:
+            return runtime
     configured = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
     if configured:
         return configured
@@ -11898,6 +13119,9 @@ def compact_ollama_messages_for_budget(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
     budget_tokens: int,
+    *,
+    provider: str = "",
+    model: str = "",
 ) -> list[dict[str, Any]]:
     if not messages:
         return messages
@@ -11912,8 +13136,7 @@ def compact_ollama_messages_for_budget(
     first_user: dict[str, Any] | None = next((m for m in non_system if m.get("role") == "user"), None)
 
     preserved_tail: list[dict[str, Any]] = []
-    omitted = 0
-    omitted_tokens = 0
+    omitted_messages_reversed: list[dict[str, Any]] = []
     summary: dict[str, Any] = {
         "role": "user",
         "content": (
@@ -11935,25 +13158,151 @@ def compact_ollama_messages_for_budget(
         if estimate_tokens({"messages": candidate, "tools": tools}) <= budget_tokens:
             preserved_tail.append(msg)
         else:
-            omitted += 1
-            omitted_tokens += estimate_tokens(msg)
+            omitted_messages_reversed.append(msg)
 
     if first_user is None:
         fixed_prefix = list(system_messages)
         fixed_prefix.append(summary)
 
-    summary["content"] = (
-        f"[claude-any context guard: omitted {omitted} older messages, approx {omitted_tokens} tokens, "
-        f"because the provider context budget is {budget_tokens} tokens. Large file contents and prior "
-        "Write/Edit inputs were truncated. Continue from the current task list and recent tool results; "
-        "use Read on specific files if exact old content is needed.]"
-    )
+    omitted_messages = list(reversed(omitted_messages_reversed))
+    summary["content"] = build_chunked_context_guard_summary(omitted_messages, budget_tokens)
     compacted = fixed_prefix + list(reversed(preserved_tail))
+    while estimate_tokens({"messages": compacted, "tools": tools}) > budget_tokens and preserved_tail:
+        removed = preserved_tail.pop()
+        omitted_messages.append(removed)
+        summary["content"] = build_chunked_context_guard_summary(omitted_messages, budget_tokens)
+        compacted = fixed_prefix + list(reversed(preserved_tail))
     router_log(
         "WARN",
         f"compacted ollama payload messages {len(messages)}->{len(compacted)} tokens {initial_tokens}->{estimate_tokens({'messages': compacted, 'tools': tools})} budget={budget_tokens}",
     )
+    chunk_count = context_guard_chunk_count(omitted_messages)
+    if chunk_count and (provider or model):
+        write_context_compact_activity(
+            provider or "provider",
+            model,
+            chunks=chunk_count,
+            parallel_sessions=1,
+            tokens=initial_tokens,
+            final_tokens=estimate_tokens({"messages": compacted, "tools": tools}),
+            budget=budget_tokens,
+            omitted_messages=len(omitted_messages),
+            retained_messages=len(compacted),
+        )
     return compacted
+
+
+def anthropic_message_has_tool_result(message: dict[str, Any]) -> bool:
+    content = message.get("content")
+    return isinstance(content, list) and any(isinstance(block, dict) and block.get("type") == "tool_result" for block in content)
+
+
+def anthropic_safe_tail_start(message: dict[str, Any]) -> bool:
+    return str(message.get("role") or "") == "user" and not anthropic_message_has_tool_result(message)
+
+
+def compact_anthropic_body_for_budget(
+    body: dict[str, Any],
+    budget_tokens: int,
+    *,
+    provider: str = "",
+    model: str = "",
+) -> dict[str, Any]:
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return body
+    typed_messages = [message for message in messages if isinstance(message, dict)]
+    if len(typed_messages) != len(messages):
+        return body
+    budget_tokens = max(8192, budget_tokens)
+    initial_tokens = estimate_tokens(body)
+    if initial_tokens <= budget_tokens:
+        return body
+
+    # Reserve part of the budget for distributed summaries of the older history.
+    summary_budget = max(1024, min(24576, budget_tokens // 10))
+    tail_budget = max(8192, budget_tokens - summary_budget)
+    tail_start = len(typed_messages)
+    base = dict(body)
+    for idx in range(len(typed_messages) - 1, -1, -1):
+        candidate = typed_messages[idx:]
+        candidate_body = dict(base)
+        candidate_body["messages"] = candidate
+        if estimate_tokens(candidate_body) <= tail_budget:
+            tail_start = idx
+            continue
+        break
+
+    while tail_start < len(typed_messages) and not anthropic_safe_tail_start(typed_messages[tail_start]):
+        tail_start += 1
+
+    if tail_start >= len(typed_messages):
+        tail_start = max(0, len(typed_messages) - 1)
+        if anthropic_message_has_tool_result(typed_messages[tail_start]):
+            safe_text = anthropic_content_to_text(typed_messages[tail_start].get("content"))
+            tail = [{"role": "user", "content": compact_message_text_for_prompt(safe_text)}]
+        else:
+            tail = [typed_messages[tail_start]]
+    else:
+        tail = typed_messages[tail_start:]
+
+    omitted = typed_messages[:tail_start]
+    summary_text = build_chunked_context_guard_summary(omitted, budget_tokens)
+    out = dict(body)
+    out["messages"] = tail
+    out["system"] = append_anthropic_system_texts(body.get("system"), [summary_text])
+
+    while estimate_tokens(out) > budget_tokens and len(tail) > 1:
+        tail = tail[1:]
+        while tail and not anthropic_safe_tail_start(tail[0]):
+            tail = tail[1:]
+        if not tail:
+            tail = [typed_messages[-1]]
+            break
+        out["messages"] = tail
+        omitted = typed_messages[: len(typed_messages) - len(tail)]
+        out["system"] = append_anthropic_system_texts(body.get("system"), [build_chunked_context_guard_summary(omitted, budget_tokens)])
+
+    final_tokens = estimate_tokens(out)
+    if final_tokens > budget_tokens:
+        compact_summary = build_chunked_context_guard_summary(omitted, max(8192, budget_tokens // 2))
+        out["system"] = append_anthropic_system_texts(body.get("system"), [truncate_for_prompt(compact_summary, max(4096, budget_tokens * 2))])
+        final_tokens = estimate_tokens(out)
+    if final_tokens > budget_tokens and tail:
+        base_without_messages = dict(out)
+        base_without_messages["messages"] = []
+        remaining_chars = max(1024, (budget_tokens - estimate_tokens(base_without_messages)) * 4 - 1024)
+        latest = tail[-1]
+        latest_role = str(latest.get("role") or "unknown")
+        latest_text = anthropic_content_to_text(latest.get("content"))
+        out["messages"] = [
+            {
+                "role": "user",
+                "content": truncate_for_prompt(
+                    f"[Latest retained message compacted from role={latest_role} because it alone exceeded the provider context budget.]\n{latest_text}",
+                    remaining_chars,
+                ),
+            }
+        ]
+        final_tokens = estimate_tokens(out)
+    router_log(
+        "WARN",
+        f"compacted anthropic payload messages {len(typed_messages)}->{len(out.get('messages') or [])} tokens {initial_tokens}->{final_tokens} budget={budget_tokens}",
+    )
+    chunk_count = context_guard_chunk_count(omitted)
+    if chunk_count and (provider or model):
+        write_context_compact_activity(
+            provider or "provider",
+            model or str(body.get("model") or ""),
+            chunks=chunk_count,
+            parallel_sessions=1,
+            tokens=initial_tokens,
+            final_tokens=final_tokens,
+            budget=budget_tokens,
+            omitted_messages=len(omitted),
+            retained_messages=len(out.get("messages") or []),
+        )
+    return out
 
 
 def provider_request_timeout_seconds(pcfg: dict[str, Any]) -> float:
@@ -12009,20 +13358,6 @@ def router_client_connection_closed(handler: BaseHTTPRequestHandler) -> bool:
         return True
 
 
-def upstream_stream_poll_timeout_seconds(idle_timeout: float) -> float:
-    try:
-        idle = float(idle_timeout)
-    except Exception:
-        idle = 30.0
-    return max(0.2, min(1.0, idle))
-
-
-def upstream_read_timed_out(exc: BaseException) -> bool:
-    if isinstance(exc, TimeoutError):
-        return True
-    return "timed out" in f"{type(exc).__name__}: {exc}".lower()
-
-
 def iter_upstream_lines_until_client_disconnect(
     handler: BaseHTTPRequestHandler,
     resp: Any,
@@ -12032,9 +13367,7 @@ def iter_upstream_lines_until_client_disconnect(
         idle = max(1.0, float(idle_timeout))
     except Exception:
         idle = 30.0
-    poll_timeout = upstream_stream_poll_timeout_seconds(idle)
-    set_upstream_stream_read_timeout(resp, poll_timeout)
-    idle_deadline = time.monotonic() + idle
+    set_upstream_stream_read_timeout(resp, idle)
     while True:
         if router_client_connection_closed(handler):
             raise UpstreamClientDisconnected("downstream client disconnected")
@@ -12043,12 +13376,9 @@ def iter_upstream_lines_until_client_disconnect(
         except (TimeoutError, OSError) as exc:
             if router_client_connection_closed(handler):
                 raise UpstreamClientDisconnected("downstream client disconnected during upstream read") from exc
-            if upstream_read_timed_out(exc) and time.monotonic() < idle_deadline:
-                continue
             raise
         if raw in (b"", ""):
             return
-        idle_deadline = time.monotonic() + idle
         yield raw
 
 
@@ -12065,14 +13395,30 @@ def sleep_until_or_client_disconnect(handler: BaseHTTPRequestHandler, seconds: f
 
 def cap_anthropic_body_for_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
     capped = dict(body)
-    if provider not in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
+    if provider == "anthropic":
         return capped
-    if provider == "vllm":
-        context_limit = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len")) or 32768
-    else:
-        context_limit = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
+    context_limit = (
+        context_limit_for_status(provider, pcfg)
+        or positive_int(pcfg.get("max_model_len"))
+        or positive_int(pcfg.get("context_window"))
+        or (32768 if provider == "vllm" else 0)
+    )
+    if not context_limit:
+        return capped
     configured = configured_output_tokens(pcfg, capped)
-    output_tokens = cap_output_tokens_for_context(pcfg, capped, {k: v for k, v in capped.items() if k != "max_tokens"}, context_limit, configured)
+    ratio_capped = cap_output_tokens_to_context_ratio(provider, pcfg, configured)
+    if ratio_capped:
+        capped["max_tokens"] = ratio_capped
+    reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
+    output_reserve = positive_int(capped.get("max_tokens")) or configured or 4096
+    input_budget = max(8192, context_limit - output_reserve - reserve)
+    capped = compact_anthropic_body_for_budget(
+        capped,
+        input_budget,
+        provider=provider,
+        model=str(capped.get("model") or pcfg.get("current_model") or ""),
+    )
+    output_tokens = cap_output_tokens_for_context(pcfg, capped, {k: v for k, v in capped.items() if k != "max_tokens"}, context_limit, positive_int(capped.get("max_tokens")) or configured)
     if output_tokens:
         capped["max_tokens"] = output_tokens
     return capped
@@ -12114,7 +13460,7 @@ def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], 
     reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
     output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
     input_budget = max(8192, context_limit - output_reserve - reserve)
-    messages = compact_ollama_messages_for_budget(messages, tools, input_budget)
+    messages = compact_ollama_messages_for_budget(messages, tools, input_budget, provider="ollama", model=model)
     req: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -12154,7 +13500,13 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
     configured = configured_output_tokens(pcfg, body)
     reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
     output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
-    messages = compact_ollama_messages_for_budget(messages, tools, max(8192, context_limit - output_reserve - reserve))
+    messages = compact_ollama_messages_for_budget(
+        messages,
+        tools,
+        max(8192, context_limit - output_reserve - reserve),
+        provider=provider,
+        model=model,
+    )
     messages = repair_openai_tool_call_adjacency(messages)
     req: dict[str, Any] = {
         "model": model,
@@ -12222,7 +13574,13 @@ def advisor_upstream_model(provider: str, model: str) -> str:
 def advisor_request(provider: str, model: str, body: dict[str, Any], pcfg: dict[str, Any], focus_override: str = "") -> dict[str, Any]:
     messages = advisor_messages_for_provider(provider, body, focus_override=focus_override)
     if advisor_provider_kind(provider) != "anthropic":
-        messages = compact_ollama_messages_for_budget(messages, [], advisor_input_budget(provider, pcfg))
+        messages = compact_ollama_messages_for_budget(
+            messages,
+            [],
+            advisor_input_budget(provider, pcfg),
+            provider=provider,
+            model=model,
+        )
     upstream_model = advisor_upstream_model(provider, model)
     if advisor_provider_kind(provider) == "anthropic":
         _, extra_system_texts = anthropic_advisor_messages_and_system(body)
@@ -12286,7 +13644,7 @@ def advisor_endpoint(provider: str, pcfg: dict[str, Any]) -> str:
         url = join_url(base, "/v1/messages")
         # Honor force_query_string like the main forwarding path; the advisor
         # call has no inbound request path, so only the explicit override applies.
-        query = upstream_messages_query(pcfg, "")
+        query = upstream_messages_query(pcfg, "", provider)
         return f"{url}?{query}" if query else url
     if advisor_provider_kind(provider) == "openai-compatible":
         return join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions")
@@ -12722,6 +14080,98 @@ def maybe_handle_router_debug_request(handler: BaseHTTPRequestHandler, body: dic
     return True
 
 
+def _format_channel_backlog_status_lines(stats: dict[str, Any], cleared: bool) -> list[str]:
+    if cleared:
+        return [
+            "Claude Any channel backlog discarded.",
+            f"- chat tail: {stats.get('chat_tail')}",
+            f"- LLM cursor advanced by: {stats.get('discarded_llm')}",
+            f"- MCP cursor advanced by: {stats.get('discarded_mcp')}",
+            f"- summary cursor advanced by: {stats.get('discarded_summaries')}",
+            f"- direct worker queue drained: {stats.get('direct_queue_drained')}",
+            f"- direct worker items marked handled: {stats.get('direct_queue_remembered')}",
+            f"- direct worker inflight still running: {stats.get('direct_inflight')}",
+            f"- active MCP channel sessions updated: {stats.get('mcp_sessions_updated')}",
+            "New channel events arriving after this point will still be delivered.",
+        ]
+    return [
+        "Claude Any channel backlog status.",
+        f"- chat tail: {stats.get('chat_tail')}",
+        f"- pending LLM items by id range: {stats.get('pending_llm')}",
+        f"- pending MCP items by id range: {stats.get('pending_mcp')}",
+        f"- pending direct summaries by id range: {stats.get('pending_summaries')}",
+        f"- direct worker queue depth: {stats.get('direct_queue')}",
+        f"- direct worker inflight: {stats.get('direct_inflight')}",
+        f"- active MCP channel sessions: {stats.get('mcp_sessions')}",
+    ]
+
+
+def maybe_handle_channel_clear_request(handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> bool:
+    if not is_channel_clear_request(body):
+        return False
+    stream = bool(body.get("stream", True))
+    value = channel_clear_value_from_body(body).strip().lower()
+    if value in {"", "all", "clear", "discard", "drop", "purge", "reset", "now"}:
+        stats = clear_channel_backlog()
+        lines = _format_channel_backlog_status_lines(stats, cleared=True)
+    elif value in {"status", "state", "show", "?", "dry-run", "dryrun"}:
+        stats = channel_backlog_status()
+        lines = _format_channel_backlog_status_lines(stats, cleared=False)
+    else:
+        lines = ["Usage: `/channel-clear`, `/channel-clear all`, or `/channel-clear status`."]
+    write_anthropic_text_response(handler, str(body.get("model") or current_alias(load_config())), "\n".join(lines), stream)
+    return True
+
+
+def handle_live_llm_options_action(action: str = "status", preset: str = "") -> tuple[list[str], bool]:
+    cfg = load_config()
+    provider, pcfg = get_current_provider(cfg)
+    raw_action = str(action or "").strip()
+    raw_preset = str(preset or "").strip()
+    if not raw_action and raw_preset:
+        raw_action = "apply"
+    value = raw_preset or raw_action
+    normalized = normalize_llm_preset_token(value)
+    if normalized in {"", "status", "state", "show", "current", "now"}:
+        return runtime_llm_status_lines(provider, pcfg), False
+    if normalized in {"list", "presets", "preset", "help", "options", "menu", "select"}:
+        return runtime_llm_preset_list_lines(provider, pcfg), False
+    if normalized in {"restore", "original", "reset", "revert", "undo"}:
+        had_snapshot = isinstance(pcfg.get(RUNTIME_LLM_ORIGINAL_KEY), dict)
+        lines = restore_runtime_llm_original_options(provider)
+        cfg_after = load_config()
+        _provider_after, pcfg_after = get_current_provider(cfg_after)
+        return lines + [""] + runtime_llm_status_lines(provider, pcfg_after), had_snapshot
+    preset_id = resolve_llm_preset_id(value)
+    if not preset_id:
+        return [
+            f"Unknown live LLM preset/action: {value or raw_action or raw_preset}",
+            "Use `/llm-options list` to see available presets, or `/llm-restore` to revert.",
+        ], False
+    lines = apply_runtime_llm_preset_config(provider, preset_id)
+    cfg_after = load_config()
+    _provider_after, pcfg_after = get_current_provider(cfg_after)
+    return lines + ["", "Updated live LLM options. The next model request uses these settings."] + runtime_llm_status_lines(provider, pcfg_after), True
+
+
+def maybe_handle_live_llm_options_request(handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> bool:
+    if not is_live_llm_options_request(body):
+        return False
+    stream = bool(body.get("stream", True))
+    value = live_llm_options_value_from_body(body)
+    lines, changed = handle_live_llm_options_action(value)
+    if changed:
+        EVENT_BUS.publish(
+            level="info",
+            category="config.llm",
+            message="live LLM options updated from slash command",
+            provider=get_current_provider(load_config())[0],
+            data={"value": value},
+        )
+    write_anthropic_text_response(handler, str(body.get("model") or current_alias(load_config())), "\n".join(lines), stream)
+    return True
+
+
 def normalize_tool_arguments(tool_name: str, args: Any) -> dict[str, Any]:
     if isinstance(args, dict):
         return args
@@ -12831,6 +14281,8 @@ def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict
             if matched_name is None:
                 continue
         fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
+        if should_drop_emitted_tool_call(matched_name, fixed_input, name, source_body):
+            continue
         append_tool_call_log(
             "ollama_nonstream_tool_call",
             {
@@ -12972,6 +14424,8 @@ def _rebatch_anthropic_sse_text(
     pending_message_delta: tuple[str | None, str] | None = None
     pending_message_stop: tuple[str | None, str] | None = None
     last_suppressed_keepalive_at = 0.0
+    stream_success = False
+    allow_tasklist_synthesis = should_synthesize_tasklist_for_provider(provider)
 
     class ClientStreamDisconnected(Exception):
         pass
@@ -13156,9 +14610,9 @@ def _rebatch_anthropic_sse_text(
                 has_tasklist_tool = has_tool(source_body, "TaskList")
                 if emitted_tool_use:
                     recovery_reason = ""
-                elif should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, []):
+                elif allow_tasklist_synthesis and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, []):
                     recovery_reason = "hidden-only" if suppressed_thinking_passback_blocks else "empty"
-                elif should_keep_work_alive_with_tasklist(source_body, text_so_far, []):
+                elif allow_tasklist_synthesis and should_keep_work_alive_with_tasklist(source_body, text_so_far, []):
                     recovery_reason = "keepalive"
             except Exception as exc:
                 router_log(
@@ -13240,6 +14694,8 @@ def _rebatch_anthropic_sse_text(
                 return
             matched_name, fixed_input = mapped_name, mapped_input
         fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
+        if should_drop_emitted_tool_call(matched_name, fixed_input, raw_name, source_body):
+            return
         tool_id = str(tool_state.get("id") or f"toolu_anthropic_{int(time.time() * 1000)}_{index}")
         _remember_channel_injected_tool_use(source_body, tool_id, matched_name, fixed_input)
         append_tool_call_log(
@@ -13358,6 +14814,8 @@ def _rebatch_anthropic_sse_text(
             stop_reason = str(delta.get("stop_reason") or "")
             tool_calls = [{"type": "tool_use"}] if emitted_tool_use else []
             if (
+                allow_tasklist_synthesis
+                and
                 stop_reason == "end_turn"
                 and source_body is not None
                 and should_auto_continue_choice_question_with_tasklist(source_body, text_so_far, tool_calls)
@@ -13374,8 +14832,14 @@ def _rebatch_anthropic_sse_text(
                 patched["delta"] = patched_delta
                 pending_message_delta = (event_type, json.dumps(patched, ensure_ascii=False))
                 return
-            should_recover = source_body is not None and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls)
+            should_recover = (
+                allow_tasklist_synthesis
+                and source_body is not None
+                and should_recover_empty_end_turn_with_tasklist(source_body, text_so_far, tool_calls)
+            )
             should_keep_alive = (
+                allow_tasklist_synthesis
+                and
                 source_body is not None
                 and not should_recover
                 and should_keep_work_alive_with_tasklist(source_body, text_so_far, tool_calls)
@@ -13483,7 +14947,9 @@ def _rebatch_anthropic_sse_text(
         flush_suppressed_thinking_passback()
         if pending_message_delta is not None or pending_message_stop is not None:
             emit_pending_message_end()
+        stream_success = bool(saw_message_stop)
     except ClientStreamDisconnected as exc:
+        mark_pending_channel_delivery_failed(handler, "anthropic_stream_client_disconnected")
         router_log(
             "WARN",
             f"anthropic_sse_client_disconnected model={model} "
@@ -13540,6 +15006,11 @@ def _rebatch_anthropic_sse_text(
         except Exception:
             pass
     finally:
+        if stream_success:
+            mark_pending_channel_delivery_success(handler, "anthropic_stream_message_stop")
+        else:
+            reason = str(getattr(handler, "_claude_any_channel_delivery_reason", "anthropic_stream_incomplete") or "anthropic_stream_incomplete")
+            mark_pending_channel_delivery_failed(handler, reason)
         try:
             resp.close()
         except Exception:
@@ -13733,6 +15204,8 @@ def _ollama_stream_to_anthropic_sse(
                     if matched_name is None:
                         continue
                 fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
+                if should_drop_emitted_tool_call(matched_name, fixed_input, raw_name, source_body):
+                    continue
                 tool_calls.append({"function": {"name": matched_name, "arguments": fixed_input}})
                 tool_id = f"toolu_ollama_{int(time.time() * 1000)}_{len(tool_calls) - 1}"
                 tool_index = next_content_index
@@ -13945,9 +15418,11 @@ def _ollama_stream_to_anthropic_sse(
                 chunks=chunks_seen,
                 stream=True,
             )
+        mark_pending_channel_delivery_success(handler, "ollama_stream_message_stop")
     except UpstreamClientDisconnected as exc:
         sse_trace_outcome = "client_disconnected"
         sse_trace_error = f"{type(exc).__name__}: {exc}"
+        mark_pending_channel_delivery_failed(handler, "ollama_stream_client_disconnected")
         router_log(
             "WARN",
             f"ollama_stream_client_disconnected provider={provider} model={model} "
@@ -13966,24 +15441,29 @@ def _ollama_stream_to_anthropic_sse(
     except Exception as exc:
         sse_trace_outcome = "error"
         sse_trace_error = f"{type(exc).__name__}: {exc}"
+        mark_pending_channel_delivery_failed(handler, f"ollama_stream_error:{type(exc).__name__}")
         router_log("ERROR", f"ollama_stream_error provider={provider} model={model} error={type(exc).__name__}: {exc}")
         write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
         try:
             ensure_message_started()
-            if word_chunking and text_started and text_buffer:
-                to_flush, text_buffer = _split_word_buffer(text_buffer, force=True)
-                if to_flush and text_index is not None:
-                    emit("content_block_delta", {"type": "content_block_delta", "index": text_index, "delta": {"type": "text_delta", "text": to_flush}})
-            if text_started and text_index is not None and not text_stopped:
+            if text_started and not text_stopped:
                 emit("content_block_stop", {"type": "content_block_stop", "index": text_index})
-            for tool_index in tool_indices:
-                if tool_index not in stopped_tool_indices:
-                    emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
             if not text_started and not tool_indices:
                 error_index = next_content_index
                 next_content_index += 1
-                emit_text_block(error_index, "")
-            emit("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": max(1, output_tokens or len(text_so_far) // 4)}})
+                emit_text_block(error_index, f"Upstream stream error: {type(exc).__name__}: {exc}")
+            for tool_index in tool_indices:
+                if tool_index not in stopped_tool_indices:
+                    emit("content_block_stop", {"type": "content_block_stop", "index": tool_index})
+                    stopped_tool_indices.add(tool_index)
+            emit(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": output_tokens or 1},
+                },
+            )
             emit("message_stop", {"type": "message_stop"})
         except Exception:
             pass
@@ -14065,7 +15545,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                 )
                 router_log("INFO", f"ollama_stream_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={req_tokens} bytes={req_bytes}")
                 resp = urllib.request.urlopen(req, timeout=ollama_request_timeout_seconds(pcfg))
-                set_upstream_stream_read_timeout(resp, upstream_stream_poll_timeout_seconds(stream_idle_timeout))
+                set_upstream_stream_read_timeout(resp, stream_idle_timeout)
                 learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
                 break
             except urllib.error.HTTPError as exc:
@@ -14168,6 +15648,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
             remember_channel_injected_tool_uses(original_body, message)
             message = prepend_anthropic_text(message, rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
             write_json(handler, message)
+            mark_pending_channel_delivery_success(handler, "ollama_collected_json")
         return
     # Non-streaming fallback
     data_bytes = json.dumps(req_body).encode("utf-8")
@@ -14261,6 +15742,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     remember_channel_injected_tool_uses(original_body, message)
     message = prepend_anthropic_text(message, rate_limit_notice(waited, rpm_used, rpm_limit, rpm_status))
     write_json(handler, message)
+    mark_pending_channel_delivery_success(handler, "ollama_json")
 
 
 def openai_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -14529,6 +16011,8 @@ def stream_openai_chat_to_anthropic_sse(
                 if matched_name is None:
                     continue
             fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
+            if should_drop_emitted_tool_call(matched_name, fixed_input, raw_name, source_body):
+                continue
             tool_calls.append({"function": {"name": matched_name, "arguments": fixed_input}})
             tool_index = next_content_index
             next_content_index += 1
@@ -15090,14 +16574,19 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
                 input_bytes=req_bytes,
             )
             if stream_ok:
+                mark_pending_channel_delivery_success(handler, "openai_stream_message_stop")
                 write_router_activity("success", provider, model, tokens=req_tokens, bytes=req_bytes, stream=True)
+            else:
+                mark_pending_channel_delivery_failed(handler, "openai_stream_error")
         except RuntimeError as exc:
             msg = str(exc)
+            mark_pending_channel_delivery_failed(handler, f"openai_stream_runtime_error:{type(exc).__name__}")
             write_anthropic_stream_blocks(handler, [{"type": "text", "text": f"Upstream error: {msg}"}], index)
             write_anthropic_open_stream_stop(handler)
             return
         except Exception as exc:
             msg = f"{type(exc).__name__}: {exc}"
+            mark_pending_channel_delivery_failed(handler, f"openai_stream_error:{type(exc).__name__}")
             write_router_activity("error", provider, model, error=type(exc).__name__, stream=True)
             write_anthropic_stream_blocks(handler, [{"type": "text", "text": f"Upstream error: {msg}"}], index)
             write_anthropic_open_stream_stop(handler)
@@ -15124,6 +16613,7 @@ def forward_openai_compatible_chat(handler: BaseHTTPRequestHandler, provider: st
     remember_channel_injected_tool_uses(original_body, message)
     message = prepend_anthropic_text(message, notice)
     write_anthropic_message_response(handler, message, stream)
+    mark_pending_channel_delivery_success(handler, "openai_json")
 
 
 class RouterHandler(BaseHTTPRequestHandler):
@@ -15266,13 +16756,21 @@ class RouterHandler(BaseHTTPRequestHandler):
         if maybe_handle_router_debug_request(self, body):
             EVENT_BUS.publish(level="info", category="router_debug.short_circuit", message="router debug request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
+        if maybe_handle_channel_clear_request(self, body):
+            EVENT_BUS.publish(level="info", category="channel_clear.short_circuit", message="channel backlog clear request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
+            return
+        if maybe_handle_live_llm_options_request(self, body):
+            EVENT_BUS.publish(level="info", category="llm_options.short_circuit", message="live LLM options request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
+            return
         if maybe_handle_advisor_request(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
         body = strip_autonomous_advisor_server_tools(provider, body)
+        body = sanitize_assistant_pseudo_tool_text_history(body)
         body = body_with_pending_channel_messages(body)
         body = body_with_pending_channel_summaries(body)
         body = body_with_channel_tool_result_context(body)
+        begin_pending_channel_delivery(self, body)
         body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
         body = normalize_tool_choice_for_provider(provider, pcfg, body)
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
@@ -15337,7 +16835,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             upstream_body = body_without_claude_any_internal_metadata(body)
             base = native_anthropic_base_url(provider, pcfg) if provider_native_compat_enabled(provider, pcfg) else provider_upstream_request_base(provider, pcfg)
             url = join_url(base, "/v1/messages")
-            upstream_query = upstream_messages_query(pcfg, self.path)
+            upstream_query = upstream_messages_query(pcfg, self.path, provider)
             if upstream_query:
                 url = f"{url}?{upstream_query}"
             headers = provider_headers(provider, pcfg, self.headers)
@@ -15388,7 +16886,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                             payload = json.loads(raw_resp.decode("utf-8", errors="replace"))
                             if isinstance(payload, dict):
                                 payload = normalize_response_thinking_for_non_anthropic_provider(provider, pcfg, payload, upstream_model)
-                                payload = append_synthetic_tasklist_to_message(payload, upstream_model, body, "native_json")
+                                payload = append_synthetic_tasklist_to_message(payload, upstream_model, body, "native_json", provider=provider)
                                 if notice:
                                     payload = prepend_anthropic_text(payload, notice)
                                 raw_resp = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -15396,6 +16894,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                             pass
                     self.wfile.write(raw_resp)
                     self.wfile.flush()
+                    mark_pending_channel_delivery_success(self, "anthropic_json")
                 commit_pending_channel_delivery_cursors(body, self)
             except urllib.error.HTTPError as e:
                 err = e.read()
@@ -15407,8 +16906,30 @@ class RouterHandler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(err)
         except Exception as exc:
+            if is_client_disconnect_error(exc):
+                mark_pending_channel_delivery_failed(self, f"client_disconnected:{type(exc).__name__}")
+                write_router_activity(
+                    "cancel",
+                    provider,
+                    str(body.get("model") or ""),
+                    error=type(exc).__name__,
+                    stream=bool(body.get("stream", True)),
+                )
+                router_log(
+                    "WARN",
+                    f"router_client_disconnected provider={provider} model={body.get('model')} error={type(exc).__name__}: {exc}",
+                )
+                EVENT_BUS.publish(
+                    level="warning",
+                    category="router.client_disconnected",
+                    message=f"client disconnected: {type(exc).__name__}",
+                    request_id=request_id,
+                    provider=provider,
+                    model=str(body.get("model") or ""),
+                )
+                return
             EVENT_BUS.publish(level="error", category="router.error", message=str(exc), request_id=request_id, provider=provider, model=str(body.get("model") or ""), data={"error_type": type(exc).__name__})
-            write_json(self, {"type": "error", "error": {"type": "api_error", "message": str(exc)}}, 500)
+            try_write_json(self, {"type": "error", "error": {"type": "api_error", "message": str(exc)}}, 500)
 
 
 def serve(_: argparse.Namespace) -> None:
@@ -15514,6 +17035,16 @@ def store_nvidia_api_key(key: str) -> None:
     env.setdefault("PROXY_HOST", "127.0.0.1")
     env.setdefault("PROXY_PORT", "8788")
     env.setdefault("STORAGE_ENGINE", "sqlite")
+    NCP_ENV.parent.mkdir(parents=True, exist_ok=True)
+    NCP_ENV.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
+    os.chmod(NCP_ENV, 0o600)
+
+
+def clear_nvidia_api_key() -> None:
+    env = read_env_file(NCP_ENV)
+    if "NVIDIA_API_KEY" not in env:
+        return
+    env.pop("NVIDIA_API_KEY", None)
     NCP_ENV.parent.mkdir(parents=True, exist_ok=True)
     NCP_ENV.write_text("".join(f"{k}={v}\n" for k, v in env.items()))
     os.chmod(NCP_ENV, 0o600)
@@ -15649,6 +17180,8 @@ def set_advisor_model_config(value: str) -> list[str]:
 
 
 def store_api_key_config(provider: str, key: str) -> list[str]:
+    if api_key_clear_requested(key):
+        return clear_api_key_config(provider)
     if provider == "nvidia-hosted":
         store_nvidia_api_key(key)
         cfg = load_config()
@@ -15669,8 +17202,50 @@ def store_api_key_config(provider: str, key: str) -> list[str]:
     ]
 
 
+def clear_api_key_config(provider: str) -> list[str]:
+    cfg = load_config()
+    providers = cfg["providers"]
+    missing = object()
+    other_key_fields: dict[str, tuple[Any, Any]] = {}
+    for name, other_pcfg in providers.items():
+        if name == provider or not isinstance(other_pcfg, dict):
+            continue
+        api_key_value = other_pcfg.get("api_key", missing)
+        api_keys_value = json.loads(json.dumps(other_pcfg.get("api_keys"))) if "api_keys" in other_pcfg else missing
+        other_key_fields[name] = (api_key_value, api_keys_value)
+    pcfg = cfg["providers"][provider]
+    had_config_key = bool(parse_api_key_list(pcfg.get("api_key")) or parse_api_key_list(pcfg.get("api_keys")))
+    pcfg.pop("api_key", None)
+    pcfg.pop("api_keys", None)
+    if provider == "nvidia-hosted":
+        had_config_key = had_config_key or bool(parse_api_key_list(read_env_file(NCP_ENV).get("NVIDIA_API_KEY")))
+        clear_nvidia_api_key()
+        ensure_nvidia_hosted_base_url(pcfg)
+    for name, (api_key_value, api_keys_value) in other_key_fields.items():
+        other_pcfg = providers.get(name)
+        if not isinstance(other_pcfg, dict):
+            continue
+        if api_key_value is missing:
+            other_pcfg.pop("api_key", None)
+        else:
+            other_pcfg["api_key"] = api_key_value
+        if api_keys_value is missing:
+            other_pcfg.pop("api_keys", None)
+        else:
+            other_pcfg["api_keys"] = api_keys_value
+    save_config(cfg)
+    clear_model_cache()
+    with _API_KEY_ROTATION_LOCK:
+        _API_KEY_ROTATION_CURSOR.pop(provider_api_key_rotation_name(provider, pcfg), None)
+    if had_config_key:
+        return [f"Cleared stored API key(s) for {provider}. Other providers unchanged."]
+    return [f"No stored API key(s) for {provider}; other providers unchanged."]
+
+
 def store_api_keys_config(provider: str, keys: list[str]) -> list[str]:
     parsed = parse_api_key_list(keys)
+    if len(parsed) == 1 and api_key_clear_requested(parsed[0]):
+        return clear_api_key_config(provider)
     if not parsed:
         raise SystemExit("No API keys provided; unchanged.")
     cfg = load_config()
@@ -15754,6 +17329,8 @@ def stored_api_key_mask(provider: str, pcfg: dict[str, Any]) -> str:
 
 
 def store_api_key_input_config(provider: str, raw_value: str) -> list[str]:
+    if api_key_clear_requested(raw_value):
+        return clear_api_key_config(provider)
     keys = parse_api_key_list(raw_value)
     if len(keys) > 1:
         return store_api_keys_config(provider, keys)
@@ -15823,7 +17400,7 @@ def cmd_api_key(args: argparse.Namespace) -> None:
     if not args.provider:
         print("API key status:")
         for p, pcfg in cfg["providers"].items():
-            needs = p in ("anthropic", "ollama-cloud", "deepseek", "opencode", "opencode-go", "nvidia-hosted", "openrouter", "fireworks")
+            needs = p in ("anthropic", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "nvidia-hosted", "openrouter", "fireworks")
             count = provider_api_key_count(p, pcfg)
             label = f"{count} keys (round-robin)" if count > 1 else ("set" if count == 1 else ("missing" if needs else "not required"))
             primary = provider_primary_api_key(p, pcfg)
@@ -15834,6 +17411,11 @@ def cmd_api_key(args: argparse.Namespace) -> None:
         print("For NVIDIA hosted, use: claude-anyctl api-key nvidia-hosted")
         return
     provider = normalize_provider(args.provider)
+    action = str(getattr(args, "action", "") or "").strip()
+    if api_key_clear_requested(action):
+        for line in clear_api_key_config(provider):
+            print(line)
+        return
     if not sys.stdin.isatty():
         print("For security, do not paste API keys into Claude Code chat.")
         print(f"Run this in the SSH terminal instead: claude-anyctl api-key {provider}")
@@ -15947,11 +17529,11 @@ def status_lines() -> list[str]:
         *([f"think: {bool(pcfg.get('think', False))}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("ollama", "ollama-cloud") else []),
-        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks") else []),
-        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks") else []),
-        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks") else []),
-        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks") else []),
-        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks") else []),
+        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
+        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
+        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
+        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
+        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
         f"log_level: {log_level_status()}",
         f"channels: {channel_status_text(cfg)}",
@@ -17064,6 +18646,64 @@ def discovered_claude_mcp_servers(
     return servers
 
 
+def _read_mcp_servers_from_generated_file(path: Path, cwd: Path) -> dict[str, dict[str, Any]]:
+    if not path.exists() or not path.is_file():
+        return {}
+    servers: dict[str, dict[str, Any]] = {}
+    for name, server in _read_mcp_servers_from_json(path, cwd):
+        if name.strip().lower() in _NATIVE_ROUTER_CHANNEL_NAMES:
+            continue
+        servers.setdefault(name, server)
+    return servers
+
+
+def discovered_claude_any_managed_mcp_servers(cwd: Path | None = None) -> dict[str, dict[str, Any]]:
+    """Return MCP servers that only exist in claude-any generated config.
+
+    Direct Claude Native launches should restore the user's MCP tool surface when
+    switching back from a routed/non-native session.  The generated channel MCP
+    bridge itself is intentionally skipped, but ordinary generated tools and
+    original servers wrapped by mcp-proxy are safe to pass back to Claude Code.
+    """
+    cwd = cwd or Path.cwd()
+    servers: dict[str, dict[str, Any]] = {}
+    servers.update(_read_mcp_servers_from_generated_file(WEB_TOOLS_MCP_CONFIG, cwd))
+
+    if MCP_PROXY_CONFIG.exists() and MCP_PROXY_CONFIG.is_file():
+        try:
+            proxy_data = json.loads(MCP_PROXY_CONFIG.read_text(encoding="utf-8"))
+        except Exception:
+            proxy_data = {}
+        proxy_servers = proxy_data.get("mcpServers") if isinstance(proxy_data, dict) else None
+        if isinstance(proxy_servers, dict):
+            for raw_name, raw_entry in proxy_servers.items():
+                name = str(raw_name or "").strip()
+                if not name or name.strip().lower() in _NATIVE_ROUTER_CHANNEL_NAMES or not isinstance(raw_entry, dict):
+                    continue
+                args = raw_entry.get("args")
+                if isinstance(args, list):
+                    args_s = [str(item) for item in args]
+                    if "mcp-proxy" in args_s and "--server-config" in args_s:
+                        try:
+                            cfg_path = Path(args_s[args_s.index("--server-config") + 1]).expanduser()
+                            wrapped_name = (
+                                args_s[args_s.index("--server-name") + 1].strip()
+                                if "--server-name" in args_s and args_s.index("--server-name") + 1 < len(args_s)
+                                else name
+                            )
+                            wrapped_server = json.loads(cfg_path.read_text(encoding="utf-8"))
+                        except Exception:
+                            continue
+                        if wrapped_name and isinstance(wrapped_server, dict):
+                            restored = dict(wrapped_server)
+                            restored.pop("claude_any_disable_notification_stream", None)
+                            if wrapped_name.strip().lower() not in _NATIVE_ROUTER_CHANNEL_NAMES:
+                                servers.setdefault(wrapped_name, restored)
+                        continue
+                servers.setdefault(name, dict(raw_entry))
+    return servers
+
+
 def write_native_mcp_config_from_discovery(
     passthrough: list[str] | None = None,
     cwd: Path | None = None,
@@ -17076,7 +18716,13 @@ def write_native_mcp_config_from_discovery(
     Code expects a top-level mcpServers record, so native launches receive this
     normalized generated file instead of the source files.
     """
+    cwd = cwd or Path.cwd()
     servers = discovered_claude_mcp_servers(passthrough, cwd, home)
+    for name, server in discovered_claude_any_managed_mcp_servers(cwd).items():
+        if name in servers:
+            router_log("INFO", f"native_mcp_managed_duplicate_skipped server={name}")
+            continue
+        servers[name] = server
     if not servers:
         return None
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -17370,21 +19016,38 @@ def _server_names_from_channel_specs(specs: Iterable[str]) -> list[str]:
     return _dedupe_strings(names)
 
 
+def channel_candidate_server_names_for_launch(cfg: dict[str, Any], passthrough: list[str]) -> list[str]:
+    """External MCP channel servers relevant to this launch.
+
+    Explicit claude-any channel settings remain honored, but non-native routed
+    launches must also pick up Streamable HTTP/SSE servers already present in
+    Claude Code MCP config files.  That is the zero-manual-setup path for users
+    switching from native Claude Code to routed/non-native providers.
+    """
+    explicit_names = [
+        name for name in _server_names_from_channel_specs(channel_specs_for_launch(cfg, passthrough))
+        if name.strip().lower() not in _NATIVE_ROUTER_CHANNEL_NAMES
+    ]
+    try:
+        discovered_names = external_mcp_channel_server_names_from_configs(passthrough)
+    except Exception as exc:
+        router_log("WARN", f"channel_auto_discovery_failed error={type(exc).__name__}: {exc}")
+        discovered_names = []
+    return _dedupe_strings([*explicit_names, *discovered_names])
+
+
 def channel_probe_cache_needs_launch_refresh(cfg: dict[str, Any], passthrough: list[str]) -> bool:
     cache = read_channel_probe_cache()
     records = cached_channel_probe_servers()
     if not cache.get("probed_at") or not records:
         return True
-    configured_names = [
-        name for name in _server_names_from_channel_specs(channel_specs_for_launch(cfg, passthrough))
-        if name != "claude-any-router"
-    ]
-    if not configured_names:
+    candidate_names = channel_candidate_server_names_for_launch(cfg, passthrough)
+    if not candidate_names:
         return False
     if not cache.get("probed_at"):
         return True
     by_name = {str(r.get("name") or ""): r for r in records if r.get("name")}
-    for name in configured_names:
+    for name in candidate_names:
         record = by_name.get(name)
         if not record or not record.get("capable"):
             return True
@@ -18153,7 +19816,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print("  claude-any --ca-ollama-option temperature=0.7 --ca-ollama-num-ctx 65536")
 
 
-PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks")
+PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks")
 PROVIDER_SAMPLING_OPTION_PROVIDERS = ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "openrouter")
 PROVIDER_SAMPLING_OPTIONS = ("temperature", "top_p", "top_k")
 
@@ -18214,10 +19877,10 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     if provider in ("ollama", "ollama-cloud"):
         parts.insert(0, f"num_ctx={ollama_num_ctx_status(pcfg)}")
         parts.append(f"ollama_options={ollama_options_status(pcfg)}")
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
-    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         native_default = True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
     if provider in OPENCODE_PROVIDER_NAMES:
@@ -18227,12 +19890,14 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
         parts.append(f"endpoint_overrides={count}")
     if provider == "anthropic":
         parts.append(f"routed={'on' if anthropic_routed_enabled(provider, pcfg) else 'off'}")
+    elif provider in PROVIDER_OPTION_PROVIDERS:
+        parts.append(f"tool_choice={provider_tool_choice_status(provider, pcfg)}")
     forced_query = str(pcfg.get("force_query_string") or "").strip()
     if forced_query:
-        parts.append(f"force_query={forced_query}")
+        parts.append(f"query={forced_query}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         parts.append(f"stream={'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
         if bool(pcfg.get("stream_word_chunking", False)):
             parts.append("word_chunk=on")
@@ -18275,7 +19940,7 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
         return "million-context"
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
-    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         ctx = provider_model_context_capacity(provider, pcfg) or positive_int(pcfg.get("context_window")) or 0
         if ctx >= 524288:
             return "million-context"
@@ -18322,6 +19987,64 @@ LLM_PRESETS: dict[str, tuple[str, str]] = {
     "product-architect": ("Product architect", "requirements, system structure, tradeoffs, and implementation plans"),
     "teacher": ("Teacher / tutor", "clear explanations, examples, and step-by-step learning"),
 }
+
+
+def llm_preset_command_name(preset_id: str) -> str:
+    return "llm-" + re.sub(r"[^a-z0-9]+", "-", str(preset_id or "").lower()).strip("-")
+
+
+def llm_preset_slash_command(preset_id: str) -> str:
+    label, description = llm_preset_text(preset_id, "en")
+    return f"""---
+description: Apply claude-any live preset: {label}
+argument-hint: [ignored]
+---
+
+CLAUDE_ANY_LIVE_LLM_OPTIONS
+
+Value: {preset_id}
+
+Apply the claude-any live LLM preset `{preset_id}` ({description}) to this routed session. The original options are captured before the first live preset change and can be restored with `/llm-restore`.
+"""
+
+
+def normalize_llm_preset_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(value or "").lower()).strip("-")
+
+
+def resolve_llm_preset_id(value: str) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    normalized = normalize_llm_preset_token(raw)
+    aliases = {
+        "65k": "long-context-65k",
+        "long-65k": "long-context-65k",
+        "context-65k": "long-context-65k",
+        "128k": "long-context-128k",
+        "long-128k": "long-context-128k",
+        "context-128k": "long-context-128k",
+        "1m": "million-context-1m",
+        "million": "million-context-1m",
+        "million-context": "million-context-1m",
+        "ultra": "million-context-1m",
+        "ultra-context": "million-context-1m",
+        "output": "large-output",
+        "large": "large-output",
+        "report": "large-output",
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    for preset_id, (label, _description) in LLM_PRESETS.items():
+        candidates = {
+            normalize_llm_preset_token(preset_id),
+            normalize_llm_preset_token(label),
+            normalize_llm_preset_token(llm_preset_command_name(preset_id)),
+            normalize_llm_preset_token(llm_preset_command_name(preset_id).removeprefix("llm-")),
+        }
+        if normalized in candidates:
+            return preset_id
+    return None
 
 
 LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
@@ -18542,7 +20265,7 @@ def model_context_hint_from_model_id(model_id: str) -> int | None:
         return catalog_limit
     if any(marker in model for marker in ("deepseek-v4-pro", "deepseek-v4-flash", "deepseek-v4", "v4-pro", "v4-flash", "1m", "million")):
         return 1048576
-    if any(marker in model for marker in ("kimi-k2.6", "kimi_k2.6", "kimi2.6", "kimi-k2")):
+    if any(marker in model for marker in ("kimi-for-coding", "kimi-code", "kimi-k2.7", "kimi_k2.7", "kimi2.7", "k2.7", "kimi-k2.6", "kimi_k2.6", "kimi2.6", "kimi-k2")):
         return 262144
     if "qwen3.6" in model:
         return 262144
@@ -18567,21 +20290,23 @@ def provider_model_context_capacity(provider: str, pcfg: dict[str, Any]) -> int 
             or model_context_hint_from_model_id(model)
             or positive_int(pcfg.get("context_window"))
         )
-    if provider in ("deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         return (
             positive_int(pcfg.get("max_model_len"))
             or model_context_hint_from_model_id(model)
             or positive_int(pcfg.get("context_window"))
         )
+    if provider in ("ollama", "ollama-cloud"):
+        cached = ollama_provider_context_limit(pcfg)
+        if cached:
+            return cached
+        hint = model_context_hint_from_model_id(model)
+        if hint:
+            return hint
+        return positive_int(pcfg.get("num_ctx_max")) or positive_int(pcfg.get("num_ctx"))
     hint = model_context_hint_from_model_id(model)
     if hint:
         return hint
-    if provider in ("ollama", "ollama-cloud"):
-        if ollama_context_model_matches(model, str(pcfg.get("model_context_model") or "")):
-            cached = positive_int(pcfg.get("model_context_max"))
-            if cached:
-                return cached
-        return positive_int(pcfg.get("num_ctx_max")) or positive_int(pcfg.get("num_ctx"))
     return positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
 
 
@@ -18602,11 +20327,59 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
         if fixed_ctx and fixed_ctx > capacity:
             pcfg["num_ctx"] = capacity
         return messages
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         context_window = positive_int(pcfg.get("context_window"))
         if context_window and context_window > capacity:
             pcfg["context_window"] = capacity
             messages.append(f"Context window capped to selected model limit: {capacity:,} tokens.")
+    return messages
+
+
+def small_context_output_token_cap(context_window: int | None) -> int | None:
+    context = positive_int(context_window)
+    if not context or context > 262144:
+        return None
+    divisor = 16 if context <= 131072 else 32
+    cap = max(1024, min(8192, context // divisor))
+    return max(1024, (cap // 1024) * 1024)
+
+
+def cap_output_tokens_to_context_ratio(provider: str, pcfg: dict[str, Any], configured: int | None) -> int | None:
+    value = positive_int(configured)
+    if not value or provider == "anthropic":
+        return value
+    context = context_limit_for_status(provider, pcfg)
+    cap = small_context_output_token_cap(context)
+    if not cap:
+        return value
+    return min(value, cap)
+
+
+def cap_output_settings_to_context_ratio(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    if provider == "anthropic":
+        return []
+    context = context_limit_for_status(provider, pcfg)
+    cap = small_context_output_token_cap(context)
+    if not cap:
+        return []
+    messages: list[str] = []
+    if provider in ("ollama", "ollama-cloud"):
+        opts = pcfg.setdefault("ollama_options", {})
+        current = positive_int(opts.get("num_predict")) or positive_int(pcfg.get("max_output_tokens"))
+        if current and current > cap:
+            opts["num_predict"] = cap
+            pcfg["max_output_tokens"] = cap
+            messages.append(
+                f"Max output capped to {cap:,} tokens for context {format_context_tokens(context)}."
+            )
+        return messages
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+        current = positive_int(pcfg.get("max_output_tokens"))
+        if current and current > cap:
+            pcfg["max_output_tokens"] = cap
+            messages.append(
+                f"Max output capped to {cap:,} tokens for context {format_context_tokens(context)}."
+            )
     return messages
 
 
@@ -18641,8 +20414,10 @@ def apply_current_model_specs_to_provider(provider: str, pcfg: dict[str, Any]) -
             pcfg["model_context_max"] = max_context
             pcfg["model_context_model"] = model
             messages.append(f"Model context size from provider specs: {format_context_tokens(max_context)} ({max_context:,} tokens).")
+        if positive_int(pcfg.get("num_ctx_max")) != max_context:
+            pcfg["num_ctx_max"] = max_context
         return messages
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         if positive_int(pcfg.get("max_model_len")) != max_context:
             pcfg["max_model_len"] = max_context
             messages.append(f"Model context size from provider specs: {format_context_tokens(max_context)} ({max_context:,} tokens).")
@@ -18765,7 +20540,7 @@ def context_setting_status(provider: str, pcfg: dict[str, Any]) -> str:
     cap_text = format_context_tokens(capacity)
     if provider in ("ollama", "ollama-cloud"):
         return f"model max {cap_text}; {ollama_num_ctx_status(pcfg)}"
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         window = positive_int(pcfg.get("context_window"))
         reserve = positive_int(pcfg.get("context_reserve_tokens"))
         reserve_text = f"; reserve {format_context_tokens(reserve)}" if reserve else ""
@@ -18777,12 +20552,15 @@ def context_setting_status(provider: str, pcfg: dict[str, Any]) -> str:
 
 def configured_context_window_for_timeout(provider: str, pcfg: dict[str, Any]) -> int | None:
     if provider in ("ollama", "ollama-cloud"):
+        raw_ctx = pcfg.get("num_ctx")
+        fixed_ctx = positive_int(raw_ctx)
+        if fixed_ctx:
+            return fixed_ctx
         return (
-            positive_int(pcfg.get("num_ctx_max"))
-            or positive_int(pcfg.get("num_ctx"))
-            or provider_model_context_capacity(provider, pcfg)
+            provider_model_context_capacity(provider, pcfg)
+            or positive_int(pcfg.get("num_ctx_max"))
         )
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         return positive_int(pcfg.get("context_window")) or provider_model_context_capacity(provider, pcfg)
     if provider == "anthropic":
         return provider_model_context_capacity(provider, pcfg)
@@ -18798,6 +20576,7 @@ HOSTED_TIMEOUT_PROVIDERS = {
     "deepseek",
     "opencode",
     "opencode-go",
+    "kimi",
     "openrouter",
     "nvidia-hosted",
     "fireworks",
@@ -18810,8 +20589,10 @@ PROVIDER_TIMEOUT_WEIGHTS = {
 def configured_output_tokens_for_timeout(provider: str, pcfg: dict[str, Any]) -> int | None:
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
-        return positive_int(opts.get("num_predict")) or positive_int(pcfg.get("max_output_tokens"))
-    return positive_int(pcfg.get("max_output_tokens")) or positive_int(pcfg.get("num_predict"))
+        configured = positive_int(opts.get("num_predict")) or positive_int(pcfg.get("max_output_tokens"))
+        return cap_output_tokens_to_context_ratio(provider, pcfg, configured)
+    configured = positive_int(pcfg.get("max_output_tokens")) or positive_int(pcfg.get("num_predict"))
+    return cap_output_tokens_to_context_ratio(provider, pcfg, configured)
 
 
 def clamp_auto_timeout_ms(ms: int | float | None) -> int:
@@ -18982,13 +20763,14 @@ def apply_context_setup_to_provider(provider: str, pcfg: dict[str, Any], mode: s
         pcfg["num_ctx_max"] = window
         pcfg["num_ctx_min"] = min(window, 32768 if window <= 65536 else 65536)
         pcfg.setdefault("ollama_options", {})["num_predict"] = output
-    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         pcfg["context_window"] = window
         pcfg["context_reserve_tokens"] = reserve
         pcfg["max_output_tokens"] = output
     else:
         return ["Context setup is managed by Claude Code for this provider."]
     messages = cap_context_settings_to_model_capacity(provider, pcfg)
+    messages.extend(cap_output_settings_to_context_ratio(provider, pcfg))
     messages.extend(apply_recommended_timeout_for_model_context(provider, pcfg))
     return [
         f"{ui_text('context_setup', lang)}: {label}",
@@ -19067,7 +20849,7 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
         if num_ctx and num_ctx <= 32768 and num_predict and num_predict <= 2048:
             return "fast"
         return None
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks", "anthropic"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "anthropic"):
         max_output = positive_int(pcfg.get("max_output_tokens")) or 0
         context_window = positive_int(pcfg.get("context_window")) or 0
         if bool(pcfg.get("think", False)):
@@ -19583,6 +21365,17 @@ def apply_llm_preset_to_provider(
                 f"native={native_default}",
             ],
             }
+            if provider == "kimi":
+                tokens_by_preset["long-context-128k"] = [
+                    "context_window=262144",
+                    "reserve=32768",
+                    "max_output_tokens=32768",
+                    "timeout=600000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                    "native=true",
+                ]
         for token in with_preset_timeout_tokens(tokens_by_preset[preset_id], preset_id):
             if provider == "nvidia-hosted" and token.startswith("native="):
                 continue
@@ -19596,6 +21389,7 @@ def apply_llm_preset_to_provider(
                 else:
                     pcfg["max_output_tokens"] = min(positive_int(pcfg.get("max_output_tokens")) or 4096, max(1024, server_limit // 8))
     context_msgs.extend(cap_context_settings_to_model_capacity(provider, pcfg))
+    context_msgs.extend(cap_output_settings_to_context_ratio(provider, pcfg))
     if provider == "lm-studio":
         context_msgs.extend(apply_lm_studio_loaded_context_guard(pcfg, load=load_lm_studio))
     context_msgs.extend(apply_recommended_timeout_for_model_context(provider, pcfg))
@@ -19682,6 +21476,127 @@ def apply_llm_preset_config(provider: str, preset_id: str) -> list[str]:
     lines = apply_llm_preset_to_provider(provider, pcfg, preset_id, cfg.get("language", "en"))
     save_config(cfg)
     clear_model_cache()
+    return lines
+
+
+RUNTIME_LLM_ORIGINAL_KEY = "runtime_llm_original_options"
+RUNTIME_LLM_OPTION_KEYS = {
+    "llm_preset",
+    "context_window",
+    "context_reserve_tokens",
+    "max_output_tokens",
+    "request_timeout_ms",
+    "stream_idle_timeout_ms",
+    "temperature",
+    "top_p",
+    "top_k",
+    "native_compat",
+    "stream_enabled",
+    "stream_word_chunking",
+    "num_ctx",
+    "num_ctx_min",
+    "num_ctx_max",
+    "keep_alive",
+    "think",
+    "ollama_options",
+    "rate_limit_rpm",
+    "rate_limit_status",
+    "force_query_string",
+    "supports_tool_choice",
+    "ip_family",
+    "model_context_max",
+    "model_context_model",
+    "max_model_len",
+}
+
+
+def runtime_llm_snapshot_from_provider(provider: str, pcfg: dict[str, Any]) -> dict[str, Any]:
+    values = {
+        key: json.loads(json.dumps(pcfg[key]))
+        for key in sorted(RUNTIME_LLM_OPTION_KEYS)
+        if key in pcfg
+    }
+    return {
+        "version": 1,
+        "captured_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "provider": provider,
+        "model": str(pcfg.get("current_model") or ""),
+        "values": values,
+    }
+
+
+def ensure_runtime_llm_original_snapshot(provider: str, pcfg: dict[str, Any]) -> bool:
+    existing = pcfg.get(RUNTIME_LLM_ORIGINAL_KEY)
+    if isinstance(existing, dict) and isinstance(existing.get("values"), dict):
+        return False
+    pcfg[RUNTIME_LLM_ORIGINAL_KEY] = runtime_llm_snapshot_from_provider(provider, pcfg)
+    return True
+
+
+def restore_runtime_llm_original_options(provider: str) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    snapshot = pcfg.get(RUNTIME_LLM_ORIGINAL_KEY)
+    if not isinstance(snapshot, dict) or not isinstance(snapshot.get("values"), dict):
+        return ["No captured live LLM options to restore."]
+    values = json.loads(json.dumps(snapshot.get("values") or {}))
+    for key in RUNTIME_LLM_OPTION_KEYS:
+        pcfg.pop(key, None)
+    pcfg.update(values)
+    pcfg.pop(RUNTIME_LLM_ORIGINAL_KEY, None)
+    save_config(cfg)
+    clear_model_cache()
+    return [
+        "Restored live LLM options to the values captured before the first runtime preset change.",
+        f"Captured provider/model: {snapshot.get('provider') or provider} / {snapshot.get('model') or 'unknown'}",
+    ]
+
+
+def apply_runtime_llm_preset_config(provider: str, preset_id: str) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    captured = ensure_runtime_llm_original_snapshot(provider, pcfg)
+    lines = apply_llm_preset_to_provider(provider, pcfg, preset_id, cfg.get("language", "en"))
+    if captured:
+        lines.insert(0, "Captured current live LLM options for /llm-restore.")
+    save_config(cfg)
+    clear_model_cache()
+    return lines
+
+
+def runtime_llm_status_lines(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    cfg = load_config()
+    lang = cfg.get("language", "en")
+    applied = applied_preset_id(provider, pcfg)
+    lines = [
+        f"Provider: {provider_mode_label(provider, pcfg)}",
+        f"Model: {pcfg.get('current_model') or 'unknown'}",
+        f"Preset: {applied} ({llm_preset_text(applied, lang)[0]})",
+        f"Context: {context_setting_status(provider, pcfg)}",
+        f"Timeout: {timeout_profile_status(pcfg, lang)}",
+    ]
+    if provider in ("ollama", "ollama-cloud"):
+        opts = ollama_extra_options(pcfg)
+        lines.append(f"Output tokens: {opts.get('num_predict', 'default')}")
+    else:
+        lines.append(f"Output tokens: {pcfg.get('max_output_tokens', 'default')}")
+    lines.append(f"Restore available: {'yes' if isinstance(pcfg.get(RUNTIME_LLM_ORIGINAL_KEY), dict) else 'no'}")
+    return lines
+
+
+def runtime_llm_preset_list_lines(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    lang = load_config().get("language", "en")
+    applied = applied_preset_id(provider, pcfg)
+    lines = runtime_llm_status_lines(provider, pcfg)
+    lines.append("")
+    lines.append("Available live presets:")
+    for preset_id in LLM_PRESETS:
+        label, description = llm_preset_text(preset_id, lang)
+        mark = "*" if preset_id == applied else " "
+        command_name = llm_preset_command_name(preset_id)
+        lines.append(f"{mark} /{command_name}  {preset_id} — {label}: {description}")
+    lines.append("  /llm-restore  restore captured original options")
+    lines.append("  /llm-options <preset-id|status|list|restore>")
     return lines
 
 
@@ -19811,6 +21726,12 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ko": "이 provider의 Anthropic-호환 /v1/messages에 직접 연결합니다. off 면 claude-any 라우터를 거칩니다.",
         "ja": "このproviderのAnthropic互換/v1/messagesに直接接続します。offだとclaude-anyルーターを経由します。",
         "zh": "对该 provider 直接走 Anthropic 兼容 /v1/messages；关闭则经由 claude-any 路由器转换。",
+    },
+    "supports_tool_choice": {
+        "en": "Forward Claude Code tool_choice upstream. For vLLM, enable only when the server was launched with --enable-auto-tool-choice and the matching --tool-call-parser.",
+        "ko": "Claude Code의 tool_choice를 upstream에 전달합니다. vLLM은 서버를 --enable-auto-tool-choice 및 모델에 맞는 --tool-call-parser로 실행한 경우에만 켜세요.",
+        "ja": "Claude Code の tool_choice を上流へ転送します。vLLM では --enable-auto-tool-choice と対応する --tool-call-parser で起動した場合のみ有効にしてください。",
+        "zh": "将 Claude Code 的 tool_choice 转发到上游。vLLM 仅在服务器使用 --enable-auto-tool-choice 和匹配的 --tool-call-parser 启动时启用。",
     },
     "stream_enabled": {
         "en": "Toggle streaming. Off forces stream:false upstream and returns the full response, useful when SSE fragmentation causes tool-call/JSON parse errors.",
@@ -19984,6 +21905,8 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Context min", "num_ctx_min", pcfg.get("num_ctx_min", "default"))
         add("Context max", "num_ctx_max", pcfg.get("num_ctx_max", "default"))
         add("Max output tokens", "num_predict", opts.get("num_predict", "default"))
+        add("Query string", "force_query_string", upstream_query_string_status(provider, pcfg))
+        add("Tool choice", "supports_tool_choice", provider_tool_choice_status(provider, pcfg))
         add("Temperature", "temperature", opts.get("temperature", "default"))
         add("Top P", "top_p", opts.get("top_p", "default"))
         add("Top K", "top_k", opts.get("top_k", "default"))
@@ -19999,11 +21922,14 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", False)) else "off")
         add("IP family", "ip_family", provider_ip_family(provider, pcfg))
     else:
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
             add("Context reserve", "context_reserve_tokens", pcfg.get("context_reserve_tokens", "default"))
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+        add("Query string", "force_query_string", upstream_query_string_status(provider, pcfg))
+        if provider in PROVIDER_OPTION_PROVIDERS and provider != "anthropic":
+            add("Tool choice", "supports_tool_choice", provider_tool_choice_status(provider, pcfg))
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
             add("RPM limiter", "rate_limit_enabled", rate_limit_status_label(provider, pcfg))
             add("Rate limit RPM", "rate_limit_rpm", rate_limit_rpm_label(provider, pcfg))
@@ -20011,7 +21937,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
             add("Temperature", "temperature", pcfg.get("temperature", "default"))
             add("Top P", "top_p", pcfg.get("top_p", "default"))
             add("Top K", "top_k", pcfg.get("top_k", "default"))
-            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "openrouter", "fireworks"):
+            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
                 add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", True)))
             add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
             if bool(pcfg.get("stream_enabled", True)):
@@ -20021,7 +21947,6 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         elif provider == "anthropic":
             add("Route through router", "route_through_router", "on" if anthropic_routed_enabled(provider, pcfg) else "off")
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "Claude Code default"))
-            add("Force query string (test)", "force_query_string", pcfg.get("force_query_string", "auto (beta=true)"))
             if anthropic_routed_enabled(provider, pcfg):
                 add("IP family", "ip_family", provider_ip_family(provider, pcfg))
 
@@ -20053,6 +21978,9 @@ def llm_option_prompt_default(provider: str, pcfg: dict[str, Any], key: str) -> 
         return claude_code_capability_string(provider, pcfg, current_upstream_model_id(provider, pcfg))
     if key == "force_query_string":
         return str(pcfg.get("force_query_string") or "")
+    if key == "supports_tool_choice":
+        value = pcfg.get("supports_tool_choice")
+        return "auto" if value is None else ("true" if bool(value) else "false")
     if key == "ip_family":
         return provider_ip_family(provider, pcfg)
     if provider in ("ollama", "ollama-cloud"):
@@ -20161,7 +22089,11 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
     token = f"unset:{key}" if value.lower() in clear_words else f"{key}={value}"
     context_changed = key in ("context_window", "context", "max_model_len", "num_ctx", "ctx", "num_ctx_min", "ctx_min", "min", "num_ctx_max", "ctx_max", "max")
     explicit_timeout = key in ("timeout", "timeout_ms", "request_timeout", "request_timeout_ms", "stream_idle_timeout", "stream_idle_timeout_ms", "idle_timeout", "idle_timeout_ms")
-    if provider in ("ollama", "ollama-cloud"):
+    if key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
+        apply_provider_option(provider, pcfg, token)
+    elif key in ("supports_tool_choice", "tool_choice", "tool-choice", "auto_tool_choice"):
+        apply_provider_option(provider, pcfg, token)
+    elif provider in ("ollama", "ollama-cloud"):
         apply_ollama_option(pcfg, token)
     elif provider == "anthropic":
         if key in ("route", "routed", "route_through_router", "router"):
@@ -20169,8 +22101,6 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
         elif key in ("max_output_tokens", "max_tokens", "maxtoken", "max_token"):
             apply_provider_option(provider, pcfg, token)
         elif key in ("timeout", "timeout_ms", "request_timeout", "request_timeout_ms"):
-            apply_provider_option(provider, pcfg, token)
-        elif key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
             apply_provider_option(provider, pcfg, token)
         else:
             raise SystemExit(f"Unknown Anthropic option: {key}")
@@ -20197,7 +22127,22 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg["model_endpoints"] = endpoints
         endpoints[normalize_model_id(provider, model_id)] = endpoint
         return
-    if provider in ("ollama", "ollama-cloud"):
+    token_key = ""
+    if token.startswith("unset:"):
+        token_key = token.split(":", 1)[1].strip()
+    elif "=" in token:
+        token_key = token.split("=", 1)[0].strip()
+    provider_common_keys = {
+        "force_query_string",
+        "force_query",
+        "upstream_query",
+        "test_query_string",
+        "supports_tool_choice",
+        "tool_choice",
+        "tool-choice",
+        "auto_tool_choice",
+    }
+    if provider in ("ollama", "ollama-cloud") and token_key not in provider_common_keys:
         apply_ollama_option(pcfg, token)
         return
     if token.startswith("unset:"):
@@ -20234,6 +22179,8 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
             pcfg.pop("ip_family", None)
         elif key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
             pcfg.pop("force_query_string", None)
+        elif key in ("supports_tool_choice", "tool_choice", "tool-choice", "auto_tool_choice"):
+            pcfg.pop("supports_tool_choice", None)
         elif provider == "fireworks" and key in ("account_id", "account"):
             pcfg.pop("account_id", None)
         elif provider == "fireworks" and key in ("model_api_base_url", "model_base_url", "models_base_url", "management_base_url"):
@@ -20259,6 +22206,21 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
     key, raw_value = token.split("=", 1)
     key = key.strip()
     value = parse_config_value(raw_value)
+    if key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
+        # Operator-controlled raw query string for upstream /v1/messages. A
+        # leading "?" is tolerated and empty/default-like values clear it.
+        text = "" if value is None else str(value).strip().lstrip("?").strip()
+        if not text or text.lower() in ("default", "unset", "none", "null"):
+            pcfg.pop("force_query_string", None)
+        else:
+            pcfg["force_query_string"] = text
+        return
+    if key in ("supports_tool_choice", "tool_choice", "tool-choice", "auto_tool_choice"):
+        if value is None or str(value).strip().lower() in ("", "auto", "default", "unset", "none", "null"):
+            pcfg.pop("supports_tool_choice", None)
+        else:
+            pcfg["supports_tool_choice"] = parse_bool(value, default=True)
+        return
     if key in ("context_window", "context", "max_model_len"):
         fixed = positive_int(value)
         if not fixed:
@@ -20321,17 +22283,6 @@ def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> No
     if key in ("ip_family", "network_family", "address_family", "addr_family"):
         pcfg["ip_family"] = normalize_ip_family(value)
         return
-    if key in ("force_query_string", "force_query", "upstream_query", "test_query_string"):
-        # Testing aid: force a raw query string onto the upstream /v1/messages URL
-        # (e.g. "beta=true" or "beta=true&foo=bar"). Lets the operator probe how the
-        # upstream reacts to arbitrary query params without code changes. A leading
-        # "?" is tolerated and stripped. Empty value clears the override.
-        text = "" if value is None else str(value).strip().lstrip("?").strip()
-        if not text:
-            pcfg.pop("force_query_string", None)
-        else:
-            pcfg["force_query_string"] = text
-        return
     if provider == "fireworks" and key in ("account_id", "account"):
         text = "" if value is None else str(value).strip()
         if not text:
@@ -20383,7 +22334,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
         except SystemExit:
             pass
     if provider not in PROVIDER_OPTION_PROVIDERS:
-        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, fireworks, vllm, lm-studio, nvidia-hosted, self-hosted-nim, and openrouter.")
+        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, kimi, fireworks, vllm, lm-studio, nvidia-hosted, self-hosted-nim, and openrouter.")
     pcfg = cfg["providers"][provider]
     if values:
         context_changed = any(
@@ -21032,12 +22983,12 @@ def cmd_test(args: argparse.Namespace) -> None:
 def claude_code_output_token_limit(provider: str, pcfg: dict[str, Any]) -> int | None:
     configured = positive_int(pcfg.get("max_output_tokens"))
     if configured:
-        return configured
+        return cap_output_tokens_to_context_ratio(provider, pcfg, configured)
     if provider in ("ollama", "ollama-cloud"):
         opts = ollama_extra_options(pcfg)
         configured = positive_int(opts.get("num_predict"))
         if configured:
-            return configured
+            return cap_output_tokens_to_context_ratio(provider, pcfg, configured)
     return None
 
 
@@ -21914,6 +23865,7 @@ def default_base_url(provider: str) -> str:
         "deepseek": "https://api.deepseek.com/anthropic",
         "opencode": OPENCODE_ZEN_BASE_URL,
         "opencode-go": OPENCODE_GO_BASE_URL,
+        "kimi": KIMI_CODING_BASE_URL,
         "vllm": "http://your-vllm:8000",
         "lm-studio": "http://127.0.0.1:1234/v1",
         "nvidia-hosted": nvidia_upstream_base_url(),
@@ -21957,6 +23909,10 @@ def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         if key_count > 1:
             return f"API keys: {round_robin} ({label}{primary_detail})"
         return f"API key: set ({label}{primary_detail})" if key_count else f"API key: missing ({label} required)"
+    if provider == "kimi":
+        if key_count > 1:
+            return f"API keys: {round_robin} (Kimi.com{primary_detail})"
+        return f"API key: set (Kimi.com{primary_detail})" if key_count else "API key: missing (Kimi.com required)"
     if provider == "fireworks":
         if key_count > 1:
             return f"API keys: {round_robin} (Fireworks.ai{primary_detail})"
@@ -21989,6 +23945,20 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         headers = provider_model_list_headers(provider, pcfg)
         try:
             data = http_json(join_url(base, path), headers=headers, timeout=2.5)
+            count = len(model_ids_from_response(data))
+            return f"Base URL: {label} model list reachable ({path}, {count} models)"
+        except urllib.error.HTTPError as exc:
+            if exc.code in (401, 403):
+                return f"Base URL: {label} reachable, auth rejected ({exc.code})"
+            return f"Base URL: {label} HTTP {exc.code}"
+        except Exception as exc:
+            return f"Base URL: {label} unreachable ({type(exc).__name__})"
+    if provider == "kimi":
+        label = PROVIDER_LABELS.get(provider, provider)
+        path = "/v1/models"
+        headers = provider_model_list_headers(provider, pcfg)
+        try:
+            data = http_json(join_url(base, path), headers=headers, timeout=2.5, provider=provider, pcfg=pcfg)
             count = len(model_ids_from_response(data))
             return f"Base URL: {label} model list reachable ({path}, {count} models)"
         except urllib.error.HTTPError as exc:
@@ -22087,6 +24057,8 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
         errors.append("Launch blocked: OpenRouter requires an OpenRouter API key.")
     if provider == "fireworks" and not provider_has_api_key(provider, pcfg):
         errors.append("Launch blocked: Fireworks.ai requires a Fireworks API key.")
+    if provider == "kimi" and not provider_has_api_key(provider, pcfg):
+        errors.append("Launch blocked: Kimi.com requires a Kimi API key.")
     if provider in OPENCODE_PROVIDER_NAMES and not provider_has_api_key(provider, pcfg):
         label = PROVIDER_LABELS.get(provider, provider)
         errors.append(f"Launch blocked: {label} requires a {label} API key.")
@@ -22726,7 +24698,7 @@ def channel_delivery_panel_rows(cfg: dict[str, Any]) -> tuple[list[str], list[st
     return rows, ["llm", "native", "stdin", "back"]
 
 
-def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
+def api_key_panel_rows(provider: str, pcfg: dict[str, Any] | None = None) -> tuple[list[str], list[str]]:
     rows = [
         "Type or paste API key as hidden input",
         "Type or paste multiple API keys (comma/newline separated)",
@@ -22740,6 +24712,9 @@ def api_key_panel_rows(provider: str) -> tuple[list[str], list[str]]:
     if os.name != "nt":
         rows[4] = "Read API key from desktop clipboard if available"
         rows[5] = "Read API keys from desktop clipboard if available"
+    if pcfg is not None and provider_api_key_count(provider, pcfg):
+        rows.insert(-1, "Clear stored API key(s)")
+        values.insert(-1, "clear")
     return rows, values
 
 
@@ -23006,6 +24981,162 @@ def prompt_menu_value(prompt: str, default: str = "", secret: bool = False, rest
     return value or default
 
 
+def _prompt_menu_multiline_value_raw(label: str, secret: bool = False) -> str | None:
+    """Read a pasted or typed multi-line value from a TTY.
+
+    A blank line, Ctrl-D, or Esc finishes input. Do not auto-finish on a newline:
+    web terminals and SSH relays can deliver a paste one line at a time, so a
+    debounce-based finish can incorrectly store only the first line.
+    """
+    if not sys.stdin.isatty():
+        return None
+    chars: list[str] = []
+    if os.name == "nt":
+        try:
+            import msvcrt
+        except Exception:
+            return None
+        sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
+        sys.stdout.flush()
+        while True:
+            ch = msvcrt.getwch()
+            batch = [ch]
+            time.sleep(0.01)
+            while msvcrt.kbhit():
+                batch.append(msvcrt.getwch())
+            for ch in batch:
+                if ch == "\x03":
+                    raise KeyboardInterrupt
+                if ch in ("\x04", "\x1b"):
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    return "".join(chars).strip()
+                if ch in ("\r", "\n"):
+                    chars.append("\n")
+                    sys.stdout.write("\n")
+                    continue
+                if ch in ("\x08", "\x7f"):
+                    if chars:
+                        chars.pop()
+                    continue
+                if ch == "\x15":
+                    chars.clear()
+                    continue
+                if ch < " ":
+                    continue
+                chars.append(ch)
+                if not secret:
+                    sys.stdout.write(ch)
+            sys.stdout.flush()
+            text = "".join(chars)
+            if text.endswith("\n\n"):
+                return text.strip()
+    try:
+        import codecs
+        import select
+        import termios
+    except Exception:
+        return None
+    fd = sys.stdin.fileno()
+    try:
+        old_settings = termios.tcgetattr(fd)
+        new_settings = termios.tcgetattr(fd)
+        new_settings[3] = new_settings[3] & ~(termios.ECHO | termios.ICANON)
+        new_settings[6][termios.VMIN] = 1
+        new_settings[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, new_settings)
+    except Exception:
+        return None
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    try:
+        sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
+        sys.stdout.flush()
+        while True:
+            first = os.read(fd, 1)
+            if not first:
+                continue
+            data = bytearray(first)
+            try:
+                while select.select([fd], [], [], 0)[0]:
+                    more = os.read(fd, 4096)
+                    if not more:
+                        break
+                    data.extend(more)
+            except Exception:
+                pass
+            display: list[str] = []
+            for byte in data:
+                b = bytes((byte,))
+                if b == b"\x03":
+                    raise KeyboardInterrupt
+                if b in (b"\x04", b"\x1b"):
+                    display.append("\n")
+                    sys.stdout.write("".join(display))
+                    sys.stdout.flush()
+                    return "".join(chars).strip()
+                if b in (b"\x7f", b"\x08"):
+                    if chars:
+                        chars.pop()
+                    continue
+                if b == b"\x15":
+                    chars.clear()
+                    continue
+                text = decoder.decode(b)
+                if not text:
+                    continue
+                for ch in text:
+                    if ch == "\ufffd":
+                        continue
+                    if ch in ("\r", "\n"):
+                        chars.append("\n")
+                        display.append("\n")
+                    elif ch >= " ":
+                        chars.append(ch)
+                        if not secret:
+                            display.append(ch)
+            if display:
+                sys.stdout.write("".join(display))
+                sys.stdout.flush()
+            text = "".join(chars)
+            if text.endswith("\n\n"):
+                return text.strip()
+    finally:
+        try:
+            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+        except Exception:
+            pass
+
+
+def prompt_menu_multiline_value(prompt: str, restore_tty: Callable[[], None] | None = None, raw_tty: Callable[[], None] | None = None, secret: bool = True) -> str:
+    label = f"{prompt} (finish with a blank line): "
+    if restore_tty:
+        restore_tty()
+    if sys.stdout.isatty():
+        sys.stdout.write("\033[?25h")
+        sys.stdout.flush()
+    try:
+        raw_value = _prompt_menu_multiline_value_raw(label, secret=secret)
+        if raw_value is not None:
+            value = raw_value
+        else:
+            sys.stdout.write("\n" + ansi(label, "1;38;5;208"))
+            sys.stdout.flush()
+            lines: list[str] = []
+            while True:
+                line = input()
+                if not line.strip():
+                    break
+                lines.append(line)
+            value = "\n".join(lines)
+    finally:
+        if sys.stdout.isatty():
+            sys.stdout.write("\033[?25l")
+            sys.stdout.flush()
+        if raw_tty:
+            raw_tty()
+    return value.strip()
+
+
 def portable_provider_menu() -> int:
     cfg = load_config()
     rows, values = provider_panel_rows(cfg)
@@ -23058,7 +25189,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
             current_choice = current_provider_panel_choice(provider, pcfg)
             panel_idx = panel_values.index(current_choice) if current_choice in panel_values else 0
         elif name == "api-key":
-            panel_rows, panel_values = api_key_panel_rows(provider)
+            panel_rows, panel_values = api_key_panel_rows(provider, pcfg)
         elif name == "base-url":
             panel_rows, panel_values = base_url_panel_rows(provider, pcfg)
         elif name == "model":
@@ -23251,9 +25382,8 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                             refresh_checks()
                         close_panel(3)
                     elif value == "multi-input":
-                        key_value = prompt_menu_value(
+                        key_value = prompt_menu_multiline_value(
                             f"API keys for {provider} (comma/newline separated)",
-                            secret=True,
                             restore_tty=restore_line_mode,
                             raw_tty=restore_raw_mode,
                         )
@@ -23267,6 +25397,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                             "deepseek": "DEEPSEEK_API_KEY",
                             "opencode": "OPENCODE_API_KEY",
                             "opencode-go": "OPENCODE_API_KEY",
+                            "kimi": "KIMI_API_KEY",
                             "nvidia-hosted": "NVIDIA_API_KEY",
                             "ollama-cloud": "OLLAMA_API_KEY",
                             "openrouter": "OPENROUTER_API_KEY",
@@ -23286,6 +25417,7 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                             "deepseek": "DEEPSEEK_API_KEYS",
                             "opencode": "OPENCODE_API_KEYS",
                             "opencode-go": "OPENCODE_API_KEYS",
+                            "kimi": "KIMI_API_KEYS",
                             "nvidia-hosted": "NVIDIA_API_KEYS",
                             "ollama-cloud": "OLLAMA_API_KEYS",
                             "openrouter": "OPENROUTER_API_KEYS",
@@ -23327,6 +25459,10 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                                 messages = store_api_keys_config(provider, keys)
                             else:
                                 messages = ["Clipboard API keys were not stored."]
+                        refresh_checks()
+                        close_panel(3)
+                    elif value == "clear":
+                        messages = clear_api_key_config(provider)
                         refresh_checks()
                         close_panel(3)
                 elif panel == "base-url":
@@ -23662,8 +25798,10 @@ def should_attach_web_search(provider: str, cfg: dict[str, Any], override: bool 
     return provider != "anthropic" and bool(cfg.get("web_search", {}).get("auto_for_non_native", True))
 
 
-def should_append_compat_prompt(provider: str, cfg: dict[str, Any]) -> bool:
-    return provider != "anthropic" and bool(cfg.get("claude_code", {}).get("compat_prompt_for_non_anthropic", True))
+def should_append_compat_prompt(provider: str, pcfg: dict[str, Any], cfg: dict[str, Any]) -> bool:
+    if provider == "anthropic":
+        return False
+    return bool(cfg.get("claude_code", {}).get("compat_prompt_for_non_anthropic", True))
 
 
 _CLAUDE_PERMISSION_MODE_SUPPORT_CACHE: dict[str, bool] = {}
@@ -23693,6 +25831,14 @@ def claude_supports_permission_mode_arg(claude: str) -> bool:
 
 def has_passthrough_option(passthrough: list[str], *names: str) -> bool:
     return any(arg in names or any(arg.startswith(name + "=") for name in names) for arg in passthrough)
+
+
+def should_disallow_claude_server_side_web_tools(
+    provider: str,
+    pcfg: dict[str, Any],
+    use_native_anthropic: bool,
+) -> bool:
+    return not use_native_anthropic and not anthropic_routed_enabled(provider, pcfg)
 
 
 CLAUDE_CODE_GENERATED_GREEDY_OPTIONS = {
@@ -24000,15 +26146,13 @@ def write_mcp_proxy_config(
     extra = [Path(item).expanduser() for item in (extra_config_paths or [])]
     paths = [*extra, *claude_mcp_config_paths(passthrough, cwd, home)]
     servers: dict[str, Any] = {}
-    seen: set[str] = set()
     server_dir = CONFIG_DIR / "mcp-proxy-servers"
     for path in paths:
         if not path.exists() or not path.is_file():
             continue
         for name, server in _read_mcp_servers_from_json(path, cwd):
-            if name in seen:
-                continue
-            seen.add(name)
+            if name in servers:
+                router_log("INFO", f"mcp_proxy_config_duplicate_overwritten server={name} source={path}")
             streamable_http = _mcp_server_is_streamable_http(server)
             force_streamable_proxy = streamable_http and (name in force_proxy_server_names or _mcp_server_force_proxy(server))
             if _mcp_server_is_stdio(server) or force_streamable_proxy:
@@ -24079,6 +26223,101 @@ def should_use_channel_screen_summary_proxy(
     )
 
 
+_CHANNEL_PROMPT_META_KEYS = (
+    "kind",
+    "type",
+    "event_type",
+    "eventType",
+    "status",
+    "mcp_server",
+    "mcp_method",
+    "room_name",
+    "room_label",
+    "room_id",
+    "room",
+    "channel",
+    "thread_id",
+    "parent_id",
+    "message_id",
+    "source_message_id",
+    "event_id",
+    "stream_id",
+    "sse_id",
+    "cursor",
+    "sequence",
+    "seq",
+    "assignment_id",
+    "poll_id",
+    "task_id",
+    "round_id",
+    "conversation_id",
+    "session_id",
+    "agent_id",
+    "agent_name",
+    "sender_id",
+    "sender",
+    "sender_name",
+    "author_id",
+    "author_name",
+    "recipient_id",
+    "recipient",
+    "recipient_name",
+    "mentioned_by",
+    "key",
+    "path",
+)
+
+
+def _channel_prompt_scalar(value: Any) -> Any:
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or len(text) > 240:
+            return None
+        return text
+    if isinstance(value, list):
+        out: list[Any] = []
+        for item in value[:10]:
+            scalar = _channel_prompt_scalar(item)
+            if scalar is not None:
+                out.append(scalar)
+        if not out:
+            return None
+        try:
+            if len(json.dumps(out, ensure_ascii=False, separators=(",", ":"), default=str)) > 300:
+                return None
+        except Exception:
+            return None
+        return out
+    return None
+
+
+def _channel_prompt_metadata(message: dict[str, Any]) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    if not meta:
+        return ""
+    prompt_meta: dict[str, Any] = {}
+    for key in _CHANNEL_PROMPT_META_KEYS:
+        if key not in meta or _metadata_key_is_sensitive(key):
+            continue
+        value = _channel_prompt_scalar(meta.get(key))
+        if value is None:
+            continue
+        prompt_meta[key] = value
+    if not prompt_meta:
+        return ""
+    kept: dict[str, Any] = {}
+    for key, value in prompt_meta.items():
+        candidate = dict(kept)
+        candidate[key] = value
+        text = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"), default=str)
+        if len(text) > 900:
+            continue
+        kept = candidate
+    return json.dumps(kept, ensure_ascii=False, separators=(",", ":"), default=str) if kept else ""
+
+
 def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     channel = str(message.get("channel") or "default")
     sender = str(message.get("sender_id") or "channel")
@@ -24092,15 +26331,22 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
         fields.append(f"id={mid}")
     if thread:
         fields.append(f"thread={thread}")
-    meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
+    prompt_meta = _channel_prompt_metadata(message)
+    if prompt_meta:
+        fields.append(f"metadata={prompt_meta}")
+    suffix = "If relevant to current work, respond or act now; otherwise keep working."
+    if _channel_message_is_web_chat_request(message):
+        suffix = (
+            "Answer back through the claude-any-router send_message tool on the same channel/thread "
+            "with recipients='web' and delivery=['web']; use send_file when returning a file attachment. "
+            + suffix
+        )
     return (
         "[claude-any external channel message] "
         + " ".join(fields)
         + f" text={json.dumps(body, ensure_ascii=False)}"
-        + meta_text
         + ". "
-        + "If this is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']; use send_file when returning a file attachment. "
-        + "If relevant to current work, respond or act now; otherwise keep working."
+        + suffix
     )
 
 
@@ -24137,6 +26383,207 @@ def _channel_wake_message_noise_reason(message: dict[str, Any]) -> str | None:
     return None
 
 
+_CHANNEL_EXTERNAL_PROVENANCE_META_KEYS = (
+    "mcp_server",
+    "mcp_method",
+    "mcp_json",
+    "sse_source",
+    "sse_event",
+    "sse_json",
+    "stream_id",
+    "sse_id",
+    "cursor",
+    "event_id",
+    "message_id",
+    "source_message_id",
+    "rpc_id",
+)
+
+
+_CHANNEL_UNIQUE_REFERENCE_META_KEYS = (
+    "message_id",
+    "source_message_id",
+    "assignment_id",
+    "poll_id",
+    "task_id",
+    "job_id",
+    "schedule_id",
+    "reminder_id",
+)
+
+
+_CHANNEL_EVENT_ORDER_META_KEYS = (
+    "stream_id",
+    "cursor",
+    "sse_id",
+    "event_id",
+    "sequence",
+    "seq",
+)
+
+
+def _channel_message_meta_sources(message: dict[str, Any]) -> list[dict[str, Any]]:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    sources: list[dict[str, Any]] = []
+    if meta:
+        sources.append(meta)
+    for envelope_key in ("mcp_json", "sse_json"):
+        envelope = meta.get(envelope_key)
+        if not isinstance(envelope, dict):
+            continue
+        params = envelope.get("params")
+        if isinstance(params, dict):
+            nested_meta = params.get("meta")
+            if isinstance(nested_meta, dict):
+                sources.append(nested_meta)
+        nested_meta = envelope.get("meta")
+        if isinstance(nested_meta, dict):
+            sources.append(nested_meta)
+    return sources
+
+
+def _channel_message_delivery_targets(message: dict[str, Any]) -> set[str]:
+    return {item.strip().lower() for item in _as_string_list(message.get("delivery")) if item.strip()}
+
+
+def _channel_message_has_external_provenance(message: dict[str, Any]) -> bool:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    if _channel_message_is_web_chat_request(message):
+        return True
+    if meta.get("llm_direct_pending") or meta.get("llm_direct_delivered"):
+        return True
+    for key in _CHANNEL_EXTERNAL_PROVENANCE_META_KEYS:
+        value = meta.get(key)
+        if value is not None and str(value).strip():
+            return True
+    return False
+
+
+def _channel_message_has_unique_reference(message: dict[str, Any]) -> bool:
+    meta_sources = _channel_message_meta_sources(message)
+    for key in _CHANNEL_UNIQUE_REFERENCE_META_KEYS:
+        for meta in meta_sources:
+            value = meta.get(key)
+            if value is not None and str(value).strip():
+                return True
+    return False
+
+
+def _channel_message_source_key(message: dict[str, Any]) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    return str(meta.get("mcp_server") or meta.get("sse_source") or meta.get("source") or "").strip()
+
+
+def _channel_message_kind_key(message: dict[str, Any]) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    meta_kind = str(
+        meta.get("kind")
+        or meta.get("type")
+        or meta.get("event_type")
+        or meta.get("eventType")
+        or meta.get("event")
+        or ""
+    ).strip()
+    if meta_kind:
+        return meta_kind
+    return str(message.get("kind") or "").strip()
+
+
+def _channel_message_topic_key(message: dict[str, Any]) -> str:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    return str(
+        meta.get("key")
+        or meta.get("topic")
+        or meta.get("resource")
+        or meta.get("target")
+        or ""
+    ).strip()
+
+
+def _channel_message_order_value(message: dict[str, Any]) -> tuple[int, int, int] | None:
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    for key in _CHANNEL_EVENT_ORDER_META_KEYS:
+        raw = meta.get(key)
+        if raw is None:
+            continue
+        text = str(raw).strip()
+        if not text:
+            continue
+        match = re.fullmatch(r"(\d+)-(\d+)", text)
+        if match:
+            return (2, int(match.group(1)), int(match.group(2)))
+        if text.isdigit():
+            return (1, int(text), 0)
+    if _channel_message_has_external_provenance(message):
+        try:
+            message_id = int(message.get("id") or 0)
+        except Exception:
+            message_id = 0
+        if message_id > 0:
+            return (3, message_id, 0)
+    return None
+
+
+def _channel_message_coalesce_key(message: dict[str, Any]) -> tuple[str, str, str, str, str] | None:
+    if _channel_message_delivery_targets(message) and not _channel_message_has_external_provenance(message):
+        return None
+    if _channel_message_is_web_chat_request(message):
+        return None
+    if _channel_message_has_unique_reference(message):
+        return None
+    source = _channel_message_source_key(message)
+    if not source:
+        return None
+    order = _channel_message_order_value(message)
+    if order is None:
+        return None
+    meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+    method = str(meta.get("mcp_method") or meta.get("sse_event") or "").strip()
+    kind = _channel_message_kind_key(message)
+    if not method and not kind:
+        return None
+    channel = str(message.get("channel") or meta.get("room_id") or meta.get("room") or meta.get("channel") or "").strip()
+    topic = _channel_message_topic_key(message)
+    return (source, channel, method, kind, topic)
+
+
+def _channel_superseded_message_ids(messages: list[dict[str, Any]]) -> set[int]:
+    latest: dict[tuple[str, str, str, str, str], tuple[tuple[int, int, int], int]] = {}
+    superseded: set[int] = set()
+    for message in messages:
+        try:
+            message_id = int(message.get("id") or 0)
+        except Exception:
+            continue
+        if message_id <= 0:
+            continue
+        key = _channel_message_coalesce_key(message)
+        if key is None:
+            continue
+        order = _channel_message_order_value(message)
+        if order is None:
+            continue
+        previous = latest.get(key)
+        if previous is None:
+            latest[key] = (order, message_id)
+            continue
+        previous_order, previous_id = previous
+        if (order, message_id) >= (previous_order, previous_id):
+            superseded.add(previous_id)
+            latest[key] = (order, message_id)
+        else:
+            superseded.add(message_id)
+    return superseded
+
+
+def _channel_pending_scan_limit() -> int:
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_PENDING_SCAN_LIMIT", "500")
+    try:
+        return max(100, min(5000, int(str(raw).strip())))
+    except Exception:
+        return 500
+
+
 def _channel_llm_message_skip_reason(message: dict[str, Any]) -> str | None:
     visibility = str(message.get("visibility") or "user").strip().lower()
     if visibility in {"hidden", "internal", "transport", "control", "system"}:
@@ -24157,9 +26604,11 @@ def _channel_llm_message_skip_reason(message: dict[str, Any]) -> str | None:
     sender = str(message.get("sender_id") or meta.get("sender_id") or "").strip().lower()
     if sse_source in _NATIVE_ROUTER_CHANNEL_NAMES or sender in _NATIVE_ROUTER_CHANNEL_NAMES:
         return "native_router_self_echo"
-    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event") or meta.get("status") or "").strip().lower()
+    meta_kind = str(meta.get("kind") or meta.get("type") or meta.get("event_type") or meta.get("eventType") or meta.get("event") or meta.get("status") or "").strip().lower()
     if meta_kind in _CHANNEL_CONTROL_KINDS:
         return meta_kind
+    if not delivery and not _channel_message_has_external_provenance(message):
+        return "unscoped_channel_message"
     return None
 
 
@@ -24182,13 +26631,22 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
         fields = [f"id={mid}", f"room={room}", f"from={sender}"]
         if thread:
             fields.append(f"thread={thread}")
-        meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
-        parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False) + meta_text)
+        prompt_meta = _channel_prompt_metadata(message)
+        if prompt_meta:
+            fields.append(f"metadata={prompt_meta}")
+        parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False))
+    suffix = "If relevant to current work, respond or act now; otherwise keep working."
+    if any(_channel_message_is_web_chat_request(message) for message in messages):
+        suffix = (
+            "For claude-any-web-chat item(s), answer back through the claude-any-router send_message tool "
+            "on the same channel/thread with recipients='web' and delivery=['web']; use send_file when returning a file attachment. "
+            + suffix
+        )
     return (
         f"[claude-any external channel messages] {len(messages)} new messages: "
         + " ; ".join(parts)
-        + ". If any item is a claude-any-web-chat message, answer back through the claude-any-router send_message tool on the same channel/thread with recipients='web' and delivery=['web']. "
-        + "If relevant to current work, respond or act now; otherwise keep working."
+        + ". "
+        + suffix
     )
 
 
@@ -24208,13 +26666,20 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
             fields.append(f"to={_compact_json_for_prompt(recipients, max_chars=400)}")
         if thread:
             fields.append(f"thread={thread}")
-        meta_text = f" metadata={_compact_json_for_prompt(meta)}" if meta else ""
+        prompt_meta = _channel_prompt_metadata(message)
+        if prompt_meta:
+            fields.append(f"metadata={prompt_meta}")
         parts.append(
             f"<< {channel} >> incoming channel message for the current agent.\n"
             f"<< 메시지 >>\n"
             + " ".join(fields)
             + f"\ntext={json.dumps(body, ensure_ascii=False)}"
-            + meta_text
+        )
+    web_chat_instructions = ""
+    if any(_channel_message_is_web_chat_request(message) for message in messages):
+        web_chat_instructions = (
+            "메시지 metadata source가 claude-any-web-chat 이거나 reply_channel/reply_recipient가 있으면, 답변 내용은 반드시 사용 가능한 claude-any-router send_message 계열 도구로 같은 channel/thread_id에 recipients='web', delivery=['web']로 보내세요. "
+            "웹 채팅 요청도 현재 Claude Code 세션의 기존 Read/Bash/Edit/MCP 도구를 사용할 수 있는 실제 작업 요청입니다. "
         )
     return (
         "[claude-any channel inbox]\n"
@@ -24241,8 +26706,8 @@ def format_channel_llm_batch_prompt(messages: list[dict[str, Any]]) -> str:
         "'진행하겠습니다', '착수합니다', '보고하겠습니다', '결과를 공유하겠습니다', "
         "'Let me send...', 'I will reply...', 'I'll respond...'처럼 미래 행동을 약속하는 말만 남기고 턴을 끝내지 마세요. "
         "그런 말을 할 상황이면 같은 턴에서 필요한 조사/도구 호출/채널 보고까지 수행하고, 수행할 수 없으면 구체적 차단 사유를 보고하세요. "
-        "메시지 metadata source가 claude-any-web-chat 이거나 reply_channel/reply_recipient가 있으면, 답변 내용은 반드시 사용 가능한 claude-any-router send_message 계열 도구로 같은 channel/thread_id에 recipients='web', delivery=['web']로 보내세요. "
-        "웹 채팅 요청도 현재 Claude Code 세션의 기존 Read/Bash/Edit/MCP 도구를 사용할 수 있는 실제 작업 요청입니다. "
+        + web_chat_instructions
+        +
         "다음 응답에는 사용자가 화면에서 볼 수 있도록 수신 메시지 요약과 수행한 처리 또는 필요한 다음 조치를 간단히 보여주세요. "
         "도구를 호출했다면 tool_result 후속 턴에서 그 결과를 LLM이 다시 검토한 뒤 사용자에게 요약하고, 필요한 경우 후속 답장/작업까지 완료하세요.\n\n"
         + "\n\n".join(parts)
@@ -25599,6 +28064,38 @@ def _channel_llm_read_cursor_locked() -> int:
     return _CHANNEL_LLM_CURSOR_LAST_ID
 
 
+def _channel_llm_clear_floor_read() -> int:
+    try:
+        if not CHANNEL_LLM_CLEAR_FLOOR_PATH.exists():
+            return 0
+        data = json.loads(CHANNEL_LLM_CLEAR_FLOOR_PATH.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return 0
+        return max(0, int(data.get("last_id") or 0))
+    except Exception as exc:
+        router_log("WARN", f"channel_llm_clear_floor_read_failed error={type(exc).__name__}: {exc}")
+        return 0
+
+
+def _channel_llm_clear_floor_write(last_id: int) -> None:
+    CHANNEL_LLM_CLEAR_FLOOR_PATH.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"last_id": max(0, int(last_id)), "updated_at": time.time()}
+    tmp_path = CHANNEL_LLM_CLEAR_FLOOR_PATH.with_suffix(".json.tmp")
+    tmp_path.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
+    tmp_path.replace(CHANNEL_LLM_CLEAR_FLOOR_PATH)
+
+
+def _channel_llm_clamp_to_clear_floor(recovered: int) -> int:
+    clear_floor = _channel_llm_clear_floor_read()
+    if clear_floor > 0 and recovered < clear_floor:
+        router_log(
+            "INFO",
+            f"channel_stdin_proxy_recovery_clamped recovered_cursor={recovered} clear_floor={clear_floor}",
+        )
+        return clear_floor
+    return recovered
+
+
 def reset_channel_llm_delivery_cursor(last_id: int | None = None) -> int:
     global _CHANNEL_LLM_CURSOR_LAST_ID
     with _CHANNEL_LLM_CURSOR_LOCK:
@@ -25613,6 +28110,135 @@ def reset_channel_llm_delivery_cursor(last_id: int | None = None) -> int:
 def ensure_channel_llm_delivery_cursor_initialized() -> int:
     with _CHANNEL_LLM_CURSOR_LOCK:
         return _channel_llm_read_cursor_locked()
+
+
+def prepare_channel_llm_delivery_for_launch() -> int:
+    # chat-messages.jsonl is a transient bridge queue, not the durable MCP inbox.
+    # On a new Claude Code process, replaying rows left by a previous process
+    # surfaces stale "one more" channel messages at startup. New channel events
+    # are appended after this point and remain deliverable.
+    last_id = reset_channel_llm_delivery_cursor()
+    _write_channel_llm_launch_guard(last_id)
+    router_log("INFO", f"channel_llm_cursor_fast_forward_on_launch last_id={last_id}")
+    return last_id
+
+
+def _drain_channel_direct_queue() -> tuple[int, int]:
+    drained = 0
+    remembered = 0
+    with _CHANNEL_LLM_DIRECT_LOCK:
+        while True:
+            try:
+                item = _CHANNEL_LLM_DIRECT_QUEUE.get_nowait()
+            except queue.Empty:
+                break
+            except Exception:
+                break
+            drained += 1
+            try:
+                message_id = int(item.get("id") or 0) if isinstance(item, dict) else 0
+            except Exception:
+                message_id = 0
+            if message_id > 0:
+                _CHANNEL_LLM_DIRECT_INFLIGHT.discard(message_id)
+                _CHANNEL_LLM_DIRECT_DELIVERED.add(message_id)
+                remembered += 1
+            try:
+                _CHANNEL_LLM_DIRECT_QUEUE.task_done()
+            except Exception:
+                pass
+        if len(_CHANNEL_LLM_DIRECT_DELIVERED) > 1000:
+            for old_id in sorted(_CHANNEL_LLM_DIRECT_DELIVERED)[: len(_CHANNEL_LLM_DIRECT_DELIVERED) - 1000]:
+                _CHANNEL_LLM_DIRECT_DELIVERED.discard(old_id)
+    return drained, remembered
+
+
+def clear_channel_backlog() -> dict[str, Any]:
+    global _CHANNEL_LLM_CURSOR_LAST_ID, _CHANNEL_MCP_CURSOR_LAST_ID, _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID
+    chat_tail = max(0, _chat_scan_max_id())
+    with _CHANNEL_LLM_SUMMARY_LOCK:
+        summary_tail = max(0, _channel_llm_summary_scan_max_id_locked())
+
+    with _CHANNEL_LLM_CURSOR_LOCK:
+        old_llm = _channel_llm_read_cursor_locked()
+        _CHANNEL_LLM_CURSOR_LAST_ID = chat_tail
+        try:
+            _channel_llm_write_cursor_locked(chat_tail)
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_cursor_write_failed error={type(exc).__name__}: {exc}")
+        try:
+            _channel_llm_clear_floor_write(chat_tail)
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_clear_floor_write_failed error={type(exc).__name__}: {exc}")
+    _CHANNEL_STDIN_RECOVERY_CACHE.clear()
+
+    with _CHANNEL_MCP_CURSOR_LOCK:
+        old_mcp = _channel_mcp_read_cursor_locked()
+        _CHANNEL_MCP_CURSOR_LAST_ID = chat_tail
+        try:
+            _channel_mcp_write_cursor_locked(chat_tail)
+        except Exception as exc:
+            router_log("WARN", f"channel_mcp_cursor_write_failed error={type(exc).__name__}: {exc}")
+
+    with _CHANNEL_MCP_LOCK:
+        for state in _CHANNEL_MCP_SESSIONS.values():
+            try:
+                state["last_id"] = max(int(state.get("last_id") or 0), chat_tail)
+            except Exception:
+                state["last_id"] = chat_tail
+
+    with _CHANNEL_LLM_SUMMARY_LOCK:
+        old_summary = _channel_llm_summary_read_cursor_locked()
+        _CHANNEL_LLM_SUMMARY_CURSOR_LAST_ID = summary_tail
+        try:
+            _channel_llm_summary_write_cursor_locked(summary_tail)
+        except Exception as exc:
+            router_log("WARN", f"channel_llm_summary_cursor_write_failed error={type(exc).__name__}: {exc}")
+
+    drained_direct, remembered_direct = _drain_channel_direct_queue()
+    with _CHAT_CONDITION:
+        _CHAT_CONDITION.notify_all()
+    stats = {
+        "chat_tail": chat_tail,
+        "summary_tail": summary_tail,
+        "discarded_llm": max(0, chat_tail - int(old_llm or 0)),
+        "discarded_mcp": max(0, chat_tail - int(old_mcp or 0)),
+        "discarded_summaries": max(0, summary_tail - int(old_summary or 0)),
+        "direct_queue_drained": drained_direct,
+        "direct_queue_remembered": remembered_direct,
+        "direct_inflight": len(_CHANNEL_LLM_DIRECT_INFLIGHT),
+        "mcp_sessions_updated": len(_CHANNEL_MCP_SESSIONS),
+    }
+    router_log(
+        "INFO",
+        "channel_backlog_cleared "
+        f"chat_tail={chat_tail} summary_tail={summary_tail} "
+        f"discarded_llm={stats['discarded_llm']} discarded_mcp={stats['discarded_mcp']} "
+        f"discarded_summaries={stats['discarded_summaries']} direct_queue_drained={drained_direct} "
+        f"direct_inflight={stats['direct_inflight']} mcp_sessions_updated={stats['mcp_sessions_updated']}",
+    )
+    return stats
+
+
+def channel_backlog_status() -> dict[str, Any]:
+    chat_tail = max(0, _chat_scan_max_id())
+    with _CHANNEL_LLM_CURSOR_LOCK:
+        llm_cursor = _channel_llm_read_cursor_locked()
+    with _CHANNEL_MCP_CURSOR_LOCK:
+        mcp_cursor = _channel_mcp_read_cursor_locked()
+    with _CHANNEL_LLM_SUMMARY_LOCK:
+        summary_tail = _channel_llm_summary_scan_max_id_locked()
+        summary_cursor = _channel_llm_summary_read_cursor_locked()
+    return {
+        "chat_tail": chat_tail,
+        "summary_tail": summary_tail,
+        "pending_llm": max(0, chat_tail - int(llm_cursor or 0)),
+        "pending_mcp": max(0, chat_tail - int(mcp_cursor or 0)),
+        "pending_summaries": max(0, summary_tail - int(summary_cursor or 0)),
+        "direct_queue": _CHANNEL_LLM_DIRECT_QUEUE.qsize(),
+        "direct_inflight": len(_CHANNEL_LLM_DIRECT_INFLIGHT),
+        "mcp_sessions": len(_CHANNEL_MCP_SESSIONS),
+    }
 
 
 def _metadata_int(metadata: dict[str, Any], key: str) -> int | None:
@@ -25699,6 +28325,10 @@ def commit_pending_channel_delivery_cursors(
                 "INFO",
                 f"channel_delivery_cursor_deferred status={status if status is not None else '-'}",
             )
+            return
+        if _channel_delivery_metadata(metadata) and not pending_channel_delivery_confirmed(handler):
+            reason = str(getattr(handler, "_claude_any_channel_delivery_reason", "unconfirmed") or "unconfirmed")
+            router_log("INFO", f"channel_delivery_cursor_deferred reason={reason}")
             return
     message_cursor = _metadata_int(metadata, "claude_any_channel_cursor_last_id")
     summary_cursor = _metadata_int(metadata, "claude_any_channel_summary_cursor_last_id")
@@ -25963,6 +28593,27 @@ def body_with_pending_channel_summaries(body: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+_CHANNEL_WAKE_PROMPT_ID_RE = re.compile(r"\bid=(\d+)(?:\D|$)")
+
+
+def _channel_message_ids_already_in_request(body: dict[str, Any]) -> set[int]:
+    ids: set[int] = set()
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        text = anthropic_content_to_text(message.get("content"))
+        if "claude-any external channel message" not in text:
+            continue
+        for match in _CHANNEL_WAKE_PROMPT_ID_RE.finditer(text):
+            try:
+                message_id = int(match.group(1))
+            except Exception:
+                continue
+            if message_id > 0:
+                ids.add(message_id)
+    return ids
+
+
 def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     global _CHANNEL_LLM_CURSOR_LAST_ID
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
@@ -25974,26 +28625,32 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     cfg = load_config()
     if channel_delivery_mode(cfg) != "llm":
         return body
+    ids_already_in_request = _channel_message_ids_already_in_request(body)
     with _CHANNEL_LLM_CURSOR_LOCK:
         last_id = _channel_llm_read_cursor_locked()
         pending: list[dict[str, Any]] = []
         max_seen = last_id
-        for message in read_chat_messages(last_id, None, None, 100):
-            try:
-                max_seen = max(max_seen, int(message.get("id") or 0))
-            except Exception:
-                continue
-            skip_reason = _channel_llm_message_skip_reason(message)
-            if skip_reason:
-                router_log(
-                    "INFO",
-                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
-                )
-                continue
+        candidates = read_chat_messages(last_id, None, None, _channel_pending_scan_limit())
+        superseded_ids = _channel_superseded_message_ids(candidates)
+        for message in candidates:
             try:
                 message_id = int(message.get("id") or 0)
             except Exception:
-                message_id = 0
+                continue
+            if message_id in ids_already_in_request:
+                max_seen = max(max_seen, message_id)
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason=already_in_request",
+                )
+                continue
+            if message_id in superseded_ids:
+                max_seen = max(max_seen, message_id)
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason=superseded_channel_notice",
+                )
+                continue
             with _CHANNEL_LLM_DIRECT_LOCK:
                 direct_inflight = message_id in _CHANNEL_LLM_DIRECT_INFLIGHT
                 direct_delivered = message_id in _CHANNEL_LLM_DIRECT_DELIVERED
@@ -26008,6 +28665,16 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                 router_log(
                     "INFO",
                     f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={reason}",
+                )
+                if direct_delivered or persisted_direct_delivered:
+                    max_seen = max(max_seen, message_id)
+                continue
+            skip_reason = _channel_llm_message_skip_reason(message)
+            if skip_reason:
+                max_seen = max(max_seen, message_id)
+                router_log(
+                    "INFO",
+                    f"channel_llm_inject_skipped message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
                 )
                 continue
             if meta.get("llm_direct_pending"):
@@ -26024,6 +28691,8 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
                 )
                 continue
             pending.append(message)
+            max_seen = message_id
+            break
         if not pending:
             if max_seen != last_id:
                 _CHANNEL_LLM_CURSOR_LAST_ID = max_seen
@@ -26147,71 +28816,370 @@ def _write_channel_wake_prompt(master_fd: int, prompt: str, enter_bytes: bytes |
     _write_fd_all(master_fd, _channel_wake_enter_bytes(enter_bytes))
 
 
+_CHANNEL_TRANSCRIPT_CACHE: dict[str, Any] = {"checked_at": 0.0, "path": None}
+_CHANNEL_STDIN_RECOVERY_CACHE: dict[str, Any] = {
+    "checked_at": 0.0,
+    "last_id": None,
+    "marker": None,
+    "recovered_last_id": None,
+}
+
+
+def _latest_claude_transcript_path(ttl_seconds: float = 2.0) -> Path | None:
+    now = time.time()
+    cached_at = float(_CHANNEL_TRANSCRIPT_CACHE.get("checked_at") or 0.0)
+    cached_path = _CHANNEL_TRANSCRIPT_CACHE.get("path")
+    if now - cached_at < ttl_seconds:
+        return cached_path if isinstance(cached_path, Path) else None
+    root = Path.home() / ".claude" / "projects"
+    latest: Path | None = None
+    latest_mtime = -1.0
+    try:
+        for path in root.glob("*/*.jsonl"):
+            try:
+                mtime = path.stat().st_mtime
+            except OSError:
+                continue
+            if mtime > latest_mtime:
+                latest = path
+                latest_mtime = mtime
+    except Exception:
+        latest = None
+    _CHANNEL_TRANSCRIPT_CACHE["checked_at"] = now
+    _CHANNEL_TRANSCRIPT_CACHE["path"] = latest
+    return latest
+
+
+def _read_file_tail_text(path: Path, max_bytes: int = 512 * 1024) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > max_bytes:
+                f.seek(max(0, size - max_bytes))
+            return f.read(max_bytes).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _channel_stdin_wake_state(message_id: int) -> str:
+    if message_id <= 0:
+        return "completed"
+    path = _latest_claude_transcript_path()
+    if path is None:
+        return "unknown"
+    text = _read_file_tail_text(path)
+    if not text:
+        return "unknown"
+    return _channel_stdin_wake_state_from_text(message_id, text)
+
+
+def _channel_stdin_wake_state_from_text(message_id: int, text: str) -> str:
+    if message_id <= 0:
+        return "completed"
+    prompt_markers = (
+        f"id={message_id} ",
+        f"id={message_id}\n",
+        f"id={message_id}\\n",
+        f"id={message_id}\"",
+        f"id={message_id}'",
+    )
+
+    def _record_text(value: Any) -> str:
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            parts: list[str] = []
+            for item in value:
+                if isinstance(item, str):
+                    parts.append(item)
+                elif isinstance(item, dict):
+                    raw = item.get("text")
+                    if isinstance(raw, str):
+                        parts.append(raw)
+                    raw = item.get("content")
+                    if isinstance(raw, str):
+                        parts.append(raw)
+            return "\n".join(parts)
+        return ""
+
+    seen_queued_prompt = False
+    seen_real_prompt = False
+    for raw_line in text.splitlines():
+        try:
+            record = json.loads(raw_line)
+        except Exception:
+            continue
+        if not isinstance(record, dict):
+            continue
+        record_type = str(record.get("type") or "")
+        message = record.get("message")
+        message_obj = message if isinstance(message, dict) else {}
+        message_role = str(message_obj.get("role") or "")
+        if seen_real_prompt and (
+            record_type == "assistant"
+            or message_role == "assistant"
+            or str(record.get("subtype") or "") == "turn_duration"
+        ):
+            return "completed"
+        if record_type == "queue-operation" and record.get("operation") == "enqueue":
+            raw = record.get("content")
+            if isinstance(raw, str) and any(marker in raw for marker in prompt_markers):
+                seen_queued_prompt = True
+            continue
+        if record_type == "attachment":
+            attachment = record.get("attachment")
+            if isinstance(attachment, dict) and attachment.get("type") == "queued_command":
+                raw = attachment.get("prompt")
+                if isinstance(raw, str) and any(marker in raw for marker in prompt_markers):
+                    seen_queued_prompt = True
+            continue
+        if record_type != "user":
+            continue
+        if not message_obj:
+            continue
+        # A queued_command attachment only means Claude Code accepted text into
+        # its line editor queue.  It is not a real user turn and can be
+        # superseded by later typed/queued prompts.  Only commit delivery after
+        # the prompt is present as an actual user message.
+        content_text = _record_text(message_obj.get("content"))
+        if any(marker in content_text for marker in prompt_markers):
+            seen_real_prompt = True
+    if seen_real_prompt:
+        return "pending"
+    return "queued" if seen_queued_prompt else "missing"
+
+
+def _channel_stdin_wake_completed(message_id: int) -> bool:
+    return _channel_stdin_wake_state(message_id) == "completed"
+
+
+def _channel_stdin_queued_command_ids_from_text(text: str) -> set[int]:
+    ids: set[int] = set()
+    for raw_line in text.splitlines():
+        try:
+            record = json.loads(raw_line)
+        except Exception:
+            continue
+        if not isinstance(record, dict):
+            continue
+        candidate = ""
+        if record.get("type") == "queue-operation" and record.get("operation") == "enqueue":
+            raw = record.get("content")
+            if isinstance(raw, str):
+                candidate = raw
+        elif record.get("type") == "attachment":
+            attachment = record.get("attachment")
+            if isinstance(attachment, dict) and attachment.get("type") == "queued_command":
+                raw = attachment.get("prompt")
+                if isinstance(raw, str):
+                    candidate = raw
+        if not candidate:
+            continue
+        for match in re.finditer(r"\bid=(\d+)(?:\D|$)", candidate):
+            try:
+                ids.add(int(match.group(1)))
+            except Exception:
+                continue
+    return ids
+
+
+def _channel_stdin_recover_cursor_from_queued_only(last_id: int) -> int:
+    if last_id <= 0:
+        return last_id
+    path = _latest_claude_transcript_path()
+    if path is None:
+        return last_id
+    try:
+        stat = path.stat()
+        marker = (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+    except OSError:
+        return last_id
+    now = time.time()
+    cached_marker = _CHANNEL_STDIN_RECOVERY_CACHE.get("marker")
+    if (
+        _CHANNEL_STDIN_RECOVERY_CACHE.get("last_id") == last_id
+        and cached_marker == marker
+        and now - float(_CHANNEL_STDIN_RECOVERY_CACHE.get("checked_at") or 0.0) < 5.0
+    ):
+        cached = _CHANNEL_STDIN_RECOVERY_CACHE.get("recovered_last_id")
+        recovered = int(cached) if isinstance(cached, int) else last_id
+        return _channel_llm_clamp_to_clear_floor(recovered)
+    text = _read_file_tail_text(path, max_bytes=8 * 1024 * 1024)
+    recovered = last_id
+    if text:
+        for message_id in sorted(_channel_stdin_queued_command_ids_from_text(text)):
+            if message_id > last_id:
+                continue
+            if _channel_stdin_wake_state_from_text(message_id, text) == "missing":
+                recovered = max(0, message_id - 1)
+                router_log(
+                    "WARN",
+                    f"channel_stdin_proxy_recover_queued_only message_id={message_id} cursor={last_id} recovered_cursor={recovered}",
+                )
+                break
+    _CHANNEL_STDIN_RECOVERY_CACHE.update(
+        {
+            "checked_at": now,
+            "last_id": last_id,
+            "marker": marker,
+            "recovered_last_id": recovered,
+        }
+    )
+    return _channel_llm_clamp_to_clear_floor(recovered)
+
+
+def _channel_stdin_unseen_retry_seconds() -> float:
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_UNSEEN_RETRY_SECONDS")
+    if raw is None:
+        return 20.0
+    try:
+        return max(2.0, min(300.0, float(raw)))
+    except Exception:
+        return 20.0
+
+
+def _channel_stdin_inflight_stale_seconds() -> float:
+    raw = os.environ.get("CLAUDE_ANY_CHANNEL_WAKE_INFLIGHT_STALE_SECONDS")
+    if raw is None:
+        return 180.0
+    try:
+        return max(30.0, min(1800.0, float(raw)))
+    except Exception:
+        return 180.0
+
+
+def _channel_stdin_inflight_is_stale(state: str, started_at: float, now: float | None = None) -> bool:
+    if state not in {"queued", "unknown"} or started_at <= 0:
+        return False
+    current = time.time() if now is None else float(now)
+    return current - started_at >= _channel_stdin_inflight_stale_seconds()
+
+
+def _channel_stdin_should_check_pending(
+    marker: tuple[float, int],
+    last_marker: tuple[float, int],
+    force_recheck: bool,
+    channel_inflight_id: int | None,
+) -> bool:
+    if channel_inflight_id is not None:
+        return False
+    return force_recheck or marker != last_marker
+
+
 def _inject_pending_channel_messages(
     master_fd: int,
     last_id: int,
     enter_bytes: bytes | None = None,
     *,
     web_chat_only: bool = False,
+    commit_cursor: bool = True,
+    injected_message_ids: list[int] | None = None,
 ) -> int:
-    pending: list[dict[str, Any]] = []
-    for message in read_chat_messages(last_id, None, None, 100):
-        try:
-            message_id = int(message.get("id") or 0)
-            last_id = max(last_id, message_id)
-        except Exception:
-            continue
-        meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
-        with _CHANNEL_LLM_DIRECT_LOCK:
-            direct_delivered = message_id in _CHANNEL_LLM_DIRECT_DELIVERED
-        if direct_delivered or meta.get("llm_direct_delivered"):
-            router_log(
-                "INFO",
-                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_delivered",
-            )
-            continue
-        if meta.get("llm_direct_pending"):
-            router_log(
-                "INFO",
-                f"channel_stdin_proxy_inject_fallback message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
-            )
-        if web_chat_only and not _channel_message_is_web_chat_request(message):
-            router_log(
-                "INFO",
-                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=not_web_chat",
-            )
-            continue
-        noise_reason = _channel_wake_message_noise_reason(message)
-        if noise_reason:
-            router_log(
-                "INFO",
-                f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason={noise_reason}",
-            )
-            continue
-        pending.append(message)
-    if pending:
-        if web_chat_only and all(_channel_message_is_web_chat_request(message) for message in pending):
-            prompt = format_channel_web_chat_wake_batch_prompt(pending)
-        else:
-            prompt = format_channel_wake_batch_prompt(pending)
-        submit_bytes = _channel_wake_enter_bytes(enter_bytes)
-        _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
-        with _CHANNEL_STDIN_WAKE_LOCK:
-            for message in pending:
-                try:
-                    _CHANNEL_STDIN_WAKE_DELIVERED.add(int(message.get("id") or 0))
-                except Exception:
+    with _CHANNEL_STDIN_INJECT_LOCK:
+        if not web_chat_only:
+            last_id = _channel_stdin_recover_cursor_from_queued_only(last_id)
+        pending: list[dict[str, Any]] = []
+        candidates = read_chat_messages(last_id, None, None, _channel_pending_scan_limit())
+        superseded_ids = _channel_superseded_message_ids(candidates)
+        for message in candidates:
+            previous_last_id = last_id
+            try:
+                message_id = int(message.get("id") or 0)
+                last_id = max(last_id, message_id)
+            except Exception:
+                continue
+            meta = message.get("meta") if isinstance(message.get("meta"), dict) else {}
+            with _CHANNEL_LLM_DIRECT_LOCK:
+                direct_delivered = message_id in _CHANNEL_LLM_DIRECT_DELIVERED
+            if direct_delivered or meta.get("llm_direct_delivered"):
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_delivered",
+                )
+                continue
+            if meta.get("llm_direct_pending"):
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_inject_fallback message_id={message.get('id')} channel={message.get('channel')} reason=llm_direct_pending",
+                )
+            if web_chat_only and not _channel_message_is_web_chat_request(message):
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=not_web_chat",
+                )
+                continue
+            skip_reason = _channel_llm_message_skip_reason(message)
+            if skip_reason:
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason={skip_reason}",
+                )
+                continue
+            if message_id in superseded_ids:
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=superseded_channel_notice",
+                )
+                continue
+            wake_state = _channel_stdin_wake_state(message_id)
+            if wake_state == "completed":
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=stdin_wake_completed",
+                )
+                continue
+            if wake_state in {"pending", "queued"}:
+                router_log(
+                    "INFO",
+                    f"channel_stdin_proxy_waiting_for_turn_completion message_id={message.get('id')} channel={message.get('channel')} state={wake_state}",
+                )
+                return previous_last_id
+            with _CHANNEL_STDIN_WAKE_LOCK:
+                if message_id in _CHANNEL_STDIN_WAKE_DELIVERED:
+                    router_log(
+                        "INFO",
+                        f"channel_stdin_proxy_skipped_noise message_id={message.get('id')} channel={message.get('channel')} reason=stdin_wake_delivered",
+                    )
                     continue
-            if len(_CHANNEL_STDIN_WAKE_DELIVERED) > 1000:
-                for old_id in sorted(_CHANNEL_STDIN_WAKE_DELIVERED)[:500]:
-                    _CHANNEL_STDIN_WAKE_DELIVERED.discard(old_id)
-        ids = ",".join(str(message.get("id") or "") for message in pending)
-        channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
-        router_log(
-            "INFO",
-            f"channel_stdin_proxy_injected count={len(pending)} message_ids={ids} channels={channels} enter={_channel_enter_label(submit_bytes)}",
-        )
-    return last_id
+                _CHANNEL_STDIN_WAKE_DELIVERED.add(message_id)
+                if len(_CHANNEL_STDIN_WAKE_DELIVERED) > 1000:
+                    for old_id in sorted(_CHANNEL_STDIN_WAKE_DELIVERED)[:500]:
+                        _CHANNEL_STDIN_WAKE_DELIVERED.discard(old_id)
+            pending.append(message)
+            last_id = message_id
+            break
+        if pending:
+            if web_chat_only and all(_channel_message_is_web_chat_request(message) for message in pending):
+                prompt = format_channel_web_chat_wake_batch_prompt(pending)
+            else:
+                prompt = format_channel_wake_batch_prompt(pending)
+            submit_bytes = _channel_wake_enter_bytes(enter_bytes)
+            try:
+                _write_channel_wake_prompt(master_fd, prompt, submit_bytes)
+            except Exception:
+                with _CHANNEL_STDIN_WAKE_LOCK:
+                    for message in pending:
+                        try:
+                            _CHANNEL_STDIN_WAKE_DELIVERED.discard(int(message.get("id") or 0))
+                        except Exception:
+                            continue
+                raise
+            if not web_chat_only:
+                if commit_cursor:
+                    _commit_channel_llm_cursor_if_newer(last_id)
+                if injected_message_ids is not None:
+                    injected_message_ids.extend(
+                        int(message.get("id") or 0)
+                        for message in pending
+                        if int(message.get("id") or 0) > 0
+                    )
+            ids = ",".join(str(message.get("id") or "") for message in pending)
+            channels = ",".join(sorted({str(message.get("channel") or "default") for message in pending}))
+            router_log(
+                "INFO",
+                f"channel_stdin_proxy_injected count={len(pending)} message_ids={ids} channels={channels} enter={_channel_enter_label(submit_bytes)} commit_cursor={commit_cursor}",
+            )
+        return last_id
 
 
 def _inject_pending_channel_summaries(master_fd: int, enter_bytes: bytes | None = None) -> int:
@@ -26337,8 +29305,8 @@ def subprocess_call_with_channel_wake_proxy(
     import termios
     import tty
 
-    last_id = _chat_scan_max_id()
-    last_channel_marker = _chat_messages_file_marker()
+    last_id = ensure_channel_llm_delivery_cursor_initialized()
+    last_channel_marker: tuple[float, int] = (0.0, -1)
     last_summary_marker = _channel_llm_summary_file_marker()
     master_fd, slave_fd = pty.openpty()
     stdout_fd = sys.stdout.fileno()
@@ -26352,6 +29320,11 @@ def subprocess_call_with_channel_wake_proxy(
     old_sigwinch = None
     sigwinch_installed = False
     last_channel_poll = 0.0
+    channel_inflight_id: int | None = None
+    channel_inflight_cursor: int | None = None
+    channel_inflight_logged_at = 0.0
+    channel_inflight_started_at = 0.0
+    channel_pending_recheck = False
     channel_enter_bytes = _channel_wake_enter_bytes()
     router_log(
         "INFO",
@@ -26400,17 +29373,86 @@ def subprocess_call_with_channel_wake_proxy(
                 if data:
                     _write_fd_all(stdout_fd, data)
             now = time.time()
+            if channel_inflight_id is not None:
+                channel_inflight_state = _channel_stdin_wake_state(channel_inflight_id)
+                if channel_inflight_state == "completed":
+                    if channel_inflight_cursor is not None:
+                        _commit_channel_llm_cursor_if_newer(channel_inflight_cursor)
+                    router_log(
+                        "INFO",
+                        f"channel_stdin_proxy_confirmed message_id={channel_inflight_id} cursor={channel_inflight_cursor or '-'}",
+                    )
+                    channel_inflight_id = None
+                    channel_inflight_cursor = None
+                    channel_inflight_started_at = 0.0
+                    channel_pending_recheck = True
+                elif (
+                    channel_inflight_state == "missing"
+                    and channel_inflight_started_at > 0
+                    and now - channel_inflight_started_at >= _channel_stdin_unseen_retry_seconds()
+                ):
+                    with _CHANNEL_STDIN_WAKE_LOCK:
+                        _CHANNEL_STDIN_WAKE_DELIVERED.discard(channel_inflight_id)
+                    router_log(
+                        "WARN",
+                        f"channel_stdin_proxy_unseen_retry message_id={channel_inflight_id} age={now - channel_inflight_started_at:.1f}s",
+                    )
+                    channel_inflight_id = None
+                    channel_inflight_cursor = None
+                    channel_inflight_started_at = 0.0
+                    channel_pending_recheck = True
+                    last_id = ensure_channel_llm_delivery_cursor_initialized()
+                    channel_inflight_logged_at = now
+                elif _channel_stdin_inflight_is_stale(channel_inflight_state, channel_inflight_started_at, now):
+                    if channel_inflight_cursor is not None:
+                        _commit_channel_llm_cursor_if_newer(channel_inflight_cursor)
+                    with _CHANNEL_STDIN_WAKE_LOCK:
+                        _CHANNEL_STDIN_WAKE_DELIVERED.discard(channel_inflight_id)
+                    router_log(
+                        "WARN",
+                        "channel_stdin_proxy_stale_inflight_skipped "
+                        f"message_id={channel_inflight_id} state={channel_inflight_state} "
+                        f"age={now - channel_inflight_started_at:.1f}s cursor={channel_inflight_cursor or '-'}",
+                    )
+                    channel_inflight_id = None
+                    channel_inflight_cursor = None
+                    channel_inflight_started_at = 0.0
+                    channel_pending_recheck = True
+                    last_id = ensure_channel_llm_delivery_cursor_initialized()
+                    channel_inflight_logged_at = now
+                elif now - channel_inflight_logged_at >= 30.0:
+                    channel_inflight_logged_at = now
+                    router_log(
+                        "INFO",
+                        f"channel_stdin_proxy_waiting_for_turn_completion message_id={channel_inflight_id} state={channel_inflight_state}",
+                    )
             if now - last_channel_poll >= 0.5:
                 last_channel_poll = now
                 marker = _chat_messages_file_marker()
-                if inject_channel_messages and marker != last_channel_marker:
-                    last_channel_marker = marker
+                if inject_channel_messages and _channel_stdin_should_check_pending(
+                    marker,
+                    last_channel_marker,
+                    channel_pending_recheck,
+                    channel_inflight_id,
+                ):
+                    if marker != last_channel_marker:
+                        last_channel_marker = marker
+                    channel_pending_recheck = False
+                    last_id = max(last_id, ensure_channel_llm_delivery_cursor_initialized())
+                    injected_ids: list[int] = []
                     last_id = _inject_pending_channel_messages(
                         master_fd,
                         last_id,
                         channel_enter_bytes,
                         web_chat_only=inject_web_chat_only,
+                        commit_cursor=False,
+                        injected_message_ids=injected_ids,
                     )
+                    if injected_ids:
+                        channel_inflight_id = injected_ids[-1]
+                        channel_inflight_cursor = last_id
+                        channel_inflight_logged_at = now
+                        channel_inflight_started_at = now
                 summary_marker = _channel_llm_summary_file_marker()
                 if inject_channel_summaries and summary_marker != last_summary_marker:
                     last_summary_marker = summary_marker
@@ -26594,6 +29636,12 @@ def _mcp_proxy_observe_json_message(server_name: str, payload: Any, *, schedule_
         if schedule_direct:
             chat_payload = _mark_channel_payload_direct_llm_pending(chat_payload)
         saved = append_chat_message(chat_payload)
+        if saved.get("_claude_any_duplicate"):
+            router_log(
+                "INFO",
+                f"mcp_proxy_notification_skipped_duplicate_persisted server={server_name} method={payload.get('method')} existing_id={saved.get('id')}",
+            )
+            return saved
         router_log(
             "INFO",
             f"mcp_proxy_notification server={server_name} method={payload.get('method')} message_id={saved.get('id')}",
@@ -27131,6 +30179,10 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
     manager_thread: threading.Thread | None = None
     pending_notifications: list[dict[str, Any]] = []
     pending_wait_count = 0
+    initialized_wait_seconds = max(
+        0.0,
+        min(5.0, float(server.get("initialized_wait_seconds") or server.get("mcp_initialized_wait_seconds") or 1.0)),
+    )
     notification_condition = threading.Condition()
     router_log("INFO", f"mcp_http_proxy_started server={server_name} endpoint={endpoint}")
 
@@ -27296,6 +30348,18 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                     if not stream_stop.is_set() and not session_requested:
                         session_cond.wait(timeout=read_timeout)
                 continue
+            if initialized_payload is None and initialized_wait_seconds > 0:
+                # MCP clients send notifications/initialized immediately after
+                # initialize. Opening the Streamable HTTP GET before that point
+                # can leave some stateful servers with a live but unsubscribed
+                # notification stream. Wait briefly for the standard handshake;
+                # if an older/nonstandard client never sends it, keep the old
+                # behavior after the grace window.
+                with session_cond:
+                    if initialized_payload is None and not stream_stop.is_set():
+                        session_cond.wait(timeout=initialized_wait_seconds)
+                    if session_requested:
+                        continue
             worker_session = current_session
             event_name = "message"
             data_lines: list[str] = []
@@ -27389,6 +30453,8 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                             _mcp_proxy_streamable_http_request(endpoint, headers, payload, timeout, protocol_version, active)
                         except Exception:
                             pass
+                    with session_cond:
+                        session_cond.notify_all()
                     continue
                 if method == "initialize":
                     # Hand the initialize off to the single session owner: cache
@@ -27725,6 +30791,12 @@ def npm_global_install_command(npm: str, package_spec: str, prefix: Path | None 
     return cmd
 
 
+def npm_global_bin_dir_from_prefix(prefix: Path) -> Path:
+    if os.name == "nt":
+        return prefix
+    return prefix / "bin"
+
+
 def claude_code_current_version(claude: str) -> str:
     try:
         p = subprocess.run(
@@ -28008,8 +31080,8 @@ def quiet_upgrade_claude_any() -> int:
 def quiet_upgrade_claude_code() -> int:
     claude = find_executable("claude")
     if not claude:
-        print("Claude Code update skipped: claude executable was not found.", flush=True)
-        return 1
+        claude = install_claude_code_if_missing()
+        return 0 if claude else 1
     current = claude_code_current_version(claude)
     npm = find_executable("npm")
     latest = ""
@@ -28028,6 +31100,51 @@ def quiet_upgrade_claude_code() -> int:
     if rc != 0:
         print(f"Claude Code update failed ({rc}).", flush=True)
     return rc
+
+
+def install_claude_code_if_missing() -> str | None:
+    claude = find_executable("claude")
+    if claude:
+        return claude
+    if os.environ.get("CLAUDE_ANY_SKIP_CLAUDE_INSTALL") == "1":
+        return None
+    npm = find_executable("npm")
+    if not npm:
+        print(
+            "Claude Code executable was not found, and npm is not available to install @anthropic-ai/claude-code.",
+            flush=True,
+        )
+        return None
+    package_spec = os.environ.get("CLAUDE_ANY_CLAUDE_CODE_PACKAGE", "@anthropic-ai/claude-code@latest")
+    install_prefix = current_npm_install_prefix()
+    cmd = npm_global_install_command(npm, package_spec, install_prefix)
+    cmd.insert(3, "--prefer-online")
+    print(f"Claude Code executable was not found; installing {package_spec}...", flush=True)
+    if install_prefix is not None:
+        print(f"Installing Claude Code into active npm prefix: {install_prefix}", flush=True)
+    rc, out = run_command_for_upgrade(cmd, timeout=300)
+    if out:
+        print(out, flush=True)
+    if rc != 0:
+        print(f"Claude Code install failed ({rc}).", flush=True)
+        if install_prefix is not None:
+            print(
+                f"Install targeted the active install prefix ({install_prefix}). "
+                "If this prefix is not writable, install Claude Code with the permissions used for that prefix.",
+                flush=True,
+            )
+        return None
+    if install_prefix is not None:
+        bin_dir = str(npm_global_bin_dir_from_prefix(install_prefix))
+        path = os.environ.get("PATH", "")
+        if bin_dir and bin_dir not in path.split(os.pathsep):
+            os.environ["PATH"] = bin_dir + (os.pathsep + path if path else "")
+    claude = find_executable("claude")
+    if claude:
+        print(f"Claude Code installed: {claude}", flush=True)
+    else:
+        print("Claude Code install completed, but the claude executable is still not visible in PATH.", flush=True)
+    return claude
 
 
 def run_quiet_upgrade_and_exit() -> int:
@@ -28076,7 +31193,6 @@ def launch_claude(
     cleanup_managed_services_for_provider(provider, pcfg, cfg, quiet=True)
     env = os.environ.copy()
     env["PATH"] = path_with_claude_any_user_dirs(env)
-    launch_env = env_vars(cfg)
     launch_passthrough = normalize_channel_passthrough(passthrough)
     native_channel_bridge = should_use_native_channel_bridge(use_router_mode, cfg, launch_passthrough)
     stdin_channel_proxy = should_use_channel_stdin_proxy(use_router_mode, launch_passthrough, cfg)
@@ -28096,6 +31212,9 @@ def launch_claude(
     manage_router_lifetime = False
     if use_router_mode or llm_channel_delivery:
         manage_router_lifetime = bool(start_router_if_needed())
+    if not use_native_anthropic:
+        ensure_model_cache_for_launch(provider, pcfg)
+    launch_env = env_vars(cfg)
     if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge or llm_channel_delivery or native_auto_channel_specs:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
         launch_env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
@@ -28153,9 +31272,12 @@ def launch_claude(
         install_claude_any_slash_commands(include_advisor=provider != "anthropic")
         install_tool_guard_hooks()
         install_claude_any_statusline()
-    claude = find_executable("claude")
+    claude = install_claude_code_if_missing()
     if not claude:
-        raise RuntimeError("claude executable was not found in PATH or the Claude Any user bin directories")
+        raise RuntimeError(
+            "claude executable was not found in PATH or the Claude Any user bin directories, "
+            "and automatic install of @anthropic-ai/claude-code did not make it available"
+        )
     run_claude_update_check(claude, enabled=update_check)
     claude = find_executable("claude") or claude
     if native_channel_bridge or native_auto_channel_specs:
@@ -28184,10 +31306,15 @@ def launch_claude(
     channel_probe_source_paths: list[Path] = []
     if stdin_channel_proxy or llm_channel_delivery:
         try:
+            candidate_channel_names = channel_candidate_server_names_for_launch(cfg, launch_passthrough)
             ensure_channel_probe_cache_for_launch(cfg, launch_passthrough)
             capable_names = cached_channel_capable_server_names()
-            detected_channel_capable_names = list(capable_names)
-            detected_channel_specs = [f"server:{name}" for name in capable_names]
+            capable_name_set = set(capable_names)
+            detected_channel_capable_names = [
+                name for name in candidate_channel_names
+                if name in capable_name_set and name.strip().lower() not in _NATIVE_ROUTER_CHANNEL_NAMES
+            ]
+            detected_channel_specs = [f"server:{name}" for name in detected_channel_capable_names]
             channel_launch_specs = channel_specs_for_launch(cfg, launch_passthrough, detected_channel_specs)
             channel_probe_source_paths = cached_channel_source_paths_for_specs(channel_launch_specs)
             if channel_probe_source_paths:
@@ -28198,8 +31325,8 @@ def launch_claude(
                 "channel_probe_loaded source=cache cache_age_ts=%d count=%d servers=%s sources=%s"
                 % (
                     int(cache_age),
-                    len(capable_names),
-                    ",".join(capable_names) or "-",
+                    len(detected_channel_capable_names),
+                    ",".join(detected_channel_capable_names) or "-",
                     ",".join(str(path) for path in channel_probe_source_paths) or "-",
                 ),
             )
@@ -28212,7 +31339,7 @@ def launch_claude(
             claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
     elif stdin_channel_proxy or llm_channel_delivery or native_auto_channel_specs:
         if llm_channel_delivery:
-            ensure_channel_llm_delivery_cursor_initialized()
+            prepare_channel_llm_delivery_for_launch()
         if should_launch_process_start_channel_sse(stdin_channel_proxy, native_channel_bridge, llm_channel_delivery):
             auto_start_sse_channels_from_mcp_configs(
                 launch_passthrough,
@@ -28244,8 +31371,8 @@ def launch_claude(
             claude_passthrough = strip_mcp_config_passthrough(launch_passthrough)
     if mcp_config_paths:
         extra_args.extend(["--mcp-config", *mcp_config_paths])
-    if should_append_compat_prompt(provider, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
-        extra_args.extend(["--append-system-prompt", NON_ANTHROPIC_COMPAT_PROMPT])
+    if should_append_compat_prompt(provider, pcfg, cfg) and not has_passthrough_option(launch_passthrough, "--system-prompt"):
+        extra_args.extend(["--append-system-prompt", ROUTED_COMPAT_PROMPT])
     extra_args.extend(
         claude_channel_args(
             cfg,
@@ -28272,6 +31399,11 @@ def launch_claude(
         and claude_supports_permission_mode_arg(claude)
     ):
         cmd.extend(["--permission-mode", "bypassPermissions"])
+    if (
+        should_disallow_claude_server_side_web_tools(provider, pcfg, use_native_anthropic)
+        and not has_passthrough_option([*extra_args, *claude_passthrough], "--disallowedTools", "--disallowed-tools")
+    ):
+        cmd.extend(["--disallowedTools", ",".join(CLAUDE_SERVER_SIDE_WEB_TOOLS)])
     model = env.get("CLAUDE_ANY_MODEL_ALIAS")
     if model:
         cmd.extend(["--model", model])
@@ -28433,6 +31565,7 @@ Control plane, runs before Claude Code and does not require LLM connectivity:
   claude-any advisor-model MODEL_ID  Set current provider advisor model (off disables)
   claude-any models [PROVIDER]       List models
   claude-any api-key PROVIDER        Store API key securely
+  claude-any api-key PROVIDER clear  Clear stored API key(s)
   claude-any set-api-key PROVIDER KEY
   claude-any set-api-keys PROVIDER KEY1,KEY2
   claude-any web-search [on|off]     Auto-attach DuckDuckGo MCP for non-native providers
@@ -28461,6 +31594,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-auto-llm-options [MODEL_ID]
                                       Apply recommended LLM options for MODEL_ID or the saved model
   claude-any --ca-api-key KEY        Set current provider API key, then launch
+  claude-any --ca-api-key clear      Clear current provider API key(s), then launch
   claude-any --ca-api-key-env ENVVAR Set current provider API key from env, then launch
   claude-any --ca-api-keys KEY1,KEY2 Set current provider API keys with round-robin
   claude-any --ca-api-keys-env ENVVAR
@@ -28501,7 +31635,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-stop               Stop router/proxy
   claude-any --                      Pass all following args directly to Claude Code
 
-Provider names: anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, vllm, lm-studio, nvidia-hosted, self-hosted-nim, openrouter, fireworks
+Provider names: anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, kimi, vllm, lm-studio, nvidia-hosted, self-hosted-nim, openrouter, fireworks
 Any other arguments are passed through to claude. Use -- before Claude flags that
 collide with claude-any setup flags."""
 
@@ -28679,7 +31813,7 @@ def run_cli(argv: list[str]) -> int:
         if head in ("api-key", "apikey"):
             if not rest:
                 raise SystemExit("Missing provider")
-            cmd_api_key(argparse.Namespace(provider=rest[0]))
+            cmd_api_key(argparse.Namespace(provider=rest[0], action=rest[1] if len(rest) > 1 else None))
             return 0
         if head in ("set-api-key", "set-apikey"):
             if len(rest) < 2:
@@ -29271,6 +32405,7 @@ def build_parser() -> argparse.ArgumentParser:
     pp.set_defaults(func=cmd_provider)
     ak = sub.add_parser("api-key")
     ak.add_argument("provider", nargs="?")
+    ak.add_argument("action", nargs="?")
     ak.set_defaults(func=cmd_api_key)
     sak = sub.add_parser("set-api-key")
     sak.add_argument("provider")

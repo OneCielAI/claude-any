@@ -176,6 +176,38 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertIsNone(name)
         self.assertEqual({}, fixed)
 
+    def test_channel_inbox_runtime_drops_enter_plan_mode_emit(self):
+        body = body_with_tools(
+            "[claude-any channel inbox]\n<< ai-net-http >> incoming channel message for the current agent.",
+            ["EnterPlanMode", "TaskList"],
+        )
+        body["metadata"] = {"claude_any_channel_injected": True}
+
+        name, fixed = claude_any.plan_mode_tool_name_for_emit(body, "EnterPlanMode", {})
+
+        self.assertIsNone(name)
+        self.assertEqual({}, fixed)
+
+    def test_external_channel_runtime_drops_enter_plan_mode_emit(self):
+        body = body_with_tools(
+            "[claude-any external channel message] channel=ai-net-http room=room1 from=agent id=42 text=\"hello\".",
+            ["EnterPlanMode", "TaskList"],
+        )
+
+        name, fixed = claude_any.plan_mode_tool_name_for_emit(body, "EnterPlanMode", {})
+
+        self.assertIsNone(name)
+        self.assertEqual({}, fixed)
+
+    def test_channel_prompt_does_not_auto_synthesize_enter_plan_mode(self):
+        body = body_with_tools(
+            "[claude-any channel inbox]\n<< ai-net-http >> incoming channel message for the current agent.",
+            ["EnterPlanMode", "TaskList"],
+        )
+        body["metadata"] = {"claude_any_channel_injected": True}
+
+        self.assertFalse(claude_any.should_auto_enter_plan_mode(body, "", []))
+
     def test_empty_turn_without_tasklist_returns_visible_notice(self):
         body = body_with_tools("continue implementation", ["Read", "Edit"])
         data = {
@@ -339,6 +371,47 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertIn("toolu_anthropic_choice_", output)
         self.assertIn('"name": "TaskList"', output)
         self.assertIn('"stop_reason": "tool_use"', output)
+
+    def test_anthropic_routed_stream_does_not_synthesize_tasklist(self):
+        body = body_with_tools("continue implementation", ["TaskList", "Read", "ExitPlanMode"])
+        body["messages"].append(
+            {
+                "role": "user",
+                "content": [],
+                "attachment": {"type": "plan_mode", "filePath": "/tmp/plan.md"},
+            }
+        )
+
+        class Handler:
+            def __init__(self):
+                self.wfile = BytesIO()
+
+        handler = Handler()
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            'event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Which part should I implement first?"}}\n\n',
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+
+        lines = []
+        for event in events:
+            lines.extend(f"{line}\n".encode("utf-8") for line in event.splitlines())
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            lines,
+            "claude-opus-4-8",
+            word_chunking=False,
+            source_body=body,
+            provider="anthropic",
+        )
+        output = handler.wfile.getvalue().decode("utf-8")
+
+        self.assertNotIn("toolu_anthropic_choice_", output)
+        self.assertNotIn('"name": "TaskList"', output)
+        self.assertIn('"stop_reason": "end_turn"', output)
 
     def test_native_stream_hidden_only_response_synthesizes_tasklist(self):
         body = body_with_tools("continue implementation", ["TaskList", "Read", "Edit"])

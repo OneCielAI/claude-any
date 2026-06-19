@@ -77,6 +77,15 @@ class ProviderLabelTests(unittest.TestCase):
         self.assertIn("Provider  [Claude Native]", claude_any.main_menu_rows(cfg, "anthropic", native, "en")[1])
         self.assertIn("Provider  [Anthropic routed]", claude_any.main_menu_rows(cfg, "anthropic", routed, "en")[1])
 
+    def test_compat_prompt_is_not_added_to_anthropic_modes(self):
+        cfg = {"claude_code": {"compat_prompt_for_non_anthropic": True}}
+
+        self.assertFalse(claude_any.should_append_compat_prompt("anthropic", {"route_through_router": False}, cfg))
+        self.assertFalse(claude_any.should_append_compat_prompt("anthropic", {"route_through_router": True}, cfg))
+        self.assertTrue(claude_any.should_append_compat_prompt("vllm", {}, cfg))
+        self.assertIn("claude-any router", claude_any.ROUTED_COMPAT_PROMPT)
+        self.assertNotIn("non-Anthropic model provider", claude_any.ROUTED_COMPAT_PROMPT)
+
     def test_routed_anthropic_resolves_tool_model_aliases(self):
         pcfg = {"current_model": "claude-opus-4-8"}
         body = {
@@ -215,6 +224,21 @@ class NativeEnvContractTests(unittest.TestCase):
 
         self.assertEqual("anthropic-routed", claude_any.provider_mode_label("anthropic", pcfg))
         self.assertFalse(claude_any.direct_native_anthropic_enabled("anthropic", pcfg))
+
+    def test_server_side_web_tools_are_only_disallowed_outside_claude_modes(self):
+        native_pcfg = self._cfg()["providers"]["anthropic"]
+        routed_pcfg = self._cfg(route_through_router=True)["providers"]["anthropic"]
+        self.assertFalse(
+            claude_any.should_disallow_claude_server_side_web_tools("anthropic", native_pcfg, True)
+        )
+        self.assertFalse(
+            claude_any.should_disallow_claude_server_side_web_tools("anthropic", routed_pcfg, False)
+        )
+        self.assertTrue(
+            claude_any.should_disallow_claude_server_side_web_tools(
+                "ollama", {"route_through_router": False}, False
+            )
+        )
 
     def test_routed_anthropic_without_api_key_can_launch_for_oauth_header_pass_through(self):
         with mock.patch.object(claude_any, "base_url_status_line", return_value="Base URL: model list reachable"):
@@ -386,14 +410,17 @@ class NativeSlashCommandContractTests(unittest.TestCase):
             commands_dir.mkdir()
             advisor = commands_dir / "advisor.md"
             router_debug = commands_dir / "router-debug.md"
+            channel_clear = commands_dir / "channel-clear.md"
             advisor.write_text(claude_any.ADVISOR_SLASH_COMMAND, encoding="utf-8")
             router_debug.write_text(claude_any.ROUTER_DEBUG_SLASH_COMMAND, encoding="utf-8")
+            channel_clear.write_text(claude_any.CHANNEL_CLEAR_SLASH_COMMAND, encoding="utf-8")
 
             with mock.patch.object(claude_any, "CLAUDE_COMMANDS_DIR", commands_dir):
                 claude_any.disable_claude_any_slash_commands_for_native()
 
             self.assertFalse(advisor.exists())
             self.assertFalse(router_debug.exists())
+            self.assertFalse(channel_clear.exists())
 
     def test_non_native_install_restores_router_backed_slash_commands(self):
         with tempfile.TemporaryDirectory() as td:

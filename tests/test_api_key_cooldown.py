@@ -152,6 +152,30 @@ class ApiKeyCooldownTests(unittest.TestCase):
         self.assertEqual(50, entry["server_rpm"])
         self.assertNotIn("penalty_until", entry)
 
+    def test_rate_limit_headers_record_concurrency_and_queue_pressure(self):
+        pcfg = self.pcfg(api_key="sk-k1", api_keys=[])
+
+        claude_any.learn_router_rate_limit_headers(
+            "openrouter",
+            pcfg,
+            "model",
+            _headers(
+                **{
+                    "X-RateLimit-Max-Concurrent": "10",
+                    "X-RateLimit-Active": "9",
+                    "X-RateLimit-Queue-Limit": "15",
+                    "X-RateLimit-Queued": "14",
+                }
+            ),
+        )
+
+        state = json.loads(Path(self._tmp.name).read_text(encoding="utf-8"))
+        entry = state["openrouter:__global__"]
+        self.assertEqual(10, entry["server_max_concurrent"])
+        self.assertEqual(9, entry["server_active"])
+        self.assertEqual(15, entry["server_queue_limit"])
+        self.assertEqual(14, entry["server_queued"])
+
     def test_multi_key_rate_limit_headers_clear_existing_global_penalty(self):
         pcfg = self.pcfg(api_key="", api_keys=["sk-k1", "sk-k2"])
         Path(self._tmp.name).write_text(
