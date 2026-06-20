@@ -500,6 +500,9 @@ _NATIVE_ROUTER_CHANNEL_NAMES = {"claude-any-router", "mcp-claude-any-router"}
 _MCP_NOTIFICATION_DEDUP_TTL_SECONDS = 3.0
 _MCP_NOTIFICATION_DEDUP_LOCK = threading.Lock()
 _MCP_NOTIFICATION_DEDUP_RECENT: dict[str, tuple[str, float]] = {}
+_TOOL_SIDE_EFFECT_DEDUP_TTL_SECONDS = 10 * 60.0
+_TOOL_SIDE_EFFECT_DEDUP_LOCK = threading.Lock()
+_TOOL_SIDE_EFFECT_DEDUP_RECENT: dict[str, float] = {}
 EVENT_BUS = EventBus()
 ADVISOR_FEEDBACK_MARKER = "CLAUDE_ANY_ADVISOR_FEEDBACK"
 PLAN_GUARD_MARKER = "[claude-any-plan-guard]"
@@ -1562,6 +1565,73 @@ def should_drop_emitted_tool_call(
         },
     )
     return True
+
+
+_SIDE_EFFECT_TOOL_SUFFIXES = {
+    "send_message",
+    "send_dm",
+    "send_file",
+    "create_message",
+    "create_dm",
+    "post_message",
+    "reply",
+}
+
+
+def side_effect_tool_call_dedupe_key(tool_name: str, tool_input: dict[str, Any]) -> str | None:
+    """Stable key for exact duplicate side-effect tool calls.
+
+    This intentionally avoids read-only tools such as get_messages. Some
+    non-native streaming backends can repeat the same side-effect MCP tool call
+    after receiving its tool result, which posts duplicate external messages.
+    """
+    if not isinstance(tool_name, str) or not tool_name:
+        return None
+    normalized_name = tool_name.strip()
+    tool_leaf = normalized_name.rsplit("__", 1)[-1].strip().lower()
+    if tool_leaf not in _SIDE_EFFECT_TOOL_SUFFIXES:
+        return None
+    try:
+        payload = json.dumps(tool_input or {}, sort_keys=True, ensure_ascii=False, separators=(",", ":"), default=str)
+    except Exception:
+        payload = repr(tool_input)
+    digest = hashlib.sha256(payload.encode("utf-8", errors="replace")).hexdigest()
+    return f"{normalized_name}:{digest}"
+
+
+def should_drop_duplicate_side_effect_tool_call(
+    tool_name: str,
+    tool_input: dict[str, Any],
+    raw_name: str = "",
+) -> bool:
+    key = side_effect_tool_call_dedupe_key(tool_name, tool_input)
+    if not key:
+        return False
+    now = time.monotonic()
+    with _TOOL_SIDE_EFFECT_DEDUP_LOCK:
+        expired = [k for k, ts in _TOOL_SIDE_EFFECT_DEDUP_RECENT.items() if now - ts > _TOOL_SIDE_EFFECT_DEDUP_TTL_SECONDS]
+        for expired_key in expired:
+            _TOOL_SIDE_EFFECT_DEDUP_RECENT.pop(expired_key, None)
+        previous = _TOOL_SIDE_EFFECT_DEDUP_RECENT.get(key)
+        if previous is not None and now - previous <= _TOOL_SIDE_EFFECT_DEDUP_TTL_SECONDS:
+            append_tool_call_log(
+                "dropped_duplicate_side_effect_tool_call",
+                {
+                    "raw_name": raw_name or tool_name,
+                    "matched_name": tool_name,
+                    "emitted_input": tool_input,
+                    "age_seconds": round(now - previous, 3),
+                    "ttl_seconds": _TOOL_SIDE_EFFECT_DEDUP_TTL_SECONDS,
+                },
+            )
+            router_log(
+                "WARN",
+                f"dropped duplicate side-effect tool call raw_name={raw_name or tool_name!r} "
+                f"matched_name={tool_name!r} age={now - previous:.1f}s",
+            )
+            return True
+        _TOOL_SIDE_EFFECT_DEDUP_RECENT[key] = now
+    return False
 
 
 MCP_NOTIFICATION_WAIT_TOOL_NAMES = {
@@ -14696,6 +14766,8 @@ def _rebatch_anthropic_sse_text(
         fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
         if should_drop_emitted_tool_call(matched_name, fixed_input, raw_name, source_body):
             return
+        if should_drop_duplicate_side_effect_tool_call(matched_name, fixed_input, raw_name):
+            return
         tool_id = str(tool_state.get("id") or f"toolu_anthropic_{int(time.time() * 1000)}_{index}")
         _remember_channel_injected_tool_use(source_body, tool_id, matched_name, fixed_input)
         append_tool_call_log(
@@ -15206,6 +15278,8 @@ def _ollama_stream_to_anthropic_sse(
                 fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
                 if should_drop_emitted_tool_call(matched_name, fixed_input, raw_name, source_body):
                     continue
+                if should_drop_duplicate_side_effect_tool_call(matched_name, fixed_input, raw_name):
+                    continue
                 tool_calls.append({"function": {"name": matched_name, "arguments": fixed_input}})
                 tool_id = f"toolu_ollama_{int(time.time() * 1000)}_{len(tool_calls) - 1}"
                 tool_index = next_content_index
@@ -15502,6 +15576,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
     model = resolve_requested_model(provider, pcfg, body.get("model"))
     base = pcfg.get("base_url", "").rstrip("/")
+    compatibility_test = str(handler.headers.get(COMPATIBILITY_TEST_HEADER) or "").strip().lower() in ("1", "true", "yes", "on")
     original_body = body
     upstream_body = body_with_advisor_tool(body, pcfg) if advisor_provider_supported(provider) else body
     stream_requested = body.get("stream", True)
@@ -15518,14 +15593,17 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     req_body = ollama_chat_request(model, upstream_body, pcfg, stream=stream_requested)
     headers = provider_headers(provider, pcfg)
     url = join_url(base, "/api/chat")
-    waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
+    if compatibility_test:
+        waited, rpm_used, rpm_limit = 0.0, 0, router_rate_limit_effective_rpm(provider, pcfg, model)
+    else:
+        waited, rpm_used, rpm_limit = apply_router_rate_limit(provider, pcfg, model)
     rpm_status = bool(pcfg.get("rate_limit_status", False))
     if stream_requested:
         # Stream Ollama response through as Anthropic SSE
         data_bytes = json.dumps(req_body).encode("utf-8")
         req_tokens = estimate_tokens(req_body)
         req_bytes = len(data_bytes)
-        gateway_retries = configured_gateway_retries(pcfg)
+        gateway_retries = 0 if compatibility_test else configured_gateway_retries(pcfg)
         max_attempts = max(1, gateway_retries + 1)
         resp = None
         stream_idle_timeout = provider_stream_idle_timeout_seconds(pcfg)
@@ -15544,7 +15622,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                     stream=True,
                 )
                 router_log("INFO", f"ollama_stream_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={req_tokens} bytes={req_bytes}")
-                resp = urllib.request.urlopen(req, timeout=ollama_request_timeout_seconds(pcfg))
+                resp = provider_urlopen(req, timeout=ollama_request_timeout_seconds(pcfg), provider=provider, pcfg=pcfg)
                 set_upstream_stream_read_timeout(resp, stream_idle_timeout)
                 learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
                 break
@@ -15654,7 +15732,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
     data_bytes = json.dumps(req_body).encode("utf-8")
     req_tokens = estimate_tokens(req_body)
     req_bytes = len(data_bytes)
-    gateway_retries = configured_gateway_retries(pcfg)
+    gateway_retries = 0 if compatibility_test else configured_gateway_retries(pcfg)
     max_attempts = max(1, gateway_retries + 1)
     data = None
     for attempt in range(max_attempts):
@@ -15671,7 +15749,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
                 timeout=ollama_request_timeout_seconds(pcfg),
             )
             router_log("INFO", f"ollama_request provider={provider} model={model} attempt={attempt + 1}/{max_attempts} tokens={req_tokens} bytes={req_bytes}")
-            with urllib.request.urlopen(req, timeout=ollama_request_timeout_seconds(pcfg)) as resp:
+            with provider_urlopen(req, timeout=ollama_request_timeout_seconds(pcfg), provider=provider, pcfg=pcfg) as resp:
                 learn_router_rate_limit_headers(provider, pcfg, model, resp.headers)
                 data = json.loads(resp.read().decode("utf-8"))
                 break
@@ -16012,6 +16090,8 @@ def stream_openai_chat_to_anthropic_sse(
                     continue
             fixed_input = cap_mcp_notification_wait_tool_input(matched_name, fixed_input)
             if should_drop_emitted_tool_call(matched_name, fixed_input, raw_name, source_body):
+                continue
+            if should_drop_duplicate_side_effect_tool_call(matched_name, fixed_input, raw_name):
                 continue
             tool_calls.append({"function": {"name": matched_name, "arguments": fixed_input}})
             tool_index = next_content_index
