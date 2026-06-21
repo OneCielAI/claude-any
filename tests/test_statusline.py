@@ -109,6 +109,68 @@ class StatuslineTests(unittest.TestCase):
         self.assertIn("ctx 100,724/262,144 tok", proc.stdout)
         self.assertNotIn("ctx 100,724/200,000 tok", proc.stdout)
 
+    def test_statusline_uses_current_configured_context_limit_over_stale_router_limit(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / "statusline.py"
+            script.write_text(claude_any.STATUSLINE_SCRIPT, encoding="utf-8")
+            config_dir = Path(tmp)
+            (config_dir / "config.json").write_text(
+                json.dumps(
+                    {
+                        "current_provider": "opencode",
+                        "providers": {
+                            "opencode": {
+                                "base_url": "https://opencode.ai/zen",
+                                "current_model": "deepseek-v4-flash-free",
+                                "context_window": 131072,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (config_dir / "context-usage.json").write_text(
+                json.dumps(
+                    {
+                        "updated_at": time.time(),
+                        "provider": "opencode",
+                        "model": "claude-any-opencode-deepseek-v4-flash-free",
+                        "tokens": 93342,
+                        "context_limit": 1048576,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = os.environ.copy()
+            env.update(
+                {
+                    "CLAUDE_ANY_CONFIG_DIR": tmp,
+                    "CLAUDE_ANY_STATUSLINE_ANSI": "0",
+                    "CLAUDE_ANY_PROVIDER": "opencode",
+                    "CLAUDE_ANY_MODEL_ALIAS": "claude-any-opencode-deepseek-v4-flash-free",
+                }
+            )
+            session = {
+                "model": {"display_name": "claude-any-opencode-deepseek-v4-flash-free"},
+                "workspace": {"current_dir": tmp},
+                "context_window": {
+                    "current_usage": {"input_tokens": 93342},
+                    "context_window_size": 1048576,
+                    "used_percentage": 8.9,
+                },
+            }
+            proc = subprocess.run(
+                [sys.executable, str(script)],
+                input=json.dumps(session),
+                text=True,
+                capture_output=True,
+                env=env,
+                check=True,
+            )
+
+        self.assertIn("ctx 93,342/131,072 tok", proc.stdout)
+        self.assertNotIn("ctx 93,342/1,048,576 tok", proc.stdout)
+
     def test_statusline_shows_pending_channel_queue_count(self):
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "statusline.py"

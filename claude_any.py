@@ -3221,7 +3221,33 @@ def token_part(value, muted=False):
     return gray(text) if muted else color(text)
 
 
-def context_status_text(context, provider, model):
+def _status_positive_int(value):
+    try:
+        number = int(value)
+        return number if number > 0 else 0
+    except Exception:
+        return 0
+
+
+def status_config_context_limit(provider, pcfg):
+    if not isinstance(pcfg, dict):
+        return 0
+    if provider in ("ollama", "ollama-cloud"):
+        fixed = str(pcfg.get("num_ctx") or "").strip().lower()
+        if fixed and fixed not in ("auto", "0", "false", "off", "none", "unset"):
+            parsed = _status_positive_int(fixed)
+            if parsed:
+                return parsed
+        return (
+            _status_positive_int(pcfg.get("num_ctx_max"))
+            or _status_positive_int(pcfg.get("model_context_max"))
+            or _status_positive_int(pcfg.get("context_window"))
+            or _status_positive_int(pcfg.get("max_model_len"))
+        )
+    return _status_positive_int(pcfg.get("context_window")) or _status_positive_int(pcfg.get("max_model_len"))
+
+
+def context_status_text(context, provider, model, expected_limit=0):
     if not isinstance(context, dict):
         return ""
     if str(context.get("provider") or "") != str(provider or ""):
@@ -3238,10 +3264,7 @@ def context_status_text(context, provider, model):
         tokens = 0
     if tokens <= 0:
         return ""
-    try:
-        limit = int(context.get("context_limit") or 0)
-    except Exception:
-        limit = 0
+    limit = _status_positive_int(expected_limit) or _status_positive_int(context.get("context_limit"))
     if limit > 0:
         pct = (tokens / limit) * 100.0
         return f"ctx {tokens:,}/{limit:,} tok ({pct:.1f}%)"
@@ -3484,7 +3507,8 @@ def main():
     if dir_name:
         left += f" {dir_name}"
     status_parts = []
-    router_ctx_text = context_status_text(context, provider, model)
+    expected_ctx_limit = status_config_context_limit(provider, pcfg)
+    router_ctx_text = context_status_text(context, provider, model, expected_ctx_limit)
     session_ctx_text = session_context_status_text(session)
     ctx_text = router_ctx_text or session_ctx_text
     if ctx_text:
