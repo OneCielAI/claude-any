@@ -4989,6 +4989,137 @@ class ChannelBridgeTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_mcp_proxy_streamable_http_reopens_get_after_late_initialized(self):
+        lock = threading.Lock()
+        state = {"initialized": False}
+        seen_gets: list[bool] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if payload.get("method") == "initialize":
+                    result = {
+                        "protocolVersion": claude_any.MCP_STREAMABLE_HTTP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "streamable-test", "version": "1"},
+                    }
+                    data = json.dumps({"jsonrpc": "2.0", "id": payload.get("id"), "result": result}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Mcp-Session-Id", "sess-late-init")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                if payload.get("method") == "notifications/initialized":
+                    with lock:
+                        state["initialized"] = True
+                data = json.dumps({"jsonrpc": "2.0", "id": payload.get("id"), "result": {}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                with lock:
+                    ready = bool(state["initialized"])
+                    seen_gets.append(ready)
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                if ready:
+                    self.wfile.write(
+                        b'id: late-ready\n'
+                        b'event: message\n'
+                        b'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"content":"late initialized notice"}}\n\n'
+                    )
+                    self.wfile.flush()
+                    time.sleep(0.1)
+                    return
+                # Simulate the real failure mode: a stream opened before
+                # notifications/initialized stays alive but does not receive
+                # backend notifications. The proxy must reopen it when the
+                # initialized notification arrives instead of waiting for this
+                # quiet stream to time out.
+                self.wfile.write(b": pre-initialized stream is quiet\n\n")
+                self.wfile.flush()
+                time.sleep(2.0)
+
+        def frame(payload: dict[str, object]) -> bytes:
+            body = json.dumps(payload).encode("utf-8")
+            return b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+
+        with tempfile.TemporaryDirectory(prefix="ca-mcp-http-late-init-test-") as td:
+            root = Path(td)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                config = root / "server.json"
+                config.write_text(
+                    json.dumps(
+                        {
+                            "type": "http",
+                            "url": f"http://127.0.0.1:{server.server_address[1]}/mcp",
+                            "initialized_wait_seconds": 0.05,
+                            "notification_read_timeout_seconds": 5,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                env = os.environ.copy()
+                env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(claude_any.__file__).resolve()),
+                        "mcp-proxy",
+                        "--server-name",
+                        "fake-http",
+                        "--server-config",
+                        str(config),
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+                assert proc.stdin is not None
+                assert proc.stdout is not None
+                assert proc.stderr is not None
+                proc.stdin.write(frame({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+                proc.stdin.flush()
+                deadline = time.time() + 1.0
+                while time.time() < deadline and not seen_gets:
+                    time.sleep(0.02)
+                self.assertTrue(seen_gets, "proxy did not open the pre-initialized GET stream")
+                proc.stdin.write(frame({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}))
+                proc.stdin.flush()
+                chat_log = root / "config" / "chat-messages.jsonl"
+                deadline = time.time() + 1.5
+                while time.time() < deadline:
+                    if chat_log.exists() and "late initialized notice" in chat_log.read_text(encoding="utf-8"):
+                        break
+                    time.sleep(0.05)
+                proc.stdin.close()
+                stderr = proc.stderr.read()
+                proc.wait(timeout=10)
+                proc.stdout.close()
+                proc.stderr.close()
+                self.assertEqual(0, proc.returncode, stderr.decode("utf-8", errors="replace"))
+                self.assertFalse(seen_gets[0], f"test did not start with a pre-initialized GET: {seen_gets}")
+                self.assertTrue(any(seen_gets[1:]), f"GET stream was not reopened after initialized: {seen_gets}")
+                self.assertTrue(chat_log.exists())
+                self.assertIn("late initialized notice", chat_log.read_text(encoding="utf-8"))
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_mcp_proxy_streamable_http_replies_jsonl_when_client_uses_jsonl(self):
         # Claude Code's stdio MCP client speaks newline-delimited JSON, not
         # LSP-style Content-Length frames. When a channel-capable streamable-HTTP

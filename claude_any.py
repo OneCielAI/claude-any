@@ -10136,6 +10136,15 @@ def _streamable_http_session_not_found(exc: urllib.error.HTTPError, body_text: s
     )
 
 
+def _mcp_stream_read_timeout_error(exc: BaseException) -> bool:
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, BaseException) and reason is not exc:
+        return _mcp_stream_read_timeout_error(reason)
+    return "timed out" in str(exc).lower()
+
+
 def _channel_streamable_http_mark_session_lost(name: str, reason: str) -> None:
     with _CHANNEL_SSE_LOCK:
         state = _CHANNEL_SSE_CONNECTIONS.get(name)
@@ -30279,6 +30288,7 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
     # session it asks the manager via session_cond and waits briefly.
     session_cond = threading.Condition(session_lock)
     session_requested = False
+    stream_reopen_requested = False
     initialize_result: dict[str, Any] | None = None
     manager_thread: threading.Thread | None = None
     pending_notifications: list[dict[str, Any]] = []
@@ -30426,14 +30436,33 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
         is never a second stream worker and the stream never stays dead while
         Claude Code is idle.
         """
-        nonlocal session_requested, session_id
+        nonlocal session_requested, session_id, stream_reopen_requested
         last_event_id: str | None = None
         retry_seconds = max(1.0, min(60.0, float(server.get("retry_seconds") or 5.0)))
-        read_timeout = max(5.0, min(3600.0, float(server.get("read_timeout_seconds") or server.get("stream_timeout") or 300.0)))
+        read_timeout = max(
+            5.0,
+            min(
+                3600.0,
+                float(
+                    server.get("notification_read_timeout_seconds")
+                    or server.get("stream_read_timeout_seconds")
+                    or server.get("read_timeout_seconds")
+                    or server.get("stream_timeout")
+                    or 60.0
+                ),
+            ),
+        )
+        pre_initialized_read_timeout = max(
+            0.2,
+            min(5.0, float(server.get("pre_initialized_read_timeout_seconds") or 0.5)),
+        )
         while not stream_stop.is_set():
             with session_cond:
                 current_session = session_id
                 requested = session_requested
+                reopen_requested = stream_reopen_requested
+                if reopen_requested:
+                    stream_reopen_requested = False
             # (Re)initialize when we have no session, or a tool call requested one.
             if current_session is None or requested:
                 with session_cond:
@@ -30474,11 +30503,13 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                 if last_event_id:
                     request_headers["Last-Event-ID"] = last_event_id
                 req = urllib.request.Request(endpoint, headers=request_headers, method="GET")
-                with urllib.request.urlopen(req, timeout=read_timeout) as response:
+                with session_cond:
+                    stream_read_timeout = read_timeout if initialized_payload is not None else min(read_timeout, pre_initialized_read_timeout)
+                with urllib.request.urlopen(req, timeout=stream_read_timeout) as response:
                     router_log("INFO", f"mcp_http_proxy_stream_connected server={server_name} session={worker_session} last_event_id={last_event_id or '-'}")
                     while not stream_stop.is_set():
                         with session_cond:
-                            if session_requested or session_id != worker_session:
+                            if session_requested or stream_reopen_requested or session_id != worker_session:
                                 break
                         raw = response.readline()
                         if raw == b"":
@@ -30517,6 +30548,19 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                     continue  # re-init at loop top
                 router_log("WARN", f"mcp_http_proxy_stream_reconnect server={server_name} event={event_name} error=HTTPError:{exc.code}:{exc.reason}")
             except Exception as exc:
+                if _mcp_stream_read_timeout_error(exc):
+                    with session_cond:
+                        initialized_seen = initialized_payload is not None
+                        if session_id == worker_session:
+                            if initialized_seen:
+                                session_id = None
+                            session_cond.notify_all()
+                    last_event_id = None
+                    router_log(
+                        "WARN",
+                        f"mcp_http_proxy_stream_timeout_reinitialize server={server_name} event={event_name} initialized={initialized_seen} error={type(exc).__name__}: {exc}",
+                    )
+                    continue
                 router_log("WARN", f"mcp_http_proxy_stream_reconnect server={server_name} event={event_name} error={type(exc).__name__}: {exc}")
             # Reconnect backoff. A plain reset retries the same session; a stream
             # that ended because the backend dropped the session will fail the
@@ -30555,9 +30599,22 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                     if active:
                         try:
                             _mcp_proxy_streamable_http_request(endpoint, headers, payload, timeout, protocol_version, active)
-                        except Exception:
-                            pass
+                            router_log("INFO", f"mcp_http_proxy_initialized_forwarded server={server_name} session={active}")
+                        except urllib.error.HTTPError as exc:
+                            body_text = _http_error_body_text(exc)
+                            with session_cond:
+                                if _streamable_http_session_not_found(exc, body_text) and session_id == active:
+                                    session_id = None
+                                    session_requested = True
+                            router_log(
+                                "WARN",
+                                f"mcp_http_proxy_initialized_forward_failed server={server_name} error=HTTPError:{exc.code}:{exc.reason}",
+                            )
+                        except Exception as exc:
+                            router_log("WARN", f"mcp_http_proxy_initialized_forward_failed server={server_name} error={type(exc).__name__}: {exc}")
                     with session_cond:
+                        if active and session_id == active:
+                            stream_reopen_requested = True
                         session_cond.notify_all()
                     continue
                 if method == "initialize":
