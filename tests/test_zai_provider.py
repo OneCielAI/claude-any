@@ -1,7 +1,9 @@
 import copy
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -119,6 +121,33 @@ class ZaiProviderTests(unittest.TestCase):
         )
         self.assertEqual("glm-5.2", claude_any.resolve_requested_model("zai", pcfg, "glm-5.2[1m]"))
         self.assertEqual("glm-5-turbo", claude_any.resolve_requested_model("zai", pcfg, "glm-5-turbo[1m]"))
+
+    def test_compatibility_test_uses_zai_api_model_without_context_suffix(self):
+        cfg = self.zai_cfg(api_key="sk-zai-test")
+        response = {
+            "id": "msg_test",
+            "type": "message",
+            "role": "assistant",
+            "model": "glm-5.2",
+            "content": [{"type": "text", "text": "OK"}],
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+        }
+        args = type("Args", (), {"mode": "quick", "timeout": 10})()
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config"),
+            mock.patch.object(claude_any, "post_json", return_value=response) as post_json,
+        ):
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                claude_any._cmd_test(args)
+
+        request_body = post_json.call_args.args[1]
+        self.assertEqual("glm-5.2", request_body["model"])
+        self.assertIn("Model: glm-5.2[1m]", stdout.getvalue())
+        self.assertIn("API model: glm-5.2", stdout.getvalue())
 
     def test_zai_managed_mcp_config_contains_official_servers(self):
         pcfg = self.zai_cfg(api_key="sk-zai-test")["providers"]["zai"]

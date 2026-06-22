@@ -22989,6 +22989,7 @@ def _cmd_test(args: argparse.Namespace) -> None:
     provider_native = provider_native_compat_enabled(provider, pcfg)
     native = ollama_native or provider_native
     model = current_upstream_model_id(provider, pcfg) if provider_native else (launch_model_id(provider, pcfg) if ollama_native else current_alias(cfg))
+    request_model = upstream_api_model_id(provider, model) if native else model
     base = native_anthropic_base_url(provider, pcfg) if native else ROUTER_BASE
     if not native:
         # Compatibility tests must exercise the currently installed router.
@@ -23010,12 +23011,12 @@ def _cmd_test(args: argparse.Namespace) -> None:
     text_body = normalize_tool_choice_for_provider(
         provider,
         pcfg,
-        normalize_thinking_for_non_anthropic_provider(provider, pcfg, compatibility_text_request(model)),
+        normalize_thinking_for_non_anthropic_provider(provider, pcfg, compatibility_text_request(request_model)),
     )
     tool_body = normalize_tool_choice_for_provider(
         provider,
         pcfg,
-        normalize_thinking_for_non_anthropic_provider(provider, pcfg, compatibility_tool_request(model)),
+        normalize_thinking_for_non_anthropic_provider(provider, pcfg, compatibility_tool_request(request_model)),
     )
     print(f"Testing provider: {provider}")
     print(f"Test mode: {effective_mode}")
@@ -23044,6 +23045,8 @@ def _cmd_test(args: argparse.Namespace) -> None:
         for line in provider_ip_family_probe_lines(provider, pcfg):
             print(line)
     print(f"Model: {model}")
+    if request_model != model:
+        print(f"API model: {request_model}")
     for line in lm_studio_preflight_lines:
         print(line)
     for line in compatibility_runtime_lines(provider, pcfg, native):
@@ -23148,7 +23151,7 @@ def _cmd_test(args: argparse.Namespace) -> None:
         print("Note: smoke mode checked text and tool_use only; run `claude-any test 180 full` for tool_result round trip.")
         return
 
-    result_body = compatibility_tool_result_request(model, tool_use)
+    result_body = compatibility_tool_result_request(request_model, tool_use)
     result_data = run_phase("Tool result", result_body)
     result_preview = response_text_preview(result_data)
     if not result_preview:
