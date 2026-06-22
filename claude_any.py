@@ -144,6 +144,7 @@ MODEL_REGISTRY_PATH = CONFIG_DIR / "model-registry.json"
 LAUNCH_STATE_PATH = CONFIG_DIR / "launch-state.json"
 WEB_TOOLS_MCP_CONFIG = CONFIG_DIR / "web-tools-mcp.json"
 DUCKDUCKGO_MCP_CONFIG = CONFIG_DIR / "duckduckgo-mcp.json"
+ZAI_MCP_CONFIG = CONFIG_DIR / "zai-mcp.json"
 CHANNEL_MCP_CONFIG = CONFIG_DIR / "channel-mcp.json"
 NATIVE_MCP_CONFIG = CONFIG_DIR / "native-mcp.json"
 CHANNEL_MCP_CURSOR_PATH = CONFIG_DIR / "channel-mcp-cursor.json"
@@ -187,6 +188,20 @@ OPENCODE_ZEN_BASE_URL = "https://opencode.ai/zen"
 OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go"
 KIMI_CODING_BASE_URL = "https://api.kimi.com/coding"
 KIMI_DEFAULT_MODEL = "kimi-for-coding"
+ZAI_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
+ZAI_DEFAULT_MODEL = "glm-5.2[1m]"
+ZAI_MODEL_FALLBACK_IDS: tuple[str, ...] = (
+    "glm-5.2[1m]",
+    "glm-5-turbo[1m]",
+    "glm-4.7",
+    "glm-5.2",
+    "glm-5-turbo",
+)
+ZAI_MANAGED_MCP_SERVERS: tuple[tuple[str, str], ...] = (
+    ("web-search-prime", "https://api.z.ai/api/mcp/web_search_prime/mcp"),
+    ("web-reader", "https://api.z.ai/api/mcp/web_reader/mcp"),
+    ("zread", "https://api.z.ai/api/mcp/zread/mcp"),
+)
 FIREWORKS_INFERENCE_BASE_URL = "https://api.fireworks.ai/inference"
 FIREWORKS_API_BASE_URL = "https://api.fireworks.ai"
 FIREWORKS_DEFAULT_ACCOUNT_ID = "fireworks"
@@ -221,6 +236,12 @@ PROVIDER_ALIASES = {
     "kimi-coding": "kimi",
     "moonshot": "kimi",
     "moonshot-kimi": "kimi",
+    "zai": "zai",
+    "z.ai": "zai",
+    "z-ai": "zai",
+    "zhipu": "zai",
+    "bigmodel": "zai",
+    "glm": "zai",
     "vllm": "vllm",
     "vllm-local": "vllm",
     "lm-studio": "lm-studio",
@@ -250,6 +271,7 @@ PROVIDER_LABELS = {
     "opencode": "OpenCode Zen",
     "opencode-go": "OpenCode Go",
     "kimi": "Kimi.com",
+    "zai": "Z.AI GLM",
     "vllm": "vLLM",
     "lm-studio": "LM Studio",
     "nvidia-hosted": "Nvidia Hosted",
@@ -2149,6 +2171,29 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "haiku_model": KIMI_DEFAULT_MODEL,
             "subagent_model": KIMI_DEFAULT_MODEL,
         },
+        "zai": {
+            "base_url": ZAI_ANTHROPIC_BASE_URL,
+            "api_key": "",
+            "current_model": ZAI_DEFAULT_MODEL,
+            "advisor_model": "",
+            "custom_models": list(ZAI_MODEL_FALLBACK_IDS),
+            "native_compat": True,
+            "preserve_anthropic_thinking": True,
+            "claude_code_supported_capabilities": ["effort", "thinking"],
+            "context_window": 1000000,
+            "auto_compact_window": 1000000,
+            "max_output_tokens": 8192,
+            "context_reserve_tokens": 8192,
+            "request_timeout_ms": 3000000,
+            "stream_enabled": True,
+            "stream_word_chunking": False,
+            "effort_level": "max",
+            "opus_model": ZAI_DEFAULT_MODEL,
+            "sonnet_model": ZAI_DEFAULT_MODEL,
+            "haiku_model": "glm-4.7",
+            "subagent_model": ZAI_DEFAULT_MODEL,
+            "managed_mcp": True,
+        },
         "vllm": {
             "base_url": "http://127.0.0.1:8000",
             "api_key": "dummy",
@@ -2549,7 +2594,7 @@ def unique_model_ids(provider: str, ids: list[str]) -> list[str]:
 
 
 def normalize_model_id(provider: str, model_id: str) -> str:
-    model_id = str(model_id or "").strip() if provider == "deepseek" else strip_claude_context_suffix(model_id).strip()
+    model_id = str(model_id or "").strip() if provider in ("deepseek", "zai") else strip_claude_context_suffix(model_id).strip()
     if provider == "kimi":
         lowered = model_id.lower().replace("_", "-").strip()
         if lowered in (
@@ -7069,7 +7114,7 @@ def provider_headers(provider: str, pcfg: dict[str, Any], inbound_headers: Any |
             raise RuntimeError("OpenRouter requires a configured API key.")
         headers["x-api-key"] = key
         headers["Authorization"] = f"Bearer {key}"
-    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "fireworks"):
+    elif provider in ("ollama", "ollama-cloud", "vllm", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "zai", "fireworks"):
         headers["x-api-key"] = key
         headers["authorization"] = f"Bearer {key}"
     elif provider == "lm-studio":
@@ -7113,6 +7158,27 @@ def upstream_model_ids(provider: str, pcfg: dict[str, Any], force_refresh: bool 
         ])
         sorted_ids = sorted_model_ids(ids)
         write_model_list_cache(provider, pcfg, sorted_ids)
+        return sorted_ids
+    if provider == "zai":
+        ids: list[str] = []
+        model_info: dict[str, dict[str, Any]] = {}
+        base = provider_upstream_request_base(provider, pcfg)
+        headers = provider_model_list_headers(provider, pcfg)
+        try:
+            data = http_json(join_url(base, "/v1/models"), headers=headers, timeout=6.0, provider=provider, pcfg=pcfg)
+            ids = [normalize_model_id(provider, mid) for mid in model_ids_from_response(data)]
+            model_info.update(model_info_from_response(provider, data))
+        except Exception as exc:
+            router_log("DEBUG", f"zai model list fetch failed: {type(exc).__name__}: {exc}")
+        ids = unique_model_ids(provider, [
+            *ids,
+            *ZAI_MODEL_FALLBACK_IDS,
+            *(pcfg.get("custom_models", []) or []),
+            pcfg.get("current_model") or "",
+        ])
+        sorted_ids = sorted_model_ids(ids)
+        metadata = {"model_info": model_info, "source": "zai:/v1/models+docs"} if model_info else {"source": "zai:docs"}
+        write_model_list_cache(provider, pcfg, sorted_ids, metadata)
         return sorted_ids
     if provider == "anthropic":
         ids: list[str] = []
@@ -7802,6 +7868,10 @@ def kimi_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return provider == "kimi" and bool(pcfg.get("native_compat", True))
 
 
+def zai_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
+    return provider == "zai" and bool(pcfg.get("native_compat", True))
+
+
 def fireworks_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return provider == "fireworks" and bool(pcfg.get("native_compat", True))
 
@@ -7815,6 +7885,7 @@ def provider_native_compat_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
         or deepseek_native_compat_enabled(provider, pcfg)
         or opencode_native_compat_enabled(provider, pcfg)
         or kimi_native_compat_enabled(provider, pcfg)
+        or zai_native_compat_enabled(provider, pcfg)
         or fireworks_native_compat_enabled(provider, pcfg)
     )
 
@@ -23143,7 +23214,12 @@ def claude_code_default_model_aliases(provider: str, pcfg: dict[str, Any], curre
         ("sonnet", "ANTHROPIC_DEFAULT_SONNET_MODEL"),
     ):
         selected = ""
-        if _model_id_matches_claude_family(current_upstream, family):
+        selected_from_config = False
+        configured_family_model = str(pcfg.get(f"{family}_model") or "").strip() if provider == "zai" else ""
+        if configured_family_model:
+            selected = normalize_model_id(provider, configured_family_model)
+            selected_from_config = bool(selected)
+        if not selected and _model_id_matches_claude_family(current_upstream, family):
             selected = current_upstream
         if not selected:
             for model_id in candidates:
@@ -23151,7 +23227,10 @@ def claude_code_default_model_aliases(provider: str, pcfg: dict[str, Any], curre
                     selected = model_id
                     break
         alias = alias_for(provider, selected) if selected else current_model_alias
-        out[key] = claude_code_context_model_alias(provider, pcfg, alias)
+        if selected_from_config:
+            out[key] = f"{alias}[1m]" if "[1m]" in selected.lower() and "[1m]" not in alias.lower() else alias
+        else:
+            out[key] = claude_code_context_model_alias(provider, pcfg, alias)
     return out
 
 
@@ -23979,6 +24058,7 @@ def default_base_url(provider: str) -> str:
         "opencode": OPENCODE_ZEN_BASE_URL,
         "opencode-go": OPENCODE_GO_BASE_URL,
         "kimi": KIMI_CODING_BASE_URL,
+        "zai": ZAI_ANTHROPIC_BASE_URL,
         "vllm": "http://your-vllm:8000",
         "lm-studio": "http://127.0.0.1:1234/v1",
         "nvidia-hosted": nvidia_upstream_base_url(),
@@ -24026,6 +24106,10 @@ def api_key_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         if key_count > 1:
             return f"API keys: {round_robin} (Kimi.com{primary_detail})"
         return f"API key: set (Kimi.com{primary_detail})" if key_count else "API key: missing (Kimi.com required)"
+    if provider == "zai":
+        if key_count > 1:
+            return f"API keys: {round_robin} (Z.AI GLM{primary_detail})"
+        return f"API key: set (Z.AI GLM{primary_detail})" if key_count else "API key: missing (Z.AI GLM required)"
     if provider == "fireworks":
         if key_count > 1:
             return f"API keys: {round_robin} (Fireworks.ai{primary_detail})"
@@ -24052,6 +24136,8 @@ def base_url_status_line(provider: str, pcfg: dict[str, Any]) -> str:
         return f"Base URL: NVIDIA hosted ({base}); local router {ROUTER_BASE} {state}"
     if provider == "deepseek":
         return f"Base URL: DeepSeek Anthropic API configured ({base})"
+    if provider == "zai":
+        return f"Base URL: Z.AI Anthropic API configured ({base})"
     if provider in OPENCODE_PROVIDER_NAMES:
         label = PROVIDER_LABELS.get(provider, provider)
         path = "/v1/models"
@@ -24166,6 +24252,8 @@ def launch_readiness_errors(cfg: dict[str, Any] | None = None) -> list[str]:
         errors.append("Launch blocked: Ollama Cloud requires an API key.")
     if provider == "deepseek" and not provider_has_api_key(provider, pcfg):
         errors.append("Launch blocked: DeepSeek.com requires a DeepSeek API key.")
+    if provider == "zai" and not provider_has_api_key(provider, pcfg):
+        errors.append("Launch blocked: Z.AI GLM requires a Z.AI API key.")
     if provider == "openrouter" and not provider_has_api_key(provider, pcfg):
         errors.append("Launch blocked: OpenRouter requires an OpenRouter API key.")
     if provider == "fireworks" and not provider_has_api_key(provider, pcfg):
@@ -25908,6 +25996,9 @@ def start_router_if_needed() -> bool:
 def should_attach_web_search(provider: str, cfg: dict[str, Any], override: bool | None) -> bool:
     if override is not None:
         return override
+    pcfg = cfg.get("providers", {}).get(provider, {}) if isinstance(cfg.get("providers"), dict) else {}
+    if provider == "zai" and bool(pcfg.get("managed_mcp", True)):
+        return False
     return provider != "anthropic" and bool(cfg.get("web_search", {}).get("auto_for_non_native", True))
 
 
@@ -26223,6 +26314,55 @@ def write_duckduckgo_mcp_config(cfg: dict[str, Any]) -> Path:
     except Exception:
         pass
     return path
+
+
+def write_zai_mcp_config(provider: str, pcfg: dict[str, Any]) -> Path | None:
+    if provider != "zai" or not bool(pcfg.get("managed_mcp", True)):
+        return None
+    key = provider_primary_api_key(provider, pcfg)
+    if not meaningful_key(key):
+        router_log("WARN", "zai_mcp_config_skipped_missing_api_key")
+        return None
+    npx = find_executable("npx") or ("npx.cmd" if os.name == "nt" else "npx")
+    servers: dict[str, Any] = {
+        "zai-mcp-server": {
+            "type": "stdio",
+            "command": npx,
+            "args": ["-y", "@z_ai/mcp-server@latest"],
+            "env": {
+                "Z_AI_API_KEY": key,
+                "Z_AI_MODE": "ZAI",
+            },
+        }
+    }
+    auth_header = {"Authorization": f"Bearer {key}"}
+    for name, url in ZAI_MANAGED_MCP_SERVERS:
+        servers[name] = {
+            "type": "http",
+            "url": url,
+            "headers": dict(auth_header),
+        }
+    data = {"mcpServers": servers}
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    ZAI_MCP_CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        os.chmod(ZAI_MCP_CONFIG, 0o600)
+    except Exception:
+        pass
+    router_log("INFO", f"zai_mcp_config_written servers={','.join(sorted(servers))}")
+    return ZAI_MCP_CONFIG
+
+
+def reset_zai_mcp_config_if_inactive(provider: str) -> None:
+    if provider == "zai":
+        return
+    try:
+        ZAI_MCP_CONFIG.unlink()
+        router_log("INFO", "zai_mcp_config_removed inactive_provider")
+    except FileNotFoundError:
+        pass
+    except Exception as exc:
+        router_log("WARN", f"zai_mcp_config_remove_failed error={type(exc).__name__}: {exc}")
 
 
 def write_channel_mcp_config() -> Path:
@@ -31453,6 +31593,10 @@ def launch_claude(
                 native_auto_channel_specs = []
     extra_args: list[str] = []
     mcp_config_paths: list[str] = []
+    reset_zai_mcp_config_if_inactive(provider)
+    zai_mcp_config = write_zai_mcp_config(provider, pcfg)
+    if zai_mcp_config:
+        mcp_config_paths.append(str(zai_mcp_config))
     if should_attach_web_search(provider, cfg, web_search_override):
         mcp_config_paths.append(str(write_duckduckgo_mcp_config(cfg)))
     if llm_channel_delivery:

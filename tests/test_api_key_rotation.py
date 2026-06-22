@@ -204,7 +204,7 @@ class ApiKeyRotationTests(unittest.TestCase):
         self.assertIn("Cleared stored API key(s) for deepseek. Other providers unchanged.", "\n".join(messages))
 
     def test_clear_api_key_preserves_other_provider_keys_after_reload(self):
-        providers = ["anthropic", "deepseek", "opencode", "openrouter", "ollama-cloud", "fireworks"]
+        providers = ["anthropic", "deepseek", "opencode", "openrouter", "ollama-cloud", "fireworks", "zai"]
         cfg = copy.deepcopy(claude_any.DEFAULT_CONFIG)
         cfg["current_provider"] = "anthropic"
         for provider in providers:

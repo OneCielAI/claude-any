@@ -161,6 +161,7 @@ class HeadlessUpdateCheckTests(unittest.TestCase):
             ("deepseek", "deepseek-v4-pro", "https://api.deepseek.com/anthropic"),
             ("opencode", "claude-sonnet-4-6", "https://opencode.ai/zen"),
             ("opencode-go", "qwen3.6-plus", "https://opencode.ai/zen/go"),
+            ("zai", "glm-5.2[1m]", "https://api.z.ai/api/anthropic"),
         )
         for provider_name, model_name, base_url in cases:
             with self.subTest(provider=provider_name):
