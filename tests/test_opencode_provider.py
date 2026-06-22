@@ -102,7 +102,7 @@ class OpenCodeProviderTests(unittest.TestCase):
         with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=None):
             self.assertEqual(262144, claude_any.model_context_hint_from_model_id("qwen3.6-27b-mtp"))
             self.assertEqual("long-context", claude_any.model_option_family("opencode-go", pcfg))
-            self.assertEqual("long-context-128k", claude_any.recommended_preset_id("opencode-go", pcfg))
+            self.assertEqual("long-context-256k", claude_any.recommended_preset_id("opencode-go", pcfg))
 
     def test_qwen36_plus_auto_preset_applies_one_million_context(self):
         pcfg = self.opencode_go_cfg(current_model="qwen3.6-plus-free", context_window=262144)["providers"]["opencode-go"]

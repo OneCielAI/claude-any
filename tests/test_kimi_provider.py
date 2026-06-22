@@ -96,10 +96,10 @@ class KimiProviderTests(unittest.TestCase):
         pcfg = self.kimi_cfg()["providers"]["kimi"]
 
         self.assertEqual(262144, claude_any.provider_model_context_capacity("kimi", pcfg))
-        self.assertEqual("long-context-128k", claude_any.recommended_preset_id("kimi", pcfg))
+        self.assertEqual("long-context-256k", claude_any.recommended_preset_id("kimi", pcfg))
         self.assertIn("window 256K", claude_any.context_setting_status("kimi", pcfg))
 
-        claude_any.apply_llm_preset_to_provider("kimi", pcfg, "long-context-128k", "en")
+        claude_any.apply_llm_preset_to_provider("kimi", pcfg, "long-context-256k", "en")
 
         self.assertEqual(262144, pcfg["context_window"])
         self.assertEqual(32768, pcfg["context_reserve_tokens"])

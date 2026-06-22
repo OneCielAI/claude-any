@@ -8025,6 +8025,54 @@ def provider_openai_router_enabled(provider: str, pcfg: dict[str, Any]) -> bool:
     return provider in OPENAI_COMPATIBLE_ROUTER_PROVIDERS and not provider_native_compat_enabled(provider, pcfg)
 
 
+def provider_wire_profile(provider: str, pcfg: dict[str, Any], body: dict[str, Any] | None = None) -> dict[str, str]:
+    """Return the active provider/base-url wire profile for this request.
+
+    The same model id can travel through different protocol adapters depending
+    on provider and base URL. Keep this provider-scoped; model metadata only
+    supplies limits and hints.
+    """
+    request_model = str((body or {}).get("model") or pcfg.get("current_model") or "")
+    try:
+        model = resolve_requested_model(provider, pcfg, request_model)
+    except Exception:
+        model = normalize_model_id(provider, request_model)
+
+    if provider in ("ollama", "ollama-cloud"):
+        upstream_format = "ollama-chat"
+        endpoint_family = "ollama-chat"
+    elif provider in OPENCODE_PROVIDER_NAMES:
+        endpoint_family = opencode_endpoint_kind(provider, model, pcfg)
+        upstream_format = "openai-chat" if endpoint_family == "openai-chat" else endpoint_family
+    elif provider_openai_router_enabled(provider, pcfg):
+        upstream_format = "openai-chat"
+        endpoint_family = "openai-chat"
+    else:
+        upstream_format = "anthropic-messages"
+        endpoint_family = "anthropic-messages"
+
+    if preserves_anthropic_thinking_contract(provider, pcfg):
+        thinking_policy = "preserve"
+    elif (
+        upstream_format == "openai-chat"
+        and body is not None
+        and openai_chat_reasoning_passback_enabled_for_body(provider, pcfg, body)
+    ):
+        thinking_policy = "openai-reasoning-passback"
+    else:
+        thinking_policy = "strip"
+
+    return {
+        "provider": provider,
+        "model": model,
+        "endpoint_family": endpoint_family,
+        "upstream_format": upstream_format,
+        "thinking_policy": thinking_policy,
+        "tool_choice_policy": "forward" if provider_supports_tool_choice(provider, pcfg, body or {}) else "strip",
+        "metadata_policy": "strip-internal-upstream-only",
+    }
+
+
 def endpoint_route_exists(url: str, headers: dict[str, str], timeout: float = 1.5) -> bool | None:
     req = urllib.request.Request(url, data=b"{}", headers=with_upstream_user_agent(headers), method="POST")
     try:
@@ -11093,7 +11141,7 @@ def _channel_mcp_tool_schemas() -> list[dict[str, Any]]:
                     },
                     "preset": {
                         "type": "string",
-                        "description": "Preset id or alias when action is apply, for example balanced, long-context-128k, or million-context-1m.",
+                        "description": "Preset id or alias when action is apply, for example balanced, long-context-256k, long-context-512k, or million-context-1m.",
                     },
                 },
             },
@@ -12153,6 +12201,166 @@ def sanitize_assistant_pseudo_tool_text_history(body: dict[str, Any]) -> dict[st
     out = dict(body)
     out["messages"] = sanitized_messages
     router_log("INFO", f"sanitized assistant pseudo tool-call text blocks={removed_blocks}")
+    return out
+
+
+def _anthropic_tool_use_ids(message: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for block in _message_content_blocks(message):
+        if isinstance(block, dict) and block.get("type") == "tool_use":
+            tool_id = str(block.get("id") or "")
+            if tool_id:
+                ids.append(tool_id)
+    return ids
+
+
+def _anthropic_tool_result_ids(message: dict[str, Any]) -> list[str]:
+    ids: list[str] = []
+    for block in _message_content_blocks(message):
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            tool_id = str(block.get("tool_use_id") or "")
+            if tool_id:
+                ids.append(tool_id)
+    return ids
+
+
+def _historical_tool_use_as_text(block: dict[str, Any]) -> dict[str, str]:
+    tool_id = str(block.get("id") or "missing-id")
+    name = str(block.get("name") or "tool")
+    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+    input_text = truncate_for_prompt(json.dumps(tool_input, ensure_ascii=False, sort_keys=True), 2000)
+    return {
+        "type": "text",
+        "text": (
+            "[claude-any preserved a historical tool request as text because its matching "
+            f"tool_result is not present in the retained transcript. tool={name} id={tool_id} input={input_text}]"
+        ),
+    }
+
+
+def _historical_tool_result_as_text(block: dict[str, Any]) -> dict[str, str]:
+    tool_id = str(block.get("tool_use_id") or "unknown")
+    text = truncate_for_prompt(anthropic_content_to_text(block.get("content")), PROMPT_TOOL_RESULT_LIMIT)
+    return {
+        "type": "text",
+        "text": (
+            "[claude-any preserved a historical tool result as text because its matching "
+            f"assistant tool_use is not present in the retained transcript. tool_use_id={tool_id}]\n{text}"
+        ),
+    }
+
+
+def normalize_anthropic_tool_turns_for_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    """Make retained Anthropic tool turns safe for non-Anthropic providers.
+
+    A continued Claude Code transcript can retain an old assistant ``tool_use``
+    while dropping the immediately-following ``tool_result``. Some gateways
+    translate that to OpenAI ``tool_calls`` and reject it. We do not synthesize
+    success; unmatched historical tool blocks are downgraded to plain text.
+    """
+    if provider == "anthropic":
+        return body
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        return body
+
+    changed = False
+    converted_tool_uses = 0
+    converted_tool_results = 0
+    normalized_messages: list[Any] = []
+    retained_tool_ids_for_next_user: set[str] = set()
+
+    for index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            normalized_messages.append(message)
+            retained_tool_ids_for_next_user = set()
+            continue
+
+        role = str(message.get("role") or "")
+        content = message.get("content")
+
+        if role == "assistant" and isinstance(content, list):
+            tool_ids = _anthropic_tool_use_ids(message)
+            if not tool_ids:
+                normalized_messages.append(message)
+                retained_tool_ids_for_next_user = set()
+                continue
+            next_message = messages[index + 1] if index + 1 < len(messages) else None
+            next_result_ids = (
+                set(_anthropic_tool_result_ids(next_message))
+                if isinstance(next_message, dict) and str(next_message.get("role") or "") == "user"
+                else set()
+            )
+            retained = {tool_id for tool_id in tool_ids if tool_id in next_result_ids}
+            next_content: list[Any] = []
+            content_changed = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_use":
+                    tool_id = str(block.get("id") or "")
+                    if not tool_id or tool_id not in retained:
+                        next_content.append(_historical_tool_use_as_text(block))
+                        converted_tool_uses += 1
+                        content_changed = True
+                        continue
+                next_content.append(block)
+            if content_changed:
+                next_message_obj = dict(message)
+                next_message_obj["content"] = next_content
+                normalized_messages.append(next_message_obj)
+                changed = True
+            else:
+                normalized_messages.append(message)
+            retained_tool_ids_for_next_user = retained
+            continue
+
+        if role == "user" and isinstance(content, list):
+            next_content = []
+            content_changed = False
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool_id = str(block.get("tool_use_id") or "")
+                    if tool_id and tool_id in retained_tool_ids_for_next_user:
+                        next_content.append(block)
+                    else:
+                        next_content.append(_historical_tool_result_as_text(block))
+                        converted_tool_results += 1
+                        content_changed = True
+                    continue
+                next_content.append(block)
+            if content_changed:
+                next_message_obj = dict(message)
+                next_message_obj["content"] = next_content
+                normalized_messages.append(next_message_obj)
+                changed = True
+            else:
+                normalized_messages.append(message)
+            retained_tool_ids_for_next_user = set()
+            continue
+
+        normalized_messages.append(message)
+        retained_tool_ids_for_next_user = set()
+
+    if not changed:
+        return body
+    out = dict(body)
+    out["messages"] = normalized_messages
+    router_log(
+        "WARN",
+        "normalized historical Anthropic tool turns for provider=%s converted_tool_uses=%d converted_tool_results=%d"
+        % (provider, converted_tool_uses, converted_tool_results),
+    )
+    return out
+
+
+def normalize_request_for_provider_wire(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
+    """Normalize a Claude Code /v1/messages request for the active provider wire profile."""
+    profile = provider_wire_profile(provider, pcfg, body)
+    out = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
+    out = normalize_tool_choice_for_provider(provider, pcfg, out)
+    out = sanitize_assistant_pseudo_tool_text_history(out)
+    out = normalize_anthropic_tool_turns_for_provider(provider, pcfg, out)
+    if profile.get("upstream_format") == "anthropic-messages":
+        out = normalize_anthropic_system_role_messages(out)
     return out
 
 
@@ -16961,13 +17169,11 @@ class RouterHandler(BaseHTTPRequestHandler):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
         body = strip_autonomous_advisor_server_tools(provider, body)
-        body = sanitize_assistant_pseudo_tool_text_history(body)
         body = body_with_pending_channel_messages(body)
         body = body_with_pending_channel_summaries(body)
         body = body_with_channel_tool_result_context(body)
         begin_pending_channel_delivery(self, body)
-        body = normalize_thinking_for_non_anthropic_provider(provider, pcfg, body)
-        body = normalize_tool_choice_for_provider(provider, pcfg, body)
+        body = normalize_request_for_provider_wire(provider, pcfg, body)
         router_log("DEBUG", f"POST {path} provider={provider} model={body.get('model')} tools={len(body.get('tools') or [])} msgs={len(body.get('messages') or [])}")
         try:
             if provider in ("ollama", "ollama-cloud"):
@@ -20137,13 +20343,13 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
         return "large"
     if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         ctx = provider_model_context_capacity(provider, pcfg) or positive_int(pcfg.get("context_window")) or 0
-        if ctx >= 524288:
+        if ctx >= 1048576:
             return "million-context"
         if ctx >= 65536:
             return "long-context"
     if provider in ("ollama", "ollama-cloud"):
         ctx = positive_int(pcfg.get("num_ctx_max")) or positive_int(pcfg.get("num_ctx")) or 0
-        if ctx >= 524288:
+        if ctx >= 1048576:
             return "million-context"
         if ctx >= 65536:
             return "long-context"
@@ -20159,7 +20365,12 @@ def recommended_preset_id(provider: str, pcfg: dict[str, Any]) -> str:
     if family == "million-context":
         return "million-context-1m"
     if family == "long-context":
-        if (provider_model_context_capacity(provider, pcfg) or 0) >= 131072:
+        capacity = provider_model_context_capacity(provider, pcfg) or 0
+        if capacity >= 524288:
+            return "long-context-512k"
+        if capacity >= 262144:
+            return "long-context-256k"
+        if capacity >= 131072:
             return "long-context-128k"
         return "long-context-65k"
     if family == "large":
@@ -20173,6 +20384,8 @@ LLM_PRESETS: dict[str, tuple[str, str]] = {
     "fast": ("Fast short tasks", "shorter output and timeout for quick jobs"),
     "long-context-65k": ("Long context 65K", "65K context target, 4K output reserve"),
     "long-context-128k": ("Long context 128K", "64K-128K context target, 4K-8K output reserve"),
+    "long-context-256k": ("Long context 256K", "256K context target, 8K output reserve"),
+    "long-context-512k": ("Long context 512K", "512K context target, 8K output reserve"),
     "million-context-1m": ("Ultra context 1M", "1M context target for high-capacity models"),
     "large-output": ("Large output/report", "larger 8K output for summaries/reports"),
     "reasoning": ("Reasoning model", "reasoning-friendly sampling"),
@@ -20219,6 +20432,12 @@ def resolve_llm_preset_id(value: str) -> str | None:
         "128k": "long-context-128k",
         "long-128k": "long-context-128k",
         "context-128k": "long-context-128k",
+        "256k": "long-context-256k",
+        "long-256k": "long-context-256k",
+        "context-256k": "long-context-256k",
+        "512k": "long-context-512k",
+        "long-512k": "long-context-512k",
+        "context-512k": "long-context-512k",
         "1m": "million-context-1m",
         "million": "million-context-1m",
         "million-context": "million-context-1m",
@@ -20249,6 +20468,8 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "fast": ("빠른 짧은 작업", "짧은 출력과 짧은 타임아웃"),
         "long-context-65k": ("긴 컨텍스트 65K", "65K 컨텍스트 목표, 4K 출력 여유"),
         "long-context-128k": ("긴 컨텍스트 128K", "64K-128K 컨텍스트 목표, 4K-8K 출력 여유"),
+        "long-context-256k": ("긴 컨텍스트 256K", "256K 컨텍스트 목표, 8K 출력 여유"),
+        "long-context-512k": ("긴 컨텍스트 512K", "512K 컨텍스트 목표, 8K 출력 여유"),
         "million-context-1m": ("초장문 컨텍스트 1M", "고용량 모델용 1M 컨텍스트 목표"),
         "large-output": ("긴 출력/리포트", "요약과 리포트용 8K 출력"),
         "reasoning": ("추론 모델", "추론 친화 샘플링"),
@@ -20264,6 +20485,8 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "fast": ("高速な短い作業", "短い出力と短いタイムアウト"),
         "long-context-65k": ("長いコンテキスト 65K", "65K コンテキスト目標、4K 出力予約"),
         "long-context-128k": ("長いコンテキスト 128K", "64K-128K コンテキスト目標、4K-8K 出力予約"),
+        "long-context-256k": ("長いコンテキスト 256K", "256K コンテキスト目標、8K 出力予約"),
+        "long-context-512k": ("長いコンテキスト 512K", "512K コンテキスト目標、8K 出力予約"),
         "million-context-1m": ("超長文コンテキスト 1M", "大容量モデル向けの 1M コンテキスト目標"),
         "large-output": ("長い出力/レポート", "要約とレポート向けの 8K 出力"),
         "reasoning": ("推論モデル", "推論向けサンプリング"),
@@ -20279,6 +20502,8 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "fast": ("快速短任务", "较短输出和较短超时"),
         "long-context-65k": ("长上下文 65K", "65K 上下文目标，4K 输出预留"),
         "long-context-128k": ("长上下文 128K", "64K-128K 上下文目标，4K-8K 输出预留"),
+        "long-context-256k": ("长上下文 256K", "256K 上下文目标，8K 输出预留"),
+        "long-context-512k": ("长上下文 512K", "512K 上下文目标，8K 输出预留"),
         "million-context-1m": ("超长上下文 1M", "面向高容量模型的 1M 上下文目标"),
         "large-output": ("长输出/报告", "用于摘要和报告的 8K 输出"),
         "reasoning": ("推理模型", "适合推理的采样"),
@@ -20331,6 +20556,8 @@ LLM_PRESET_TIMEOUT_MS: dict[str, int] = {
     "fast": 120000,
     "long-context-65k": DEFAULT_REQUEST_TIMEOUT_MS,
     "long-context-128k": 600000,
+    "long-context-256k": 600000,
+    "long-context-512k": 600000,
     "million-context-1m": 600000,
     "large-output": 600000,
     "reasoning": 600000,
@@ -20433,6 +20660,8 @@ def with_preset_timeout_tokens(tokens: list[str], preset_id: str) -> list[str]:
 CONTEXT_HEAVY_PRESETS = {
     "long-context-65k",
     "long-context-128k",
+    "long-context-256k",
+    "long-context-512k",
     "million-context-1m",
     "large-output",
     "reasoning",
@@ -20690,6 +20919,10 @@ def required_context_for_preset(preset_id: str, provider: str | None = None) -> 
         if provider in ("ollama", "ollama-cloud"):
             return 131072
         return 65536
+    if preset_id == "long-context-512k":
+        return 524288
+    if preset_id == "long-context-256k":
+        return 262144
     if preset_id == "long-context-128k":
         return 131072
     if preset_id == "long-context-65k":
@@ -21033,8 +21266,12 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
         num_ctx_max = positive_int(pcfg.get("num_ctx_max")) or 0
         if bool(pcfg.get("think", False)):
             return "reasoning"
-        if num_ctx_max >= 524288:
+        if num_ctx_max >= 1048576:
             return "million-context-1m"
+        if num_ctx_max >= 524288:
+            return "long-context-512k"
+        if num_ctx_max >= 262144:
+            return "long-context-256k"
         if num_ctx_max >= 131072 and num_predict >= 8192:
             return "long-context-128k"
         if num_predict >= 8192:
@@ -21049,8 +21286,12 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
         context_window = positive_int(pcfg.get("context_window")) or 0
         if bool(pcfg.get("think", False)):
             return "reasoning"
-        if context_window >= 524288:
+        if context_window >= 1048576:
             return "million-context-1m"
+        if context_window >= 524288:
+            return "long-context-512k"
+        if context_window >= 262144:
+            return "long-context-256k"
         if context_window >= 131072 and max_output >= 8192:
             return "long-context-128k"
         if max_output >= 8192:
@@ -21172,6 +21413,30 @@ def apply_llm_preset_to_provider(
                 "keep_alive=10m",
                 "timeout=300000",
             ],
+            "long-context-256k": [
+                "num_ctx=auto",
+                "num_ctx_min=131072",
+                "num_ctx_max=262144",
+                "num_predict=8192",
+                "temperature=0.3",
+                "top_p=0.9",
+                "top_k=40",
+                "think=false",
+                "keep_alive=15m",
+                "timeout=300000",
+            ],
+            "long-context-512k": [
+                "num_ctx=auto",
+                "num_ctx_min=262144",
+                "num_ctx_max=524288",
+                "num_predict=8192",
+                "temperature=0.3",
+                "top_p=0.9",
+                "top_k=40",
+                "think=false",
+                "keep_alive=15m",
+                "timeout=300000",
+            ],
             "million-context-1m": [
                 "num_ctx=auto",
                 "num_ctx_min=262144",
@@ -21290,6 +21555,8 @@ def apply_llm_preset_to_provider(
             "fast": ["timeout=300000"],
             "long-context-65k": ["timeout=300000"],
             "long-context-128k": ["timeout=300000"],
+            "long-context-256k": ["timeout=300000"],
+            "long-context-512k": ["timeout=300000"],
             "million-context-1m": ["timeout=300000"],
             "large-output": ["timeout=300000"],
             "reasoning": ["timeout=300000"],
@@ -21348,6 +21615,24 @@ def apply_llm_preset_to_provider(
                 "long-context-128k": [
                     "context_window=131072",
                     "reserve=8192",
+                    "max_output_tokens=8192",
+                    "timeout=300000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
+                "long-context-256k": [
+                    "context_window=262144",
+                    "reserve=8192",
+                    "max_output_tokens=8192",
+                    "timeout=300000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
+                "long-context-512k": [
+                    "context_window=524288",
+                    "reserve=16384",
                     "max_output_tokens=8192",
                     "timeout=300000",
                     "temperature=0.3",
@@ -21479,6 +21764,26 @@ def apply_llm_preset_to_provider(
                 "unset:top_k",
                 f"native={native_default}",
             ],
+            "long-context-256k": [
+                "context_window=262144",
+                "reserve=8192",
+                "max_output_tokens=8192",
+                "timeout=300000",
+                "temperature=0.3",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
+            "long-context-512k": [
+                "context_window=524288",
+                "reserve=16384",
+                "max_output_tokens=8192",
+                "timeout=300000",
+                "temperature=0.3",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
             "million-context-1m": [
                 "context_window=1048576",
                 "reserve=16384",
@@ -21562,6 +21867,16 @@ def apply_llm_preset_to_provider(
             }
             if provider == "kimi":
                 tokens_by_preset["long-context-128k"] = [
+                    "context_window=262144",
+                    "reserve=32768",
+                    "max_output_tokens=32768",
+                    "timeout=600000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                    "native=true",
+                ]
+                tokens_by_preset["long-context-256k"] = [
                     "context_window=262144",
                     "reserve=32768",
                     "max_output_tokens=32768",
