@@ -108,6 +108,18 @@ class ZaiProviderTests(unittest.TestCase):
         self.assertEqual("claude-any-zai-glm-5.2-1m[1m]", env["ANTHROPIC_DEFAULT_SONNET_MODEL"])
         self.assertIn("thinking", env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"])
 
+    def test_resolve_requested_model_strips_zai_context_suffix_for_api(self):
+        cfg = self.zai_cfg(api_key="sk-zai-test")
+        pcfg = cfg["providers"]["zai"]
+
+        self.assertEqual("glm-5.2[1m]", claude_any.current_upstream_model_id("zai", pcfg))
+        self.assertEqual(
+            "glm-5.2",
+            claude_any.resolve_requested_model("zai", pcfg, "claude-any-zai-glm-5.2-1m[1m]"),
+        )
+        self.assertEqual("glm-5.2", claude_any.resolve_requested_model("zai", pcfg, "glm-5.2[1m]"))
+        self.assertEqual("glm-5-turbo", claude_any.resolve_requested_model("zai", pcfg, "glm-5-turbo[1m]"))
+
     def test_zai_managed_mcp_config_contains_official_servers(self):
         pcfg = self.zai_cfg(api_key="sk-zai-test")["providers"]["zai"]
         with tempfile.TemporaryDirectory() as td:

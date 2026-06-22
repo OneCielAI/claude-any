@@ -2617,6 +2617,17 @@ def strip_claude_context_suffix(model_id: str | None) -> str:
     return re.sub(r"\[(?:1m)\]\s*$", "", text, flags=re.IGNORECASE)
 
 
+def upstream_api_model_id(provider: str, model_id: str | None) -> str:
+    """Return the provider's real API model code for a Claude Code-facing id."""
+    text = str(model_id or "").strip()
+    if provider == "zai":
+        # Z.AI documents [1m] for Claude Code model routing, but its Anthropic
+        # API currently accepts the underlying GLM model code without that
+        # suffix. Sending glm-5.2[1m] returns code 1211 Unknown Model.
+        return strip_claude_context_suffix(text)
+    return text
+
+
 def alias_for(provider: str, model_id: str) -> str:
     if provider == "nvidia-hosted" and model_id.startswith("claude-"):
         return model_id
@@ -7917,26 +7928,26 @@ def resolve_requested_model(provider: str, pcfg: dict[str, Any], requested: str 
     fallback = normalize_model_id(provider, pcfg.get("current_model") or "model")
     if provider == "nvidia-hosted":
         if requested and requested.startswith("claude-nvidia-"):
-            return requested
+            return upstream_api_model_id(provider, requested)
         if fallback:
-            return fallback
+            return upstream_api_model_id(provider, fallback)
     mmap = model_map_for(provider, pcfg)
     if requested:
         resolved = unslug_provider_alias(provider, requested, mmap)
         if resolved:
-            return resolved
+            return upstream_api_model_id(provider, resolved)
         # If Claude Code sends a bare model id from the gateway /v1/models list
         # during /model switching, route it to that exact upstream model. This is
         # especially important for third-party providers that expose Claude-named
         # models: unknown/stale Claude ids must still fall back, but models the
         # router advertised are valid for this provider.
         if requested in set(mmap.values()):
-            return requested
+            return upstream_api_model_id(provider, requested)
         # Built-in Claude aliases and stale aliases from another provider route to current provider's model.
         if requested.startswith("claude-") or requested.startswith("claude-any-"):
-            return fallback
-        return normalize_model_id(provider, requested)
-    return fallback
+            return upstream_api_model_id(provider, fallback)
+        return upstream_api_model_id(provider, normalize_model_id(provider, requested))
+    return upstream_api_model_id(provider, fallback)
 
 
 def resolve_tool_model_references(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
