@@ -138,6 +138,60 @@ class OllamaProviderOptionTests(unittest.TestCase):
         self.assertEqual(262144, pcfg["num_ctx_max"])
         self.assertTrue(any("/api/show" in message for message in messages))
 
+    def test_sync_ollama_context_preserves_explicit_preset_cap_below_provider_max(self):
+        pcfg = {
+            "current_model": "glm-5.2",
+            "llm_preset": "long-context-512k",
+            "num_ctx": "auto",
+            "num_ctx_min": 262144,
+            "num_ctx_max": 524288,
+        }
+
+        with (
+            mock.patch.object(claude_any, "fetch_ollama_api_model_specs", return_value={"max_model_len": 1000000}),
+            mock.patch.object(claude_any, "load_ollama_model_catalog") as load_catalog,
+        ):
+            claude_any.sync_ollama_library_context_limit("ollama-cloud", pcfg, "glm-5.2")
+
+        load_catalog.assert_not_called()
+        self.assertEqual(1000000, pcfg["model_context_max"])
+        self.assertEqual(524288, pcfg["num_ctx_max"])
+        self.assertEqual(524288, claude_any.ollama_context_limit_for_budget(pcfg))
+        self.assertEqual(524288, claude_any.ollama_num_ctx_for_payload(pcfg, {"messages": []}))
+        self.assertIn("model max 1,000,000", claude_any.ollama_num_ctx_status(pcfg))
+
+    def test_sync_ollama_context_caps_explicit_preset_above_provider_max(self):
+        pcfg = {
+            "current_model": "small-model",
+            "llm_preset": "million-context-1m",
+            "num_ctx": "auto",
+            "num_ctx_min": 262144,
+            "num_ctx_max": 1048576,
+        }
+
+        with mock.patch.object(claude_any, "fetch_ollama_api_model_specs", return_value={"max_model_len": 262144}):
+            claude_any.sync_ollama_library_context_limit("ollama-cloud", pcfg, "small-model")
+
+        self.assertEqual(262144, pcfg["model_context_max"])
+        self.assertEqual(262144, pcfg["num_ctx_max"])
+        self.assertEqual(262144, pcfg["num_ctx_min"])
+
+    def test_current_model_specs_preserve_explicit_ollama_preset_cap(self):
+        pcfg = {
+            "current_model": "glm-5.2",
+            "llm_preset": "long-context-512k",
+            "num_ctx": "auto",
+            "num_ctx_min": 262144,
+            "num_ctx_max": 524288,
+        }
+
+        with mock.patch.object(claude_any, "read_model_info_cache", return_value={"glm-5.2": {"max_model_len": 1000000}}):
+            claude_any.apply_current_model_specs_to_provider("ollama-cloud", pcfg)
+
+        self.assertEqual(1000000, pcfg["model_context_max"])
+        self.assertEqual(524288, pcfg["num_ctx_max"])
+        self.assertEqual(524288, claude_any.context_limit_for_status("ollama-cloud", pcfg))
+
     def test_unset_generic_ollama_aliases_clears_effective_options(self):
         pcfg = {
             "context_window": 1048576,

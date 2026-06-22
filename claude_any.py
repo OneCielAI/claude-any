@@ -1141,7 +1141,10 @@ def sync_ollama_library_context_limit(provider: str, pcfg: dict[str, Any], model
     old_max = positive_int(pcfg.get("num_ctx_max"))
     pcfg["model_context_max"] = limit
     pcfg["model_context_model"] = matched_model
-    pcfg["num_ctx_max"] = limit
+    if old_max and old_max <= limit and ollama_preserve_configured_context_cap(pcfg):
+        pass
+    else:
+        pcfg["num_ctx_max"] = min(old_max, limit) if old_max and old_max > limit else limit
     minimum = positive_int(pcfg.get("num_ctx_min"))
     if minimum and minimum > limit:
         pcfg["num_ctx_min"] = limit
@@ -13397,6 +13400,19 @@ def ollama_provider_context_limit(pcfg: dict[str, Any]) -> int | None:
     return cached_limit
 
 
+def ollama_preserve_configured_context_cap(pcfg: dict[str, Any]) -> bool:
+    preset = str(pcfg.get("llm_preset") or "").strip()
+    return preset in LLM_PRESETS
+
+
+def ollama_effective_context_limit(pcfg: dict[str, Any]) -> int | None:
+    provider_limit = ollama_provider_context_limit(pcfg)
+    configured_max = positive_int(pcfg.get("num_ctx_max"))
+    if provider_limit and configured_max and ollama_preserve_configured_context_cap(pcfg):
+        return min(provider_limit, configured_max)
+    return provider_limit or configured_max
+
+
 def ollama_num_ctx_for_payload(pcfg: dict[str, Any], payload: Any, _token_cache: dict[int, int] | None = None) -> int | None:
     override = os.environ.get("CLAUDE_ANY_OLLAMA_NUM_CTX")
     if override:
@@ -13405,7 +13421,8 @@ def ollama_num_ctx_for_payload(pcfg: dict[str, Any], payload: Any, _token_cache:
     if isinstance(raw, str) and raw.strip().lower() in ("", "auto", "dynamic"):
         provider_limit = ollama_provider_context_limit(pcfg)
         if provider_limit:
-            return provider_limit
+            effective_limit = ollama_effective_context_limit(pcfg) or provider_limit
+            return effective_limit
         minimum = positive_int(pcfg.get("num_ctx_min")) or 8192
         maximum = positive_int(pcfg.get("num_ctx_max")) or 65536
         if maximum < minimum:
@@ -13422,7 +13439,10 @@ def ollama_num_ctx_status(pcfg: dict[str, Any]) -> str:
     if isinstance(raw, str) and raw.strip().lower() in ("", "auto", "dynamic"):
         provider_limit = ollama_provider_context_limit(pcfg)
         if provider_limit:
-            return f"auto (provider {provider_limit:,})"
+            effective_limit = ollama_effective_context_limit(pcfg) or provider_limit
+            if provider_limit and effective_limit < provider_limit:
+                return f"auto ({effective_limit:,}; model max {provider_limit:,})"
+            return f"auto (provider {effective_limit:,})"
         minimum = positive_int(pcfg.get("num_ctx_min")) or 8192
         maximum = positive_int(pcfg.get("num_ctx_max")) or 65536
         return f"auto ({minimum}-{maximum})"
@@ -13491,7 +13511,7 @@ def cap_output_tokens_for_context(
 def ollama_context_limit_for_budget(pcfg: dict[str, Any]) -> int:
     raw = pcfg.get("num_ctx", "auto")
     if isinstance(raw, str) and raw.strip().lower() in ("", "auto", "dynamic"):
-        return ollama_provider_context_limit(pcfg) or positive_int(pcfg.get("num_ctx_max")) or 65536
+        return ollama_effective_context_limit(pcfg) or 65536
     return positive_int(raw) or positive_int(pcfg.get("num_ctx_max")) or 65536
 
 
@@ -20838,8 +20858,11 @@ def apply_current_model_specs_to_provider(provider: str, pcfg: dict[str, Any]) -
             pcfg["model_context_max"] = max_context
             pcfg["model_context_model"] = model
             messages.append(f"Model context size from provider specs: {format_context_tokens(max_context)} ({max_context:,} tokens).")
-        if positive_int(pcfg.get("num_ctx_max")) != max_context:
-            pcfg["num_ctx_max"] = max_context
+        current_max = positive_int(pcfg.get("num_ctx_max"))
+        if current_max and current_max <= max_context and ollama_preserve_configured_context_cap(pcfg):
+            pass
+        else:
+            pcfg["num_ctx_max"] = min(current_max, max_context) if current_max and current_max > max_context else max_context
         return messages
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
         if positive_int(pcfg.get("max_model_len")) != max_context:
