@@ -708,6 +708,26 @@ steps under that larger model's supervision.
 
 ## Changelog
 
+### 0.1.108
+
+- **Z.AI GLM provider**: added first-class Z.AI support using the official
+  Anthropic-compatible base `https://api.z.ai/api/anthropic`, including
+  `glm-5.2[1m]` defaults, `[1m]` model suffix preservation, long-context
+  presets, and Claude Code family-model environment mapping.
+- **Z.AI managed MCP**: when Z.AI is active, Claude Any can generate the
+  provider MCP config for vision, search, reader, and zread servers using the
+  configured Z.AI API key; switching away from Z.AI removes the generated
+  provider-specific MCP file.
+- **Runtime provider architecture contracts**: added architecture helpers,
+  documentation, and tests that make provider-specific behavior easier to find
+  and keep isolated as Claude Any prepares for future non-Claude runtimes.
+- **Streamable MCP notification hardening**: improved reconnect and
+  notification delivery behavior for routed/non-native channel handling while
+  preserving Claude Native behavior.
+- **Statusline and Ollama handling fixes**: corrected context-limit display
+  after preset changes and improved Ollama compatibility-test handling around
+  provider rate-limit responses.
+
 ### 0.1.107
 
 - **Fireworks.ai provider**: added first-class Fireworks support using the
