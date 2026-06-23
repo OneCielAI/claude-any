@@ -29,6 +29,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path, PureWindowsPath
@@ -196,6 +197,13 @@ ZAI_MODEL_FALLBACK_IDS: tuple[str, ...] = (
     "glm-4.7",
     "glm-5.2",
     "glm-5-turbo",
+)
+ZAI_MODEL_CONTEXT_HINTS: tuple[tuple[str, int], ...] = (
+    ("glm-5.2", 1_000_000),
+    ("glm-5-turbo", 200_000),
+    ("glm-5.1", 200_000),
+    ("glm-5", 200_000),
+    ("glm-4.7", 200_000),
 )
 ZAI_MANAGED_MCP_SERVERS: tuple[tuple[str, str], ...] = (
     ("web-search-prime", "https://api.z.ai/api/mcp/web_search_prime/mcp"),
@@ -489,6 +497,7 @@ SSE_TRACE_PAYLOAD_LIMIT = 4_000
 CHAT_MESSAGES_MAX_BYTES = 20_000_000
 CHAT_MESSAGE_DEDUPE_SCAN_LIMIT = 500
 CHAT_MESSAGE_FALLBACK_DEDUPE_TTL_SECONDS = 30.0
+CHANNEL_LLM_LAUNCH_RECENT_SECONDS_DEFAULT = 600.0
 DEFAULT_REQUEST_TIMEOUT_MS = 300000
 _LOG_LEVEL_CACHE: dict[str, Any] = {"value": None, "checked_at": 0.0, "file_mtime": 0.0}
 _RATE_LIMIT_LOCK = threading.Lock()
@@ -3830,6 +3839,20 @@ Value: $ARGUMENTS
 Discard pending claude-any external channel backlog without sending it to the model. Use `status` to show pending counts without clearing.
 """
 
+API_KEYS_SLASH_COMMAND = """---
+description: Set/show claude-any live API key(s)
+argument-hint: [status|clear|KEY|KEY1,KEY2]
+---
+
+Set API key(s) for the current claude-any provider without restarting Claude Code. With no argument, show masked key status. Use `clear` or `unset` to remove keys for only the current provider. Multiple keys may be comma-, semicolon-, or newline-separated and are used round-robin. Never print raw keys.
+
+CLAUDE_ANY_LIVE_API_KEYS
+
+Value: $0
+Arguments:
+$ARGUMENTS
+"""
+
 CLAUDE_ANY_ADVISOR_COMMAND_MARKERS = (
     "CLAUDE_ANY_ADVISOR_CALL",
     "Run the selected claude-any Advisor Model",
@@ -3848,6 +3871,10 @@ CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS = (
 CLAUDE_ANY_CHANNEL_CLEAR_COMMAND_MARKERS = (
     "CLAUDE_ANY_CHANNEL_CLEAR_BACKLOG",
     "Discard pending claude-any external channel backlog",
+)
+CLAUDE_ANY_API_KEYS_COMMAND_MARKERS = (
+    "CLAUDE_ANY_LIVE_API_KEYS",
+    "Set/show claude-any live API key(s)",
 )
 
 
@@ -3879,6 +3906,8 @@ def install_claude_any_slash_commands(include_advisor: bool = True) -> None:
             "llm-options.md": LLM_OPTIONS_SLASH_COMMAND,
             "llm-restore.md": LLM_RESTORE_SLASH_COMMAND,
             "channel-clear.md": CHANNEL_CLEAR_SLASH_COMMAND,
+            "api-key.md": API_KEYS_SLASH_COMMAND,
+            "api-keys.md": API_KEYS_SLASH_COMMAND,
         }
         if include_advisor:
             commands["advisor.md"] = ADVISOR_SLASH_COMMAND
@@ -3911,6 +3940,8 @@ def install_claude_any_slash_commands(include_advisor: bool = True) -> None:
                     if name == "router-debug.md"
                     else CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS
                     if name == "llm-options.md" or name == "llm-restore.md" or name.startswith("llm-")
+                    else CLAUDE_ANY_API_KEYS_COMMAND_MARKERS
+                    if name in {"api-key.md", "api-keys.md"}
                     else CLAUDE_ANY_CHANNEL_CLEAR_COMMAND_MARKERS
                 )
                 if existing == content:
@@ -3937,6 +3968,8 @@ def disable_claude_any_slash_commands_for_native() -> None:
             "llm-options.md": CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS,
             "llm-restore.md": CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS,
             "channel-clear.md": CLAUDE_ANY_CHANNEL_CLEAR_COMMAND_MARKERS,
+            "api-key.md": CLAUDE_ANY_API_KEYS_COMMAND_MARKERS,
+            "api-keys.md": CLAUDE_ANY_API_KEYS_COMMAND_MARKERS,
         }
         for name, markers in commands.items():
             path = CLAUDE_COMMANDS_DIR / name
@@ -8328,6 +8361,8 @@ def context_limit_for_status(provider: str, pcfg: dict[str, Any]) -> int | None:
         return ollama_context_limit_for_budget(pcfg)
     if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim"):
         return openai_context_limit_for_budget(provider, pcfg)
+    if provider == "zai":
+        return provider_model_context_capacity(provider, pcfg)
     return positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
 
 
@@ -9606,6 +9641,62 @@ def _chat_scan_max_id() -> int:
                         max_id = max(max_id, int(item.get("id") or 0))
                     except Exception:
                         continue
+    except Exception:
+        pass
+    return max_id
+
+
+def _chat_message_epoch_seconds(item: dict[str, Any]) -> float | None:
+    raw = item.get("time") or item.get("created_at") or item.get("updated_at")
+    if not raw:
+        return None
+    if isinstance(raw, (int, float)):
+        try:
+            return float(raw)
+        except Exception:
+            return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.timestamp()
+    except Exception:
+        return None
+
+
+def _channel_launch_recent_seconds() -> float:
+    raw = str(os.environ.get("CLAUDE_ANY_CHANNEL_LAUNCH_RECENT_SECONDS") or "").strip()
+    if not raw:
+        return CHANNEL_LLM_LAUNCH_RECENT_SECONDS_DEFAULT
+    try:
+        return float(raw)
+    except Exception:
+        return CHANNEL_LLM_LAUNCH_RECENT_SECONDS_DEFAULT
+
+
+def _chat_scan_max_id_before_epoch(cutoff_epoch: float) -> int:
+    max_id = 0
+    try:
+        if CHAT_MESSAGES_PATH.exists():
+            with CHAT_MESSAGES_PATH.open("r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        item = json.loads(line)
+                        item_id = int(item.get("id") or 0)
+                    except Exception:
+                        continue
+                    if item_id <= 0:
+                        continue
+                    item_epoch = _chat_message_epoch_seconds(item)
+                    if item_epoch is None:
+                        # Unknown timestamps are treated as possibly recent so
+                        # launch-time cleanup cannot silently skip a fresh event.
+                        continue
+                    if item_epoch < cutoff_epoch:
+                        max_id = max(max_id, item_id)
     except Exception:
         pass
     return max_id
@@ -11885,11 +11976,19 @@ def _compact_chunk_ranges(count: int, chunks: int) -> list[tuple[int, int]]:
     return ranges
 
 
-def context_guard_chunk_count(omitted_messages: list[dict[str, Any]]) -> int:
+def context_guard_chunk_count(omitted_messages: list[dict[str, Any]], budget_tokens: int | None = None) -> int:
     if not omitted_messages:
         return 0
     omitted_tokens = sum(estimate_tokens(message) for message in omitted_messages)
-    return max(1, min(12, (omitted_tokens + 32767) // 32768))
+    target_chunk_tokens = 32768
+    budget = positive_int(budget_tokens)
+    if budget:
+        # This is a deterministic summary of omitted history, not a set of
+        # independent compaction jobs. Larger provider budgets can preserve a
+        # larger recent tail, so the omitted-history summary should avoid
+        # fragmenting into many tiny chunks.
+        target_chunk_tokens = max(target_chunk_tokens, min(262144, max(1, budget // 4)))
+    return max(1, min(12, (omitted_tokens + target_chunk_tokens - 1) // target_chunk_tokens))
 
 
 def build_chunked_context_guard_summary(
@@ -11907,7 +12006,7 @@ def build_chunked_context_guard_summary(
         )
     max_summary_tokens = max(1024, min(24576, max(1, budget_tokens) // 10))
     max_summary_chars = max_summary_tokens * 4
-    chunk_count = context_guard_chunk_count(omitted_messages)
+    chunk_count = context_guard_chunk_count(omitted_messages, budget_tokens)
     lines: list[str] = [
         (
             f"[claude-any context guard: compacted {omitted_count} older messages, approx "
@@ -11955,6 +12054,10 @@ def is_channel_clear_request(body: dict[str, Any]) -> bool:
 
 def is_live_llm_options_request(body: dict[str, Any]) -> bool:
     return "CLAUDE_ANY_LIVE_LLM_OPTIONS" in latest_user_text(body)
+
+
+def is_live_api_keys_request(body: dict[str, Any]) -> bool:
+    return "CLAUDE_ANY_LIVE_API_KEYS" in latest_user_text(body)
 
 
 def parse_channel_bridge_args(raw: str) -> tuple[str, dict[str, str]]:
@@ -12062,6 +12165,48 @@ def live_llm_options_value_from_body(body: dict[str, Any]) -> str:
                 fallback_values.append(value)
     if fallback_values:
         return fallback_values[0]
+    if saw_structured_value:
+        return "status"
+    fallback = tail.strip()
+    if not fallback or fallback in placeholder_values:
+        return "status"
+    return fallback
+
+
+def live_api_keys_value_from_body(body: dict[str, Any]) -> str:
+    text = latest_user_text(body)
+    marker = "CLAUDE_ANY_LIVE_API_KEYS"
+    if marker not in text:
+        return "status"
+    tail = text.split(marker, 1)[1]
+    placeholder_values = {"$0", "${0}", "$ARGUMENTS", "${ARGUMENTS}"}
+    value_line = ""
+    argument_lines: list[str] = []
+    saw_structured_value = False
+    capture_arguments = False
+    for line in tail.splitlines():
+        stripped = line.strip()
+        if capture_arguments:
+            if stripped and stripped not in placeholder_values:
+                argument_lines.append(stripped)
+            continue
+        if stripped.lower().startswith("value:"):
+            saw_structured_value = True
+            value = stripped.split(":", 1)[1].strip()
+            if value and value not in placeholder_values:
+                value_line = value
+            continue
+        if stripped.lower().startswith("arguments:"):
+            saw_structured_value = True
+            capture_arguments = True
+            value = stripped.split(":", 1)[1].strip()
+            if value and value not in placeholder_values:
+                argument_lines.append(value)
+            continue
+    if argument_lines:
+        return "\n".join(argument_lines)
+    if value_line:
+        return value_line
     if saw_structured_value:
         return "status"
     fallback = tail.strip()
@@ -13629,7 +13774,7 @@ def compact_ollama_messages_for_budget(
         "WARN",
         f"compacted ollama payload messages {len(messages)}->{len(compacted)} tokens {initial_tokens}->{estimate_tokens({'messages': compacted, 'tools': tools})} budget={budget_tokens}",
     )
-    chunk_count = context_guard_chunk_count(omitted_messages)
+    chunk_count = context_guard_chunk_count(omitted_messages, budget_tokens)
     if chunk_count and (provider or model):
         write_context_compact_activity(
             provider or "provider",
@@ -13742,7 +13887,7 @@ def compact_anthropic_body_for_budget(
         "WARN",
         f"compacted anthropic payload messages {len(typed_messages)}->{len(out.get('messages') or [])} tokens {initial_tokens}->{final_tokens} budget={budget_tokens}",
     )
-    chunk_count = context_guard_chunk_count(omitted)
+    chunk_count = context_guard_chunk_count(omitted, budget_tokens)
     if chunk_count and (provider or model):
         write_context_compact_activity(
             provider or "provider",
@@ -14630,6 +14775,58 @@ def maybe_handle_live_llm_options_request(handler: BaseHTTPRequestHandler, body:
             message="live LLM options updated from slash command",
             provider=get_current_provider(load_config())[0],
             data={"value": value},
+        )
+    write_anthropic_text_response(handler, str(body.get("model") or current_alias(load_config())), "\n".join(lines), stream)
+    return True
+
+
+def live_api_key_status_lines(provider: str, pcfg: dict[str, Any]) -> list[str]:
+    return [
+        f"Live API key status for provider: {provider}",
+        api_key_status_line(provider, pcfg),
+        f"Stored: {stored_api_key_mask(provider, pcfg)}",
+    ]
+
+
+def handle_live_api_keys_action(value: str) -> tuple[list[str], bool]:
+    cfg = load_config()
+    provider, pcfg = get_current_provider(cfg)
+    raw = str(value or "").strip()
+    normalized = raw.lower()
+    if normalized in {"", "status", "state", "show", "current", "now"}:
+        return live_api_key_status_lines(provider, pcfg), False
+    if normalized in {"help", "usage", "list"}:
+        return [
+            "Use `/api-key status` to show masked key status.",
+            "Use `/api-key clear` or `/api-key unset` to remove API keys for only the current provider.",
+            "Use `/api-key KEY` to set one key.",
+            "Use `/api-key KEY1,KEY2` or `/api-keys KEY1;KEY2` to set multiple round-robin keys.",
+            "Raw keys are never echoed; responses show only masked keys and fingerprints.",
+        ], False
+    try:
+        lines = store_api_key_input_config(provider, raw)
+    except SystemExit as exc:
+        message = str(exc).strip() or "No API keys provided; unchanged."
+        return [message, "", *live_api_key_status_lines(provider, pcfg)], False
+    cfg_after = load_config()
+    provider_after, pcfg_after = get_current_provider(cfg_after)
+    return lines + ["", "Updated live API key settings. The next model request uses these settings.", *live_api_key_status_lines(provider_after, pcfg_after)], True
+
+
+def maybe_handle_live_api_keys_request(handler: BaseHTTPRequestHandler, body: dict[str, Any]) -> bool:
+    if not is_live_api_keys_request(body):
+        return False
+    stream = bool(body.get("stream", True))
+    value = live_api_keys_value_from_body(body)
+    lines, changed = handle_live_api_keys_action(value)
+    if changed:
+        provider_after, pcfg_after = get_current_provider(load_config())
+        EVENT_BUS.publish(
+            level="info",
+            category="config.api_key",
+            message="live API key settings updated from slash command",
+            provider=provider_after,
+            data={"key_count": provider_api_key_count(provider_after, pcfg_after)},
         )
     write_anthropic_text_response(handler, str(body.get("model") or current_alias(load_config())), "\n".join(lines), stream)
     return True
@@ -17235,6 +17432,9 @@ class RouterHandler(BaseHTTPRequestHandler):
         if maybe_handle_live_llm_options_request(self, body):
             EVENT_BUS.publish(level="info", category="llm_options.short_circuit", message="live LLM options request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
+        if maybe_handle_live_api_keys_request(self, body):
+            EVENT_BUS.publish(level="info", category="api_keys.short_circuit", message="live API key request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
+            return
         if maybe_handle_advisor_request(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="advisor.short_circuit", message="advisor request handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
@@ -18000,11 +18200,11 @@ def status_lines() -> list[str]:
         *([f"think: {bool(pcfg.get('think', False))}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("ollama", "ollama-cloud") else []),
         *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("ollama", "ollama-cloud") else []),
-        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
-        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
-        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
-        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
-        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks") else []),
+        *([f"context_window: {pcfg.get('context_window', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai") else []),
+        *([f"context_reserve_tokens: {pcfg.get('context_reserve_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai") else []),
+        *([f"max_output_tokens: {pcfg.get('max_output_tokens', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai") else []),
+        *([f"request_timeout_ms: {pcfg.get('request_timeout_ms', 'default')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai") else []),
+        *([f"stream_idle_timeout_ms: {pcfg.get('stream_idle_timeout_ms', 'auto')}"] if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai") else []),
         f"claude_model: {current_upstream_model_id(provider, pcfg) if direct_native else current_alias(cfg)}",
         f"log_level: {log_level_status()}",
         f"channels: {channel_status_text(cfg)}",
@@ -20287,7 +20487,7 @@ def cmd_ollama_options(args: argparse.Namespace) -> None:
     print("  claude-any --ca-ollama-option temperature=0.7 --ca-ollama-num-ctx 65536")
 
 
-PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks")
+PROVIDER_OPTION_PROVIDERS = ("anthropic", "vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai")
 PROVIDER_SAMPLING_OPTION_PROVIDERS = ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "openrouter")
 PROVIDER_SAMPLING_OPTIONS = ("temperature", "top_p", "top_k")
 
@@ -20348,10 +20548,10 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
     if provider in ("ollama", "ollama-cloud"):
         parts.insert(0, f"num_ctx={ollama_num_ctx_status(pcfg)}")
         parts.append(f"ollama_options={ollama_options_status(pcfg)}")
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
         parts.insert(0, f"context_window={pcfg.get('context_window', 'default')}")
         parts.insert(1, f"reserve={pcfg.get('context_reserve_tokens', 'default')}")
-    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
         native_default = True
         parts.append(f"native={bool(pcfg.get('native_compat', native_default))}")
     if provider in OPENCODE_PROVIDER_NAMES:
@@ -20368,7 +20568,7 @@ def provider_options_status(provider: str, pcfg: dict[str, Any]) -> str:
         parts.append(f"query={forced_query}")
     if provider in PROVIDER_SAMPLING_OPTION_PROVIDERS:
         parts.extend(provider_sampling_status(pcfg))
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "ollama", "ollama-cloud", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
         parts.append(f"stream={'on' if bool(pcfg.get('stream_enabled', True)) else 'off'}")
         if bool(pcfg.get("stream_word_chunking", False)):
             parts.append("word_chunk=on")
@@ -20407,11 +20607,18 @@ def model_option_family(provider: str, pcfg: dict[str, Any]) -> str:
         return "coding"
     if any(marker in model for marker in ("reason", "thinking", "r1", "qwq")):
         return "reasoning"
+    if provider == "zai":
+        ctx = provider_model_context_capacity(provider, pcfg) or positive_int(pcfg.get("context_window")) or 0
+        if ctx >= 1048576:
+            return "million-context"
+        if ctx >= 65536:
+            return "long-context"
+        return "general"
     if any(marker in model for marker in ("1m", "v4-pro", "million")):
         return "million-context"
     if any(marker in model for marker in ("70b", "120b", "253b", "405b", "480b", "large", "ultra", "pro")):
         return "large"
-    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
         ctx = provider_model_context_capacity(provider, pcfg) or positive_int(pcfg.get("context_window")) or 0
         if ctx >= 1048576:
             return "million-context"
@@ -20783,10 +20990,23 @@ def is_qwen36_plus_model_id(model_id: str) -> bool:
     return "qwen36plus" in compact
 
 
+def zai_model_context_hint(model_id: str) -> int | None:
+    model = strip_claude_context_suffix(model_id).strip().lower().replace("_", "-")
+    if not model:
+        return None
+    for prefix, limit in ZAI_MODEL_CONTEXT_HINTS:
+        if model == prefix or model.startswith(prefix + "-"):
+            return limit
+    return None
+
+
 def model_context_hint_from_model_id(model_id: str) -> int | None:
     model = (model_id or "").lower()
     if not model:
         return None
+    zai_hint = zai_model_context_hint(model_id)
+    if zai_hint:
+        return zai_hint
     if is_qwen36_plus_model_id(model_id):
         return 1048576
     catalog_limit, _, _ = ollama_catalog_context_for_model(model_id)
@@ -20799,7 +21019,7 @@ def model_context_hint_from_model_id(model_id: str) -> int | None:
     if "qwen3.6" in model:
         return 262144
     if "glm-4.7" in model or "glm-5.1" in model:
-        return 131072
+        return 200000
     if "deepseek-r1" in model or "llama3.3" in model:
         return 131072
     preset = model_preset(model_id)
@@ -20823,6 +21043,12 @@ def provider_model_context_capacity(provider: str, pcfg: dict[str, Any]) -> int 
         return (
             positive_int(pcfg.get("max_model_len"))
             or model_context_hint_from_model_id(model)
+            or positive_int(pcfg.get("context_window"))
+        )
+    if provider == "zai":
+        return (
+            model_context_hint_from_model_id(model)
+            or positive_int(pcfg.get("max_model_len"))
             or positive_int(pcfg.get("context_window"))
         )
     if provider in ("ollama", "ollama-cloud"):
@@ -20856,7 +21082,7 @@ def cap_context_settings_to_model_capacity(provider: str, pcfg: dict[str, Any]) 
         if fixed_ctx and fixed_ctx > capacity:
             pcfg["num_ctx"] = capacity
         return messages
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
         context_window = positive_int(pcfg.get("context_window"))
         if context_window and context_window > capacity:
             pcfg["context_window"] = capacity
@@ -20902,7 +21128,7 @@ def cap_output_settings_to_context_ratio(provider: str, pcfg: dict[str, Any]) ->
                 f"Max output capped to {cap:,} tokens for context {format_context_tokens(context)}."
             )
         return messages
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
         current = positive_int(pcfg.get("max_output_tokens"))
         if current and current > cap:
             pcfg["max_output_tokens"] = cap
@@ -20949,7 +21175,7 @@ def apply_current_model_specs_to_provider(provider: str, pcfg: dict[str, Any]) -
         else:
             pcfg["num_ctx_max"] = min(current_max, max_context) if current_max and current_max > max_context else max_context
         return messages
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
         if positive_int(pcfg.get("max_model_len")) != max_context:
             pcfg["max_model_len"] = max_context
             messages.append(f"Model context size from provider specs: {format_context_tokens(max_context)} ({max_context:,} tokens).")
@@ -21078,7 +21304,7 @@ def context_setting_status(provider: str, pcfg: dict[str, Any]) -> str:
     cap_text = format_context_tokens(capacity)
     if provider in ("ollama", "ollama-cloud"):
         return f"model max {cap_text}; {ollama_num_ctx_status(pcfg)}"
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
         window = positive_int(pcfg.get("context_window"))
         reserve = positive_int(pcfg.get("context_reserve_tokens"))
         reserve_text = f"; reserve {format_context_tokens(reserve)}" if reserve else ""
@@ -21098,7 +21324,7 @@ def configured_context_window_for_timeout(provider: str, pcfg: dict[str, Any]) -
             provider_model_context_capacity(provider, pcfg)
             or positive_int(pcfg.get("num_ctx_max"))
         )
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
         return positive_int(pcfg.get("context_window")) or provider_model_context_capacity(provider, pcfg)
     if provider == "anthropic":
         return provider_model_context_capacity(provider, pcfg)
@@ -21301,7 +21527,7 @@ def apply_context_setup_to_provider(provider: str, pcfg: dict[str, Any], mode: s
         pcfg["num_ctx_max"] = window
         pcfg["num_ctx_min"] = min(window, 32768 if window <= 65536 else 65536)
         pcfg.setdefault("ollama_options", {})["num_predict"] = output
-    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+    elif provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
         pcfg["context_window"] = window
         pcfg["context_reserve_tokens"] = reserve
         pcfg["max_output_tokens"] = output
@@ -21393,7 +21619,7 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
         if num_ctx and num_ctx <= 32768 and num_predict and num_predict <= 2048:
             return "fast"
         return None
-    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "anthropic"):
+    if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai", "anthropic"):
         max_output = positive_int(pcfg.get("max_output_tokens")) or 0
         context_window = positive_int(pcfg.get("context_window")) or 0
         if bool(pcfg.get("think", False)):
@@ -22612,14 +22838,14 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         add("Rate limit status", "rate_limit_status", "on" if bool(pcfg.get("rate_limit_status", False)) else "off")
         add("IP family", "ip_family", provider_ip_family(provider, pcfg))
     else:
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
             add("Context window", "context_window", pcfg.get("context_window", "default"))
             add("Context reserve", "context_reserve_tokens", pcfg.get("context_reserve_tokens", "default"))
         add("Max output tokens", "max_output_tokens", pcfg.get("max_output_tokens", "default"))
         add("Query string", "force_query_string", upstream_query_string_status(provider, pcfg))
         if provider in PROVIDER_OPTION_PROVIDERS and provider != "anthropic":
             add("Tool choice", "supports_tool_choice", provider_tool_choice_status(provider, pcfg))
-        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+        if provider in ("vllm", "lm-studio", "nvidia-hosted", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
             add("Timeout ms", "request_timeout_ms", pcfg.get("request_timeout_ms", "default"))
             add("RPM limiter", "rate_limit_enabled", rate_limit_status_label(provider, pcfg))
             add("Rate limit RPM", "rate_limit_rpm", rate_limit_rpm_label(provider, pcfg))
@@ -22627,7 +22853,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
             add("Temperature", "temperature", pcfg.get("temperature", "default"))
             add("Top P", "top_p", pcfg.get("top_p", "default"))
             add("Top K", "top_k", pcfg.get("top_k", "default"))
-            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks"):
+            if provider in ("vllm", "lm-studio", "self-hosted-nim", "deepseek", "opencode", "opencode-go", "kimi", "openrouter", "fireworks", "zai"):
                 add("Native compatibility", "native_compat", bool(pcfg.get("native_compat", True)))
             add("Stream", "stream_enabled", "on" if bool(pcfg.get("stream_enabled", True)) else "off")
             if bool(pcfg.get("stream_enabled", True)):
@@ -22796,10 +23022,12 @@ def set_llm_option_config(provider: str, key: str, raw_value: str) -> list[str]:
             raise SystemExit(f"Unknown Anthropic option: {key}")
     else:
         apply_provider_option(provider, pcfg, token)
+    cap_lines = cap_context_settings_to_model_capacity(provider, pcfg)
+    cap_lines.extend(cap_output_settings_to_context_ratio(provider, pcfg))
     timeout_lines = apply_recommended_timeout_for_model_context(provider, pcfg) if context_changed and not explicit_timeout else []
     save_config(cfg)
     clear_model_cache()
-    return [f"{PROVIDER_LABELS.get(provider, provider)} option updated.", f"{key}: {value}", *timeout_lines]
+    return [f"{PROVIDER_LABELS.get(provider, provider)} option updated.", f"{key}: {value}", *cap_lines, *timeout_lines]
 
 
 def apply_provider_option(provider: str, pcfg: dict[str, Any], token: str) -> None:
@@ -23024,7 +23252,7 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
         except SystemExit:
             pass
     if provider not in PROVIDER_OPTION_PROVIDERS:
-        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, kimi, fireworks, vllm, lm-studio, nvidia-hosted, self-hosted-nim, and openrouter.")
+        raise SystemExit("Provider options are available for anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, kimi, z.ai, fireworks, vllm, lm-studio, nvidia-hosted, self-hosted-nim, and openrouter.")
     pcfg = cfg["providers"][provider]
     if values:
         context_changed = any(
@@ -23037,10 +23265,14 @@ def cmd_provider_options(args: argparse.Namespace) -> None:
         )
         for token in values:
             apply_provider_option(provider, pcfg, token)
+        cap_lines = cap_context_settings_to_model_capacity(provider, pcfg)
+        cap_lines.extend(cap_output_settings_to_context_ratio(provider, pcfg))
         timeout_lines = apply_recommended_timeout_for_model_context(provider, pcfg) if context_changed and not explicit_timeout else []
         save_config(cfg)
         clear_model_cache()
         print(f"Provider options updated for {provider}.")
+        for line in cap_lines:
+            print(line)
         for line in timeout_lines:
             print(line)
     print(f"provider: {provider}")
@@ -23687,9 +23919,9 @@ def claude_code_output_token_limit(provider: str, pcfg: dict[str, Any]) -> int |
 
 def claude_code_auto_compact_window(provider: str, pcfg: dict[str, Any]) -> int | None:
     configured = positive_int(pcfg.get("auto_compact_window"))
-    if configured:
-        return configured
     limit = context_limit_for_status(provider, pcfg)
+    if configured:
+        return min(configured, limit) if limit else configured
     if limit:
         return limit
     return None
@@ -28880,12 +29112,23 @@ def ensure_channel_llm_delivery_cursor_initialized() -> int:
 
 def prepare_channel_llm_delivery_for_launch() -> int:
     # chat-messages.jsonl is a transient bridge queue, not the durable MCP inbox.
-    # On a new Claude Code process, replaying rows left by a previous process
-    # surfaces stale "one more" channel messages at startup. New channel events
-    # are appended after this point and remain deliverable.
-    last_id = reset_channel_llm_delivery_cursor()
+    # On a new Claude Code process, replaying old rows left by a previous process
+    # surfaces stale "one more" channel messages at startup. Do not fast-forward
+    # over very recent rows, though: users often restart immediately after an
+    # injected event, and those fresh rows still need to be delivered.
+    current = ensure_channel_llm_delivery_cursor_initialized()
+    recent_seconds = _channel_launch_recent_seconds()
+    if recent_seconds <= 0:
+        target = _chat_scan_max_id()
+    else:
+        target = _chat_scan_max_id_before_epoch(time.time() - recent_seconds)
+    last_id = reset_channel_llm_delivery_cursor(max(current, target))
     _write_channel_llm_launch_guard(last_id)
-    router_log("INFO", f"channel_llm_cursor_fast_forward_on_launch last_id={last_id}")
+    router_log(
+        "INFO",
+        "channel_llm_cursor_fast_forward_on_launch "
+        f"last_id={last_id} previous_cursor={current} recent_seconds={recent_seconds:g}",
+    )
     return last_id
 
 
@@ -32453,7 +32696,7 @@ Headless setup flags, namespaced to avoid Claude CLI collisions:
   claude-any --ca-stop               Stop router/proxy
   claude-any --                      Pass all following args directly to Claude Code
 
-Provider names: anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, kimi, vllm, lm-studio, nvidia-hosted, self-hosted-nim, openrouter, fireworks
+Provider names: anthropic, ollama, ollama-cloud, deepseek, opencode, opencode-go, kimi, z.ai, vllm, lm-studio, nvidia-hosted, self-hosted-nim, openrouter, fireworks
 Any other arguments are passed through to claude. Use -- before Claude flags that
 collide with claude-any setup flags."""
 

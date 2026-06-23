@@ -203,6 +203,81 @@ class ApiKeyRotationTests(unittest.TestCase):
         self.assertNotIn("api_keys", pcfg)
         self.assertIn("Cleared stored API key(s) for deepseek. Other providers unchanged.", "\n".join(messages))
 
+    def test_live_api_key_slash_value_preserves_multiline_arguments(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "CLAUDE_ANY_LIVE_API_KEYS\n\nValue: sk-one\nArguments:\nsk-one\nsk-two\nsk-three",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        self.assertEqual("sk-one\nsk-two\nsk-three", claude_any.live_api_keys_value_from_body(body))
+
+    def test_live_api_key_slash_status_when_arguments_unexpanded(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "CLAUDE_ANY_LIVE_API_KEYS\n\nValue: $0\nArguments:\n$ARGUMENTS",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        self.assertEqual("status", claude_any.live_api_keys_value_from_body(body))
+
+    def test_live_api_key_action_updates_current_provider_only(self):
+        cfg = {
+            "current_provider": "deepseek",
+            "providers": {
+                "deepseek": self.deepseek_pcfg(api_key="sk-old", api_keys=[]),
+                "opencode": self.provider_pcfg("opencode", api_key="sk-opencode", api_keys=["sk-opencode"]),
+            },
+        }
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config"),
+            mock.patch.object(claude_any, "clear_model_cache"),
+        ):
+            lines, changed = claude_any.handle_live_api_keys_action("sk-live-one\nsk-live-two")
+
+        self.assertTrue(changed)
+        self.assertEqual("sk-live-one", cfg["providers"]["deepseek"]["api_key"])
+        self.assertEqual(["sk-live-one", "sk-live-two"], cfg["providers"]["deepseek"]["api_keys"])
+        self.assertEqual(["sk-opencode"], cfg["providers"]["opencode"]["api_keys"])
+        output = "\n".join(lines)
+        self.assertIn("Stored 2 API keys for deepseek.", output)
+        self.assertIn("Round-robin: enabled", output)
+        self.assertNotIn("sk-live-one", output)
+        self.assertNotIn("sk-live-two", output)
+
+    def test_slash_command_install_adds_live_api_key_commands(self):
+        with tempfile.TemporaryDirectory() as td:
+            commands_dir = Path(td)
+            with mock.patch.object(claude_any, "CLAUDE_COMMANDS_DIR", commands_dir):
+                claude_any.install_claude_any_slash_commands(include_advisor=False)
+
+            api_key = commands_dir / "api-key.md"
+            api_keys = commands_dir / "api-keys.md"
+            self.assertTrue(api_key.exists())
+            self.assertTrue(api_keys.exists())
+            text = api_key.read_text(encoding="utf-8")
+            self.assertIn("CLAUDE_ANY_LIVE_API_KEYS", text)
+            self.assertIn("Arguments:", text)
+            self.assertIn("$ARGUMENTS", text)
+
     def test_clear_api_key_preserves_other_provider_keys_after_reload(self):
         providers = ["anthropic", "deepseek", "opencode", "openrouter", "ollama-cloud", "fireworks", "zai"]
         cfg = copy.deepcopy(claude_any.DEFAULT_CONFIG)

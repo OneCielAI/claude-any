@@ -6,6 +6,19 @@ import claude_any
 
 
 class VllmProviderTests(unittest.TestCase):
+    def test_context_guard_summary_chunks_scale_with_large_budget(self):
+        omitted = [{"role": "user", "content": f"old message {idx}"} for idx in range(9)]
+
+        with mock.patch.object(claude_any, "estimate_tokens", return_value=32768):
+            self.assertEqual(9, claude_any.context_guard_chunk_count(omitted))
+            self.assertEqual(3, claude_any.context_guard_chunk_count(omitted, 499712))
+
+        with mock.patch.object(claude_any, "estimate_tokens", return_value=32768):
+            summary = claude_any.build_chunked_context_guard_summary(omitted, 499712)
+
+        self.assertIn("Chunk 3/3", summary)
+        self.assertNotIn("Chunk 4/3", summary)
+
     def test_vllm_native_base_url_strips_v1_suffix(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
         pcfg["base_url"] = "http://vllm.local:8000/v1"

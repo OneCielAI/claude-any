@@ -44,6 +44,31 @@ class ZaiProviderTests(unittest.TestCase):
 
     def test_model_suffix_is_preserved_for_zai_one_million_context(self):
         self.assertEqual("glm-5.2[1m]", claude_any.normalize_model_id("zai", "glm-5.2[1m]"))
+        pcfg = self.zai_cfg(current_model="glm-5.2[1m]")["providers"]["zai"]
+
+        self.assertEqual(1000000, claude_any.provider_model_context_capacity("zai", pcfg))
+
+    def test_zai_turbo_suffix_does_not_claim_one_million_context(self):
+        pcfg = self.zai_cfg(
+            current_model="glm-5-turbo[1m]",
+            context_window=524288,
+            auto_compact_window=1000000,
+            max_output_tokens=32768,
+            context_reserve_tokens=16384,
+        )["providers"]["zai"]
+
+        self.assertEqual(200000, claude_any.provider_model_context_capacity("zai", pcfg))
+        self.assertEqual(200000, claude_any.context_limit_for_status("zai", pcfg))
+        self.assertEqual(200000, claude_any.claude_code_auto_compact_window("zai", pcfg))
+        self.assertEqual("long-context", claude_any.model_option_family("zai", pcfg))
+        self.assertEqual("long-context-128k", claude_any.recommended_preset_id("zai", pcfg))
+
+        messages = claude_any.cap_context_settings_to_model_capacity("zai", pcfg)
+        messages.extend(claude_any.cap_output_settings_to_context_ratio("zai", pcfg))
+
+        self.assertEqual(200000, pcfg["context_window"])
+        self.assertEqual(6144, pcfg["max_output_tokens"])
+        self.assertTrue(any("Context window capped" in line for line in messages))
 
     def test_provider_headers_include_zai_api_key(self):
         pcfg = self.zai_cfg(api_key="sk-zai-test")["providers"]["zai"]
