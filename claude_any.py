@@ -11144,7 +11144,7 @@ def _channel_mcp_tool_schemas() -> list[dict[str, Any]]:
                     },
                     "preset": {
                         "type": "string",
-                        "description": "Preset id or alias when action is apply, for example balanced, long-context-256k, long-context-512k, or million-context-1m.",
+                        "description": "Preset id or alias when action is apply, for example balanced, long-context-256k, long-context-300k, long-context-512k, or million-context-1m.",
                     },
                 },
             },
@@ -20388,6 +20388,8 @@ def recommended_preset_id(provider: str, pcfg: dict[str, Any]) -> str:
         capacity = provider_model_context_capacity(provider, pcfg) or 0
         if capacity >= 524288:
             return "long-context-512k"
+        if capacity >= 307200:
+            return "long-context-300k"
         if capacity >= 262144:
             return "long-context-256k"
         if capacity >= 131072:
@@ -20405,6 +20407,7 @@ LLM_PRESETS: dict[str, tuple[str, str]] = {
     "long-context-65k": ("Long context 65K", "65K context target, 4K output reserve"),
     "long-context-128k": ("Long context 128K", "64K-128K context target, 4K-8K output reserve"),
     "long-context-256k": ("Long context 256K", "256K context target, 8K output reserve"),
+    "long-context-300k": ("Long context 300K", "300K context target, 8K output reserve"),
     "long-context-512k": ("Long context 512K", "512K context target, 8K output reserve"),
     "million-context-1m": ("Ultra context 1M", "1M context target for high-capacity models"),
     "large-output": ("Large output/report", "larger 8K output for summaries/reports"),
@@ -20455,6 +20458,9 @@ def resolve_llm_preset_id(value: str) -> str | None:
         "256k": "long-context-256k",
         "long-256k": "long-context-256k",
         "context-256k": "long-context-256k",
+        "300k": "long-context-300k",
+        "long-300k": "long-context-300k",
+        "context-300k": "long-context-300k",
         "512k": "long-context-512k",
         "long-512k": "long-context-512k",
         "context-512k": "long-context-512k",
@@ -20489,6 +20495,7 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "long-context-65k": ("긴 컨텍스트 65K", "65K 컨텍스트 목표, 4K 출력 여유"),
         "long-context-128k": ("긴 컨텍스트 128K", "64K-128K 컨텍스트 목표, 4K-8K 출력 여유"),
         "long-context-256k": ("긴 컨텍스트 256K", "256K 컨텍스트 목표, 8K 출력 여유"),
+        "long-context-300k": ("긴 컨텍스트 300K", "300K 컨텍스트 목표, 8K 출력 여유"),
         "long-context-512k": ("긴 컨텍스트 512K", "512K 컨텍스트 목표, 8K 출력 여유"),
         "million-context-1m": ("초장문 컨텍스트 1M", "고용량 모델용 1M 컨텍스트 목표"),
         "large-output": ("긴 출력/리포트", "요약과 리포트용 8K 출력"),
@@ -20506,6 +20513,7 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "long-context-65k": ("長いコンテキスト 65K", "65K コンテキスト目標、4K 出力予約"),
         "long-context-128k": ("長いコンテキスト 128K", "64K-128K コンテキスト目標、4K-8K 出力予約"),
         "long-context-256k": ("長いコンテキスト 256K", "256K コンテキスト目標、8K 出力予約"),
+        "long-context-300k": ("長いコンテキスト 300K", "300K コンテキスト目標、8K 出力予約"),
         "long-context-512k": ("長いコンテキスト 512K", "512K コンテキスト目標、8K 出力予約"),
         "million-context-1m": ("超長文コンテキスト 1M", "大容量モデル向けの 1M コンテキスト目標"),
         "large-output": ("長い出力/レポート", "要約とレポート向けの 8K 出力"),
@@ -20523,6 +20531,7 @@ LLM_PRESET_I18N: dict[str, dict[str, tuple[str, str]]] = {
         "long-context-65k": ("长上下文 65K", "65K 上下文目标，4K 输出预留"),
         "long-context-128k": ("长上下文 128K", "64K-128K 上下文目标，4K-8K 输出预留"),
         "long-context-256k": ("长上下文 256K", "256K 上下文目标，8K 输出预留"),
+        "long-context-300k": ("长上下文 300K", "300K 上下文目标，8K 输出预留"),
         "long-context-512k": ("长上下文 512K", "512K 上下文目标，8K 输出预留"),
         "million-context-1m": ("超长上下文 1M", "面向高容量模型的 1M 上下文目标"),
         "large-output": ("长输出/报告", "用于摘要和报告的 8K 输出"),
@@ -20577,6 +20586,7 @@ LLM_PRESET_TIMEOUT_MS: dict[str, int] = {
     "long-context-65k": DEFAULT_REQUEST_TIMEOUT_MS,
     "long-context-128k": 600000,
     "long-context-256k": 600000,
+    "long-context-300k": 600000,
     "long-context-512k": 600000,
     "million-context-1m": 600000,
     "large-output": 600000,
@@ -20681,6 +20691,7 @@ CONTEXT_HEAVY_PRESETS = {
     "long-context-65k",
     "long-context-128k",
     "long-context-256k",
+    "long-context-300k",
     "long-context-512k",
     "million-context-1m",
     "large-output",
@@ -20944,6 +20955,8 @@ def required_context_for_preset(preset_id: str, provider: str | None = None) -> 
         return 65536
     if preset_id == "long-context-512k":
         return 524288
+    if preset_id == "long-context-300k":
+        return 307200
     if preset_id == "long-context-256k":
         return 262144
     if preset_id == "long-context-128k":
@@ -21293,6 +21306,8 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
             return "million-context-1m"
         if num_ctx_max >= 524288:
             return "long-context-512k"
+        if num_ctx_max >= 307200:
+            return "long-context-300k"
         if num_ctx_max >= 262144:
             return "long-context-256k"
         if num_ctx_max >= 131072 and num_predict >= 8192:
@@ -21313,6 +21328,8 @@ def infer_preset_id_from_options(provider: str, pcfg: dict[str, Any]) -> str | N
             return "million-context-1m"
         if context_window >= 524288:
             return "long-context-512k"
+        if context_window >= 307200:
+            return "long-context-300k"
         if context_window >= 262144:
             return "long-context-256k"
         if context_window >= 131072 and max_output >= 8192:
@@ -21440,6 +21457,18 @@ def apply_llm_preset_to_provider(
                 "num_ctx=auto",
                 "num_ctx_min=131072",
                 "num_ctx_max=262144",
+                "num_predict=8192",
+                "temperature=0.3",
+                "top_p=0.9",
+                "top_k=40",
+                "think=false",
+                "keep_alive=15m",
+                "timeout=300000",
+            ],
+            "long-context-300k": [
+                "num_ctx=auto",
+                "num_ctx_min=131072",
+                "num_ctx_max=307200",
                 "num_predict=8192",
                 "temperature=0.3",
                 "top_p=0.9",
@@ -21579,6 +21608,7 @@ def apply_llm_preset_to_provider(
             "long-context-65k": ["timeout=300000"],
             "long-context-128k": ["timeout=300000"],
             "long-context-256k": ["timeout=300000"],
+            "long-context-300k": ["timeout=300000"],
             "long-context-512k": ["timeout=300000"],
             "million-context-1m": ["timeout=300000"],
             "large-output": ["timeout=300000"],
@@ -21646,6 +21676,15 @@ def apply_llm_preset_to_provider(
                 ],
                 "long-context-256k": [
                     "context_window=262144",
+                    "reserve=8192",
+                    "max_output_tokens=8192",
+                    "timeout=300000",
+                    "temperature=0.3",
+                    "unset:top_p",
+                    "unset:top_k",
+                ],
+                "long-context-300k": [
+                    "context_window=307200",
                     "reserve=8192",
                     "max_output_tokens=8192",
                     "timeout=300000",
@@ -21789,6 +21828,16 @@ def apply_llm_preset_to_provider(
             ],
             "long-context-256k": [
                 "context_window=262144",
+                "reserve=8192",
+                "max_output_tokens=8192",
+                "timeout=300000",
+                "temperature=0.3",
+                "unset:top_p",
+                "unset:top_k",
+                f"native={native_default}",
+            ],
+            "long-context-300k": [
+                "context_window=307200",
                 "reserve=8192",
                 "max_output_tokens=8192",
                 "timeout=300000",

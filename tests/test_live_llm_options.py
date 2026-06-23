@@ -72,6 +72,7 @@ class LiveLlmOptionsTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertTrue(any("/llm-long-context-128k" in line for line in lines))
         self.assertTrue(any("/llm-long-context-256k" in line for line in lines))
+        self.assertTrue(any("/llm-long-context-300k" in line for line in lines))
         self.assertTrue(any("/llm-long-context-512k" in line for line in lines))
         self.assertTrue(any("Restore available: yes" in line for line in lines))
 
@@ -104,6 +105,7 @@ class LiveLlmOptionsTests(unittest.TestCase):
             self.assertTrue((commands_dir / "llm-restore.md").exists())
             self.assertTrue((commands_dir / "llm-long-context-128k.md").exists())
             self.assertTrue((commands_dir / "llm-long-context-256k.md").exists())
+            self.assertTrue((commands_dir / "llm-long-context-300k.md").exists())
             self.assertTrue((commands_dir / "llm-long-context-512k.md").exists())
             self.assertIn("CLAUDE_ANY_LIVE_LLM_OPTIONS", (commands_dir / "llm-balanced.md").read_text(encoding="utf-8"))
 

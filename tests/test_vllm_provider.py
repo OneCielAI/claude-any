@@ -213,6 +213,17 @@ class VllmProviderTests(unittest.TestCase):
         self.assertEqual("long-context-256k", pcfg["llm_preset"])
         self.assertTrue(any("Long context 256K" in line for line in lines))
 
+    def test_long_context_300k_preset_configures_vllm_range(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+
+        lines = claude_any.apply_llm_preset_to_provider("vllm", pcfg, "long-context-300k", "en")
+
+        self.assertEqual(307200, pcfg["context_window"])
+        self.assertEqual(8192, pcfg["context_reserve_tokens"])
+        self.assertEqual(8192, pcfg["max_output_tokens"])
+        self.assertEqual("long-context-300k", pcfg["llm_preset"])
+        self.assertTrue(any("Long context 300K" in line for line in lines))
+
     def test_long_context_512k_preset_configures_vllm_range(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
 
@@ -267,11 +278,14 @@ class VllmProviderTests(unittest.TestCase):
 
         self.assertEqual(131072, pcfg["context_window"])
 
-    def test_context_capacity_recommends_256k_and_512k_presets(self):
+    def test_context_capacity_recommends_256k_300k_and_512k_presets(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
         pcfg["max_model_len"] = 262144
 
         self.assertEqual("long-context-256k", claude_any.recommended_preset_id("vllm", pcfg))
+
+        pcfg["max_model_len"] = 307200
+        self.assertEqual("long-context-300k", claude_any.recommended_preset_id("vllm", pcfg))
 
         pcfg["max_model_len"] = 524288
         self.assertEqual("long-context-512k", claude_any.recommended_preset_id("vllm", pcfg))
@@ -345,7 +359,7 @@ class VllmProviderTests(unittest.TestCase):
         self.assertEqual("long-context-128k", pcfg["llm_preset"])
         self.assertTrue(any("Long context 128K" in line for line in lines))
 
-    def test_long_context_256k_and_512k_presets_configure_ollama_ranges(self):
+    def test_long_context_256k_300k_and_512k_presets_configure_ollama_ranges(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["ollama-cloud"])
         pcfg["current_model"] = "custom-ctx-model"
 
@@ -359,6 +373,18 @@ class VllmProviderTests(unittest.TestCase):
         self.assertEqual("auto", pcfg["num_ctx"])
         self.assertEqual(131072, pcfg["num_ctx_min"])
         self.assertEqual(262144, pcfg["num_ctx_max"])
+        self.assertEqual(8192, pcfg["ollama_options"]["num_predict"])
+
+        claude_any.apply_llm_preset_to_provider(
+            "ollama-cloud",
+            pcfg,
+            "long-context-300k",
+            "en",
+            sync_ollama_context=False,
+        )
+        self.assertEqual("auto", pcfg["num_ctx"])
+        self.assertEqual(131072, pcfg["num_ctx_min"])
+        self.assertEqual(307200, pcfg["num_ctx_max"])
         self.assertEqual(8192, pcfg["ollama_options"]["num_predict"])
 
         claude_any.apply_llm_preset_to_provider(
