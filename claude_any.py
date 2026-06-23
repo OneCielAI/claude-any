@@ -3782,14 +3782,14 @@ This session bypasses the claude-any router. Launch a non-native provider or ena
 
 LLM_OPTIONS_SLASH_COMMAND = """---
 description: Show or change claude-any live LLM options
-argument-hint: [status|list|restore|preset-id]
+argument-hint: [status|list|restore|preset-id|300k]
 ---
 
 CLAUDE_ANY_LIVE_LLM_OPTIONS
 
 Value: $ARGUMENTS
 
-Show or change the live claude-any LLM preset for this routed session. With no argument, show status and available presets. Use `restore` to return to the options captured before the first live preset change.
+Show or change the live claude-any LLM preset for this routed session. With no argument, show status and available presets. Use `restore` to return to the options captured before the first live preset change. Context sizes can be applied by argument, for example `128k`, `300k`, `512k`, or `1m`.
 """
 
 LLM_RESTORE_SLASH_COMMAND = """---
@@ -3865,8 +3865,15 @@ def install_claude_any_slash_commands(include_advisor: bool = True) -> None:
             "llm-restore.md": LLM_RESTORE_SLASH_COMMAND,
             "channel-clear.md": CHANNEL_CLEAR_SLASH_COMMAND,
         }
-        for preset_id in LLM_PRESETS:
+        for preset_id in runtime_slash_llm_preset_ids():
             commands[f"{llm_preset_command_name(preset_id)}.md"] = llm_preset_slash_command(preset_id)
+        for preset_id in CONTEXT_SIZE_PRESET_IDS:
+            path = CLAUDE_COMMANDS_DIR / f"{llm_preset_command_name(preset_id)}.md"
+            if path.exists() and command_file_is_claude_any_owned(path, CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS):
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
         if include_advisor:
             commands["advisor.md"] = ADVISOR_SLASH_COMMAND
         else:
@@ -20420,6 +20427,28 @@ LLM_PRESETS: dict[str, tuple[str, str]] = {
 }
 
 
+CONTEXT_SIZE_PRESET_IDS: tuple[str, ...] = (
+    "long-context-65k",
+    "long-context-128k",
+    "long-context-256k",
+    "long-context-300k",
+    "long-context-512k",
+    "million-context-1m",
+)
+
+
+def is_context_size_preset(preset_id: str) -> bool:
+    return str(preset_id or "") in CONTEXT_SIZE_PRESET_IDS
+
+
+def runtime_slash_llm_preset_ids() -> list[str]:
+    return [preset_id for preset_id in LLM_PRESETS if not is_context_size_preset(preset_id)]
+
+
+def workload_llm_preset_ids() -> list[str]:
+    return runtime_slash_llm_preset_ids()
+
+
 def llm_preset_command_name(preset_id: str) -> str:
     return "llm-" + re.sub(r"[^a-z0-9]+", "-", str(preset_id or "").lower()).strip("-")
 
@@ -21364,7 +21393,7 @@ def llm_preset_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         f"{ui_text('recommended_preset_is', lang)} {recommended_label}"
     ]
     values = ["__info__"]
-    for preset_id in LLM_PRESETS:
+    for preset_id in workload_llm_preset_ids():
         label, description = llm_preset_text(preset_id, lang)
         mark = "*" if preset_id == applied else " "
         suffix = ""
@@ -22146,6 +22175,77 @@ def apply_runtime_llm_preset_config(provider: str, preset_id: str) -> list[str]:
     return lines
 
 
+def context_size_preset_from_tokens(tokens: int | None) -> str:
+    value = positive_int(tokens) or 0
+    if value >= 1048576:
+        return "million-context-1m"
+    if value >= 524288:
+        return "long-context-512k"
+    if value >= 307200:
+        return "long-context-300k"
+    if value >= 262144:
+        return "long-context-256k"
+    if value >= 131072:
+        return "long-context-128k"
+    return "long-context-65k"
+
+
+def context_size_preset_for_options(provider: str, pcfg: dict[str, Any]) -> str:
+    explicit = str(pcfg.get("llm_preset") or "").strip()
+    if is_context_size_preset(explicit):
+        return explicit
+    inferred = infer_preset_id_from_options(provider, pcfg)
+    if inferred and is_context_size_preset(inferred):
+        return inferred
+    if provider in ("ollama", "ollama-cloud"):
+        if positive_int(pcfg.get("num_ctx")):
+            tokens = positive_int(pcfg.get("num_ctx"))
+        else:
+            tokens = positive_int(pcfg.get("num_ctx_max")) or ollama_effective_context_limit(pcfg)
+    else:
+        tokens = positive_int(pcfg.get("context_window")) or provider_model_context_capacity(provider, pcfg)
+    return context_size_preset_from_tokens(tokens)
+
+
+def context_size_slider_text(provider: str, pcfg: dict[str, Any], lang: str | None = None) -> str:
+    current = context_size_preset_for_options(provider, pcfg)
+    label_by_preset = {
+        "long-context-65k": "65K",
+        "long-context-128k": "128K",
+        "long-context-256k": "256K",
+        "long-context-300k": "300K",
+        "long-context-512k": "512K",
+        "million-context-1m": "1M",
+    }
+    labels: list[str] = []
+    for preset_id in CONTEXT_SIZE_PRESET_IDS:
+        label = label_by_preset[preset_id]
+        labels.append(f"[{label}]" if preset_id == current else label)
+    capacity = provider_model_context_capacity(provider, pcfg)
+    suffix = f"; model max {format_context_tokens(capacity)}" if capacity else ""
+    return "< " + " | ".join(labels) + f" >{suffix}"
+
+
+def apply_context_size_slider_delta_config(provider: str, delta: int) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    current = context_size_preset_for_options(provider, pcfg)
+    try:
+        current_idx = CONTEXT_SIZE_PRESET_IDS.index(current)
+    except ValueError:
+        current_idx = 0
+    next_idx = max(0, min(len(CONTEXT_SIZE_PRESET_IDS) - 1, current_idx + delta))
+    next_preset = CONTEXT_SIZE_PRESET_IDS[next_idx]
+    if next_idx == current_idx:
+        label = llm_preset_text(next_preset, cfg.get("language", "en"))[0]
+        return [f"Context size remains at {label}."]
+    lines = apply_llm_preset_to_provider(provider, pcfg, next_preset, cfg.get("language", "en"))
+    save_config(cfg)
+    clear_model_cache()
+    label = llm_preset_text(next_preset, cfg.get("language", "en"))[0]
+    return [f"Context size set to {label}."] + lines
+
+
 def runtime_llm_status_lines(provider: str, pcfg: dict[str, Any]) -> list[str]:
     cfg = load_config()
     lang = cfg.get("language", "en")
@@ -22171,14 +22271,17 @@ def runtime_llm_preset_list_lines(provider: str, pcfg: dict[str, Any]) -> list[s
     applied = applied_preset_id(provider, pcfg)
     lines = runtime_llm_status_lines(provider, pcfg)
     lines.append("")
+    lines.append(f"Context size: {context_size_slider_text(provider, pcfg, lang)}")
+    lines.append("Context arguments: 65k, 128k, 256k, 300k, 512k, 1m")
+    lines.append("")
     lines.append("Available live presets:")
-    for preset_id in LLM_PRESETS:
+    for preset_id in runtime_slash_llm_preset_ids():
         label, description = llm_preset_text(preset_id, lang)
         mark = "*" if preset_id == applied else " "
         command_name = llm_preset_command_name(preset_id)
         lines.append(f"{mark} /{command_name}  {preset_id} — {label}: {description}")
     lines.append("  /llm-restore  restore captured original options")
-    lines.append("  /llm-options <preset-id|status|list|restore>")
+    lines.append("  /llm-options <preset-id|65k|128k|256k|300k|512k|1m|status|list|restore>")
     return lines
 
 
@@ -22194,6 +22297,12 @@ LLM_OPTION_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "ko": "처음엔 여기부터 설정하세요. 선택한 모델의 컨텍스트 창을 claude-any가 얼마나 사용할지 고릅니다. 클수록 파일/히스토리를 더 많이 읽지만 느리고 provider 한도를 더 씁니다.",
         "ja": "まずここから設定します。選択モデルのコンテキスト窓をclaude-anyがどれだけ使うかを選びます。大きいほど多くのファイル/履歴を読めますが、遅くなりprovider枠を使います。",
         "zh": "先从这里设置：选择 claude-any 可使用所选模型多少上下文窗口。越大可读更多文件/历史，但更慢并消耗 provider 配额。",
+    },
+    "context_size_preset": {
+        "en": "Use Left/Right on this row to change the context-size preset without opening a long preset list.",
+        "ko": "이 줄에서 Left/Right 키로 컨텍스트 크기 프리셋을 바꿉니다. 긴 프리셋 목록을 열 필요가 없습니다.",
+        "ja": "この行で Left/Right を使い、長いプリセット一覧を開かずにコンテキストサイズを変更します。",
+        "zh": "在这一行用 Left/Right 调整上下文大小预设，无需打开很长的预设列表。",
     },
     "num_ctx": {
         "en": "Ollama context window (num_ctx). Use 'auto' to size per-request between min/max, or a fixed integer like 65536.",
@@ -22472,6 +22581,7 @@ def llm_option_panel_rows(provider: str, pcfg: dict[str, Any], lang: str | None 
         values.append(key)
 
     add(ui_text("context_setup", lang), "context_setup", context_setting_status(provider, pcfg))
+    add("Context size", "context_size_preset", context_size_slider_text(provider, pcfg, lang))
     add(ui_text("apply_preset", lang), "preset", llm_preset_text(applied_preset_id(provider, pcfg), lang)[0])
     add(ui_text("timeout_preset", lang), "timeout_profile", timeout_profile_status(pcfg, lang))
     add("Router debug external", "router_debug_external_access", "on" if router_debug_external_access_enabled() else "off")
@@ -25451,7 +25561,7 @@ def render_prelaunch_screen(
         for line in checks[:2]:
             add("  " + line, "1;38;5;208")
     add("")
-    help_text = "Up/Down moves. Enter selects. Esc/Left closes submenu. q quits. Actions expand in place."
+    help_text = "Up/Down moves. Left/Right adjusts sliders. Enter selects. Esc closes submenu. q quits."
     add(help_text, "2")
     rendered = "\n".join(screen) + "\n"
     if sys.stdout.isatty():
@@ -25906,6 +26016,22 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         panel_idx = (panel_idx + 1) % max(1, len(panel_rows))
                     panel_last_idx[panel_name] = panel_idx
                     continue
+                selected_value = panel_values[panel_idx] if panel_idx < len(panel_values) else ""
+                if panel == "options" and selected_value == "context_size_preset" and key in ("left", "right", "h", "l"):
+                    try:
+                        cfg = load_config()
+                        provider, pcfg = get_current_provider(cfg)
+                        messages = apply_context_size_slider_delta_config(provider, -1 if key in ("left", "h") else 1)
+                    except Exception as exc:
+                        messages = [f"Context size update failed: {type(exc).__name__}: {exc}"]
+                    refresh_checks()
+                    cfg = load_config()
+                    provider, pcfg = get_current_provider(cfg)
+                    old_idx = panel_idx
+                    panel_rows, panel_values = llm_option_panel_rows(provider, pcfg, cfg.get("language", "en"))
+                    panel_idx = max(0, min(old_idx, len(panel_rows) - 1))
+                    panel_last_idx["options"] = panel_idx
+                    continue
                 if key in ("esc", "left", "q"):
                     close_panel()
                     continue
@@ -26163,6 +26289,8 @@ def portable_prelaunch_menu(passthrough: list[str] | None = None) -> int:
                         close_panel()
                     elif value == "context_setup":
                         open_panel("context")
+                    elif value == "context_size_preset":
+                        messages = ["Use Left/Right on this row to change the context-size preset."]
                     elif value == "preset":
                         open_panel("preset")
                     elif value == "timeout_profile":

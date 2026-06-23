@@ -235,17 +235,19 @@ class VllmProviderTests(unittest.TestCase):
         self.assertEqual("long-context-512k", pcfg["llm_preset"])
         self.assertTrue(any("Long context 512K" in line for line in lines))
 
-    def test_long_context_128k_preset_is_visible_even_when_capacity_lower(self):
+    def test_context_size_slider_shows_current_size_when_capacity_lower(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
         pcfg["max_model_len"] = 65536
+        pcfg["context_window"] = 131072
+        pcfg["llm_preset"] = "long-context-128k"
 
-        rows, values = claude_any.llm_preset_panel_rows("vllm", pcfg, "en")
+        rows, values = claude_any.llm_option_panel_rows("vllm", pcfg, "en")
 
-        self.assertIn("long-context-128k", values)
-        row = rows[values.index("long-context-128k")]
-        self.assertIn("Long context 128K", row)
-        self.assertIn("requires 128K", row)
-        self.assertIn("server", row)
+        self.assertIn("context_size_preset", values)
+        row = rows[values.index("context_size_preset")]
+        self.assertIn("[128K]", row)
+        slider = claude_any.context_size_slider_text("vllm", pcfg, "en")
+        self.assertIn("model max 64K", slider)
 
     def test_stored_preset_status_is_preserved_even_when_capacity_lower(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
