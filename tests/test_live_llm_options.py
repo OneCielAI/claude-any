@@ -70,9 +70,10 @@ class LiveLlmOptionsTests(unittest.TestCase):
             lines, changed = claude_any.handle_live_llm_options_action("list")
 
         self.assertFalse(changed)
-        self.assertTrue(any("Context size:" in line and "[1M]" in line for line in lines))
-        self.assertTrue(any("Context arguments:" in line and "300k" in line for line in lines))
-        self.assertFalse(any("/llm-long-context-" in line for line in lines))
+        self.assertTrue(any("/llm-long-context-128k" in line for line in lines))
+        self.assertTrue(any("/llm-long-context-256k" in line for line in lines))
+        self.assertTrue(any("/llm-long-context-300k" in line for line in lines))
+        self.assertTrue(any("/llm-long-context-512k" in line for line in lines))
         self.assertTrue(any("Restore available: yes" in line for line in lines))
 
     def test_anthropic_routed_live_preset_does_not_force_output_tokens(self):
@@ -97,43 +98,16 @@ class LiveLlmOptionsTests(unittest.TestCase):
     def test_slash_command_install_adds_keyboard_selectable_llm_presets(self):
         with tempfile.TemporaryDirectory() as td:
             commands_dir = Path(td)
-            (commands_dir / "llm-long-context-300k.md").write_text(
-                "CLAUDE_ANY_LIVE_LLM_OPTIONS\nValue: long-context-300k\n",
-                encoding="utf-8",
-            )
             with mock.patch.object(claude_any, "CLAUDE_COMMANDS_DIR", commands_dir):
                 claude_any.install_claude_any_slash_commands(include_advisor=False)
 
             self.assertTrue((commands_dir / "llm-options.md").exists())
             self.assertTrue((commands_dir / "llm-restore.md").exists())
-            self.assertFalse((commands_dir / "llm-long-context-128k.md").exists())
-            self.assertFalse((commands_dir / "llm-long-context-256k.md").exists())
-            self.assertFalse((commands_dir / "llm-long-context-300k.md").exists())
-            self.assertFalse((commands_dir / "llm-long-context-512k.md").exists())
+            self.assertTrue((commands_dir / "llm-long-context-128k.md").exists())
+            self.assertTrue((commands_dir / "llm-long-context-256k.md").exists())
+            self.assertTrue((commands_dir / "llm-long-context-300k.md").exists())
+            self.assertTrue((commands_dir / "llm-long-context-512k.md").exists())
             self.assertIn("CLAUDE_ANY_LIVE_LLM_OPTIONS", (commands_dir / "llm-balanced.md").read_text(encoding="utf-8"))
-
-    def test_context_size_slider_delta_applies_adjacent_preset(self):
-        cfg = {
-            "language": "en",
-            "current_provider": "opencode",
-            "providers": {
-                "opencode": {
-                    "current_model": "deepseek-v4-flash-free",
-                    "context_window": 262144,
-                    "context_reserve_tokens": 8192,
-                    "max_output_tokens": 8192,
-                    "request_timeout_ms": 300000,
-                }
-            },
-        }
-        patches = self._with_config(cfg)
-        with patches[0], patches[1], patches[2]:
-            lines = claude_any.apply_context_size_slider_delta_config("opencode", 1)
-
-        pcfg = cfg["providers"]["opencode"]
-        self.assertEqual("long-context-300k", pcfg["llm_preset"])
-        self.assertEqual(307200, pcfg["context_window"])
-        self.assertTrue(any("Context size set to Long context 300K" in line for line in lines))
 
     def test_native_mode_removes_owned_llm_slash_commands(self):
         with tempfile.TemporaryDirectory() as td:
