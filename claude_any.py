@@ -23678,7 +23678,11 @@ def claude_code_auto_compact_window(provider: str, pcfg: dict[str, Any]) -> int 
 def claude_code_context_model_alias(provider: str, pcfg: dict[str, Any], model: str) -> str:
     model = strip_claude_context_suffix(model)
     limit = context_limit_for_status(provider, pcfg)
-    if limit and limit >= 1000000 and "[1m]" not in model.lower():
+    # Claude Code treats custom model aliases without an explicit long-context
+    # hint as roughly 200K-context models. For routed/non-native providers the
+    # router still enforces the real provider window, but Claude Code needs the
+    # long-context hint to avoid compacting at ~180K for 256K/300K/512K presets.
+    if limit and limit > 200000 and "[1m]" not in model.lower():
         return f"{model}[1m]"
     return model
 

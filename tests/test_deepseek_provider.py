@@ -48,6 +48,18 @@ class DeepSeekProviderTests(unittest.TestCase):
         self.assertEqual(expected_model, env["CLAUDE_CODE_SUBAGENT_MODEL"])
         self.assertEqual("8192", env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"])
 
+    def test_long_context_deepseek_alias_marks_claude_code_as_one_million_context(self):
+        cfg = self.deepseek_cfg(
+            api_key="sk-deepseek-test",
+            current_model="deepseek-v4-flash",
+            context_window=524288,
+        )
+
+        env = claude_any.env_vars(cfg)
+
+        self.assertEqual("claude-any-deepseek-deepseek-v4-flash[1m]", env["ANTHROPIC_MODEL"])
+        self.assertEqual("524288", env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
+
     def test_launch_removes_inherited_anthropic_api_key_for_deepseek(self):
         cfg = self.deepseek_cfg(api_key="sk-deepseek-test")
         with ExitStack() as stack:

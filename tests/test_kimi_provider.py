@@ -116,6 +116,7 @@ class KimiProviderTests(unittest.TestCase):
         self.assertEqual(claude_any.ROUTER_BASE, env["ANTHROPIC_BASE_URL"])
         self.assertEqual("sk-kimi-test", env["ANTHROPIC_AUTH_TOKEN"])
         self.assertNotIn("ANTHROPIC_API_KEY", env)
+        self.assertEqual("claude-any-kimi-kimi-for-coding[1m]", env["ANTHROPIC_MODEL"])
         self.assertEqual("8192", env["CLAUDE_CODE_MAX_OUTPUT_TOKENS"])
         self.assertEqual("262144", env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"])
         self.assertIn("thinking", env["ANTHROPIC_CUSTOM_MODEL_OPTION_SUPPORTED_CAPABILITIES"])
