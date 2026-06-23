@@ -3780,16 +3780,28 @@ Do not run tools, shell commands, file searches, config scans, or environment ch
 This session bypasses the claude-any router. Launch a non-native provider or enable Anthropic routed mode to use /router-debug.
 """
 
-LLM_OPTIONS_SLASH_COMMAND = """---
-description: Show or change claude-any live LLM options
-argument-hint: [status|list|restore|preset-id]
+LLM_SLIDER_SLASH_COMMAND = """---
+description: Move/select claude-any live LLM preset slider
+argument-hint: [left|right|status|list|restore|preset-id]
 ---
 
 CLAUDE_ANY_LIVE_LLM_OPTIONS
 
 Value: $ARGUMENTS
 
-Show or change the live claude-any LLM preset for this routed session. With no argument, show status and available presets. Use `restore` to return to the options captured before the first live preset change.
+Use one compact claude-any live LLM preset control. With no argument, show the current slider. Use `left` or `right` to move one preset, `restore` to return to captured options, or a preset id/alias such as `coding`, `300k`, `512k`, or `1m`.
+"""
+
+LLM_OPTIONS_SLASH_COMMAND = """---
+description: Show or change claude-any live LLM options
+argument-hint: [left|right|status|list|restore|preset-id]
+---
+
+CLAUDE_ANY_LIVE_LLM_OPTIONS
+
+Value: $ARGUMENTS
+
+Show or change the live claude-any LLM preset for this routed session. With no argument, show status and the compact preset slider. Use `left` or `right` to move one preset, `restore` to return to captured options, or a preset id/alias such as `coding`, `300k`, `512k`, or `1m`.
 """
 
 LLM_RESTORE_SLASH_COMMAND = """---
@@ -3861,16 +3873,23 @@ def install_claude_any_slash_commands(include_advisor: bool = True) -> None:
         CLAUDE_COMMANDS_DIR.mkdir(parents=True, exist_ok=True)
         commands = {
             "router-debug.md": ROUTER_DEBUG_SLASH_COMMAND,
+            "llm.md": LLM_SLIDER_SLASH_COMMAND,
             "llm-options.md": LLM_OPTIONS_SLASH_COMMAND,
             "llm-restore.md": LLM_RESTORE_SLASH_COMMAND,
             "channel-clear.md": CHANNEL_CLEAR_SLASH_COMMAND,
         }
-        for preset_id in LLM_PRESETS:
-            commands[f"{llm_preset_command_name(preset_id)}.md"] = llm_preset_slash_command(preset_id)
         if include_advisor:
             commands["advisor.md"] = ADVISOR_SLASH_COMMAND
         else:
             remove_claude_any_advisor_command()
+        for path in CLAUDE_COMMANDS_DIR.glob("llm-*.md"):
+            if path.name in commands:
+                continue
+            if command_file_is_claude_any_owned(path, CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS):
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
         stale_channel = CLAUDE_COMMANDS_DIR / "channel.md"
         if stale_channel.exists():
             try:
@@ -3912,6 +3931,7 @@ def disable_claude_any_slash_commands_for_native() -> None:
         commands = {
             "advisor.md": CLAUDE_ANY_ADVISOR_COMMAND_MARKERS,
             "router-debug.md": CLAUDE_ANY_ROUTER_DEBUG_COMMAND_MARKERS,
+            "llm.md": CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS,
             "llm-options.md": CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS,
             "llm-restore.md": CLAUDE_ANY_LLM_OPTIONS_COMMAND_MARKERS,
             "channel-clear.md": CLAUDE_ANY_CHANNEL_CLEAR_COMMAND_MARKERS,
@@ -14549,6 +14569,16 @@ def handle_live_llm_options_action(action: str = "status", preset: str = "") -> 
         return runtime_llm_status_lines(provider, pcfg), False
     if normalized in {"list", "presets", "preset", "help", "options", "menu", "select"}:
         return runtime_llm_preset_list_lines(provider, pcfg), False
+    if normalized in {"left", "prev", "previous", "backward", "back", "decrease", "minus"}:
+        lines = apply_runtime_llm_slider_delta_config(provider, -1)
+        cfg_after = load_config()
+        _provider_after, pcfg_after = get_current_provider(cfg_after)
+        return lines + ["", "Updated live LLM options. The next model request uses these settings."] + runtime_llm_status_lines(provider, pcfg_after), True
+    if normalized in {"right", "next", "forward", "increase", "plus"}:
+        lines = apply_runtime_llm_slider_delta_config(provider, 1)
+        cfg_after = load_config()
+        _provider_after, pcfg_after = get_current_provider(cfg_after)
+        return lines + ["", "Updated live LLM options. The next model request uses these settings."] + runtime_llm_status_lines(provider, pcfg_after), True
     if normalized in {"restore", "original", "reset", "revert", "undo"}:
         had_snapshot = isinstance(pcfg.get(RUNTIME_LLM_ORIGINAL_KEY), dict)
         lines = restore_runtime_llm_original_options(provider)
@@ -20420,6 +20450,30 @@ LLM_PRESETS: dict[str, tuple[str, str]] = {
 }
 
 
+LLM_SLIDER_LABELS: dict[str, str] = {
+    "balanced": "balanced",
+    "coding": "coding",
+    "fast": "fast",
+    "long-context-65k": "65K",
+    "long-context-128k": "128K",
+    "long-context-256k": "256K",
+    "long-context-300k": "300K",
+    "long-context-512k": "512K",
+    "million-context-1m": "1M",
+    "large-output": "output",
+    "reasoning": "reasoning",
+    "novelist": "novel",
+    "humanities-researcher": "research",
+    "mathematician": "math",
+    "product-architect": "architect",
+    "teacher": "teacher",
+}
+
+
+def llm_slider_preset_ids() -> list[str]:
+    return list(LLM_PRESETS)
+
+
 def llm_preset_command_name(preset_id: str) -> str:
     return "llm-" + re.sub(r"[^a-z0-9]+", "-", str(preset_id or "").lower()).strip("-")
 
@@ -22146,6 +22200,39 @@ def apply_runtime_llm_preset_config(provider: str, preset_id: str) -> list[str]:
     return lines
 
 
+def runtime_llm_slider_line(provider: str, pcfg: dict[str, Any]) -> str:
+    current = applied_preset_id(provider, pcfg)
+    parts: list[str] = []
+    for preset_id in llm_slider_preset_ids():
+        label = LLM_SLIDER_LABELS.get(preset_id, preset_id)
+        parts.append(f"[{label}]" if preset_id == current else label)
+    return "< " + " | ".join(parts) + " >"
+
+
+def apply_runtime_llm_slider_delta_config(provider: str, delta: int) -> list[str]:
+    cfg = load_config()
+    pcfg = cfg["providers"][provider]
+    presets = llm_slider_preset_ids()
+    current = applied_preset_id(provider, pcfg)
+    try:
+        current_idx = presets.index(current)
+    except ValueError:
+        current_idx = 0
+    next_idx = max(0, min(len(presets) - 1, current_idx + delta))
+    next_preset = presets[next_idx]
+    if next_idx == current_idx:
+        label = llm_preset_text(next_preset, cfg.get("language", "en"))[0]
+        return [f"Live LLM preset remains at {label}.", f"Slider: {runtime_llm_slider_line(provider, pcfg)}"]
+    captured = ensure_runtime_llm_original_snapshot(provider, pcfg)
+    lines = apply_llm_preset_to_provider(provider, pcfg, next_preset, cfg.get("language", "en"))
+    if captured:
+        lines.insert(0, "Captured current live LLM options for /llm-restore.")
+    save_config(cfg)
+    clear_model_cache()
+    label = llm_preset_text(next_preset, cfg.get("language", "en"))[0]
+    return [f"Live LLM preset moved to {label}."] + lines + [f"Slider: {runtime_llm_slider_line(provider, pcfg)}"]
+
+
 def runtime_llm_status_lines(provider: str, pcfg: dict[str, Any]) -> list[str]:
     cfg = load_config()
     lang = cfg.get("language", "en")
@@ -22154,6 +22241,7 @@ def runtime_llm_status_lines(provider: str, pcfg: dict[str, Any]) -> list[str]:
         f"Provider: {provider_mode_label(provider, pcfg)}",
         f"Model: {pcfg.get('current_model') or 'unknown'}",
         f"Preset: {applied} ({llm_preset_text(applied, lang)[0]})",
+        f"Slider: {runtime_llm_slider_line(provider, pcfg)}",
         f"Context: {context_setting_status(provider, pcfg)}",
         f"Timeout: {timeout_profile_status(pcfg, lang)}",
     ]
@@ -22171,14 +22259,14 @@ def runtime_llm_preset_list_lines(provider: str, pcfg: dict[str, Any]) -> list[s
     applied = applied_preset_id(provider, pcfg)
     lines = runtime_llm_status_lines(provider, pcfg)
     lines.append("")
-    lines.append("Available live presets:")
-    for preset_id in LLM_PRESETS:
+    lines.append("Use `/llm left` or `/llm right` to move one step, or `/llm <preset-id>` to jump directly.")
+    lines.append("Preset ids:")
+    for preset_id in llm_slider_preset_ids():
         label, description = llm_preset_text(preset_id, lang)
         mark = "*" if preset_id == applied else " "
-        command_name = llm_preset_command_name(preset_id)
-        lines.append(f"{mark} /{command_name}  {preset_id} — {label}: {description}")
+        lines.append(f"{mark} {preset_id} — {label}: {description}")
     lines.append("  /llm-restore  restore captured original options")
-    lines.append("  /llm-options <preset-id|status|list|restore>")
+    lines.append("  /llm <left|right|preset-id|status|list|restore>")
     return lines
 
 
