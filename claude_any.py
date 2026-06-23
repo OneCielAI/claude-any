@@ -3787,7 +3787,8 @@ argument-hint: [left|right|status|list|restore|preset-id]
 
 CLAUDE_ANY_LIVE_LLM_OPTIONS
 
-Value: $ARGUMENTS
+Value: $0
+Arguments: $ARGUMENTS
 
 Use one compact claude-any live LLM preset control. With no argument, show the current slider. Use `left` or `right` to move one preset, `restore` to return to captured options, or a preset id/alias such as `coding`, `300k`, `512k`, or `1m`.
 """
@@ -3799,7 +3800,8 @@ argument-hint: [left|right|status|list|restore|preset-id]
 
 CLAUDE_ANY_LIVE_LLM_OPTIONS
 
-Value: $ARGUMENTS
+Value: $0
+Arguments: $ARGUMENTS
 
 Show or change the live claude-any LLM preset for this routed session. With no argument, show status and the compact preset slider. Use `left` or `right` to move one preset, `restore` to return to captured options, or a preset id/alias such as `coding`, `300k`, `512k`, or `1m`.
 """
@@ -12040,14 +12042,32 @@ def live_llm_options_value_from_body(body: dict[str, Any]) -> str:
     if marker not in text:
         return "status"
     tail = text.split(marker, 1)[1]
+    placeholder_values = {"$0", "${0}", "$ARGUMENTS", "${ARGUMENTS}"}
+    fallback_values: list[str] = []
+    saw_structured_value = False
     for line in tail.splitlines():
         stripped = line.strip()
         if not stripped:
             continue
         if stripped.lower().startswith("value:"):
+            saw_structured_value = True
             value = stripped.split(":", 1)[1].strip()
-            return value or "status"
-    return tail.strip() or "status"
+            if value and value not in placeholder_values:
+                return value
+            continue
+        if stripped.lower().startswith("arguments:"):
+            saw_structured_value = True
+            value = stripped.split(":", 1)[1].strip()
+            if value and value not in placeholder_values:
+                fallback_values.append(value)
+    if fallback_values:
+        return fallback_values[0]
+    if saw_structured_value:
+        return "status"
+    fallback = tail.strip()
+    if not fallback or fallback in placeholder_values:
+        return "status"
+    return fallback
 
 
 def advisor_focus_from_body(body: dict[str, Any]) -> str:

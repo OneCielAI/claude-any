@@ -116,7 +116,61 @@ class LiveLlmOptionsTests(unittest.TestCase):
             self.assertFalse((commands_dir / "llm-long-context-256k.md").exists())
             self.assertFalse((commands_dir / "llm-long-context-300k.md").exists())
             self.assertFalse((commands_dir / "llm-long-context-512k.md").exists())
-            self.assertIn("CLAUDE_ANY_LIVE_LLM_OPTIONS", (commands_dir / "llm.md").read_text(encoding="utf-8"))
+            llm_command = (commands_dir / "llm.md").read_text(encoding="utf-8")
+            self.assertIn("CLAUDE_ANY_LIVE_LLM_OPTIONS", llm_command)
+            self.assertIn("Value: $0", llm_command)
+            self.assertIn("Arguments: $ARGUMENTS", llm_command)
+
+    def test_live_llm_slash_value_uses_arg0(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "CLAUDE_ANY_LIVE_LLM_OPTIONS\n\nValue: right\nArguments: $ARGUMENTS",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        self.assertEqual("right", claude_any.live_llm_options_value_from_body(body))
+
+    def test_live_llm_slash_value_falls_back_to_arguments(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "CLAUDE_ANY_LIVE_LLM_OPTIONS\n\nValue: $0\nArguments: left",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        self.assertEqual("left", claude_any.live_llm_options_value_from_body(body))
+
+    def test_live_llm_slash_value_ignores_unexpanded_placeholders(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "CLAUDE_ANY_LIVE_LLM_OPTIONS\n\nValue: $0\nArguments: $ARGUMENTS",
+                        }
+                    ],
+                }
+            ]
+        }
+
+        self.assertEqual("status", claude_any.live_llm_options_value_from_body(body))
 
     def test_live_llm_slider_right_moves_to_next_preset(self):
         cfg = {
