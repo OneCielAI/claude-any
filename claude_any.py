@@ -11974,11 +11974,19 @@ def _compact_chunk_ranges(count: int, chunks: int) -> list[tuple[int, int]]:
     return ranges
 
 
-def context_guard_chunk_count(omitted_messages: list[dict[str, Any]]) -> int:
+def context_guard_chunk_count(omitted_messages: list[dict[str, Any]], budget_tokens: int | None = None) -> int:
     if not omitted_messages:
         return 0
     omitted_tokens = sum(estimate_tokens(message) for message in omitted_messages)
-    return max(1, min(12, (omitted_tokens + 32767) // 32768))
+    target_chunk_tokens = 32768
+    budget = positive_int(budget_tokens)
+    if budget:
+        # This is a deterministic summary of omitted history, not a set of
+        # independent compaction jobs. Larger provider budgets can preserve a
+        # larger recent tail, so the omitted-history summary should avoid
+        # fragmenting into many tiny chunks.
+        target_chunk_tokens = max(target_chunk_tokens, min(262144, max(1, budget // 4)))
+    return max(1, min(12, (omitted_tokens + target_chunk_tokens - 1) // target_chunk_tokens))
 
 
 def build_chunked_context_guard_summary(
@@ -11996,7 +12004,7 @@ def build_chunked_context_guard_summary(
         )
     max_summary_tokens = max(1024, min(24576, max(1, budget_tokens) // 10))
     max_summary_chars = max_summary_tokens * 4
-    chunk_count = context_guard_chunk_count(omitted_messages)
+    chunk_count = context_guard_chunk_count(omitted_messages, budget_tokens)
     lines: list[str] = [
         (
             f"[claude-any context guard: compacted {omitted_count} older messages, approx "
@@ -13746,7 +13754,7 @@ def compact_ollama_messages_for_budget(
         "WARN",
         f"compacted ollama payload messages {len(messages)}->{len(compacted)} tokens {initial_tokens}->{estimate_tokens({'messages': compacted, 'tools': tools})} budget={budget_tokens}",
     )
-    chunk_count = context_guard_chunk_count(omitted_messages)
+    chunk_count = context_guard_chunk_count(omitted_messages, budget_tokens)
     if chunk_count and (provider or model):
         write_context_compact_activity(
             provider or "provider",
@@ -13859,7 +13867,7 @@ def compact_anthropic_body_for_budget(
         "WARN",
         f"compacted anthropic payload messages {len(typed_messages)}->{len(out.get('messages') or [])} tokens {initial_tokens}->{final_tokens} budget={budget_tokens}",
     )
-    chunk_count = context_guard_chunk_count(omitted)
+    chunk_count = context_guard_chunk_count(omitted, budget_tokens)
     if chunk_count and (provider or model):
         write_context_compact_activity(
             provider or "provider",
