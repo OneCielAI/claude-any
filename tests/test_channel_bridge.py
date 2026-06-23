@@ -396,8 +396,9 @@ class ChannelBridgeTests(unittest.TestCase):
             root = Path(td)
             path = root / "chat-messages.jsonl"
             cursor_path = root / "channel-llm-cursor.json"
+            old_time = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time() - 3600))
             path.write_text(
-                "\n".join(json.dumps({"id": item_id, "message": f"old-{item_id}"}) for item_id in (1, 2, 3)) + "\n",
+                "\n".join(json.dumps({"id": item_id, "time": old_time, "message": f"old-{item_id}"}) for item_id in (1, 2, 3)) + "\n",
                 encoding="utf-8",
             )
             cursor_path.write_text(json.dumps({"last_id": 1}), encoding="utf-8")
@@ -2022,6 +2023,62 @@ class ChannelBridgeTests(unittest.TestCase):
                     mock.patch.object(claude_any, "_chat_init_next_id", return_value=10),
                 ):
                     self.assertEqual(3, claude_any.ensure_channel_llm_delivery_cursor_initialized())
+            finally:
+                claude_any._CHANNEL_LLM_CURSOR_LAST_ID = original_cursor
+
+    def test_prepare_channel_llm_delivery_for_launch_preserves_recent_messages(self):
+        with tempfile.TemporaryDirectory(prefix="ca-channel-launch-") as td:
+            root = Path(td)
+            chat_path = root / "chat-messages.jsonl"
+            cursor_path = root / "channel-llm-cursor.json"
+            guard_path = root / "channel-llm-launch-guard.json"
+            now = time.time()
+            old_time = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 3600))
+            recent_time = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now - 30))
+            chat_path.write_text(
+                json.dumps({"id": 10, "time": old_time, "channel": "room", "message": "old"}, ensure_ascii=False) + "\n"
+                + json.dumps({"id": 11, "time": recent_time, "channel": "room", "message": "recent"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            cursor_path.write_text('{"last_id":9}\n', encoding="utf-8")
+            original_cursor = claude_any._CHANNEL_LLM_CURSOR_LAST_ID
+            try:
+                claude_any._CHANNEL_LLM_CURSOR_LAST_ID = None
+                with (
+                    mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", chat_path),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_CURSOR_PATH", cursor_path),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_LAUNCH_GUARD_PATH", guard_path),
+                    mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_LAUNCH_RECENT_SECONDS": "600"}, clear=False),
+                ):
+                    self.assertEqual(10, claude_any.prepare_channel_llm_delivery_for_launch())
+                self.assertEqual({"last_id": 10}, json.loads(cursor_path.read_text(encoding="utf-8")))
+                self.assertEqual(10, json.loads(guard_path.read_text(encoding="utf-8"))["max_existing_id"])
+            finally:
+                claude_any._CHANNEL_LLM_CURSOR_LAST_ID = original_cursor
+
+    def test_prepare_channel_llm_delivery_for_launch_can_fast_forward_all_when_recent_disabled(self):
+        with tempfile.TemporaryDirectory(prefix="ca-channel-launch-") as td:
+            root = Path(td)
+            chat_path = root / "chat-messages.jsonl"
+            cursor_path = root / "channel-llm-cursor.json"
+            guard_path = root / "channel-llm-launch-guard.json"
+            recent_time = time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(time.time()))
+            chat_path.write_text(
+                json.dumps({"id": 12, "time": recent_time, "channel": "room", "message": "recent"}, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            cursor_path.write_text('{"last_id":2}\n', encoding="utf-8")
+            original_cursor = claude_any._CHANNEL_LLM_CURSOR_LAST_ID
+            try:
+                claude_any._CHANNEL_LLM_CURSOR_LAST_ID = None
+                with (
+                    mock.patch.object(claude_any, "CHAT_MESSAGES_PATH", chat_path),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_CURSOR_PATH", cursor_path),
+                    mock.patch.object(claude_any, "CHANNEL_LLM_LAUNCH_GUARD_PATH", guard_path),
+                    mock.patch.dict(os.environ, {"CLAUDE_ANY_CHANNEL_LAUNCH_RECENT_SECONDS": "0"}, clear=False),
+                ):
+                    self.assertEqual(12, claude_any.prepare_channel_llm_delivery_for_launch())
+                self.assertEqual({"last_id": 12}, json.loads(cursor_path.read_text(encoding="utf-8")))
             finally:
                 claude_any._CHANNEL_LLM_CURSOR_LAST_ID = original_cursor
 
