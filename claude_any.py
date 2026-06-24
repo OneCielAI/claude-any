@@ -31497,14 +31497,12 @@ def run_mcp_streamable_http_proxy(server_name: str, server_config_path: Path) ->
                 if _mcp_stream_read_timeout_error(exc):
                     with session_cond:
                         initialized_seen = initialized_payload is not None
-                        if session_id == worker_session:
-                            if initialized_seen:
-                                session_id = None
-                            session_cond.notify_all()
-                    last_event_id = None
+                        session_cond.notify_all()
                     router_log(
                         "WARN",
-                        f"mcp_http_proxy_stream_timeout_reinitialize server={server_name} event={event_name} initialized={initialized_seen} error={type(exc).__name__}: {exc}",
+                        f"mcp_http_proxy_stream_timeout_reconnect server={server_name} event={event_name} "
+                        f"initialized={initialized_seen} session={worker_session or '-'} "
+                        f"last_event_id={last_event_id or '-'} error={type(exc).__name__}: {exc}",
                     )
                     continue
                 router_log("WARN", f"mcp_http_proxy_stream_reconnect server={server_name} event={event_name} error={type(exc).__name__}: {exc}")

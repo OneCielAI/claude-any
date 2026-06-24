@@ -5585,6 +5585,138 @@ class ChannelBridgeTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_mcp_proxy_streamable_http_quiet_timeout_resumes_same_session(self):
+        lock = threading.Lock()
+        state = {"inits": 0}
+        seen_gets: list[dict[str, str | None]] = []
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                return
+
+            def do_POST(self):
+                length = int(self.headers.get("Content-Length") or "0")
+                payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
+                if payload.get("method") == "initialize":
+                    with lock:
+                        state["inits"] += 1
+                    result = {
+                        "protocolVersion": claude_any.MCP_STREAMABLE_HTTP_PROTOCOL_VERSION,
+                        "capabilities": {"tools": {}},
+                        "serverInfo": {"name": "streamable-test", "version": "1"},
+                    }
+                    data = json.dumps({"jsonrpc": "2.0", "id": payload.get("id"), "result": result}).encode("utf-8")
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Mcp-Session-Id", "sess-quiet")
+                    self.send_header("Content-Length", str(len(data)))
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+                data = json.dumps({"jsonrpc": "2.0", "id": payload.get("id"), "result": {}}).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                incoming_last_event_id = self.headers.get("Last-Event-ID")
+                with lock:
+                    seen_gets.append(
+                        {
+                            "session": self.headers.get("Mcp-Session-Id"),
+                            "last_event_id": incoming_last_event_id,
+                        }
+                    )
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                if incoming_last_event_id != "first-event":
+                    self.wfile.write(
+                        b'id: first-event\n'
+                        b'event: message\n'
+                        b'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"content":"first quiet event","room_id":"r1"}}\n\n'
+                    )
+                    self.wfile.flush()
+                    time.sleep(7.0)
+                    return
+                self.wfile.write(
+                    b'event: message\n'
+                    b'data: {"jsonrpc":"2.0","method":"notifications/message","params":{"content":"resumed after quiet timeout","room_id":"r1"}}\n\n'
+                )
+                self.wfile.flush()
+
+        def frame(payload: dict[str, object]) -> bytes:
+            body = json.dumps(payload).encode("utf-8")
+            return b"Content-Length: " + str(len(body)).encode("ascii") + b"\r\n\r\n" + body
+
+        with tempfile.TemporaryDirectory(prefix="ca-mcp-http-quiet-timeout-") as td:
+            root = Path(td)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            try:
+                config = root / "server.json"
+                config.write_text(
+                    json.dumps(
+                        {
+                            "type": "http",
+                            "url": f"http://127.0.0.1:{server.server_address[1]}/mcp",
+                            "notification_read_timeout_seconds": 5,
+                            "retry_seconds": 1,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                env = os.environ.copy()
+                env["CLAUDE_ANY_CONFIG_DIR"] = str(root / "config")
+                proc = subprocess.Popen(
+                    [
+                        sys.executable,
+                        str(Path(claude_any.__file__).resolve()),
+                        "mcp-proxy",
+                        "--server-name",
+                        "quiet-http",
+                        "--server-config",
+                        str(config),
+                    ],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=env,
+                )
+                assert proc.stdin is not None and proc.stdout is not None and proc.stderr is not None
+                proc.stdin.write(frame({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}))
+                proc.stdin.write(frame({"jsonrpc": "2.0", "method": "notifications/initialized", "params": {}}))
+                proc.stdin.flush()
+                chat_log = root / "config" / "chat-messages.jsonl"
+                deadline = time.time() + 9.0
+                while time.time() < deadline:
+                    if chat_log.exists() and "resumed after quiet timeout" in chat_log.read_text(encoding="utf-8"):
+                        break
+                    time.sleep(0.05)
+                proc.stdin.close()
+                stderr = proc.stderr.read()
+                proc.wait(timeout=10)
+                proc.stdout.close()
+                proc.stderr.close()
+                self.assertEqual(0, proc.returncode, stderr.decode("utf-8", errors="replace"))
+                self.assertTrue(chat_log.exists())
+                self.assertIn("resumed after quiet timeout", chat_log.read_text(encoding="utf-8"))
+                with lock:
+                    inits = state["inits"]
+                    gets = list(seen_gets)
+                self.assertEqual(1, inits)
+                self.assertGreaterEqual(len(gets), 2)
+                self.assertEqual("sess-quiet", gets[0]["session"])
+                self.assertTrue(
+                    any(item["session"] == "sess-quiet" and item["last_event_id"] == "first-event" for item in gets[1:]),
+                    f"proxy did not resume quiet timeout with Last-Event-ID: {gets}",
+                )
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_channel_mcp_config_points_to_router_sse(self):
         with tempfile.TemporaryDirectory() as td:
             path = Path(td) / "channel-mcp.json"
