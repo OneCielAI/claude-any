@@ -11905,19 +11905,9 @@ def is_claude_code_compact_request(body: dict[str, Any]) -> bool:
     """
     if not isinstance(body, dict):
         return False
-    parts: list[str] = []
-    system_text = anthropic_content_to_text(body.get("system")).strip()
-    if system_text:
-        parts.append(system_text)
-    for message in body.get("messages") or []:
-        if not isinstance(message, dict):
-            continue
-        text = anthropic_content_to_text(message.get("content")).strip()
-        if text:
-            parts.append(text)
-    if not parts:
+    text = latest_user_text(body).lower()
+    if not text:
         return False
-    text = "\n".join(parts).lower()
     if "<command-name>/compact</command-name>" in text:
         return True
     if "<command-message>compact</command-message>" in text and "<command-name>" in text:

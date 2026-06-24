@@ -2011,6 +2011,27 @@ class ChannelBridgeTests(unittest.TestCase):
         log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
         self.assertTrue(any("compact_request" in item for item in log_messages))
 
+    def test_compact_request_text_only_ignores_old_compact_history(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<command-name>/compact</command-name>\n<command-message>compact</command-message>",
+                },
+                {"role": "assistant", "content": "Compacted summary was created."},
+                {"role": "user", "content": "continue current work"},
+            ],
+            "tools": [{"name": "mcp__ai_net__get_messages", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"},
+            "stream": True,
+        }
+
+        out = claude_any.compact_request_text_only_body(body)
+
+        self.assertIs(out, body)
+        self.assertIn("tools", out)
+        self.assertIn("tool_choice", out)
+
     def test_body_without_claude_any_internal_metadata_strips_private_keys(self):
         body = {
             "model": "claude-any-test",
