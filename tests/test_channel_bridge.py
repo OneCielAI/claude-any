@@ -1964,6 +1964,53 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertTrue(any("channel_llm_injected" in item and "message_ids=3" in item for item in log_messages))
         self.assertTrue(any("channel_llm_inject_skipped" in item and "transport_connected" in item for item in log_messages))
 
+    def test_compact_request_text_only_body_removes_tools(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<command-name>/compact</command-name>\n<command-message>compact</command-message>",
+                }
+            ],
+            "tools": [{"name": "mcp__ai_net__get_messages", "input_schema": {"type": "object"}}],
+            "tool_choice": {"type": "auto"},
+            "parallel_tool_calls": True,
+            "stream": True,
+        }
+        with mock.patch.object(claude_any, "router_log") as router_log:
+            out = claude_any.compact_request_text_only_body(body)
+
+        self.assertIsNot(out, body)
+        self.assertNotIn("tools", out)
+        self.assertNotIn("tool_choice", out)
+        self.assertNotIn("parallel_tool_calls", out)
+        self.assertIn("compacting the conversation", claude_any.anthropic_content_to_text(out["system"]))
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("compact_request_text_only" in item for item in log_messages))
+
+    def test_body_with_pending_channel_messages_skips_compact_request(self):
+        body = {
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "<command-name>/compact</command-name>\n<command-message>compact</command-message>",
+                }
+            ],
+            "stream": True,
+        }
+        with (
+            mock.patch.object(claude_any, "load_config") as load_config,
+            mock.patch.object(claude_any, "read_chat_messages") as read_chat_messages,
+            mock.patch.object(claude_any, "router_log") as router_log,
+        ):
+            out = claude_any.body_with_pending_channel_messages(body)
+
+        self.assertIs(out, body)
+        load_config.assert_not_called()
+        read_chat_messages.assert_not_called()
+        log_messages = [str(call.args[1]) for call in router_log.call_args_list if len(call.args) > 1]
+        self.assertTrue(any("compact_request" in item for item in log_messages))
+
     def test_body_without_claude_any_internal_metadata_strips_private_keys(self):
         body = {
             "model": "claude-any-test",

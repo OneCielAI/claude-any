@@ -11890,6 +11890,62 @@ def anthropic_content_to_text(content: Any) -> str:
     return "\n".join(part for part in parts if part)
 
 
+COMPACT_TEXT_ONLY_SYSTEM_PROMPT = (
+    "Claude Code is compacting the conversation. Return only the requested summary text. "
+    "Do not call tools, browse, inspect files, or request external data during compaction."
+)
+
+
+def is_claude_code_compact_request(body: dict[str, Any]) -> bool:
+    """Detect Claude Code's internal /compact summarization request.
+
+    Compact requests must produce text. If an upstream model sees the normal
+    tool list and chooses a tool instead, Claude Code reports an empty compact
+    summary even though the router returned HTTP 200.
+    """
+    if not isinstance(body, dict):
+        return False
+    parts: list[str] = []
+    system_text = anthropic_content_to_text(body.get("system")).strip()
+    if system_text:
+        parts.append(system_text)
+    for message in body.get("messages") or []:
+        if not isinstance(message, dict):
+            continue
+        text = anthropic_content_to_text(message.get("content")).strip()
+        if text:
+            parts.append(text)
+    if not parts:
+        return False
+    text = "\n".join(parts).lower()
+    if "<command-name>/compact</command-name>" in text:
+        return True
+    if "<command-message>compact</command-message>" in text and "<command-name>" in text:
+        return True
+    if "create a detailed summary of the conversation" in text and "compact" in text:
+        return True
+    if "summarize the conversation so far" in text and "compact" in text:
+        return True
+    return False
+
+
+def compact_request_text_only_body(body: dict[str, Any]) -> dict[str, Any]:
+    if not is_claude_code_compact_request(body):
+        return body
+    out = dict(body)
+    removed_tools = bool(out.pop("tools", None))
+    removed_tool_choice = bool(out.pop("tool_choice", None))
+    out.pop("parallel_tool_calls", None)
+    out["system"] = append_anthropic_system_texts(out.get("system"), [COMPACT_TEXT_ONLY_SYSTEM_PROMPT])
+    if removed_tools or removed_tool_choice:
+        router_log(
+            "INFO",
+            "compact_request_text_only removed_tools=%s removed_tool_choice=%s"
+            % (str(removed_tools).lower(), str(removed_tool_choice).lower()),
+        )
+    return out
+
+
 PROMPT_TOOL_INPUT_FIELD_LIMIT = 1200
 PROMPT_TOOL_RESULT_LIMIT = 12000
 PROMPT_MESSAGE_TEXT_LIMIT = 20000
@@ -17417,6 +17473,7 @@ class RouterHandler(BaseHTTPRequestHandler):
             },
         )
         dump_request_for_trace(provider, path, body)
+        body = compact_request_text_only_body(body)
         if maybe_handle_plan_mode_tool_choice(self, provider, pcfg, body):
             EVENT_BUS.publish(level="info", category="plan_mode.short_circuit", message="plan mode tool choice handled locally", request_id=request_id, provider=provider, model=str(body.get("model") or ""))
             return
@@ -29627,6 +29684,9 @@ def body_with_pending_channel_messages(body: dict[str, Any]) -> dict[str, Any]:
     global _CHANNEL_LLM_CURSOR_LAST_ID
     metadata = body.get("metadata") if isinstance(body.get("metadata"), dict) else {}
     if body.get("claude_any_channel_direct") or metadata.get("claude_any_channel_direct"):
+        return body
+    if is_claude_code_compact_request(body):
+        router_log("INFO", "channel_llm_inject_skipped reason=compact_request")
         return body
     if plan_mode_active(body):
         router_log("INFO", "channel_llm_inject_skipped reason=plan_mode_active")
