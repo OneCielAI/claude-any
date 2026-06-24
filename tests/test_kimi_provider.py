@@ -107,6 +107,34 @@ class KimiProviderTests(unittest.TestCase):
         self.assertEqual(600000, pcfg["request_timeout_ms"])
         self.assertTrue(pcfg["native_compat"])
 
+    def test_migration_updates_stale_128k_kimi_config(self):
+        cfg = self.kimi_cfg(
+            context_window=131072,
+            max_output_tokens=4096,
+            context_reserve_tokens=4096,
+            request_timeout_ms=300000,
+            llm_preset="long-context-128k",
+            native_compat=False,
+            preserve_anthropic_thinking=False,
+            claude_code_supported_capabilities=[],
+            supports_tool_choice=False,
+        )
+        cfg["migrations"] = {}
+
+        claude_any.apply_config_migrations(cfg)
+        pcfg = cfg["providers"]["kimi"]
+
+        self.assertEqual(262144, pcfg["context_window"])
+        self.assertEqual(32768, pcfg["max_output_tokens"])
+        self.assertEqual(32768, pcfg["context_reserve_tokens"])
+        self.assertEqual("long-context-256k", pcfg["llm_preset"])
+        self.assertEqual(600000, pcfg["request_timeout_ms"])
+        self.assertTrue(pcfg["native_compat"])
+        self.assertTrue(pcfg["preserve_anthropic_thinking"])
+        self.assertTrue(pcfg["supports_tool_choice"])
+        self.assertIn("effort", pcfg["claude_code_supported_capabilities"])
+        self.assertIn("thinking", pcfg["claude_code_supported_capabilities"])
+
     def test_env_vars_route_kimi_through_claude_any_router(self):
         cfg = self.kimi_cfg(api_key="sk-kimi-test")
         with mock.patch.object(claude_any, "upstream_model_ids", return_value=["kimi-for-coding"]):

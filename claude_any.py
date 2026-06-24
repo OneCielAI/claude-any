@@ -2498,6 +2498,33 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
                 pcfg["ip_family"] = "ipv6-preferred"
         migrations[marker] = True
 
+    marker = "kimi_for_coding_context_256k_20260624"
+    if not migrations.get(marker):
+        providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        pcfg = providers.get("kimi")
+        if isinstance(pcfg, dict) and normalize_model_id("kimi", str(pcfg.get("current_model") or "")) == KIMI_DEFAULT_MODEL:
+            if (positive_int(pcfg.get("context_window")) or 0) <= 131072:
+                pcfg["context_window"] = 262144
+            if (positive_int(pcfg.get("context_reserve_tokens")) or 0) <= 4096:
+                pcfg["context_reserve_tokens"] = 32768
+            if (positive_int(pcfg.get("max_output_tokens")) or 0) <= 4096:
+                pcfg["max_output_tokens"] = 32768
+            if str(pcfg.get("llm_preset") or "").strip() == "long-context-128k":
+                pcfg["llm_preset"] = "long-context-256k"
+            pcfg["native_compat"] = True
+            pcfg["preserve_anthropic_thinking"] = True
+            pcfg["supports_tool_choice"] = True
+            caps = pcfg.get("claude_code_supported_capabilities")
+            if not isinstance(caps, list):
+                caps = []
+            for cap in ("effort", "thinking"):
+                if cap not in caps:
+                    caps.append(cap)
+            pcfg["claude_code_supported_capabilities"] = caps
+            if (positive_int(pcfg.get("request_timeout_ms")) or 0) < 600000:
+                pcfg["request_timeout_ms"] = 600000
+        migrations[marker] = True
+
 
 _config_cache: dict[str, Any] | None = None
 _config_cache_mtime: float = 0.0
