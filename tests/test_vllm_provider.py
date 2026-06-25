@@ -204,6 +204,53 @@ class VllmProviderTests(unittest.TestCase):
         self.assertTrue(cfg["providers"]["vllm"]["native_compat"])
         self.assertTrue(any("Anthropic default" in line for line in lines))
 
+    def test_vllm_placeholder_model_autoselects_single_provider_model(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["current_model"] = "my-model"
+
+        with (
+            mock.patch.object(claude_any, "upstream_model_ids", return_value=["served-model"]),
+            mock.patch.object(claude_any, "apply_current_model_specs_to_provider", return_value=[]),
+            mock.patch.object(claude_any, "apply_recommended_timeout_for_model_context", return_value=[]),
+        ):
+            selected, lines = claude_any.ensure_current_model_from_provider_list("vllm", pcfg)
+
+        self.assertTrue(selected)
+        self.assertEqual("served-model", pcfg["current_model"])
+        self.assertTrue(any("Model auto-selected" in line for line in lines))
+
+    def test_vllm_empty_model_requires_choice_when_provider_has_multiple_models(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["current_model"] = ""
+
+        with mock.patch.object(claude_any, "upstream_model_ids", return_value=["model-a", "model-b"]):
+            selected, lines = claude_any.ensure_current_model_from_provider_list("vllm", pcfg)
+
+        self.assertFalse(selected)
+        self.assertEqual("", pcfg["current_model"])
+        self.assertTrue(any("Model selection required" in line for line in lines))
+
+    def test_set_base_url_autoselects_single_vllm_model_after_reset(self):
+        cfg = {
+            "current_provider": "vllm",
+            "providers": {"vllm": dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])},
+        }
+
+        with (
+            mock.patch.object(claude_any, "load_config", return_value=cfg),
+            mock.patch.object(claude_any, "save_config") as save,
+            mock.patch.object(claude_any, "clear_model_cache"),
+            mock.patch.object(claude_any, "endpoint_route_exists", return_value=None),
+            mock.patch.object(claude_any, "upstream_model_ids", return_value=["served-model"]),
+            mock.patch.object(claude_any, "apply_current_model_specs_to_provider", return_value=[]),
+            mock.patch.object(claude_any, "apply_recommended_timeout_for_model_context", return_value=[]),
+        ):
+            lines = claude_any.set_base_url_config("vllm", "http://vllm.local:9000")
+
+        self.assertEqual("served-model", cfg["providers"]["vllm"]["current_model"])
+        self.assertTrue(any("Model auto-selected" in line for line in lines))
+        save.assert_called_once()
+
     def test_long_context_128k_preset_configures_vllm_range(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
 

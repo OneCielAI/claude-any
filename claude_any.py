@@ -8015,6 +8015,67 @@ def current_upstream_model_id(provider: str, pcfg: dict[str, Any]) -> str:
     return cur
 
 
+MODEL_LIST_BACKED_SELECTION_PROVIDERS = ("vllm", "lm-studio", "self-hosted-nim")
+
+
+def provider_placeholder_model_ids(provider: str) -> set[str]:
+    base = {"", "model"}
+    if provider == "vllm":
+        base.add("my-model")
+    elif provider == "lm-studio":
+        base.add("local-model")
+    return base
+
+
+def current_model_needs_provider_selection(provider: str, pcfg: dict[str, Any]) -> bool:
+    if provider not in MODEL_LIST_BACKED_SELECTION_PROVIDERS:
+        return False
+    current = normalize_model_id(provider, str(pcfg.get("current_model") or ""))
+    return current in provider_placeholder_model_ids(provider)
+
+
+def ensure_current_model_from_provider_list(
+    provider: str,
+    pcfg: dict[str, Any],
+    *,
+    force_refresh: bool = False,
+) -> tuple[bool, list[str]]:
+    """Ensure model-list-backed providers do not send placeholder model ids.
+
+    Some self-hosted providers ship with harmless placeholders such as
+    "model" or "my-model". Those are useful defaults before a URL is
+    configured, but they become harmful when sent to a real endpoint that
+    advertises a different model id. If the endpoint exposes exactly one model,
+    select it automatically; if it exposes several, require an explicit choice.
+    """
+    if provider not in MODEL_LIST_BACKED_SELECTION_PROVIDERS:
+        return True, []
+    current = normalize_model_id(provider, str(pcfg.get("current_model") or ""))
+    placeholders = provider_placeholder_model_ids(provider)
+    if current and current not in placeholders:
+        return True, []
+    try:
+        ids = unique_model_ids(provider, upstream_model_ids(provider, pcfg, force_refresh=force_refresh))
+    except Exception as exc:
+        if current:
+            return True, [f"Model list unavailable for {provider}; keeping configured model {current} ({type(exc).__name__}: {exc})."]
+        return False, [f"Model selection required for {provider}: model list unavailable ({type(exc).__name__}: {exc})."]
+    if current and current in ids:
+        return True, []
+    candidates = [mid for mid in ids if normalize_model_id(provider, mid) not in placeholders]
+    if len(candidates) == 1:
+        selected = normalize_model_id(provider, candidates[0])
+        pcfg["current_model"] = selected
+        context_messages = apply_current_model_specs_to_provider(provider, pcfg)
+        timeout_messages = apply_recommended_timeout_for_model_context(provider, pcfg, use_context_fallback=False)
+        return True, [f"Model auto-selected from provider list: {selected}.", *context_messages, *timeout_messages]
+    if len(candidates) > 1:
+        return False, [f"Model selection required for {provider}: provider returned {len(candidates)} models; choose one before launch/test."]
+    if current:
+        return True, [f"Model list for {provider} did not include a non-placeholder model; keeping configured model {current}."]
+    return False, [f"Model selection required for {provider}: provider returned no usable model ids."]
+
+
 def launch_model_id(provider: str, pcfg: dict[str, Any]) -> str:
     cur = normalize_model_id(provider, pcfg.get("current_model") or "model")
     if provider != "ollama":
@@ -18489,6 +18550,7 @@ def set_base_url_config(provider: str, url: str) -> list[str]:
         pcfg["custom_models"] = []
     lines = [f"Base URL for {provider} set to {pcfg['base_url']}."]
     if reset_model:
+        clear_model_cache()
         lines.append("Model selection was reset because the provider endpoint changed.")
         detected_native, detect_reason = auto_detect_native_compat_for_base_url(provider, pcfg)
         if detected_native is None:
@@ -18499,8 +18561,13 @@ def set_base_url_config(provider: str, url: str) -> list[str]:
             pcfg["native_compat"] = bool(detected_native)
             mode = "enabled" if detected_native else "disabled"
             lines.append(f"Endpoint auto-detected ({detect_reason}); Native compatibility {mode}.")
+        selected, selection_lines = ensure_current_model_from_provider_list(provider, pcfg, force_refresh=True)
+        lines.extend(selection_lines)
+        if not selected:
+            lines.append("Choose a model before running compatibility test or Launch Claude Code.")
     save_config(cfg)
-    clear_model_cache()
+    if not reset_model:
+        clear_model_cache()
     return lines
 
 
@@ -24424,6 +24491,17 @@ def _cmd_test(args: argparse.Namespace) -> None:
             print("Reason: Claude Any could not automatically load the selected LM Studio model with the recommended context.")
             print(f"Diagnosis: LM Studio load failed ({type(exc).__name__}: {exc}).")
             sys.exit(1)
+    selected, selection_lines = ensure_current_model_from_provider_list(provider, pcfg)
+    for line in selection_lines:
+        print(line)
+    if selection_lines:
+        save_config(cfg)
+    if not selected:
+        print("Compatibility: FAIL")
+        print("Reason: No concrete provider model is selected.")
+        print("Diagnosis: choose a model from the provider model list, then retry the compatibility test.")
+        set_compatibility_cache(cfg, provider, normalize_model_id(provider, str(pcfg.get("current_model") or "")) or "(unset)", False, None, "No concrete provider model is selected.", "Choose a model from the provider model list.")
+        raise SystemExit(1)
     ollama_native = ollama_native_compat_enabled(provider, pcfg)
     provider_native = provider_native_compat_enabled(provider, pcfg)
     native = ollama_native or provider_native
@@ -32984,6 +33062,15 @@ def launch_claude(
         manage_router_lifetime = bool(start_router_if_needed())
     if not use_native_anthropic:
         ensure_model_cache_for_launch(provider, pcfg)
+        selected, selection_lines = ensure_current_model_from_provider_list(provider, pcfg)
+        if selection_lines:
+            for line in selection_lines:
+                print(line)
+            save_config(cfg)
+        if not selected:
+            raise RuntimeError(
+                f"No concrete model is selected for provider {provider}; choose a model from the provider model list before launching Claude Code."
+            )
     launch_env = env_vars(cfg)
     if claude_channels_requested(cfg, launch_passthrough) or native_channel_bridge or llm_channel_delivery or native_auto_channel_specs:
         env.pop("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS", None)
