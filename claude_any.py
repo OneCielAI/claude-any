@@ -193,10 +193,21 @@ ZAI_ANTHROPIC_BASE_URL = "https://api.z.ai/api/anthropic"
 ZAI_DEFAULT_MODEL = "glm-5.2[1m]"
 ZAI_MODEL_FALLBACK_IDS: tuple[str, ...] = (
     "glm-5.2[1m]",
-    "glm-5-turbo[1m]",
-    "glm-4.7",
     "glm-5.2",
+    "glm-5.1",
+    "glm-5",
+    "glm-5-turbo[1m]",
     "glm-5-turbo",
+    "glm-4.7",
+    "glm-4.7-flashx",
+    "glm-4.7-flash",
+    "glm-4.6",
+    "glm-4.5",
+    "glm-4.5-x",
+    "glm-4.5-airx",
+    "glm-4.5-air",
+    "glm-4.5-flash",
+    "glm-4-32b-0414-128k",
 )
 ZAI_MODEL_CONTEXT_HINTS: tuple[tuple[str, int], ...] = (
     ("glm-5.2", 1_000_000),
@@ -204,6 +215,9 @@ ZAI_MODEL_CONTEXT_HINTS: tuple[tuple[str, int], ...] = (
     ("glm-5.1", 200_000),
     ("glm-5", 200_000),
     ("glm-4.7", 200_000),
+    ("glm-4.6", 200_000),
+    ("glm-4.5", 128_000),
+    ("glm-4-32b-0414-128k", 128_000),
 )
 ZAI_MANAGED_MCP_SERVERS: tuple[tuple[str, str], ...] = (
     ("web-search-prime", "https://api.z.ai/api/mcp/web_search_prime/mcp"),

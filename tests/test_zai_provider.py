@@ -117,7 +117,34 @@ class ZaiProviderTests(unittest.TestCase):
 
         self.assertIn("glm-5.2[1m]", models)
         self.assertIn("glm-5-turbo", models)
+        self.assertIn("glm-4.7-flash", models)
+        self.assertIn("glm-4.7-flashx", models)
+        self.assertIn("glm-4.6", models)
+        self.assertIn("glm-4.5-flash", models)
+        self.assertIn("glm-4-32b-0414-128k", models)
         write_cache.assert_called_once()
+
+    def test_zai_documented_model_context_hints_cover_current_text_models(self):
+        cases = {
+            "glm-5.2": 1000000,
+            "glm-5.2[1m]": 1000000,
+            "glm-5.1": 200000,
+            "glm-5": 200000,
+            "glm-5-turbo": 200000,
+            "glm-4.7": 200000,
+            "glm-4.7-flashx": 200000,
+            "glm-4.7-flash": 200000,
+            "glm-4.6": 200000,
+            "glm-4.5": 128000,
+            "glm-4.5-x": 128000,
+            "glm-4.5-airx": 128000,
+            "glm-4.5-air": 128000,
+            "glm-4.5-flash": 128000,
+            "glm-4-32b-0414-128k": 128000,
+        }
+        for model, expected in cases.items():
+            with self.subTest(model=model):
+                self.assertEqual(expected, claude_any.model_context_hint_from_model_id(model))
 
     def test_env_vars_route_zai_through_claude_any_router_with_glm_defaults(self):
         cfg = self.zai_cfg(api_key="sk-zai-test")
