@@ -494,6 +494,35 @@ class VllmProviderTests(unittest.TestCase):
             self.assertEqual(131072, claude_any.context_limit_for_status("vllm", pcfg))
             self.assertEqual(131072, claude_any.claude_code_auto_compact_window("vllm", pcfg))
 
+    def test_openai_compatible_request_compacts_to_headroom_not_hard_ceiling(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["current_model"] = "qwen3.6-35b-a3b-nvfp4"
+        pcfg["context_window"] = 307200
+        pcfg["max_model_len"] = 307200
+        pcfg["max_output_tokens"] = 8192
+        body = {
+            "model": "claude-any-test",
+            "messages": [{"role": "user", "content": "x" * 1000}],
+            "max_tokens": 8192,
+        }
+        captured = {}
+
+        def fake_compact(messages, tools, budget_tokens, **kwargs):
+            captured["budget_tokens"] = budget_tokens
+            captured["trigger_tokens"] = kwargs.get("trigger_tokens")
+            return messages
+
+        with mock.patch.object(claude_any, "compact_ollama_messages_for_budget", side_effect=fake_compact):
+            claude_any.openai_compatible_chat_request("vllm", "qwen3.6-35b-a3b-nvfp4", body, pcfg, stream=False)
+
+        expected_trigger = (
+            claude_any.openai_context_limit_for_budget("vllm", pcfg)
+            - pcfg["max_output_tokens"]
+            - claude_any.context_guard_reserve_tokens(pcfg, pcfg["context_window"])
+        )
+        self.assertEqual(expected_trigger, captured["trigger_tokens"])
+        self.assertEqual(claude_any.context_compact_result_budget(expected_trigger), captured["budget_tokens"])
+
     def test_vllm_anthropic_body_cap_uses_runtime_model_limit_over_stale_window(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
         pcfg["current_model"] = "qwen36-35b-a3b-mtp-nvfp4"

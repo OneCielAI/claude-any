@@ -14156,6 +14156,23 @@ def openai_context_limit_for_budget(provider: str, pcfg: dict[str, Any]) -> int:
     return 65536
 
 
+def context_compact_result_budget(trigger_budget_tokens: int) -> int:
+    """Target a smaller post-compact payload than the hard upstream limit.
+
+    The trigger budget is the maximum input payload the provider can accept
+    after reserving room for output and guard tokens. Compacting to exactly
+    that ceiling leaves no room for the next user message, channel event, or
+    tool result, causing Claude Code to compact again immediately. Keep a
+    meaningful hysteresis band so one compact actually buys working space.
+    """
+    budget = positive_int(trigger_budget_tokens)
+    if not budget:
+        return 8192
+    if budget <= 16384:
+        return max(8192, budget)
+    return max(8192, int(budget * 0.70))
+
+
 def compact_ollama_messages_for_budget(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]],
@@ -14166,13 +14183,15 @@ def compact_ollama_messages_for_budget(
     pcfg: dict[str, Any] | None = None,
     full_compact_request: bool = False,
     wire: str | None = None,
+    trigger_tokens: int | None = None,
 ) -> list[dict[str, Any]]:
     if not messages:
         return messages
     budget_tokens = max(8192, budget_tokens)
     payload = {"messages": messages, "tools": tools}
     initial_tokens = estimate_tokens(payload)
-    if initial_tokens <= budget_tokens:
+    trigger_budget = max(8192, positive_int(trigger_tokens) or budget_tokens)
+    if initial_tokens <= trigger_budget:
         return messages
     if full_compact_request and pcfg is not None and provider and model:
         compact_wire = wire or ("ollama" if provider in ("ollama", "ollama-cloud") else "openai")
@@ -14264,6 +14283,7 @@ def compact_anthropic_body_for_budget(
     model: str = "",
     pcfg: dict[str, Any] | None = None,
     full_compact_request: bool = False,
+    trigger_tokens: int | None = None,
 ) -> dict[str, Any]:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -14273,7 +14293,8 @@ def compact_anthropic_body_for_budget(
         return body
     budget_tokens = max(8192, budget_tokens)
     initial_tokens = estimate_tokens(body)
-    if initial_tokens <= budget_tokens:
+    trigger_budget = max(8192, positive_int(trigger_tokens) or budget_tokens)
+    if initial_tokens <= trigger_budget:
         return body
     if full_compact_request and pcfg is not None and provider and model:
         compact_messages = maybe_build_llm_compacted_messages(provider, model, pcfg, typed_messages, budget_tokens, wire="anthropic")
@@ -14484,13 +14505,15 @@ def cap_anthropic_body_for_provider(provider: str, pcfg: dict[str, Any], body: d
     reserve = context_guard_reserve_tokens(pcfg, context_limit)
     output_reserve = positive_int(capped.get("max_tokens")) or configured or 4096
     input_budget = max(8192, context_limit - output_reserve - reserve)
+    compact_budget = context_compact_result_budget(input_budget)
     capped = compact_anthropic_body_for_budget(
         capped,
-        input_budget,
+        compact_budget,
         provider=provider,
         pcfg=pcfg,
         model=str(capped.get("model") or pcfg.get("current_model") or ""),
         full_compact_request=is_claude_code_compact_request(capped),
+        trigger_tokens=input_budget,
     )
     output_tokens = cap_output_tokens_for_context(pcfg, capped, {k: v for k, v in capped.items() if k != "max_tokens"}, context_limit, positive_int(capped.get("max_tokens")) or configured)
     if output_tokens:
@@ -14534,15 +14557,17 @@ def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], 
     reserve = context_guard_reserve_tokens(pcfg, context_limit)
     output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
     input_budget = max(8192, context_limit - output_reserve - reserve)
+    compact_budget = context_compact_result_budget(input_budget)
     messages = compact_ollama_messages_for_budget(
         messages,
         tools,
-        input_budget,
+        compact_budget,
         provider=provider,
         model=model,
         pcfg=pcfg,
         full_compact_request=is_claude_code_compact_request(body),
         wire="ollama",
+        trigger_tokens=input_budget,
     )
     req: dict[str, Any] = {
         "model": model,
@@ -14583,15 +14608,18 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
     configured = configured_output_tokens(pcfg, body)
     reserve = context_guard_reserve_tokens(pcfg, context_limit)
     output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
+    input_budget = max(8192, context_limit - output_reserve - reserve)
+    compact_budget = context_compact_result_budget(input_budget)
     messages = compact_ollama_messages_for_budget(
         messages,
         tools,
-        max(8192, context_limit - output_reserve - reserve),
+        compact_budget,
         provider=provider,
         model=model,
         pcfg=pcfg,
         full_compact_request=is_claude_code_compact_request(body),
         wire="openai",
+        trigger_tokens=input_budget,
     )
     messages = repair_openai_tool_call_adjacency(messages)
     req: dict[str, Any] = {

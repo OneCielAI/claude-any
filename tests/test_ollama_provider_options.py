@@ -180,6 +180,37 @@ class OllamaProviderOptionTests(unittest.TestCase):
         self.assertLessEqual(claude_any.estimate_tokens({"messages": compacted, "tools": tools}), budget)
         self.assertEqual(499712, budget)
 
+    def test_compact_result_budget_keeps_headroom_below_trigger_budget(self):
+        self.assertEqual(8192, claude_any.context_compact_result_budget(8192))
+        self.assertEqual(203571, claude_any.context_compact_result_budget(290816))
+
+    def test_ollama_request_compacts_to_headroom_not_hard_ceiling(self):
+        pcfg = {
+            "current_model": "glm-5.2",
+            "base_url": "https://ollama.com",
+            "num_ctx": "auto",
+            "num_ctx_min": 65536,
+            "num_ctx_max": 307200,
+            "max_output_tokens": 8192,
+        }
+        body = {
+            "model": "claude-any-test",
+            "messages": [{"role": "user", "content": "x" * 1000}],
+            "max_tokens": 8192,
+        }
+        captured = {}
+
+        def fake_compact(messages, tools, budget_tokens, **kwargs):
+            captured["budget_tokens"] = budget_tokens
+            captured["trigger_tokens"] = kwargs.get("trigger_tokens")
+            return messages
+
+        with mock.patch.object(claude_any, "compact_ollama_messages_for_budget", side_effect=fake_compact):
+            claude_any.ollama_chat_request("glm-5.2", body, pcfg, stream=False, provider="ollama-cloud")
+
+        self.assertEqual(289408, captured["trigger_tokens"])
+        self.assertEqual(claude_any.context_compact_result_budget(289408), captured["budget_tokens"])
+
     def test_compact_request_uses_segmented_llm_compaction(self):
         calls = []
         original = claude_any.context_compact_request_summary
