@@ -1120,6 +1120,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn("send_message", prompt)
         self.assertNotIn("recipients='web'", prompt)
         self.assertNotIn("send_file", prompt)
+        self.assertIn("actual available Claude Code/MCP tool", prompt)
+        self.assertIn("do not write XML-like snippets", prompt)
         self.assertNotIn("\n", prompt)
 
     def test_channel_wake_prompt_includes_small_event_metadata_only(self):
@@ -2670,6 +2672,57 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("removed prior assistant pseudo tool-call", assistant_content[0]["text"])
         self.assertEqual("tool_use", assistant_content[1]["type"])
         self.assertIn("<invoke", out["messages"][1]["content"])
+
+    def test_sanitize_assistant_pseudo_tool_text_history_removes_xml_alias_tool_snippets(self):
+        body = {
+            "tools": [
+                {"name": "Read"},
+                {"name": "mcp__ai-net-http__get_assignment"},
+            ],
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "I need to read the file.\n"
+                                "<read>\n"
+                                "<file_path>/tmp/example.txt</file_path>\n"
+                                "<offset>0</offset>\n"
+                                "<limit>20</limit>\n"
+                                "</read>\n"
+                                "Then fetch the assignment.\n"
+                                "<get_assignment>\n"
+                                "<parameter name=\"assignment_id\">tasgn_123</parameter>\n"
+                                "</get_assignment>\n"
+                                "<note>This is ordinary XML and should remain.</note>"
+                            ),
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "toolu_real",
+                            "name": "Read",
+                            "input": {"file_path": "/tmp/example.txt", "offset": 0, "limit": 20},
+                        },
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": "<get_assignment><parameter name=\"assignment_id\">tasgn_user</parameter></get_assignment>",
+                },
+            ]
+        }
+
+        out = claude_any.sanitize_assistant_pseudo_tool_text_history(body)
+
+        assistant_text = out["messages"][0]["content"][0]["text"]
+        self.assertNotIn("<read>", assistant_text)
+        self.assertNotIn("<get_assignment>", assistant_text)
+        self.assertIn("<note>This is ordinary XML and should remain.</note>", assistant_text)
+        self.assertIn("removed prior assistant pseudo tool-call", assistant_text)
+        self.assertEqual("tool_use", out["messages"][0]["content"][1]["type"])
+        self.assertIn("<get_assignment>", out["messages"][1]["content"])
 
     def test_body_with_pending_channel_messages_skips_stdin_wake_delivered_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}

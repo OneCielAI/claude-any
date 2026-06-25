@@ -12113,6 +12113,316 @@ def build_chunked_context_guard_summary(
     return summary
 
 
+def context_compact_message_text(message: dict[str, Any], index: int) -> str:
+    role = str(message.get("role") or "unknown")
+    parts = [f"Message {index} role={role}"]
+    name = message.get("name") or message.get("tool_name")
+    if name:
+        parts.append(f"name={name}")
+    if message.get("tool_call_id"):
+        parts.append(f"tool_call_id={message.get('tool_call_id')}")
+    header = " ".join(parts)
+    content = anthropic_content_to_text(message.get("content"))
+    if not content and message.get("tool_calls"):
+        content = "tool_calls=" + _compact_json_for_prompt(message.get("tool_calls"), max_chars=6000)
+    elif message.get("tool_calls"):
+        content += "\n\ntool_calls=" + _compact_json_for_prompt(message.get("tool_calls"), max_chars=6000)
+    return f"{header}\n{compact_message_text_for_prompt(content)}"
+
+
+def context_compact_instruction_index(messages: list[dict[str, Any]]) -> int | None:
+    fallback: int | None = None
+    for idx, message in enumerate(messages):
+        if str(message.get("role") or "") != "user":
+            continue
+        text = anthropic_content_to_text(message.get("content")).lower()
+        if text:
+            fallback = idx
+        if "<command-name>/compact</command-name>" in text:
+            return idx
+        if "<command-message>compact</command-message>" in text and "<command-name>" in text:
+            return idx
+        if "create a detailed summary of the conversation" in text and "compact" in text:
+            return idx
+        if "summarize the conversation so far" in text and "compact" in text:
+            return idx
+    return fallback
+
+
+def context_compact_chunk_target_tokens(pcfg: dict[str, Any] | None, budget_tokens: int) -> int:
+    configured = positive_int((pcfg or {}).get("context_compact_chunk_tokens"))
+    if configured:
+        return max(8192, configured)
+    return max(8192, min(65536, max(1, budget_tokens) // 4))
+
+
+def context_compact_summary_output_tokens(pcfg: dict[str, Any] | None, budget_tokens: int) -> int:
+    configured = positive_int((pcfg or {}).get("context_compact_summary_tokens"))
+    if configured:
+        return max(512, configured)
+    return max(1024, min(8192, max(1, budget_tokens) // 64))
+
+
+def context_compact_parallel_sessions(pcfg: dict[str, Any] | None, chunks: int) -> int:
+    # Chunk compaction is currently sequential; keep status-line reporting honest.
+    return 1
+
+
+def split_messages_for_context_compact(
+    messages: list[dict[str, Any]],
+    target_tokens: int,
+) -> list[tuple[int, list[dict[str, Any]]]]:
+    chunks: list[tuple[int, list[dict[str, Any]]]] = []
+    current: list[dict[str, Any]] = []
+    current_start = 0
+    current_tokens = 0
+    for idx, message in enumerate(messages):
+        tokens = max(1, estimate_tokens(message))
+        if current and current_tokens + tokens > target_tokens:
+            chunks.append((current_start, current))
+            current = []
+            current_tokens = 0
+            current_start = idx
+        if not current:
+            current_start = idx
+        current.append(message)
+        current_tokens += tokens
+    if current:
+        chunks.append((current_start, current))
+    return chunks
+
+
+CONTEXT_COMPACT_MAP_SYSTEM_PROMPT = (
+    "You are compacting one segment of a larger Claude Code conversation. "
+    "Return only a concise but durable summary of this segment. Preserve user goals, "
+    "decisions, file paths, tool results, unresolved tasks, errors, and any facts needed "
+    "to continue later. Do not call tools."
+)
+
+
+def build_context_compact_chunk_prompt(chunk: list[dict[str, Any]], start_index: int, chunk_no: int, chunk_total: int) -> str:
+    parts = [
+        f"Segment {chunk_no}/{chunk_total}. Summarize messages {start_index}-{start_index + len(chunk) - 1}.",
+        "Return only the segment summary.",
+    ]
+    for offset, message in enumerate(chunk):
+        parts.append(context_compact_message_text(message, start_index + offset))
+    return "\n\n".join(parts)
+
+
+def context_compact_extract_text(data: Any, wire: str) -> str:
+    if not isinstance(data, dict):
+        return ""
+    if wire == "ollama":
+        message = data.get("message") if isinstance(data.get("message"), dict) else {}
+        return str(message.get("content") or data.get("response") or "").strip()
+    if wire == "openai":
+        choices = data.get("choices")
+        if isinstance(choices, list) and choices:
+            choice = choices[0] if isinstance(choices[0], dict) else {}
+            message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+            return str(message.get("content") or "").strip()
+        return ""
+    if wire == "anthropic":
+        return anthropic_content_to_text(data.get("content")).strip()
+    return ""
+
+
+def context_compact_request_summary(
+    provider: str,
+    model: str,
+    pcfg: dict[str, Any],
+    prompt: str,
+    *,
+    wire: str,
+    budget_tokens: int,
+) -> str:
+    max_tokens = context_compact_summary_output_tokens(pcfg, budget_tokens)
+    timeout = provider_request_timeout_seconds(pcfg)
+    if wire == "ollama":
+        req: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": CONTEXT_COMPACT_MAP_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "think": False,
+            "options": {"num_predict": max_tokens},
+        }
+        if pcfg.get("keep_alive"):
+            req["keep_alive"] = str(pcfg["keep_alive"])
+        url = join_url(str(pcfg.get("base_url") or "").rstrip("/"), "/api/chat")
+        data = post_json_with_rate_retry(
+            url,
+            req,
+            provider_headers(provider, pcfg),
+            timeout,
+            provider,
+            pcfg,
+            model,
+            retry_rate_limits=True,
+        )
+        return context_compact_extract_text(data, wire)
+    if wire == "openai":
+        req = {
+            "model": model,
+            "messages": [
+                {"role": "system", "content": CONTEXT_COMPACT_MAP_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "max_tokens": max_tokens,
+        }
+        url = join_url(provider_upstream_request_base(provider, pcfg), "/v1/chat/completions")
+        data = post_json_with_rate_retry(
+            url,
+            req,
+            provider_headers(provider, pcfg),
+            timeout,
+            provider,
+            pcfg,
+            model,
+            retry_rate_limits=True,
+        )
+        return context_compact_extract_text(data, wire)
+    req = {
+        "model": model,
+        "system": CONTEXT_COMPACT_MAP_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_tokens": max_tokens,
+        "stream": False,
+    }
+    base = native_anthropic_base_url(provider, pcfg) if provider_native_compat_enabled(provider, pcfg) else provider_upstream_request_base(provider, pcfg)
+    url = join_url(base, "/v1/messages")
+    data = post_json_with_rate_retry(
+        url,
+        req,
+        provider_headers(provider, pcfg),
+        timeout,
+        provider,
+        pcfg,
+        model,
+        retry_rate_limits=True,
+    )
+    return context_compact_extract_text(data, "anthropic")
+
+
+def build_context_compact_reduce_prompt(
+    summaries: list[str],
+    compact_instruction: str,
+    *,
+    budget_tokens: int,
+    source_message_count: int,
+) -> str:
+    parts = [
+        "[claude-any segmented compact]",
+        (
+            f"The previous conversation was too large for a single compact request. "
+            f"It was summarized in {len(summaries)} segment(s) from {source_message_count} message(s)."
+        ),
+        "Segment summaries:",
+    ]
+    for idx, summary in enumerate(summaries, start=1):
+        parts.append(f"## Segment {idx}\n{summary.strip()}")
+    parts.append("Claude Code compact instruction:")
+    parts.append(compact_message_text_for_prompt(compact_instruction))
+    parts.append("Using the segment summaries above, return only the final compact summary text requested by Claude Code.")
+    text = "\n\n".join(parts)
+    max_chars = max(8192, max(1, budget_tokens) * 3)
+    if len(text) > max_chars:
+        text = truncate_for_prompt(text, max_chars)
+    return text
+
+
+def maybe_build_llm_compacted_messages(
+    provider: str,
+    model: str,
+    pcfg: dict[str, Any] | None,
+    messages: list[dict[str, Any]],
+    budget_tokens: int,
+    *,
+    wire: str,
+) -> list[dict[str, Any]] | None:
+    if not pcfg or not messages:
+        return None
+    if parse_bool(pcfg.get("context_compact_llm"), default=True) is False:
+        return None
+    if provider == "anthropic" and not meaningful_key(str(provider_primary_api_key(provider, pcfg) or "")):
+        return None
+    instruction_idx = context_compact_instruction_index(messages)
+    if instruction_idx is None:
+        return None
+    compact_instruction = anthropic_content_to_text(messages[instruction_idx].get("content"))
+    history = [message for idx, message in enumerate(messages) if idx != instruction_idx and str(message.get("role") or "") != "system"]
+    system_messages = [message for message in messages if str(message.get("role") or "") == "system"]
+    if not history:
+        return None
+    target_tokens = context_compact_chunk_target_tokens(pcfg, budget_tokens)
+    chunks = split_messages_for_context_compact(history, target_tokens)
+    if not chunks:
+        return None
+    parallel_sessions = context_compact_parallel_sessions(pcfg, len(chunks))
+    write_context_compact_activity(
+        provider or "provider",
+        model,
+        chunks=len(chunks),
+        parallel_sessions=parallel_sessions,
+        tokens=estimate_tokens({"messages": messages}),
+        final_tokens=0,
+        budget=budget_tokens,
+        phase="map",
+        completed_chunks=0,
+    )
+    summaries: list[str] = []
+    for chunk_no, (start, chunk) in enumerate(chunks, start=1):
+        prompt = build_context_compact_chunk_prompt(chunk, start, chunk_no, len(chunks))
+        try:
+            summary = context_compact_request_summary(provider, model, pcfg, prompt, wire=wire, budget_tokens=budget_tokens)
+        except Exception as exc:
+            router_log("WARN", f"context_compact_chunk_failed provider={provider} model={model} chunk={chunk_no}/{len(chunks)} error={type(exc).__name__}: {exc}")
+            summary = build_chunked_context_guard_summary(chunk, target_tokens, start_index=start)
+        if not summary.strip():
+            summary = build_chunked_context_guard_summary(chunk, target_tokens, start_index=start)
+        summaries.append(summary.strip())
+        write_context_compact_activity(
+            provider or "provider",
+            model,
+            chunks=len(chunks),
+            parallel_sessions=parallel_sessions,
+            tokens=estimate_tokens({"messages": messages}),
+            final_tokens=sum(estimate_tokens(item) for item in summaries),
+            budget=budget_tokens,
+            phase="map",
+            completed_chunks=chunk_no,
+        )
+    reduce_prompt = build_context_compact_reduce_prompt(
+        summaries,
+        compact_instruction,
+        budget_tokens=budget_tokens,
+        source_message_count=len(history),
+    )
+    out = list(system_messages)
+    out.append({"role": "user", "content": reduce_prompt})
+    router_log(
+        "WARN",
+        f"context_compact_map_reduce provider={provider} model={model} chunks={len(chunks)} messages {len(messages)}->{len(out)} tokens {estimate_tokens({'messages': messages})}->{estimate_tokens({'messages': out})} budget={budget_tokens}",
+    )
+    write_context_compact_activity(
+        provider or "provider",
+        model,
+        chunks=len(chunks),
+        parallel_sessions=parallel_sessions,
+        tokens=estimate_tokens({"messages": messages}),
+        final_tokens=estimate_tokens({"messages": out}),
+        budget=budget_tokens,
+        phase="reduce",
+        completed_chunks=len(chunks),
+        retained_messages=len(out),
+    )
+    return out
+
+
 def is_advisor_request(body: dict[str, Any]) -> bool:
     return "CLAUDE_ANY_ADVISOR_CALL" in latest_user_text(body)
 
@@ -12404,19 +12714,62 @@ def normalize_anthropic_system_role_messages(body: dict[str, Any]) -> dict[str, 
 _PSEUDO_TOOL_INVOKE_RE = re.compile(
     r"(?is)(?:^|\n)[ \t]*(?:court[ \t]*(?:\r?\n)+)?<invoke\s+name=[\"'][^\"']+[\"'][\s\S]*?</invoke>[ \t]*(?=\n|$)"
 )
+_PSEUDO_TOOL_XML_RE = re.compile(
+    r"(?is)(?:^|\n)[ \t]*(?:court[ \t]*(?:\r?\n)+)?<(?P<name>[A-Za-z_][\w.-]{0,96})\b[^>]*>[\s\S]*?</(?P=name)>[ \t]*(?=\n|$)"
+)
+
+
+def _request_tool_name_aliases(body: dict[str, Any]) -> set[str]:
+    aliases: set[str] = set()
+    tools = body.get("tools")
+    if not isinstance(tools, list):
+        return aliases
+    for tool in tools:
+        if not isinstance(tool, dict):
+            continue
+        name = str(tool.get("name") or "").strip()
+        if not name:
+            continue
+        lowered = name.lower()
+        aliases.add(lowered)
+        aliases.add(lowered.replace("-", "_"))
+        if "__" in lowered:
+            short = lowered.rsplit("__", 1)[-1]
+            aliases.add(short)
+            aliases.add(short.replace("-", "_"))
+    return aliases
+
+
+def _remove_assistant_pseudo_tool_xml(text: str, tool_aliases: set[str], replacement: str) -> tuple[str, int]:
+    if not text:
+        return text, 0
+    removed = 0
+
+    def repl(match: re.Match[str]) -> str:
+        nonlocal removed
+        name = str(match.group("name") or "").strip().lower()
+        if not name:
+            return match.group(0)
+        if name not in tool_aliases and name.replace("-", "_") not in tool_aliases:
+            return match.group(0)
+        removed += 1
+        return replacement
+
+    return _PSEUDO_TOOL_XML_RE.sub(repl, text), removed
 
 
 def sanitize_assistant_pseudo_tool_text_history(body: dict[str, Any]) -> dict[str, Any]:
     """Remove prior assistant text that looks like a fake tool invocation.
 
     Claude Code only executes structured ``tool_use`` blocks. If an earlier
-    routed turn accidentally emitted XML-like ``<invoke ...>`` text, continuing
+    routed turn accidentally emitted XML-like tool-call text, continuing
     the same transcript can teach the model to repeat that invalid pattern.
     Keep real tool_use blocks untouched and only rewrite assistant text blocks.
     """
     messages = body.get("messages")
     if not isinstance(messages, list):
         return body
+    tool_aliases = _request_tool_name_aliases(body)
     changed = False
     sanitized_messages: list[Any] = []
     removed_blocks = 0
@@ -12428,6 +12781,9 @@ def sanitize_assistant_pseudo_tool_text_history(body: dict[str, Any]) -> dict[st
         content = message.get("content")
         if isinstance(content, str):
             next_text, count = _PSEUDO_TOOL_INVOKE_RE.subn(replacement, content)
+            if tool_aliases:
+                next_text, xml_count = _remove_assistant_pseudo_tool_xml(next_text, tool_aliases, replacement)
+                count += xml_count
             if count:
                 changed = True
                 removed_blocks += count
@@ -12442,6 +12798,9 @@ def sanitize_assistant_pseudo_tool_text_history(body: dict[str, Any]) -> dict[st
                 if isinstance(block, dict) and block.get("type") == "text":
                     text = str(block.get("text") or "")
                     next_text, count = _PSEUDO_TOOL_INVOKE_RE.subn(replacement, text)
+                    if tool_aliases:
+                        next_text, xml_count = _remove_assistant_pseudo_tool_xml(next_text, tool_aliases, replacement)
+                        count += xml_count
                     if count:
                         content_changed = True
                         removed_blocks += count
@@ -13758,12 +14117,21 @@ def cap_output_tokens_for_context(
         return None
     if not context_limit:
         return configured
-    reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
+    reserve = context_guard_reserve_tokens(pcfg, context_limit)
     estimated_input = estimate_tokens(payload, _token_cache)
     available = context_limit - estimated_input - reserve
     if available <= 0:
         return min(configured, 256)
     return max(1, min(configured, available))
+
+
+def context_guard_reserve_tokens(pcfg: dict[str, Any], context_limit: int | None) -> int:
+    configured = positive_int(pcfg.get("context_reserve_tokens"))
+    if configured:
+        return configured
+    if not context_limit:
+        return 1024
+    return max(1024, min(32768, int(context_limit) // 32))
 
 
 def ollama_context_limit_for_budget(pcfg: dict[str, Any]) -> int:
@@ -13774,11 +14142,13 @@ def ollama_context_limit_for_budget(pcfg: dict[str, Any]) -> int:
 
 
 def openai_context_limit_for_budget(provider: str, pcfg: dict[str, Any]) -> int:
+    configured = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
     if provider in ("vllm", "self-hosted-nim"):
         runtime = provider_model_context_capacity(provider, pcfg)
+        if configured and str(pcfg.get("llm_preset") or "").strip():
+            return min(configured, runtime) if runtime else configured
         if runtime:
             return runtime
-    configured = positive_int(pcfg.get("context_window")) or positive_int(pcfg.get("max_model_len"))
     if configured:
         return configured
     if provider == "nvidia-hosted":
@@ -13793,6 +14163,9 @@ def compact_ollama_messages_for_budget(
     *,
     provider: str = "",
     model: str = "",
+    pcfg: dict[str, Any] | None = None,
+    full_compact_request: bool = False,
+    wire: str | None = None,
 ) -> list[dict[str, Any]]:
     if not messages:
         return messages
@@ -13801,6 +14174,17 @@ def compact_ollama_messages_for_budget(
     initial_tokens = estimate_tokens(payload)
     if initial_tokens <= budget_tokens:
         return messages
+    if full_compact_request and pcfg is not None and provider and model:
+        compact_wire = wire or ("ollama" if provider in ("ollama", "ollama-cloud") else "openai")
+        llm_compacted = maybe_build_llm_compacted_messages(provider, model, pcfg, messages, budget_tokens, wire=compact_wire)
+        if llm_compacted:
+            final_tokens = estimate_tokens({"messages": llm_compacted, "tools": []})
+            if final_tokens <= budget_tokens:
+                return llm_compacted
+            router_log(
+                "WARN",
+                f"context_compact_map_reduce_oversize provider={provider} model={model} tokens={final_tokens} budget={budget_tokens}; falling back to deterministic compact",
+            )
 
     system_messages = [m for m in messages if m.get("role") == "system"]
     non_system = [m for m in messages if m.get("role") != "system"]
@@ -13878,6 +14262,8 @@ def compact_anthropic_body_for_budget(
     *,
     provider: str = "",
     model: str = "",
+    pcfg: dict[str, Any] | None = None,
+    full_compact_request: bool = False,
 ) -> dict[str, Any]:
     messages = body.get("messages")
     if not isinstance(messages, list) or not messages:
@@ -13889,6 +14275,21 @@ def compact_anthropic_body_for_budget(
     initial_tokens = estimate_tokens(body)
     if initial_tokens <= budget_tokens:
         return body
+    if full_compact_request and pcfg is not None and provider and model:
+        compact_messages = maybe_build_llm_compacted_messages(provider, model, pcfg, typed_messages, budget_tokens, wire="anthropic")
+        if compact_messages:
+            out = dict(body)
+            out["messages"] = compact_messages
+            out["tools"] = []
+            out.pop("tool_choice", None)
+            out.pop("parallel_tool_calls", None)
+            final_tokens = estimate_tokens(out)
+            if final_tokens <= budget_tokens:
+                return out
+            router_log(
+                "WARN",
+                f"context_compact_map_reduce_oversize provider={provider} model={model} tokens={final_tokens} budget={budget_tokens}; falling back to deterministic compact",
+            )
 
     # Reserve part of the budget for distributed summaries of the older history.
     summary_budget = max(1024, min(24576, budget_tokens // 10))
@@ -14080,14 +14481,16 @@ def cap_anthropic_body_for_provider(provider: str, pcfg: dict[str, Any], body: d
     ratio_capped = cap_output_tokens_to_context_ratio(provider, pcfg, configured)
     if ratio_capped:
         capped["max_tokens"] = ratio_capped
-    reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
+    reserve = context_guard_reserve_tokens(pcfg, context_limit)
     output_reserve = positive_int(capped.get("max_tokens")) or configured or 4096
     input_budget = max(8192, context_limit - output_reserve - reserve)
     capped = compact_anthropic_body_for_budget(
         capped,
         input_budget,
         provider=provider,
+        pcfg=pcfg,
         model=str(capped.get("model") or pcfg.get("current_model") or ""),
+        full_compact_request=is_claude_code_compact_request(capped),
     )
     output_tokens = cap_output_tokens_for_context(pcfg, capped, {k: v for k, v in capped.items() if k != "max_tokens"}, context_limit, positive_int(capped.get("max_tokens")) or configured)
     if output_tokens:
@@ -14123,15 +14526,24 @@ def normalize_anthropic_model_request_options(provider: str, pcfg: dict[str, Any
     return out
 
 
-def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], stream: bool = True) -> dict[str, Any]:
+def ollama_chat_request(model: str, body: dict[str, Any], pcfg: dict[str, Any], stream: bool = True, provider: str = "ollama") -> dict[str, Any]:
     messages = anthropic_messages_to_ollama(body)
     tools = anthropic_tools_to_ollama(body.get("tools"))
     context_limit = ollama_context_limit_for_budget(pcfg)
     configured = configured_output_tokens(pcfg, body, "num_predict")
-    reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
+    reserve = context_guard_reserve_tokens(pcfg, context_limit)
     output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
     input_budget = max(8192, context_limit - output_reserve - reserve)
-    messages = compact_ollama_messages_for_budget(messages, tools, input_budget, provider="ollama", model=model)
+    messages = compact_ollama_messages_for_budget(
+        messages,
+        tools,
+        input_budget,
+        provider=provider,
+        model=model,
+        pcfg=pcfg,
+        full_compact_request=is_claude_code_compact_request(body),
+        wire="ollama",
+    )
     req: dict[str, Any] = {
         "model": model,
         "messages": messages,
@@ -14169,7 +14581,7 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
     tools = anthropic_tools_to_ollama(body.get("tools"))
     context_limit = openai_context_limit_for_budget(provider, pcfg)
     configured = configured_output_tokens(pcfg, body)
-    reserve = positive_int(pcfg.get("context_reserve_tokens")) or 1024
+    reserve = context_guard_reserve_tokens(pcfg, context_limit)
     output_reserve = configured or positive_int(body.get("max_tokens")) or 4096
     messages = compact_ollama_messages_for_budget(
         messages,
@@ -14177,6 +14589,9 @@ def openai_compatible_chat_request(provider: str, model: str, body: dict[str, An
         max(8192, context_limit - output_reserve - reserve),
         provider=provider,
         model=model,
+        pcfg=pcfg,
+        full_compact_request=is_claude_code_compact_request(body),
+        wire="openai",
     )
     messages = repair_openai_tool_call_adjacency(messages)
     req: dict[str, Any] = {
@@ -14235,7 +14650,7 @@ def advisor_input_budget(provider: str, pcfg: dict[str, Any]) -> int:
         context_limit = context_limit_for_status(provider, pcfg) or 200000
     else:
         context_limit = openai_context_limit_for_budget(provider, pcfg)
-    return max(8192, context_limit - 4096 - (positive_int(pcfg.get("context_reserve_tokens")) or 1024))
+    return max(8192, context_limit - 4096 - context_guard_reserve_tokens(pcfg, context_limit))
 
 
 def advisor_upstream_model(provider: str, model: str) -> str:
@@ -14433,7 +14848,7 @@ def call_provider_chat_once(provider: str, pcfg: dict[str, Any], body: dict[str,
     body = normalize_tool_choice_for_provider(provider, pcfg, body)
     if provider in ("ollama", "ollama-cloud"):
         base = pcfg.get("base_url", "").rstrip("/")
-        req_body = ollama_chat_request(model, body, pcfg, stream=False)
+        req_body = ollama_chat_request(model, body, pcfg, stream=False, provider=provider)
         apply_router_rate_limit(provider, pcfg, model)
         data = post_json_with_rate_retry(
             join_url(base, "/api/chat"),
@@ -16253,7 +16668,7 @@ def forward_ollama_api_chat(handler: BaseHTTPRequestHandler, provider: str, pcfg
         stream_requested = False
         router_log("INFO", f"advisor gate enabled reason={gate_reason}; collecting this turn before returning it to Claude Code")
     word_chunking = bool(pcfg.get("stream_word_chunking", False))
-    req_body = ollama_chat_request(model, upstream_body, pcfg, stream=stream_requested)
+    req_body = ollama_chat_request(model, upstream_body, pcfg, stream=stream_requested, provider=provider)
     headers = provider_headers(provider, pcfg)
     url = join_url(base, "/api/chat")
     if compatibility_test:
@@ -23622,7 +24037,7 @@ def compatibility_api_key_probe_request(
     upstream_model = resolve_requested_model(provider, pcfg, model)
     headers = provider_headers(provider, pcfg)
     if provider in ("ollama", "ollama-cloud"):
-        req_body = ollama_chat_request(upstream_model, body, pcfg, stream=False)
+        req_body = ollama_chat_request(upstream_model, body, pcfg, stream=False, provider=provider)
         return join_url(provider_upstream_request_base(provider, pcfg), "/api/chat"), req_body, headers
     if provider in OPENCODE_PROVIDER_NAMES:
         endpoint_kind = opencode_endpoint_kind(provider, upstream_model, pcfg)
@@ -23840,7 +24255,7 @@ def _cmd_test(args: argparse.Namespace) -> None:
         for line in provider_ip_family_probe_lines(provider, pcfg):
             print(line)
         if provider in ("ollama", "ollama-cloud"):
-            req_preview = ollama_chat_request(resolve_requested_model(provider, pcfg, model), tool_body, pcfg, stream=False)
+            req_preview = ollama_chat_request(resolve_requested_model(provider, pcfg, model), tool_body, pcfg, stream=False, provider=provider)
             print(f"Ollama num_ctx: {req_preview.get('options', {}).get('num_ctx', 'default')}")
     elif provider in OPENCODE_PROVIDER_NAMES:
         for line in provider_ip_family_probe_lines(provider, pcfg):
@@ -27406,7 +27821,11 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     prompt_meta = _channel_prompt_metadata(message)
     if prompt_meta:
         fields.append(f"metadata={prompt_meta}")
-    suffix = "If relevant to current work, respond or act now; otherwise keep working."
+    suffix = (
+        "If relevant to current work, respond or act now; otherwise keep working. "
+        "When action requires a tool, call the actual available Claude Code/MCP tool; "
+        "do not write XML-like snippets, pseudo tool calls, or partial JSON as text."
+    )
     if _channel_message_is_web_chat_request(message):
         suffix = (
             "Answer back through the claude-any-router send_message tool on the same channel/thread "
@@ -27707,7 +28126,11 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
         if prompt_meta:
             fields.append(f"metadata={prompt_meta}")
         parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False))
-    suffix = "If relevant to current work, respond or act now; otherwise keep working."
+    suffix = (
+        "If relevant to current work, respond or act now; otherwise keep working. "
+        "When action requires a tool, call the actual available Claude Code/MCP tool; "
+        "do not write XML-like snippets, pseudo tool calls, or partial JSON as text."
+    )
     if any(_channel_message_is_web_chat_request(message) for message in messages):
         suffix = (
             "For claude-any-web-chat item(s), answer back through the claude-any-router send_message tool "

@@ -482,6 +482,18 @@ class VllmProviderTests(unittest.TestCase):
             self.assertEqual(8192, claude_any.claude_code_output_token_limit("vllm", {**pcfg, "max_output_tokens": 32768}))
             self.assertEqual(262144, claude_any.claude_code_auto_compact_window("vllm", pcfg))
 
+    def test_vllm_context_budget_respects_explicit_preset_window_below_runtime(self):
+        pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
+        pcfg["current_model"] = "qwen3.6-35b-a3b-nvfp4"
+        pcfg["context_window"] = 131072
+        pcfg["max_model_len"] = 262144
+        pcfg["llm_preset"] = "long-context-128k"
+
+        with mock.patch.object(claude_any, "upstream_model_context_limit", return_value=262144):
+            self.assertEqual(131072, claude_any.openai_context_limit_for_budget("vllm", pcfg))
+            self.assertEqual(131072, claude_any.context_limit_for_status("vllm", pcfg))
+            self.assertEqual(131072, claude_any.claude_code_auto_compact_window("vllm", pcfg))
+
     def test_vllm_anthropic_body_cap_uses_runtime_model_limit_over_stale_window(self):
         pcfg = dict(claude_any.DEFAULT_CONFIG["providers"]["vllm"])
         pcfg["current_model"] = "qwen36-35b-a3b-mtp-nvfp4"

@@ -160,6 +160,71 @@ class OllamaProviderOptionTests(unittest.TestCase):
         self.assertEqual(524288, claude_any.ollama_num_ctx_for_payload(pcfg, {"messages": []}))
         self.assertIn("model max 1,000,000", claude_any.ollama_num_ctx_status(pcfg))
 
+    def test_large_ollama_context_uses_dynamic_reserve_when_unset(self):
+        pcfg = {
+            "current_model": "glm-5.2",
+            "num_ctx": "auto",
+            "num_ctx_min": 262144,
+            "num_ctx_max": 524288,
+            "max_output_tokens": 8192,
+        }
+
+        self.assertEqual(16384, claude_any.context_guard_reserve_tokens(pcfg, 524288))
+
+        messages = [{"role": "user", "content": "x" * 3000} for _ in range(4000)]
+        tools = []
+        context_limit = claude_any.ollama_context_limit_for_budget(pcfg)
+        budget = context_limit - pcfg["max_output_tokens"] - claude_any.context_guard_reserve_tokens(pcfg, context_limit)
+        compacted = claude_any.compact_ollama_messages_for_budget(messages, tools, budget, provider="ollama-cloud", model="glm-5.2")
+
+        self.assertLessEqual(claude_any.estimate_tokens({"messages": compacted, "tools": tools}), budget)
+        self.assertEqual(499712, budget)
+
+    def test_compact_request_uses_segmented_llm_compaction(self):
+        calls = []
+        original = claude_any.context_compact_request_summary
+
+        def fake_summary(provider, model, pcfg, prompt, *, wire, budget_tokens):
+            calls.append((provider, model, wire, prompt, budget_tokens))
+            return f"summary {len(calls)}"
+
+        claude_any.context_compact_request_summary = fake_summary
+        try:
+            pcfg = {
+                "base_url": "https://ollama.com",
+                "context_compact_chunk_tokens": 512,
+                "context_compact_summary_tokens": 512,
+            }
+            messages = [
+                {"role": "user", "content": "history " + ("x" * 10000)}
+                for _ in range(4)
+            ]
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "<command-name>/compact</command-name>\nCreate a detailed summary of the conversation.",
+                }
+            )
+
+            compacted = claude_any.compact_ollama_messages_for_budget(
+                messages,
+                [],
+                8192,
+                provider="ollama-cloud",
+                model="deepseek-v4-flash",
+                pcfg=pcfg,
+                full_compact_request=True,
+                wire="ollama",
+            )
+
+            self.assertGreaterEqual(len(calls), 2)
+            self.assertEqual(1, len(compacted))
+            self.assertIn("[claude-any segmented compact]", compacted[0]["content"])
+            self.assertIn("summary 1", compacted[0]["content"])
+            self.assertIn("Claude Code compact instruction", compacted[0]["content"])
+        finally:
+            claude_any.context_compact_request_summary = original
+
     def test_sync_ollama_context_caps_explicit_preset_above_provider_max(self):
         pcfg = {
             "current_model": "small-model",
