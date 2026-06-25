@@ -2172,6 +2172,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "custom_models": [KIMI_DEFAULT_MODEL],
             "native_compat": True,
             "preserve_anthropic_thinking": True,
+            "normalize_anthropic_tool_use": True,
+            "supports_tool_choice": False,
             "claude_code_supported_capabilities": ["effort", "thinking"],
             "context_window": 262144,
             "max_output_tokens": 32768,
@@ -2513,7 +2515,8 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
                 pcfg["llm_preset"] = "long-context-256k"
             pcfg["native_compat"] = True
             pcfg["preserve_anthropic_thinking"] = True
-            pcfg["supports_tool_choice"] = True
+            pcfg["normalize_anthropic_tool_use"] = True
+            pcfg["supports_tool_choice"] = False
             caps = pcfg.get("claude_code_supported_capabilities")
             if not isinstance(caps, list):
                 caps = []
@@ -2523,6 +2526,15 @@ def apply_config_migrations(cfg: dict[str, Any]) -> None:
             pcfg["claude_code_supported_capabilities"] = caps
             if (positive_int(pcfg.get("request_timeout_ms")) or 0) < 600000:
                 pcfg["request_timeout_ms"] = 600000
+        migrations[marker] = True
+
+    marker = "kimi_tool_choice_auto_only_20260625"
+    if not migrations.get(marker):
+        providers = cfg.get("providers") if isinstance(cfg.get("providers"), dict) else {}
+        pcfg = providers.get("kimi")
+        if isinstance(pcfg, dict):
+            pcfg["normalize_anthropic_tool_use"] = True
+            pcfg["supports_tool_choice"] = False
         migrations[marker] = True
 
 
@@ -4431,6 +4443,13 @@ def preserves_anthropic_thinking_contract(provider: str, pcfg: dict[str, Any]) -
     if configured is not None:
         return bool(configured)
     return provider == "anthropic"
+
+
+def should_normalize_anthropic_stream_tool_use(provider: str, pcfg: dict[str, Any]) -> bool:
+    configured = pcfg.get("normalize_anthropic_tool_use")
+    if configured is not None:
+        return bool(configured)
+    return provider != "anthropic" and not preserves_anthropic_thinking_contract(provider, pcfg)
 
 
 def normalize_thinking_for_non_anthropic_provider(provider: str, pcfg: dict[str, Any], body: dict[str, Any]) -> dict[str, Any]:
@@ -12714,8 +12733,28 @@ def normalize_anthropic_system_role_messages(body: dict[str, Any]) -> dict[str, 
 _PSEUDO_TOOL_INVOKE_RE = re.compile(
     r"(?is)(?:^|\n)[ \t]*(?:court[ \t]*(?:\r?\n)+)?<invoke\s+name=[\"'][^\"']+[\"'][\s\S]*?</invoke>[ \t]*(?=\n|$)"
 )
+_PSEUDO_TOOL_INVOKE_CALL_RE = re.compile(
+    r"(?is)(?:^|\n)[ \t]*(?:court[ \t]*(?:\r?\n)+)?"
+    r"<invoke\s+name=[\"'](?P<name>[^\"']+)[\"'][^>]*>(?P<body>[\s\S]*?)</invoke>[ \t]*(?=\n|$)"
+)
+_PSEUDO_TOOL_INVOKE_OPEN_RE = re.compile(
+    r"(?is)(?:^|\n)[ \t]*(?:court[ \t]*(?:\r?\n)+)?<invoke\s+name=[\"'](?P<name>[^\"']+)[\"'][^>]*>"
+)
 _PSEUDO_TOOL_XML_RE = re.compile(
     r"(?is)(?:^|\n)[ \t]*(?:court[ \t]*(?:\r?\n)+)?<(?P<name>[A-Za-z_][\w.-]{0,96})\b[^>]*>[\s\S]*?</(?P=name)>[ \t]*(?=\n|$)"
+)
+_PSEUDO_TOOL_XML_CALL_RE = re.compile(
+    r"(?is)(?:^|\n)[ \t]*(?:court[ \t]*(?:\r?\n)+)?"
+    r"<(?P<name>[A-Za-z_][\w.-]{0,96})\b[^>]*>(?P<body>[\s\S]*?)</(?P=name)>[ \t]*(?=\n|$)"
+)
+_PSEUDO_TOOL_XML_OPEN_RE = re.compile(
+    r"(?is)(?:^|\n)[ \t]*(?:court[ \t]*(?:\r?\n)+)?<(?P<name>[A-Za-z_][\w.-]{0,96})\b[^>]*>"
+)
+_PSEUDO_TOOL_PARAMETER_RE = re.compile(
+    r"(?is)<parameter\s+name=[\"'](?P<name>[^\"']+)[\"'][^>]*>(?P<value>[\s\S]*?)</parameter>"
+)
+_PSEUDO_TOOL_CHILD_ARG_RE = re.compile(
+    r"(?is)<(?P<name>[A-Za-z_][\w.-]{0,96})\b[^>]*>(?P<value>[\s\S]*?)</(?P=name)>"
 )
 
 
@@ -12738,6 +12777,104 @@ def _request_tool_name_aliases(body: dict[str, Any]) -> set[str]:
             aliases.add(short)
             aliases.add(short.replace("-", "_"))
     return aliases
+
+
+def _resolve_pseudo_xml_tool_name(raw_name: str, source_body: dict[str, Any] | None) -> str | None:
+    if not isinstance(source_body, dict):
+        return None
+    raw = str(raw_name or "").strip()
+    if not raw:
+        return None
+    available = tool_names_in_body(source_body)
+    if not available:
+        return None
+    matched = _match_available_tool_name(raw, available)
+    if matched:
+        return matched
+    aliases = _request_tool_name_aliases(source_body)
+    lowered = raw.lower()
+    normalized = lowered.replace("-", "_")
+    if lowered not in aliases and normalized not in aliases:
+        return None
+    return resolve_emitted_tool_name(raw, source_body)
+
+
+def _xml_unescape_text(value: str) -> str:
+    return html_lib.unescape(str(value or "")).strip()
+
+
+def _parse_pseudo_xml_tool_args(tool_name: str, body: str) -> dict[str, Any]:
+    inner = str(body or "").strip()
+    args: dict[str, Any] = {}
+    for match in _PSEUDO_TOOL_PARAMETER_RE.finditer(inner):
+        key = str(match.group("name") or "").strip()
+        if key:
+            args[key] = _xml_unescape_text(match.group("value") or "")
+    if args:
+        return args
+    for match in _PSEUDO_TOOL_CHILD_ARG_RE.finditer(inner):
+        key = str(match.group("name") or "").strip()
+        if key and key.lower() not in {"invoke", tool_name.lower()}:
+            args[key] = _xml_unescape_text(match.group("value") or "")
+    if args:
+        return args
+    try:
+        parsed = json.loads(inner)
+        if isinstance(parsed, dict):
+            return parsed
+    except Exception:
+        pass
+    return normalize_tool_arguments(tool_name, _xml_unescape_text(inner))
+
+
+def _find_pseudo_xml_tool_start(text: str, source_body: dict[str, Any] | None) -> int:
+    if not isinstance(source_body, dict) or "<" not in text:
+        return -1
+    for match in sorted(
+        list(_PSEUDO_TOOL_INVOKE_CALL_RE.finditer(text))
+        + list(_PSEUDO_TOOL_XML_CALL_RE.finditer(text))
+        + list(_PSEUDO_TOOL_INVOKE_OPEN_RE.finditer(text))
+        + list(_PSEUDO_TOOL_XML_OPEN_RE.finditer(text)),
+        key=lambda item: item.start(),
+    ):
+        raw_name = str(match.group("name") or "")
+        if raw_name.lower() == "invoke":
+            continue
+        if _resolve_pseudo_xml_tool_name(raw_name, source_body):
+            return match.start()
+    return -1
+
+
+def _parse_xml_pseudo_tool_calls(text: str, source_body: dict[str, Any] | None) -> tuple[str, list[dict[str, Any]]]:
+    if not isinstance(source_body, dict) or "<" not in text:
+        return text, []
+    matches: list[tuple[int, int, str, str]] = []
+    for match in _PSEUDO_TOOL_INVOKE_CALL_RE.finditer(text):
+        matches.append((match.start(), match.end(), str(match.group("name") or ""), str(match.group("body") or "")))
+    for match in _PSEUDO_TOOL_XML_CALL_RE.finditer(text):
+        raw_name = str(match.group("name") or "")
+        if raw_name.lower() == "invoke":
+            continue
+        matches.append((match.start(), match.end(), raw_name, str(match.group("body") or "")))
+    if not matches:
+        return text, []
+    visible_parts: list[str] = []
+    calls: list[dict[str, Any]] = []
+    pos = 0
+    for start, end, raw_name, body in sorted(matches, key=lambda item: item[0]):
+        if start < pos:
+            continue
+        matched_name = _resolve_pseudo_xml_tool_name(raw_name, source_body)
+        if not matched_name:
+            continue
+        visible_parts.append(text[pos:start])
+        args = _parse_pseudo_xml_tool_args(matched_name, body)
+        calls.append({"function": {"name": matched_name, "arguments": args}, "id": f"xml:{raw_name}:{start}"})
+        pos = end
+    if not calls:
+        return text, []
+    visible_parts.append(text[pos:])
+    return "".join(visible_parts), calls
 
 
 def _remove_assistant_pseudo_tool_xml(text: str, tool_aliases: set[str], replacement: str) -> tuple[str, int]:
@@ -15389,9 +15526,9 @@ def infer_tool_name_from_args(args: dict[str, Any]) -> str:
     return "TaskList" if not args else "Write"
 
 
-def parse_pseudo_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+def parse_pseudo_tool_calls(text: str, source_body: dict[str, Any] | None = None) -> tuple[str, list[dict[str, Any]]]:
     if PSEUDO_TOOL_START not in text:
-        return text, []
+        return _parse_xml_pseudo_tool_calls(text, source_body)
     visible_parts: list[str] = []
     calls: list[dict[str, Any]] = []
     pos = 0
@@ -15432,14 +15569,15 @@ def parse_pseudo_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
             calls.append({"function": {"name": name, "arguments": args}, "id": raw_header})
         if end < 0:
             break
-    return "".join(visible_parts), calls
+    visible_text, xml_calls = _parse_xml_pseudo_tool_calls("".join(visible_parts), source_body)
+    return visible_text, calls + xml_calls
 
 
 def ollama_chat_to_anthropic(data: dict[str, Any], model: str, source_body: dict[str, Any] | None = None) -> dict[str, Any]:
     message = data.get("message") if isinstance(data.get("message"), dict) else {}
     content: list[dict[str, Any]] = []
     text = message.get("content") or ""
-    text, pseudo_tool_calls = parse_pseudo_tool_calls(text)
+    text, pseudo_tool_calls = parse_pseudo_tool_calls(text, source_body)
     if text:
         content.append({"type": "text", "text": text})
     tool_id_prefix = f"toolu_ollama_{int(time.time() * 1000)}_{os.getpid()}"
@@ -15597,6 +15735,7 @@ def _rebatch_anthropic_sse_text(
     suppressed_thinking_blocks: dict[int, dict[str, Any]] = {}
     suppressed_thinking_passback_blocks: list[dict[str, Any]] = []
     buffered_tool_uses: dict[int, dict[str, Any]] = {}
+    held_pseudo_tool_text: dict[int, str] = {}
     pending_message_delta: tuple[str | None, str] | None = None
     pending_message_stop: tuple[str | None, str] | None = None
     last_suppressed_keepalive_at = 0.0
@@ -15912,6 +16051,25 @@ def _rebatch_anthropic_sse_text(
         emit_raw("content_block_stop", json.dumps({"type": "content_block_stop", "index": index}, ensure_ascii=False))
         emitted_tool_use = True
 
+    def emit_pseudo_tool_uses(pseudo_tool_calls: list[dict[str, Any]]) -> bool:
+        nonlocal next_content_index, saw_tool_use
+        if not pseudo_tool_calls:
+            return False
+        for call in pseudo_tool_calls:
+            fn = call.get("function") if isinstance(call, dict) else {}
+            if not isinstance(fn, dict) or not fn.get("name"):
+                continue
+            tool_index = next_content_index
+            next_content_index += 1
+            tool_state = {
+                "id": str(call.get("id") or ""),
+                "name": str(fn.get("name") or ""),
+                "partial_json": json.dumps(fn.get("arguments") or {}, ensure_ascii=False),
+            }
+            emit_normalized_tool_use(tool_index, tool_state)
+            saw_tool_use = True
+        return True
+
     def process_event(event_type: str | None, data_str: str) -> None:
         nonlocal saw_message_start, saw_message_stop, text_so_far, saw_tool_use, emitted_tool_use, next_content_index, pending_message_delta, pending_message_stop
         try:
@@ -15985,12 +16143,30 @@ def _rebatch_anthropic_sse_text(
                 data_str = json.dumps(patched, ensure_ascii=False)
                 if isinstance(mapped_index, int) and word_chunking:
                     flush_buffer(mapped_index, force=True)
+                if isinstance(mapped_index, int) and mapped_index in held_pseudo_tool_text:
+                    held_text = held_pseudo_tool_text.pop(mapped_index)
+                    visible_text, pseudo_tool_calls = parse_pseudo_tool_calls(held_text, source_body)
+                    if pseudo_tool_calls:
+                        if visible_text.strip():
+                            emit_text_delta(mapped_index, visible_text)
+                        emit_raw(event_type, data_str)
+                        emit_pseudo_tool_uses(pseudo_tool_calls)
+                        return
+                    else:
+                        emit_text_delta(mapped_index, held_text)
                 emit_raw(event_type, data_str)
                 return
         elif evt_type == "message_delta":
             delta = event.get("delta") if isinstance(event.get("delta"), dict) else {}
             stop_reason = str(delta.get("stop_reason") or "")
             tool_calls = [{"type": "tool_use"}] if emitted_tool_use else []
+            if emitted_tool_use and stop_reason == "end_turn":
+                patched = dict(event)
+                patched_delta = dict(delta)
+                patched_delta["stop_reason"] = "tool_use"
+                patched["delta"] = patched_delta
+                pending_message_delta = (event_type, json.dumps(patched, ensure_ascii=False))
+                return
             if (
                 allow_tasklist_synthesis
                 and
@@ -16067,6 +16243,25 @@ def _rebatch_anthropic_sse_text(
                 if not text:
                     return
                 text_so_far += text
+                if provider != "anthropic" and mapped_index in held_pseudo_tool_text:
+                    held_pseudo_tool_text[mapped_index] += text
+                    return
+                pseudo_start = _find_pseudo_xml_tool_start(text, source_body) if provider != "anthropic" else -1
+                if pseudo_start >= 0:
+                    prefix = text[:pseudo_start]
+                    held_pseudo_tool_text[mapped_index] = text[pseudo_start:]
+                    if not prefix:
+                        return
+                    if not word_chunking:
+                        patched = dict(event)
+                        patched_delta = dict(delta)
+                        patched_delta["text"] = prefix
+                        patched["delta"] = patched_delta
+                        emit_raw(event_type, json.dumps(patched, ensure_ascii=False))
+                        return
+                    text_buffers[mapped_index] = text_buffers.get(mapped_index, "") + prefix
+                    flush_buffer(mapped_index, force=False)
+                    return
                 if not word_chunking:
                     emit_raw(event_type, data_str)
                     return
@@ -17174,7 +17369,7 @@ def stream_openai_chat_to_anthropic_sse(
         close_reasoning_block()
 
         tool_calls: list[dict[str, Any]] = []
-        _, pseudo_tool_calls = parse_pseudo_tool_calls(pseudo_text)
+        _, pseudo_tool_calls = parse_pseudo_tool_calls(pseudo_text, source_body)
         for i, pseudo in enumerate(pseudo_tool_calls):
             fn = pseudo.get("function") if isinstance(pseudo, dict) else {}
             if isinstance(fn, dict):
@@ -18060,7 +18255,7 @@ class RouterHandler(BaseHTTPRequestHandler):
                         word_chunking=word_chunking,
                         source_body=body,
                         preserve_thinking=preserves_anthropic_thinking_contract(provider, pcfg),
-                        normalize_tool_use=not preserves_anthropic_thinking_contract(provider, pcfg),
+                        normalize_tool_use=should_normalize_anthropic_stream_tool_use(provider, pcfg),
                         provider=provider,
                     )
                 else:
@@ -27849,11 +28044,7 @@ def format_channel_wake_prompt(message: dict[str, Any]) -> str:
     prompt_meta = _channel_prompt_metadata(message)
     if prompt_meta:
         fields.append(f"metadata={prompt_meta}")
-    suffix = (
-        "If relevant to current work, respond or act now; otherwise keep working. "
-        "When action requires a tool, call the actual available Claude Code/MCP tool; "
-        "do not write XML-like snippets, pseudo tool calls, or partial JSON as text."
-    )
+    suffix = "If relevant to current work, respond or act now; otherwise keep working."
     if _channel_message_is_web_chat_request(message):
         suffix = (
             "Answer back through the claude-any-router send_message tool on the same channel/thread "
@@ -28154,11 +28345,7 @@ def format_channel_wake_batch_prompt(messages: list[dict[str, Any]]) -> str:
         if prompt_meta:
             fields.append(f"metadata={prompt_meta}")
         parts.append("(" + " ".join(fields) + ") " + json.dumps(body, ensure_ascii=False))
-    suffix = (
-        "If relevant to current work, respond or act now; otherwise keep working. "
-        "When action requires a tool, call the actual available Claude Code/MCP tool; "
-        "do not write XML-like snippets, pseudo tool calls, or partial JSON as text."
-    )
+    suffix = "If relevant to current work, respond or act now; otherwise keep working."
     if any(_channel_message_is_web_chat_request(message) for message in messages):
         suffix = (
             "For claude-any-web-chat item(s), answer back through the claude-any-router send_message tool "

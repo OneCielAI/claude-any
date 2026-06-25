@@ -1,4 +1,5 @@
 import copy
+import io
 import unittest
 from unittest import mock
 
@@ -33,6 +34,8 @@ class KimiProviderTests(unittest.TestCase):
         self.assertEqual(600000, pcfg["request_timeout_ms"])
         self.assertTrue(pcfg["native_compat"])
         self.assertTrue(pcfg["preserve_anthropic_thinking"])
+        self.assertTrue(pcfg["normalize_anthropic_tool_use"])
+        self.assertFalse(pcfg["supports_tool_choice"])
         self.assertIn("thinking", pcfg["claude_code_supported_capabilities"])
 
     def test_kimi_aliases_normalize_to_documented_model_id(self):
@@ -117,7 +120,7 @@ class KimiProviderTests(unittest.TestCase):
             native_compat=False,
             preserve_anthropic_thinking=False,
             claude_code_supported_capabilities=[],
-            supports_tool_choice=False,
+            supports_tool_choice=True,
         )
         cfg["migrations"] = {}
 
@@ -131,9 +134,68 @@ class KimiProviderTests(unittest.TestCase):
         self.assertEqual(600000, pcfg["request_timeout_ms"])
         self.assertTrue(pcfg["native_compat"])
         self.assertTrue(pcfg["preserve_anthropic_thinking"])
-        self.assertTrue(pcfg["supports_tool_choice"])
+        self.assertTrue(pcfg["normalize_anthropic_tool_use"])
+        self.assertFalse(pcfg["supports_tool_choice"])
         self.assertIn("effort", pcfg["claude_code_supported_capabilities"])
         self.assertIn("thinking", pcfg["claude_code_supported_capabilities"])
+
+    def test_kimi_strips_forced_tool_choice_by_default(self):
+        pcfg = self.kimi_cfg()["providers"]["kimi"]
+        body = claude_any.compatibility_tool_request("kimi-for-coding")
+
+        out = claude_any.normalize_tool_choice_for_provider("kimi", pcfg, body)
+
+        self.assertIn("tool_choice", body)
+        self.assertNotIn("tool_choice", out)
+
+    def test_kimi_preserves_thinking_while_normalizing_tool_use_stream(self):
+        class FakeHandler:
+            def __init__(self):
+                self.wfile = io.BytesIO()
+
+        def sse(event_name, payload):
+            return f"event: {event_name}\ndata: {claude_any.json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+
+        chunks = [
+            sse("message_start", {"type": "message_start", "message": {"id": "msg", "type": "message", "role": "assistant", "content": [], "model": "kimi-for-coding"}}),
+            sse("content_block_start", {"type": "content_block_start", "index": 0, "content_block": {"type": "thinking", "thinking": ""}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 0, "delta": {"type": "thinking_delta", "thinking": "private reasoning"}}),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+            sse("content_block_start", {"type": "content_block_start", "index": 1, "content_block": {"type": "tool_use", "id": "toolu_bad", "name": "Bash", "input": {}}}),
+            sse("content_block_delta", {"type": "content_block_delta", "index": 1, "delta": {"type": "input_json_delta", "partial_json": "echo hello"}}),
+            sse("content_block_stop", {"type": "content_block_stop", "index": 1}),
+            sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "tool_use", "stop_sequence": None}, "usage": {"output_tokens": 3}}),
+            sse("message_stop", {"type": "message_stop"}),
+        ]
+        handler = FakeHandler()
+        pcfg = self.kimi_cfg()["providers"]["kimi"]
+
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            io.BytesIO(b"".join(chunks)),
+            "kimi-for-coding",
+            source_body={"tools": [{"name": "Bash", "input_schema": {"type": "object"}}]},
+            preserve_thinking=claude_any.preserves_anthropic_thinking_contract("kimi", pcfg),
+            normalize_tool_use=claude_any.should_normalize_anthropic_stream_tool_use("kimi", pcfg),
+            provider="kimi",
+        )
+
+        output = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("private reasoning", output)
+        payloads = []
+        for event_block in output.split("\n\n"):
+            data_lines = [line[5:].strip() for line in event_block.splitlines() if line.startswith("data:")]
+            if data_lines:
+                payloads.append(claude_any.json.loads("\n".join(data_lines)))
+        tool_deltas = [
+            payload
+            for payload in payloads
+            if payload.get("type") == "content_block_delta"
+            and isinstance(payload.get("delta"), dict)
+            and payload["delta"].get("type") == "input_json_delta"
+        ]
+        emitted_input = claude_any.json.loads(tool_deltas[0]["delta"]["partial_json"])
+        self.assertEqual("echo hello", emitted_input["command"])
 
     def test_env_vars_route_kimi_through_claude_any_router(self):
         cfg = self.kimi_cfg(api_key="sk-kimi-test")

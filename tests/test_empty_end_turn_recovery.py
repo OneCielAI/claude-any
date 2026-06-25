@@ -413,6 +413,58 @@ class EmptyEndTurnRecoveryTests(unittest.TestCase):
         self.assertNotIn('"name": "TaskList"', output)
         self.assertIn('"stop_reason": "end_turn"', output)
 
+    def test_non_anthropic_stream_converts_bash_xml_pseudo_tool_text(self):
+        body = body_with_tools("search memory", ["Bash", "Read"])
+
+        class Handler:
+            def __init__(self):
+                self.wfile = BytesIO()
+
+        handler = Handler()
+        events = [
+            'event: message_start\ndata: {"type":"message_start","message":{"content":[]}}\n\n',
+            'event: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n\n',
+            (
+                'event: content_block_delta\ndata: '
+                + json.dumps(
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {
+                            "type": "text_delta",
+                            "text": '1차 탐색\n\n<bash>\ngrep -rin "bb" /home/robert-any/.claude/projects/-home-robert-any/memory/ 2>/dev/null\n</bash>',
+                        },
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n\n"
+            ),
+            'event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\n',
+            'event: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":1}}\n\n',
+            'event: message_stop\ndata: {"type":"message_stop"}\n\n',
+        ]
+        lines = []
+        for event in events:
+            lines.extend(f"{line}\n".encode("utf-8") for line in event.splitlines())
+
+        claude_any._rebatch_anthropic_sse_text(
+            handler,
+            lines,
+            "deepseek-v4-flash",
+            word_chunking=False,
+            source_body=body,
+            preserve_thinking=False,
+            provider="deepseek",
+            normalize_tool_use=True,
+        )
+
+        output = handler.wfile.getvalue().decode("utf-8")
+        self.assertIn("1차 탐색", output)
+        self.assertNotIn("<bash>", output)
+        self.assertIn('"name": "Bash"', output)
+        self.assertIn('grep -rin', output)
+        self.assertIn('"stop_reason": "tool_use"', output)
+
     def test_native_stream_hidden_only_response_synthesizes_tasklist(self):
         body = body_with_tools("continue implementation", ["TaskList", "Read", "Edit"])
         body["messages"].append(

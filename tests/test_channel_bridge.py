@@ -1120,8 +1120,8 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertNotIn("send_message", prompt)
         self.assertNotIn("recipients='web'", prompt)
         self.assertNotIn("send_file", prompt)
-        self.assertIn("actual available Claude Code/MCP tool", prompt)
-        self.assertIn("do not write XML-like snippets", prompt)
+        self.assertNotIn("XML-like", prompt)
+        self.assertNotIn("actual available Claude Code/MCP tool", prompt)
         self.assertNotIn("\n", prompt)
 
     def test_channel_wake_prompt_includes_small_event_metadata_only(self):
@@ -1168,6 +1168,7 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("send_message", prompt)
         self.assertIn("recipients='web'", prompt)
         self.assertIn("send_file", prompt)
+        self.assertNotIn("XML-like", prompt)
 
     def test_channel_wake_batch_omits_browser_reply_instructions_without_web_chat(self):
         prompt = claude_any.format_channel_wake_batch_prompt(
@@ -2723,6 +2724,29 @@ class ChannelBridgeTests(unittest.TestCase):
         self.assertIn("removed prior assistant pseudo tool-call", assistant_text)
         self.assertEqual("tool_use", out["messages"][0]["content"][1]["type"])
         self.assertIn("<get_assignment>", out["messages"][1]["content"])
+
+    def test_parse_pseudo_tool_calls_converts_invoke_only_for_available_tool(self):
+        body = {
+            "tools": [
+                {"name": "mcp__ai-net-http__get_messages", "input_schema": {"type": "object"}},
+            ]
+        }
+        text = (
+            "Reading latest.\n"
+            "<invoke name=\"mcp__ai-net-http__get_messages\">\n"
+            "<parameter name=\"room_id\">room1</parameter>\n"
+            "<parameter name=\"limit\">5</parameter>\n"
+            "</invoke>\n"
+            "<note>ordinary XML remains</note>"
+        )
+
+        visible, calls = claude_any.parse_pseudo_tool_calls(text, body)
+
+        self.assertIn("Reading latest.", visible)
+        self.assertIn("<note>ordinary XML remains</note>", visible)
+        self.assertNotIn("<invoke", visible)
+        self.assertEqual("mcp__ai-net-http__get_messages", calls[0]["function"]["name"])
+        self.assertEqual({"room_id": "room1", "limit": "5"}, calls[0]["function"]["arguments"])
 
     def test_body_with_pending_channel_messages_skips_stdin_wake_delivered_messages(self):
         body = {"messages": [{"role": "user", "content": "continue"}], "stream": True}
